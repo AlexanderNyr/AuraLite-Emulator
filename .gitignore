@@ -1,0 +1,16 @@
+# Build outputs
+/x86emu
+/firmware/*.bin
+/disk/*.bin
+/disk/*.img
+
+# Emulator output
+*.ppm
+*.log
+*.out
+*.err
+
+# Tool/editor files
+.DS_Store
+.vscode/
+.idea/

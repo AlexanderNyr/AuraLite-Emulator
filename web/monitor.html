@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Universal x86 Emulator Monitor</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--line:#263451;--muted:#8fa2c2;--accent:#58d6ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e7efff;font:14px ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:22px 28px;border-bottom:1px solid var(--line);background:linear-gradient(110deg,#15243d,#10182b)}h1{margin:0 0 6px;font-size:20px;color:var(--accent)}.sub{color:var(--muted)}main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:18px;max-width:1300px;margin:auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.panel h2{margin:0;padding:12px 14px;font-size:13px;color:#b8d7ff;border-bottom:1px solid var(--line)}.body{padding:14px}.kv{display:grid;grid-template-columns:120px 1fr;gap:8px 12px}.key{color:var(--muted)}.value{color:#c8f4ff}.ok{color:#62e6a6}.warn{color:#ffd36a}.wide{grid-column:1/-1}canvas{width:100%;background:#030611;border:1px solid var(--line);image-rendering:pixelated;aspect-ratio:4/3}.drop{border:1px dashed #486187;border-radius:7px;padding:12px;color:var(--muted);margin-top:10px}input{max-width:100%}pre{margin:0;max-height:260px;overflow:auto;white-space:pre-wrap;color:#b9cbe8}.pill{display:inline-block;border:1px solid #34758a;border-radius:99px;padding:4px 9px;color:var(--accent)}
+</style>
+<header><h1>Universal x86 Emulator Monitor</h1><div class="sub">from-scratch x86 firmware emulator · CPU, PCI, MMIO, USB and framebuffer</div></header>
+<main>
+<section class="panel"><h2>Machine</h2><div class="body kv"><div class="key">Platform</div><div class="value">Haswell / Intel profile</div><div class="key">Execution</div><div class="value ok">CPU interpreter active</div><div class="key">Mode</div><div class="value" id="mode">long64</div><div class="key">Firmware</div><div class="value">firmware.bin · 128 KiB</div><div class="key">RAM</div><div class="value">128 MiB</div><div class="key">USB</div><div class="value ok">EHCI / MSC model</div></div></section>
+<section class="panel"><h2>Registers</h2><div class="body kv"><div class="key">RIP</div><div class="value">0x00000000000e38d5</div><div class="key">RAX</div><div class="value">0x0000000000000000</div><div class="key">RSP</div><div class="value">0x00000000fef0fffc</div><div class="key">CR0</div><div class="value">0x00000000e0000011</div><div class="key">CR3</div><div class="value">0x0000000000010000</div><div class="key">EFER</div><div class="value">0x0000000000000500</div></div></section>
+<section class="panel wide"><h2>Framebuffer preview · 800×600</h2><div class="body"><canvas id="screen" width="800" height="600"></canvas><div class="drop">Load a PPM produced by <code>./x86emu --dump-fb=framebuffer.ppm</code>: <input id="ppm" type="file" accept=".ppm,image/x-portable-pixmap"></div></div></section>
+<section class="panel wide"><h2>Event log</h2><div class="body"><pre id="log">[boot] platform=Haswell
+[pci] MMCONFIG window enabled at 0xe0000000
+[usb-msc] READ(10) LBA=0 blocks=512
+</pre><div class="drop">Load a text log: <input id="logfile" type="file" accept=".txt,.log"></div></div></section>
+</main>
+<script>
+const c=document.querySelector('#screen'),x=c.getContext('2d');let g=x.createLinearGradient(0,0,800,600);g.addColorStop(0,'#162b4d');g.addColorStop(.5,'#163f55');g.addColorStop(1,'#08121e');x.fillStyle=g;x.fillRect(0,0,800,600);x.fillStyle='#58d6ff';x.font='24px monospace';x.fillText('x86 PC emulator',28,48);x.font='14px monospace';x.fillText('Framebuffer is ready for a guest payload',28,76);
+function ppm(buf){let s=new TextDecoder().decode(buf.slice(0,1000)),m=s.match(/^P6\s+(\d+)\s+(\d+)\s+255\s/);if(!m)return;let h=m[0].length,w=+m[1],ht=+m[2],im=new ImageData(w,ht),a=new Uint8Array(buf);for(let i=0;i<w*ht;i++){im.data[i*4]=a[h+i*3+0];im.data[i*4+1]=a[h+i*3+1];im.data[i*4+2]=a[h+i*3+2];im.data[i*4+3]=255}c.width=w;c.height=ht;x.putImageData(im,0,0)}
+document.querySelector('#ppm').onchange=e=>{let f=e.target.files[0];if(f)f.arrayBuffer().then(ppm)};document.querySelector('#logfile').onchange=e=>{let f=e.target.files[0];if(f)f.text().then(t=>document.querySelector('#log').textContent=t)};
+</script>

@@ -1,0 +1,78 @@
+// cpu.h -- Generic x86 (16/32/64-bit) interpreter core
+#ifndef CPU_H
+#define CPU_H
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct machine machine_t; // fwd decl (defined in mem.h/machine.h)
+
+enum { RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,RBP=5,RSI=6,RDI=7,
+       R8=8,R9=9,R10=10,R11=11,R12=12,R13=13,R14=14,R15=15 };
+enum { SEG_ES=0,SEG_CS=1,SEG_SS=2,SEG_DS=3,SEG_FS=4,SEG_GS=5 };
+
+/* RFLAGS bits */
+#define FLAG_CF (1ULL<<0)
+#define FLAG_PF (1ULL<<2)
+#define FLAG_AF (1ULL<<4)
+#define FLAG_ZF (1ULL<<6)
+#define FLAG_SF (1ULL<<7)
+#define FLAG_TF (1ULL<<8)
+#define FLAG_IF (1ULL<<9)
+#define FLAG_DF (1ULL<<10)
+#define FLAG_OF (1ULL<<11)
+
+typedef struct {
+    uint16_t sel;
+    uint64_t base;
+    uint32_t limit;
+    uint8_t  d_b;     /* default operand size bit (1=32bit,0=16bit) for CS/SS etc */
+    uint8_t  l;       /* long-mode 64-bit code segment bit (CS only) */
+    uint8_t  present;
+    uint8_t  type;    /* raw access-rights byte, for diagnostics */
+} segment_t;
+
+#define MAX_MSR 64
+
+typedef struct {
+    uint32_t idx;
+    uint64_t val;
+} msr_entry_t;
+
+typedef struct cpu {
+    uint64_t gpr[16];
+    uint64_t rip;
+    uint64_t rflags;
+    segment_t seg[6];
+    uint64_t cr0, cr2, cr3, cr4;
+    uint64_t efer;
+    uint64_t gdtr_base; uint16_t gdtr_limit;
+    uint64_t idtr_base; uint16_t idtr_limit;
+
+    msr_entry_t msr[MAX_MSR];
+    int msr_count;
+
+    int halted;
+    int in_exception;        /* re-entrancy guard against exception-during-exception (double fault) */
+    int exception_taken;     /* set when raise_exception() redirected RIP mid-instruction */
+    int fault;              /* set on unrecoverable decode/exec error */
+    char fault_msg[256];
+    uint64_t fault_rip;
+
+    uint64_t instr_count;
+    int trace;               /* if non-zero, print each instruction */
+
+    machine_t *mach;         /* back-reference to owning machine (memory/io) */
+} cpu_t;
+
+void cpu_reset(cpu_t *c);
+/* executes exactly one instruction; returns 0 normally, -1 on fault/halt-without-progress */
+int  cpu_step(cpu_t *c);
+
+uint64_t cpu_get_msr(cpu_t *c, uint32_t idx, int *found);
+void     cpu_set_msr(cpu_t *c, uint32_t idx, uint64_t val);
+
+const char *cpu_mode_name(cpu_t *c);
+int cpu_addr_size(cpu_t *c);
+int cpu_op_size_default(cpu_t *c);
+
+#endif

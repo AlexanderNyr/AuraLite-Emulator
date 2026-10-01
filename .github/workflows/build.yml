@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc make nasm python3
+      - name: Build emulator and sample inputs
+        run: make firmware/firmware.bin disk/disk.img
+      - name: Build and run platform smoke tests
+        run: make test
