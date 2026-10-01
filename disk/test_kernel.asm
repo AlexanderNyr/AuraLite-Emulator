@@ -13,6 +13,25 @@ HEIGHT equ 600
 
 start:
     cli
+    mov dx, 0x03F8
+    mov al, 'G'
+    out dx, al
+    mov al, 'U'
+    out dx, al
+    mov al, 'E'
+    out dx, al
+    mov al, 'S'
+    out dx, al
+    mov al, 'T'
+    out dx, al
+    mov al, '_'
+    out dx, al
+    mov al, 'O'
+    out dx, al
+    mov al, 'K'
+    out dx, al
+    mov al, 10
+    out dx, al
     mov rdi, 0xD0000000      ; framebuffer pixel pointer (matches devices.c GPU VRAM)
     xor r12, r12              ; row = 0
 

@@ -74,6 +74,7 @@ struct machine {
     uint64_t max_instructions; /* safety cap, 0 = unlimited */
     int running;
     int stop_requested;
+    int guest_entry_seen; /* conventional guest entry at physical 0x00100000 */
 };
 typedef struct machine machine_t;
 

@@ -26,6 +26,8 @@ make firmware/firmware.bin disk/disk.img
 
 ## Run
 
+The emulator returns exit code `0` for a normal stop or instruction-limit stop and exit code `2` when the CPU enters a fault state. Input-file errors return exit code `1`.
+
 The unmodified firmware is useful for observing its actual behaviour and faults:
 
 ```sh
@@ -40,6 +42,20 @@ Run any compatible ROM directly; the emulator does not rewrite the guest image. 
 ```
 
 Select other profiles with `--platform=sandybridge`, `ivybridge`, `broadwell`, or `baytrail`. `--disk=...` supplies the virtual USB storage image. `--rom=...` supplies another firmware image.
+
+## Testing
+
+Run the CPU unit tests and the platform smoke tests with:
+
+```sh
+make test
+```
+
+The focused CPU tests can be run independently:
+
+```sh
+make test-unit
+```
 
 ## Architecture
 

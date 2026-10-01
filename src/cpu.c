@@ -261,12 +261,22 @@ static uint32_t fetch32(dctx_t *d){ uint32_t v=(uint32_t)read_mem_v(d->m, d->c->
 static uint64_t fetch64(dctx_t *d){ uint64_t v=read_mem_v(d->m, d->c->seg[SEG_CS].base+d->pc,8); d->pc+=8; return v; }
 static int8_t  fetch8s(dctx_t *d){ return (int8_t)fetch8(d); }
 static int32_t fetch32s(dctx_t *d){ return (int32_t)fetch32(d); }
-static uint64_t fetch_imm(dctx_t *d, int size){
-    if (size==1) return fetch8(d); if (size==2) return fetch16(d);
-    if (size==4) return fetch32(d); return fetch64(d);
+static uint64_t fetch_imm(dctx_t *d, int size) {
+    if (size == 1)
+        return fetch8(d);
+    if (size == 2)
+        return fetch16(d);
+    if (size == 4)
+        return fetch32(d);
+    return fetch64(d);
 }
-static int64_t fetch_imm_signed_z(dctx_t *d, int size){ /* imm sign-extended to operand size, but itself read at <=32 bits (used for group1 0x81/0x83-style) */
-    if (size==1) return fetch8s(d); if (size==2) return (int16_t)fetch16(d);
+
+static int64_t fetch_imm_signed_z(dctx_t *d, int size) {
+    /* The immediate is at most 32 bits and is sign-extended by the caller. */
+    if (size == 1)
+        return fetch8s(d);
+    if (size == 2)
+        return (int16_t)fetch16(d);
     return fetch32s(d);
 }
 

@@ -55,6 +55,10 @@ static rw2_t *make_spd_window(machine_t *m, uint64_t base, uint64_t size, const 
 /* ================================= EHCI/USB ================================ */
 #define DISK_SECTOR 512
 
+uint16_t usb_msc_be16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
 typedef struct {
     rw2_t *regs;         /* BAR-backed register window, also used as scratch */
     uint64_t base;
@@ -84,7 +88,11 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, uint32_t *pending_
                                (uint32_t)mem_read(m, buf+18, 1) << 16 |
                                (uint32_t)mem_read(m, buf+19, 1) << 8  |
                                (uint32_t)mem_read(m, buf+20, 1);
-                uint32_t blocks = (uint32_t)mem_read(m, buf+22, 1) << 8 | (uint32_t)mem_read(m, buf+23, 1);
+                uint8_t transfer_len[2] = {
+                    (uint8_t)mem_read(m, buf+22, 1),
+                    (uint8_t)mem_read(m, buf+23, 1)
+                };
+                uint32_t blocks = usb_msc_be16(transfer_len);
                 if (blocks == 0) blocks = 1;
                 *pending_lba = lba; *pending_blocks = blocks; *have_cmd = 1;
                 mlog(&m->log, "[usb-msc] READ(10) LBA=%u blocks=%u", lba, blocks);
@@ -94,19 +102,35 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, uint32_t *pending_
         }
     } else if (pid == 1) {
         if (*have_cmd) {
+            uint64_t disk_off = (uint64_t)(*pending_lba) * DISK_SECTOR;
+            uint64_t disk_avail = disk_off < m->disk_len ? m->disk_len - disk_off : 0;
             uint32_t bytes = total;
-            uint32_t avail = (uint32_t)(m->disk_len > (uint64_t)(*pending_lba)*DISK_SECTOR
-                                         ? m->disk_len - (uint64_t)(*pending_lba)*DISK_SECTOR : 0);
-            if (bytes > avail) bytes = avail;
+            if (disk_avail < bytes) bytes = (uint32_t)disk_avail;
+            if (buf >= RAM_SIZE) {
+                bytes = 0;
+                mlog(&m->log, "[usb-msc] rejected qTD buffer 0x%08x outside guest RAM", buf);
+            } else if ((uint64_t)buf + bytes > RAM_SIZE) {
+                bytes = (uint32_t)(RAM_SIZE - buf);
+                mlog(&m->log, "[usb-msc] clipped qTD transfer at guest RAM end");
+            }
             for (uint32_t i = 0; i < bytes; i++)
-                mem_write(m, buf+i, 1, m->disk[(uint64_t)(*pending_lba)*DISK_SECTOR + i]);
+                mem_write(m, (uint64_t)buf+i, 1, m->disk[disk_off + i]);
             mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (from LBA %u)", bytes, buf, *pending_lba);
+            /* Once the requested data phase is complete, the next short IN
+             * transfer is the CSW, not another disk read. */
+            uint64_t expected = (uint64_t)(*pending_blocks ? *pending_blocks : 1) * DISK_SECTOR;
+            if (bytes >= expected)
+                *have_cmd = 0;
         } else {
             /* Likely the CSW (status) phase -- fabricate a successful one. */
-            wr32(m, buf+0, 0x53425355u); /* 'USBS' */
-            wr32(m, buf+4, 0);
-            wr32(m, buf+8, 0); /* status = good */
-            mlog(&m->log, "[usb-msc] synthesized CSW (status=OK) -> guest 0x%08x", buf);
+            if (buf <= RAM_SIZE - 12) {
+                wr32(m, buf+0, 0x53425355u); /* 'USBS' */
+                wr32(m, buf+4, 0);
+                wr32(m, buf+8, 0); /* status = good */
+                mlog(&m->log, "[usb-msc] synthesized CSW (status=OK) -> guest 0x%08x", buf);
+            } else {
+                mlog(&m->log, "[usb-msc] rejected CSW buffer 0x%08x outside guest RAM", buf);
+            }
         }
     }
     /* mark complete */
@@ -136,6 +160,34 @@ static void ehci_doorbell(ehci_t *e) {
 
 static ehci_t g_ehci; /* single controller instance is all the firmware ever needs */
 
+/* COM1 is intentionally small but useful: guest boot markers and diagnostics
+ * remain observable even when no framebuffer is attached. */
+typedef struct {
+    machine_t *m;
+    char line[256];
+    size_t len;
+} serial_t;
+static serial_t g_serial;
+
+static uint32_t serial_read(void *ctx, uint16_t port, int size) {
+    (void)ctx; (void)port; (void)size;
+    return 0x20; /* THR empty */
+}
+
+static void serial_write(void *ctx, uint16_t port, int size, uint32_t val) {
+    serial_t *s = ctx;
+    if (port != 0x3F8 || size < 1) return;
+    unsigned char ch = (unsigned char)val;
+    if (ch == '\r') return;
+    if (ch == '\n' || s->len == sizeof(s->line) - 1) {
+        s->line[s->len] = 0;
+        mlog(&s->m->log, "[serial] %s", s->line);
+        s->len = 0;
+        return;
+    }
+    s->line[s->len++] = (char)ch;
+}
+
 static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
     rw2_write(ctx, addr, size, val);
     ehci_doorbell(&g_ehci);
@@ -149,6 +201,10 @@ static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
 /* =========================== public init entry points ====================== */
 void devices_init_common(machine_t *m) {
     pci_init(m);
+
+    memset(&g_serial, 0, sizeof g_serial);
+    g_serial.m = m;
+    io_register(m, 0x3F8, 1, serial_read, serial_write, &g_serial, "COM1");
 
     /* Host bridge: bus0 dev0 func0 */
     pci_add_device(m, 0,0,0, "host-bridge", 0x8086, 0x0100, 0x06, 0x00, 0);

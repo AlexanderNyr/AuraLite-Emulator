@@ -686,8 +686,9 @@ mov [rax+15],byte 0x28
 mov [rax+16],byte 0
 mov [rax+17],dword 0
 mov [rax+21],byte 0
-; READ(10) requests one 512-byte sector, matching dCBWDataTransferLength.
-mov [rax+22],word 0x0001
+; READ(10) transfer length is big-endian: one 512-byte sector.
+mov [rax+22],byte 0
+mov [rax+23],byte 1
 mov [rax+24],byte 0
 
 mov [0x2004C],rax
@@ -699,7 +700,7 @@ mov [r14+0x00],r12
     mov r11,[0x20048]
     mov eax,r11d
     test eax,0x80
-    je .loop_ff
+    jne .loop_ff
 ;======BOOTING======
 ;mov al,'B'        ;+
 ;call engine       ;=
@@ -734,7 +735,7 @@ mov [r14+0x00],r10
 .loopd:
     mov rax,[0x20068]
     test rax,0x80
-    je .loopd
+    jne .loopd
 
 mov [0x20060],dword 0x20080
 mov [0x20080],dword 0x1
@@ -749,17 +750,20 @@ mov [r14+0x00],rax
 .loopz:
     mov rax,[0x20088]
     test rax,0x80
-    je .loopz
+    jne .loopz
 ;=+=+=+=+=+=+=+=+=+=+=+=+=+=+==+=+=+=+=+=+=+=+=+=+=+=+=+=+=
 ;+=+=+=+=+=+=+=+=+=+=+=+=+=+=++=+=+=+=+=+=+=+=+=+=+=+=+=+=+
 ;=+=+=+=+=+=+=+=+=+=+=+=+=+=+==+=+=+=+=+=+=+=+=+=+=+=+=+=+=
+; USB boot has completed; transfer control to the loaded guest.
+mov rax, 0x00100000
+jmp rax
+jmp fault
 fault:
-    hlt 
+    hlt
     jmp fault
 ;+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
-call launch
 align 8 
-launch_mode db 2
+launch_mode db 3
 launch:
     cmp byte [rel launch_mode],0
     je none

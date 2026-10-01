@@ -49,6 +49,12 @@ static void dump_regs(cpu_t *c) {
     if (c->fault)  printf("STATE: FAULT -- %s (at rip=0x%llx)\n", c->fault_msg, (unsigned long long)c->fault_rip);
 }
 
+enum {
+    EXIT_OK = 0,
+    EXIT_INPUT_ERROR = 1,
+    EXIT_CPU_FAULT = 2
+};
+
 int main(int argc, char **argv) {
     const char *rom_path = "firmware/firmware.bin";
     const char *disk_path = "disk/disk.img";
@@ -97,12 +103,26 @@ int main(int argc, char **argv) {
          platform_by_name(platform_name)->name, rom_path, rom_len, disk_path, disk_len);
 
     uint64_t n = 0;
+    int step_result = 0;
     while (n < max_instr) {
-        if (cpu_step(&m->cpu) != 0) break;
+        if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
+            m->guest_entry_seen = 1;
+            mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
+        }
+        step_result = cpu_step(&m->cpu);
+        if (step_result != 0)
+            break;
         n++;
-        if (m->stop_requested) break;
+        if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
+            m->guest_entry_seen = 1;
+            mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
+        }
+        if (m->stop_requested)
+            break;
     }
 
+    if (m->guest_entry_seen && m->fb && m->fb[0] == 0x00200000u)
+        mlog(&m->log, "[guest] framebuffer marker OK: pixel[0]=0x%08x", m->fb[0]);
     dump_regs(&m->cpu);
     printf("\n---- last log lines ----\n");
     int start = m->log.count < 60 ? 0 : m->log.count - 60;
@@ -123,5 +143,9 @@ int main(int argc, char **argv) {
             fclose(f);
         }
     }
-    return 0;
+    if (m->cpu.fault)
+        return EXIT_CPU_FAULT;
+    if (step_result != 0 && !m->cpu.halted)
+        return EXIT_CPU_FAULT;
+    return EXIT_OK;
 }
