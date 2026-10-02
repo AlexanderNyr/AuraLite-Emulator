@@ -6,9 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include "machine.h"
+#include "devices.h"
+#include "pci.h"
 #include "platform.h"
 #include "pci.h"
 #include "devices.h"
+#include "pci.h"
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -143,9 +146,18 @@ int main(int argc, char **argv) {
             fclose(f);
         }
     }
+    int rc = EXIT_OK;
     if (m->cpu.fault)
-        return EXIT_CPU_FAULT;
-    if (step_result != 0 && !m->cpu.halted)
-        return EXIT_CPU_FAULT;
-    return EXIT_OK;
+        rc = EXIT_CPU_FAULT;
+    else if (step_result != 0 && !m->cpu.halted)
+        rc = EXIT_CPU_FAULT;
+
+    /* C10: orderly teardown keeps the ASan/UBSan lane leak-clean. */
+    devices_done(m);
+    pci_done(m);
+    mem_done(m);
+    free(disk);
+    free(rom);
+    free(m);
+    return rc;
 }

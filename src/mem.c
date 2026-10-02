@@ -54,9 +54,15 @@ void mem_register_mmio(machine_t *m, uint64_t base, uint64_t size,
                         mmio_read_fn r, mmio_write_fn w, void *ctx, const char *name) {
     mmio_region_t *reg = calloc(1, sizeof *reg);
     reg->base = base; reg->size = size; reg->read = r; reg->write = w; reg->ctx = ctx;
-    reg->name = name; reg->enabled = 1;
+    reg->name = name; reg->enabled = 1; reg->owned_ctx = 0;
     reg->next = m->mmio_list;
     m->mmio_list = reg;
+}
+
+void mem_register_mmio_owned(machine_t *m, uint64_t base, uint64_t size,
+                        mmio_read_fn r, mmio_write_fn w, void *ctx, const char *name) {
+    mem_register_mmio(m, base, size, r, w, ctx, name);
+    m->mmio_list->owned_ctx = 1;
 }
 
 uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
@@ -102,4 +108,11 @@ void mem_write(machine_t *m, uint64_t phys, int size, uint64_t val) {
     mmio_region_t *r = find_mmio(m, phys);
     if (r) { r->write(r->ctx, phys, size, val); return; }
     /* unmapped: ignored (open bus) */
+}
+
+/* C10: counterpart of mem_init; the CLI and the test harness call this at
+ * shutdown so the sanitizer lanes stay leak-clean. */
+void mem_done(machine_t *m) {
+    free(m->ram);  m->ram = NULL;
+    free(m->rom);  m->rom = NULL;
 }

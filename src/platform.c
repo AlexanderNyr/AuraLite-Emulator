@@ -5,16 +5,17 @@
 // 0x306D4 Broadwell, 0x30678 Bay Trail/Silvermont) -- they reproduce exactly
 // what the firmware's hand-rolled family/model extraction expects to branch on.
 #define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include "platform.h"
 
 static const platform_t PROFILES[PLAT_COUNT] = {
-    { PLAT_SANDYBRIDGE, "Sandy Bridge (LGA1155, model 0x2A)", 0x2A, 0x000206A7u },
-    { PLAT_IVYBRIDGE,   "Ivy Bridge (LGA1155, model 0x3A)",   0x3A, 0x000306A9u },
-    { PLAT_HASWELL,     "Haswell (LGA1150, model 0x3C)",      0x3C, 0x000306C3u },
-    { PLAT_BROADWELL,   "Broadwell (model 0x3D)",             0x3D, 0x000306D4u },
-    { PLAT_BAYTRAIL,    "Bay Trail / Silvermont (model 0x37)",0x37, 0x00030678u },
+    { PLAT_SANDYBRIDGE, "Sandy Bridge (LGA1155, model 0x2A)", 0x2A, 0x000206A7u, 100 },
+    { PLAT_IVYBRIDGE,   "Ivy Bridge (LGA1155, model 0x3A)",   0x3A, 0x000306A9u,  96 },
+    { PLAT_HASWELL,     "Haswell (LGA1150, model 0x3C)",      0x3C, 0x000306C3u,  92 },
+    { PLAT_BROADWELL,   "Broadwell (model 0x3D)",             0x3D, 0x000306D4u,  88 },
+    { PLAT_BAYTRAIL,    "Bay Trail / Silvermont (model 0x37)",0x37, 0x00030678u, 140 },
 };
 
 const platform_t *platform_get(platform_id_t id) {
@@ -53,6 +54,42 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
     case 0x80000001:
         *d = (1u<<29); /* long mode supported */
         break;
+
+    /* ---- C9 leaves ---- */
+    case 0x2: /* cache/TLB descriptors: repeat once, 0xFF = "use leaf 4" */
+        *a = 0x0000FF01u; break;
+    case 0x4: { /* deterministic cache parameters, indexed by ECX */
+        switch (subleaf) {
+        case 0: /* L1 data: 32KB, 8-way, 64 sets, 64B line */
+            *a = (1u)|(1u<<5)|(1u<<9); *b = 63u|(0u<<12)|(7u<<22); *c = 63u; break;
+        case 1: /* L1 instruction: 32KB, 8-way, 64 sets, 64B line */
+            *a = (2u)|(1u<<5)|(1u<<9); *b = 63u|(0u<<12)|(7u<<22); *c = 63u; break;
+        case 2: /* L2 unified: 256KB, 8-way, 512 sets, 64B line */
+            *a = (3u)|(2u<<5)|(1u<<9); *b = 63u|(0u<<12)|(7u<<22); *c = 511u; break;
+        default: break; /* type=0 terminates the enumeration */
+        }
+        break; }
+    case 0x7: /* structured extended features */
+        if (subleaf == 0) { *a = 0; *b = (1u<<9); /* ERMS: we do fast REP MOVSB/STOSB */ }
+        break;
+    case 0x80000002: case 0x80000003: case 0x80000004: { /* brand string, 48B */
+        char brand[48];
+        memset(brand, ' ', sizeof brand);
+        int n = snprintf(brand, sizeof brand, "AuraLite Virtual CPU, model 0x%02X",
+                         p->cpuid_family_model);
+        if (n < 0) n = 0;
+        if (n > (int)sizeof brand) n = sizeof brand;
+        else brand[n] = ' '; /* no NUL byte inside the architected 48B field */
+        size_t off = (size_t)(leaf - 0x80000002u) * 16;
+        uint32_t w[4] = {0,0,0,0};
+        memcpy(w, brand + off, 16);
+        *a=w[0]; *b=w[1]; *c=w[2]; *d=w[3];
+        break; }
+    case 0x80000006: /* L2 cache info: 64B line, 8-way (encoding 6), 256KB */
+        *c = 64u|(6u<<12)|(256u<<16); break;
+    case 0x80000008: /* address sizes: EAX[7:0]=physical 40, [15:8]=virtual 48 */
+        *a = 40u|(48u<<8); break;
+
     default:
         break;
     }

@@ -16,6 +16,7 @@ typedef struct pci_dev {
 } pci_dev_t;
 
 void pci_init(machine_t *m);
+void pci_done(machine_t *m);   /* C10: frees the device list */
 pci_dev_t *pci_add_device(machine_t *m, int bus, int dev, int func, const char *name,
                            uint16_t vendor, uint16_t device, uint8_t class_, uint8_t subclass, uint8_t progif);
 pci_dev_t *pci_find(machine_t *m, int bus, int dev, int func);

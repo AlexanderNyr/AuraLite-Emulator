@@ -15,3 +15,23 @@ jobs:
         run: make firmware/firmware.bin disk/disk.img
       - name: Build and run platform smoke tests
         run: make test
+
+  # C10 lane: same suites under ASan+UBSan, leaks and UB are hard errors.
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc make nasm python3
+      - name: Build and test under ASan+UBSan
+        run: make test-sanitize
+
+  # C11 lane: differential fuzz vs the host CPU + crash-invariant sweep.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc make nasm python3
+      - name: Differential fuzz + crash invariant
+        run: make fuzz

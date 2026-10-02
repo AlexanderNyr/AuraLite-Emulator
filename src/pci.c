@@ -81,7 +81,10 @@ static void hostbridge_write(pci_dev_t *d, int reg, int size, uint64_t val) {
     machine_t *m = d->ctx;
     default_cfg_write(d, reg, size, val);
     if (reg <= 0x60 && reg+size > 0x60) {
-        uint32_t v = (uint32_t)(d->cfg[0x60]|(d->cfg[0x61]<<8)|(d->cfg[0x62]<<16)|(d->cfg[0x63]<<24));
+        /* byte<<24 must be done in uint32_t: shifting 224<<24 in int is UB
+         * (measured by the C10 UBSan lane). */
+        uint32_t v = (uint32_t)d->cfg[0x60] | ((uint32_t)d->cfg[0x61] << 8)
+                   | ((uint32_t)d->cfg[0x62] << 16) | ((uint32_t)d->cfg[0x63] << 24);
         if (v & 1) {
             m->mmconfig_base = v & 0xF0000000ULL;
             mlog(&m->log, "[pci] host bridge: MMCONFIG (ECAM) window enabled at 0x%08llx", (unsigned long long)m->mmconfig_base);
@@ -109,4 +112,11 @@ pci_dev_t *pci_add_device(machine_t *m, int bus, int dev, int func, const char *
     d->next = m->pci_devices;
     m->pci_devices = d;
     return d;
+}
+
+/* C10: teardown keeps the ASan CI lane leak-clean. */
+void pci_done(machine_t *m) {
+    pci_dev_t *d = m->pci_devices;
+    while (d) { pci_dev_t *next = d->next; free(d); d = next; }
+    m->pci_devices = NULL;
 }

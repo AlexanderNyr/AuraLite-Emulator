@@ -31,7 +31,7 @@ static void rw2_write(void *ctx, uint64_t addr, int size, uint64_t val) {
 static rw2_t *make_ramwindow(machine_t *m, uint64_t base, uint64_t size, uint32_t clear_bits_on_read, const char *name) {
     rw2_t *w = calloc(1, sizeof *w);
     w->buf = calloc(1, size); w->base = base; w->size = size; w->clear_bits_on_read = clear_bits_on_read; w->name = name;
-    mem_register_mmio(m, base, size, rw2_read, rw2_write, w, name);
+    mem_register_mmio_owned(m, base, size, rw2_read, rw2_write, w, name);
     return w;
 }
 
@@ -48,7 +48,7 @@ static uint64_t spd_read(void *ctx, uint64_t addr, int size) {
 static rw2_t *make_spd_window(machine_t *m, uint64_t base, uint64_t size, const char *name) {
     rw2_t *w = calloc(1, sizeof *w);
     w->buf = calloc(1, size); w->base = base; w->size = size; w->name = name;
-    mem_register_mmio(m, base, size, spd_read, rw2_write, w, name);
+    mem_register_mmio_owned(m, base, size, spd_read, rw2_write, w, name);
     return w;
 }
 
@@ -233,7 +233,7 @@ void devices_init_common(machine_t *m) {
     g_ehci.base = ehci_bar; g_ehci.m = m;
     rw2_t *regs = calloc(1, sizeof *regs);
     regs->buf = calloc(1, 0x1000); regs->base = ehci_bar; regs->size = 0x1000; regs->name = "EHCI BAR0";
-    mem_register_mmio(m, ehci_bar, 0x1000, rw2_read, ehci_write2, regs, "EHCI BAR0");
+    mem_register_mmio_owned(m, ehci_bar, 0x1000, rw2_read, ehci_write2, regs, "EHCI BAR0");
     g_ehci.regs = regs;
     /* CAPLENGTH byte (offset 0) small so capability/operational math the firmware
      * performs stays within this same register window. */
@@ -280,4 +280,20 @@ void devices_init_platform(machine_t *m) {
         break;
     default: break;
     }
+}
+
+/* C10: teardown keeps the ASan/UBSan CI lane leak-clean -- every device
+ * window allocated by devices_init_* is an rw2_t hanging off the mmio list. */
+void devices_done(machine_t *m) {
+    mmio_region_t *r = m->mmio_list;
+    while (r) {
+        mmio_region_t *next = r->next;
+        if (r->owned_ctx) {
+            rw2_t *w = r->ctx;
+            free(w->buf); free(w);
+        }
+        free(r);
+        r = next;
+    }
+    m->mmio_list = NULL;
 }

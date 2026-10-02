@@ -6,6 +6,7 @@ A from-scratch C emulator for raw x86 firmware, with a switchable Intel platform
 
 - x86 interpreter starting in real mode and transitioning through protected mode, compatibility mode and long mode.
 - 16/32/64-bit general registers, ModRM/SIB addressing, segmentation, GDT/IDT loading, CR0/CR3/CR4, EFER/MSR, CPUID, paging (4-level, 2 MiB/1 GiB pages), I/O instructions, PCI config-space access and firmware-oriented integer instructions.
+- Integer ISA per `docs/plans/CORE_PLAN.md`: all conditional branches (short and near, all 16 conditions), the full shift/rotate group with correct count masks and CF/OF, MUL/IMUL/DIV/IDIV with `#DE`, SMSW/LMSW, SGDT/SIDT, PUSHF/POPF, software interrupts `INT n`/`INT3`/`INTO` delivered through the real-mode IVT or the protected/long-mode IDT, and `IRET`/`IRETQ` returning through the hardware-ordered exception frame.
 - Physical address space with 128 MiB RAM, 128 KiB ROM and ROM aliases at `0xE0000` and `0xFFFE0000`.
 - PCI mechanism #1 and ECAM/MMCONFIG.
 - Platform profiles for Sandy Bridge, Ivy Bridge, Haswell, Broadwell and Bay Trail.

@@ -22,6 +22,7 @@ typedef struct mmio_region {
     void *ctx;
     const char *name;
     int enabled;
+    int owned_ctx;              /* C10: devices_done() frees ctx (rw2_t) only when set */
     struct mmio_region *next;
 } mmio_region_t;
 
@@ -80,10 +81,13 @@ typedef struct machine machine_t;
 
 /* memory.c */
 void      mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len);
+void      mem_done(machine_t *m);                            /* C10: frees ram/rom */
 uint64_t  mem_read(machine_t *m, uint64_t phys, int size);
 void      mem_write(machine_t *m, uint64_t phys, int size, uint64_t val);
 void      mem_register_mmio(machine_t *m, uint64_t base, uint64_t size,
                              mmio_read_fn r, mmio_write_fn w, void *ctx, const char *name);
+void      mem_register_mmio_owned(machine_t *m, uint64_t base, uint64_t size,
+                        mmio_read_fn r, mmio_write_fn w, void *ctx, const char *name); /* C10 */
 
 /* io.c */
 void     io_init(machine_t *m);

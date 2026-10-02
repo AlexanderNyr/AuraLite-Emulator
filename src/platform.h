@@ -25,6 +25,9 @@ typedef struct platform {
     uint32_t cpuid1_eax;         /* raw value returned for CPUID.1.EAX so the
                                     firmware's own extraction logic reproduces
                                     cpuid_family_model */
+    uint32_t tsc_per_instr;      /* virtual TSC ticks per retired instruction;
+                                    RDTSC = instr_count * tsc_per_instr, so
+                                    runs stay deterministic (C9) */
 } platform_t;
 
 const platform_t *platform_get(platform_id_t id);
