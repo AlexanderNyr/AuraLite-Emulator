@@ -47,6 +47,7 @@ typedef struct cpu {
     uint64_t efer;
     uint64_t gdtr_base; uint16_t gdtr_limit;
     uint64_t idtr_base; uint16_t idtr_limit;
+    uint64_t tr_base;  uint16_t tr_limit;     /* H6: cached by LTR (0F 00 /3) */
 
     msr_entry_t msr[MAX_MSR];
     int msr_count;

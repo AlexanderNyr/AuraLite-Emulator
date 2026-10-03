@@ -66,6 +66,10 @@ void mem_register_mmio_owned(machine_t *m, uint64_t base, uint64_t size,
 }
 
 uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
+    /* CHIPSET H5: with the A20 gate closed the bus forces address bit 20
+     * to zero -- odd megabytes alias onto the even ones below (the real
+     * 1MB wrap). Applies to fetches too; the CPU path funnels here. */
+    if (!m->chipset.a20) phys &= ~0x100000ULL;
     /* ROM aliasing: legacy shadow window and top-of-4GB reset window both map
      * to the same 128KB firmware image (this mirrors real PCH/ICH firmware hub
      * decoding and is how the firmware's own reset vector -> 0xE000:0000 trick works). */
@@ -96,6 +100,8 @@ uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
 }
 
 void mem_write(machine_t *m, uint64_t phys, int size, uint64_t val) {
+    /* CHIPSET H5: A20 mask, same bus rule as mem_read. */
+    if (!m->chipset.a20) phys &= ~0x100000ULL;
     if (phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE) return; /* ROM: read-only */
     if (phys >= ROM_TOPOF4G_BASE && phys <= 0xFFFFFFFFULL) return;                   /* ROM: read-only */
     if (phys < RAM_SIZE) {

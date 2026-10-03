@@ -25,7 +25,7 @@ maps to exactly one plan below.
 | Plan | Status | Scope | Phases |
 |---|---|---|---|
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
-| [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0 done ✅, H1–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+| [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
 | `docs/plans/STORE_PLAN.md` | 📋 planned | real AHCI HBA (command lists, FIS, IDENTIFY, READ/WRITE DMA EXT); disk geometry; second-disk support | S0–S5 |
 | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
@@ -58,4 +58,10 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 - ~~`0011` — CORE C10: test rig, ASan/UBSan CI lanes, Makefile hygiene, CHANGELOG~~ shipped
 - ~~`0012` — CORE C11: differential fuzzer vs host CPU, crash-invariant~~ shipped
 - ~~`0013` — CHIPSET H0: IRQ delivery scaffold + PIC 8259 (sketch)~~ shipped
-- `0014` — CHIPSET H1: full PIC (priorities/rotation, special mask, spurious IRQ, poll, level lines)  ← next
+- ~~`0014` — CHIPSET H1: full PIC (priorities/rotation, special mask, spurious IRQ, poll, level lines)~~ shipped
+- ~~`0015` — CHIPSET H2: PIT 8254 (counter 0 periodic/one-shot, counter 2 + port 0x61, virtual-time tick)~~ shipped
+- ~~`0016` — CHIPSET H3: RTC/CMOS (clock registers, update-ended IRQ8, equipment/memory CMOS bytes)~~ shipped
+- ~~`0017` — CHIPSET H4: KBC 8042 (status/command/data ports + IRQ1, scancode set-1 injection, A20 command consumed by H5)~~ shipped
+- ~~`0018` — CHIPSET H5: A20 gate + warm reset (A20 = 8042-outport-bit1 OR port-0x92-bit1, masked on the bus; 0x92 bit0 + 0xCF9 + KBC 0xFE/outport-bit0 → boundary-consumed full warm reset)~~ shipped
+- ~~`0019` — CHIPSET H6: LAPIC (MMIO 0xFEE00000, SVR, TPR/PPR, self-IPI, timer; +IST/LTR CPU support)~~ shipped
+- ~~`0020` — CHIPSET H7: IOAPIC (IOREGSEL/IOWIN, 24 RTEs, edge-latch + level remote-IRR, LAPIC delivery; PIC-line fan-out; PAIR-TEST 8254→IOAPIC→LAPIC→CPU)~~ shipped — CHIPSET plan complete H0–H7

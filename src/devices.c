@@ -205,6 +205,31 @@ void devices_init_common(machine_t *m) {
     /* CHIPSET H0: the 8259A pair exists identically on all five platforms */
     pic_init(m);
     pic_io_register(m);
+    pit_init(m);
+    pit_io_register(m);
+    /* CHIPSET H3: 0x70/0x71 are a real MC146818A now -- long gone as the
+     * silent sinks they were at baseline. The Super I/O config ports
+     * (0x2E/0x2F) stay unclaimed: reads float high, and the sample
+     * firmware never depends on them (measured). */
+    rtc_init(m);
+    rtc_io_register(m);
+    /* CHIPSET H4: the 8042 keyboard controller at 0x60/0x64 (IRQ1 level-
+     * driven off OBF); since H5 its 0xFE pulses and output-port bit0
+     * actually reset the machine. */
+    kbc_init(m);
+    kbc_io_register(m);
+    /* CHIPSET H5: A20 gate + system-control port 0x92 + reset control
+     * 0xCF9 (chipset.[ch], consumed by cpu_step at the boundary). */
+    chipset_init(m);
+    chipset_io_register(m);
+    /* CHIPSET H6: local APIC MMIO window at 0xFEE00000 -- CPUID.1:EDX
+     * advertised APIC long before the window existed (measured). */
+    lapic_init(m);
+    lapic_mmio_register(m);
+    /* CHIPSET H7: 82093AA I/O APIC at 0xFEC00000; ISA lines are fanned
+     * out to it inside pic_raise_irq/pic_set_irq (the board wire). */
+    ioapic_init(m);
+    ioapic_mmio_register(m);
 
     memset(&g_serial, 0, sizeof g_serial);
     g_serial.m = m;
@@ -255,10 +280,6 @@ void devices_init_common(machine_t *m) {
      * since it only uses it as early stack + scratch space. */
     make_ramwindow(m, 0xFEF00000ULL, 0x00400000ULL, 0, "CAR scratch window");
 
-    /* small I/O "sinks" the firmware pokes but never reads back meaningfully:
-     * Super I/O config (0x2E/0x2F) and CMOS/RTC index+data (0x70/0x71). */
-    static uint8_t superio_idx, cmos_idx;
-    (void)superio_idx; (void)cmos_idx;
 }
 
 void devices_init_platform(machine_t *m) {

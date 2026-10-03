@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
     const char *platform_name = "haswell";
     const char *fb_out = NULL;
     const char *log_out = NULL;
+    const char *keys_list = NULL;   /* --keys=1E,9E: scancode set-1 bytes (H4) */
     uint64_t max_instr = 50ull*1000*1000;
     int trace = 0;
 
@@ -74,10 +75,12 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--max-instr=", 12)) max_instr = strtoull(argv[i]+12, NULL, 0);
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
+        else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
-                   "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--log=out.txt]\n", argv[0]);
+                   "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--log=out.txt]\n"
+                   "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n", argv[0]);
             return 0;
         }
     }
@@ -93,6 +96,10 @@ int main(int argc, char **argv) {
     m->plat = (struct platform *)platform_by_name(platform_name);
     devices_init_common(m);
     devices_init_platform(m);
+    if (keys_list && kbc_queue_keys(m, keys_list) < 0) {
+        mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
+        return 1;
+    }
 
     size_t disk_len = 0;
     uint8_t *disk = read_file(disk_path, &disk_len);

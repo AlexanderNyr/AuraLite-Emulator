@@ -5,6 +5,12 @@
 #include <stddef.h>
 #include "cpu.h"
 #include "pic.h"
+#include "pit.h"
+#include "rtc.h"
+#include "kbc.h"
+#include "chipset.h"
+#include "lapic.h"
+#include "ioapic.h"
 
 #define RAM_SIZE   (128u*1024*1024)   /* matches bochsrc "megs:128" */
 #define ROM_SIZE   (128u*1024)        /* 0x20000, matches firmware.bin size */
@@ -57,6 +63,12 @@ struct machine {
 
     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
     pic_t pic;
+    pit_t pit;
+    rtc_t rtc;
+    kbc_t kbc;
+    chipset_t chipset;   /* CHIPSET H5: A20 gate + reset plumbing */
+    lapic_t lapic;       /* CHIPSET H6: local APIC for the single vCPU */
+    ioapic_t ioapic;     /* CHIPSET H7: 82093AA I/O APIC, ISA lines fanned out */
 
     /* PCI mechanism #1 state */
     uint32_t pci_config_address;

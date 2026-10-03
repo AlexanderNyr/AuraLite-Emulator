@@ -12,6 +12,7 @@
 #include <string.h>
 #include "machine.h"
 #include "platform.h"
+#include "chipset.h"
 
 /* The ASan CI lane (make test-sanitize) requires leak-free exits. A full
  * machine_t takes 128MB of RAM + 128KB of ROM from mem_init; allocating
@@ -42,6 +43,7 @@ static void setup_machine(machine_t *m) {
     memset(HARNESS_RAM, 0, 1u * 1024 * 1024);
     io_init(m);
     m->plat = (struct platform *)platform_by_name("haswell");
+    chipset_init(m);   /* H5: power-on defaults -- A20 gate open */
     cpu_reset(&m->cpu);
 
     /* Start a tiny test program directly at physical address zero. */

@@ -1,4 +1,4 @@
-/* tests/test_pic.c -- CHIPSET H0 vectors: INTR delivery through the PIC.
+/* tests/test_pic.c -- CHIPSET H0+H1 vectors: INTR delivery through the PIC.
  *
  * Every test drives the real port interface (0x20/0x21/0xA0/0xA1) with
  * guest code, asserts IRQ lines through the public pic_raise_irq(), and
@@ -45,9 +45,9 @@ static const uint8_t H_SLAVE_MARK[] =      /* mov byte[0x2030],0x2A; eoi both; i
     { 0xC6,0x06,0x30,0x20,0x2A, 0xB0,0x20, 0xE6,0x20, 0xE6,0xA0, 0xCF };
 
 #define PH0 0x0100
-#define PH1 0x0110
-#define PH2 0x0120
-#define PH3 0x0130
+#define PH1 0x0140   /* 0x40 apart: H1 nesting handlers are ~20 bytes */
+#define PH2 0x0180
+#define PH3 0x01C0
 
 static void ivt(machine_t *m, int vec, uint16_t off) {
     mem_write(m, (uint64_t)vec * 4,     2, off);
@@ -97,7 +97,10 @@ static void test_defaults(void) {
     assert(f.m.pic.master.vector_base == 0x08 && f.m.pic.slave.vector_base == 0x70);
     assert(f.m.pic.master.irr == 0 && f.m.pic.master.isr == 0);
     assert(!pic_pending(&f.m));
-    assert(pic_intack(&f.m) == -1);
+    /* H1 contract: an INTA with nothing pending answers with the spurious
+     * vector base+7 and sets NO ISR bit (see test_spurious_vectors_api) */
+    assert(pic_intack(&f.m) == 0x0F);
+    assert(f.m.pic.master.isr == 0);
     /* command-port reads default to IRR = 0 */
     const uint8_t prog[] = { 0xE4,0x20, 0xA2,0x40,0x20, 0xF4 }; /* in al,0x20; mov [0x2040],al */
     memcpy(f.m.ram, prog, sizeof prog);
@@ -267,6 +270,253 @@ static void test_sti_shadow_delays_one_instruction(void) {
     assert(mem_read(&f.m, 0x2005, 1) == 1);               /* shadow held: marker first */
 }
 
+
+/* ======================= H1: full-PIC vectors ======================= */
+
+/* additional init variants */
+static const uint8_t INIT_MASTER_LTIM[] = {   /* level-triggered (ICW1 bit3) */
+    0xB0,0x19, 0xE6,0x20,
+    0xB0,0x20, 0xE6,0x21,
+    0xB0,0x04, 0xE6,0x21,
+    0xB0,0x01, 0xE6,0x21,
+};
+static const uint8_t INIT_MASTER_AEOI[] = {   /* auto-EOI (ICW4 bit1) */
+    0xB0,0x11, 0xE6,0x20,
+    0xB0,0x20, 0xE6,0x21,
+    0xB0,0x04, 0xE6,0x21,
+    0xB0,0x03, 0xE6,0x21,
+};
+
+/* run until ram[addr]==val or cap */
+static int fx_until(fx_t *f, uint32_t addr, uint8_t val, int cap) {
+    int i;
+    for (i = 0; i < cap && mem_read(&f->m, addr, 1) != val; i++) cpu_step(&f->m.cpu);
+    return mem_read(&f->m, addr, 1) == val;
+}
+
+/* H1 handlers. Marker cells: [0x2020]=A deliveries, [0x2021]=B deliveries,
+ * [0x2022]=nesting indicator. A guest can't observe "A already EOIed" with a
+ * memory flag (delivery lands at the boundary between A's EOI write and A's
+ * flag write -- measured in bring-up); the observable faithful to hardware
+ * is the ISR itself: B reads it back through OCW3 0x0B and trips iff A's
+ * line 3 is still in service (i.e. B was delivered BEFORE A's EOI). */
+/* A: nesting probe -- inc A-count; sti; 3 nop window; EOI; iret */
+static const uint8_t H_A_NEST[] =
+    { 0xFE,0x06,0x20,0x20, 0xFB, 0x90,0x90,0x90,
+      0xB0,0x20, 0xE6,0x20, 0xCF };
+/* B: read ISR; if bit3 set (A's EOI not yet issued) then [0x2022]=1;
+ * inc B-count; eoi; iret */
+static const uint8_t H_B_NEST[] =
+    { 0xB0,0x0B, 0xE6,0x20, 0xE4,0x20, 0x24,0x08, 0x74,0x05,
+      0xC6,0x06,0x22,0x20,0x01,
+      0xFE,0x06,0x21,0x20, 0xB0,0x20, 0xE6,0x20, 0xCF };
+/* B with SPECIFIC eoi (line 5) for the SMM nesting case */
+static const uint8_t H_B_NEST_SPEC[] =
+    { 0xB0,0x0B, 0xE6,0x20, 0xE4,0x20, 0x24,0x08, 0x74,0x05,
+      0xC6,0x06,0x22,0x20,0x01,
+      0xFE,0x06,0x21,0x20, 0xB0,0x65, 0xE6,0x20, 0xCF };
+/* A-count/rotation probe: on 2nd run, [0x2022]=1 iff B already ran twice.
+ * EOI style selectable at build: last-but-two bytes: 0xA0 rotate-EOI / 0x20 plain. */
+static const uint8_t H_A_ROT[] =
+    { 0xFE,0x06,0x20,0x20, 0x80,0x3E,0x20,0x20,0x02, 0x75,0x0C,
+      0x80,0x3E,0x21,0x20,0x02, 0x75,0x05, 0xC6,0x06,0x22,0x20,0x01,
+      0xB0,0xA0, 0xE6,0x20, 0xCF };
+static const uint8_t H_A_PLAIN[] =
+    { 0xFE,0x06,0x20,0x20, 0x80,0x3E,0x20,0x20,0x02, 0x75,0x0C,
+      0x80,0x3E,0x21,0x20,0x02, 0x75,0x05, 0xC6,0x06,0x22,0x20,0x01,
+      0xB0,0x20, 0xE6,0x20, 0xCF };
+static const uint8_t H_B_CNT[] =  /* inc B-count; plain eoi; iret */
+    { 0xFE,0x06,0x21,0x20, 0xB0,0x20, 0xE6,0x20, 0xCF };
+static const uint8_t H_SPUR[] =   /* spurious-delivery tripwire */
+    { 0xC6,0x06,0x50,0x20,0x01, 0xCF };
+
+static void test_fn_nesting_blocks_lower(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x23, PH0);  /* irq3 -> A */
+    ivt(&f.m, 0x25, PH1);  /* irq5 -> B */
+    memcpy(f.m.ram + PH0, H_A_NEST, sizeof H_A_NEST);
+    memcpy(f.m.ram + PH1, H_B_NEST, sizeof H_B_NEST);
+    fx_load_run(&f, INIT_MASTER_BASE20, sizeof INIT_MASTER_BASE20,
+                0xD7, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64); /* unmask 3,5 */
+    pic_raise_irq(&f.m, 3);
+    assert(fx_until(&f, 0x2020, 1, 64));          /* A entered, sti window open */
+    pic_raise_irq(&f.m, 5);                        /* lower prio: must WAIT for EOI */
+    pic_raise_irq(&f.m, 3);                        /* same line: also blocked */
+    assert(fx_until(&f, 0x2020, 2, 128));          /* re-raised 3 runs after A's EOI */
+    assert(fx_until(&f, 0x2021, 1, 64));           /* then 5 */
+    assert(mem_read(&f.m, 0x2022, 1) == 0);        /* B never delivered pre-EOI */
+    fx_steps(&f, 16);                              /* let B's own EOI land */
+    assert(f.m.pic.master.isr == 0);
+}
+
+static void test_fn_nesting_allows_higher(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x23, PH0);  /* irq3 -> A */
+    ivt(&f.m, 0x21, PH1);  /* irq1 -> B */
+    memcpy(f.m.ram + PH0, H_A_NEST, sizeof H_A_NEST);
+    memcpy(f.m.ram + PH1, H_B_NEST, sizeof H_B_NEST);
+    fx_load_run(&f, INIT_MASTER_BASE20, sizeof INIT_MASTER_BASE20,
+                0xF5, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64); /* unmask 1,3 */
+    pic_raise_irq(&f.m, 3);
+    assert(fx_until(&f, 0x2020, 1, 64));
+    pic_raise_irq(&f.m, 1);                        /* HIGHER prio: nests immediately */
+    assert(fx_until(&f, 0x2021, 1, 64));
+    assert(mem_read(&f.m, 0x2022, 1) == 1);        /* B ran BEFORE A's EOI */
+    fx_steps(&f, 32);
+    assert(f.m.pic.master.isr == 0);
+}
+
+static void test_smm_unblocks_lower(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x23, PH0);
+    ivt(&f.m, 0x25, PH1);
+    memcpy(f.m.ram + PH0, H_A_NEST, sizeof H_A_NEST);
+    memcpy(f.m.ram + PH1, H_B_NEST_SPEC, sizeof H_B_NEST_SPEC);
+    /* init + SET special mask mode (OCW3 0x68: ESMM=1 SMM=1) + masks */
+    uint8_t init[64]; size_t n = 0;
+    memcpy(init, INIT_MASTER_BASE20, sizeof INIT_MASTER_BASE20); n += sizeof INIT_MASTER_BASE20;
+    { uint8_t w[4] = { 0xB0,0x68, 0xE6,0x20 }; memcpy(init + n, w, 4); n += 4; }
+    fx_load_run(&f, init, n, 0xD7, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64);
+    pic_raise_irq(&f.m, 3);
+    assert(fx_until(&f, 0x2020, 1, 64));
+    pic_raise_irq(&f.m, 5);                        /* lower prio: SMM lets it nest */
+    pic_raise_irq(&f.m, 3);                        /* same line: still blocked */
+    assert(fx_until(&f, 0x2021, 1, 64));
+    assert(mem_read(&f.m, 0x2022, 1) == 1);        /* B delivered pre-EOI under SMM */
+    assert(fx_until(&f, 0x2020, 2, 128));          /* re-raised 3 after A's EOI */
+    fx_steps(&f, 16);
+    assert(f.m.pic.master.isr == 0);
+}
+
+static void test_rotate_on_eoi_changes_order(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x23, PH0);  /* irq3 -> A (rotate-on-EOI) */
+    ivt(&f.m, 0x25, PH1);  /* irq5 -> B */
+    memcpy(f.m.ram + PH0, H_A_ROT, sizeof H_A_ROT);
+    memcpy(f.m.ram + PH1, H_B_CNT, sizeof H_B_CNT);
+    fx_load_run(&f, INIT_MASTER_BASE20, sizeof INIT_MASTER_BASE20,
+                0xD7, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64);
+    /* round 1: default priority, irq3 wins */
+    pic_raise_irq(&f.m, 3); pic_raise_irq(&f.m, 5);
+    assert(fx_until(&f, 0x2021, 1, 64));
+    fx_steps(&f, 8);                               /* let B's EOI/IRET land */
+    assert(f.m.pic.master.prio_low == 3);          /* A's rotate-EOI took effect */
+    /* round 2: 3 is now lowest, irq5 must win */
+    pic_raise_irq(&f.m, 3); pic_raise_irq(&f.m, 5);
+    assert(fx_until(&f, 0x2020, 2, 64));
+    assert(mem_read(&f.m, 0x2021, 1) == 2);
+    fx_steps(&f, 16);     /* run A's evaluate+EOI tail past the marker step */
+    assert(mem_read(&f.m, 0x2022, 1) == 1);        /* B ran twice before A's 2nd */
+}
+
+static void test_set_priority_command(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x24, PH0);  /* irq4 -> A */
+    ivt(&f.m, 0x27, PH1);  /* irq7 -> B */
+    memcpy(f.m.ram + PH0, H_A_PLAIN, sizeof H_A_PLAIN);
+    memcpy(f.m.ram + PH1, H_B_CNT, sizeof H_B_CNT);
+    fx_load_run(&f, INIT_MASTER_BASE20, sizeof INIT_MASTER_BASE20,
+                0x6F, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64); /* unmask 4,7 */
+    /* round 1: 4 beats 7 */
+    pic_raise_irq(&f.m, 4); pic_raise_irq(&f.m, 7);
+    assert(fx_until(&f, 0x2021, 1, 64));
+    fx_steps(&f, 8);   /* B's EOI/IRET must land BEFORE phase 2 runs -- the
+                        * marker step is B's counter inc, mid-handler */
+    /* guest phase 2: OCW2 set-priority: line4 lowest -> order 5,6,7,0.. */
+    const uint8_t p2[] = { 0xB0,0xC4, 0xE6,0x20, 0xC6,0x06,0x42,0x20,0x01, 0xF4 };
+    memcpy(f.m.ram + 0x0300, p2, sizeof p2);
+    f.m.cpu.rip = 0x0300;
+    assert(fx_until(&f, 0x2042, 1, 16));
+    assert(f.m.pic.master.prio_low == 4);
+    /* round 2: 7 outranks 4 now */
+    pic_raise_irq(&f.m, 4); pic_raise_irq(&f.m, 7);
+    assert(fx_until(&f, 0x2020, 2, 64));
+    assert(mem_read(&f.m, 0x2021, 1) == 2);
+    fx_steps(&f, 16);     /* run A's evaluate+EOI tail past the marker step */
+    assert(mem_read(&f.m, 0x2022, 1) == 1);
+}
+
+static void test_spurious_vectors_api(void) {
+    fx_t f; fx_init(&f);
+    /* empty PIC: INTA answers with master spurious vector, no ISR set */
+    assert(!pic_pending(&f.m));
+    assert(pic_intack(&f.m) == 0x0F);              /* base 0x08 + 7 */
+    assert(f.m.pic.master.isr == 0 && f.m.pic.master.irr == 0);
+    /* cascade edge latched on master IRQ2 but the slave has drained:
+     * INTR is up; the INTA consumes master slot 2 and the slave answers
+     * with ITS spurious vector, no slave ISR (the "EOI slave only" case) */
+    f.m.pic.master.imr = 0xFB;
+    f.m.pic.master.irr = 0x04;
+    assert(pic_pending(&f.m));
+    assert(pic_intack(&f.m) == 0x77);              /* slave base 0x70 + 7 */
+    assert(f.m.pic.master.isr == 0x04);
+    assert(f.m.pic.slave.isr == 0);
+    assert(f.m.pic.master.irr == 0);
+}
+
+static void test_idle_guest_never_sees_spurious(void) {
+    fx_t f; fx_init(&f);
+    /* default bases: spurious would be vector 0x0F; tripwire at its IVT */
+    ivt(&f.m, 0x0F, PH0);
+    memcpy(f.m.ram + PH0, H_SPUR, sizeof H_SPUR);
+    uint8_t prog[64]; size_t n = 0;
+    uint8_t w[4] = { 0xB0,0x00, 0xE6,0x21 };       /* unmask everything */
+    memcpy(prog, w, 4); n += 4;
+    memcpy(prog + n, TAIL_SPIN, sizeof TAIL_SPIN); n += sizeof TAIL_SPIN;
+    memcpy(f.m.ram, prog, n);
+    f.m.cpu.rip = 0;
+    fx_steps(&f, 64);
+    assert(mem_read(&f.m, 0x2001, 1) == 1);        /* guest is spinning, IF=1 */
+    assert(mem_read(&f.m, 0x2050, 1) == 0);        /* no phantom 0x0F delivery */
+}
+
+static void test_poll_command(void) {
+    fx_t f; fx_init(&f);
+    /* IF=0 whole time (no sti): poll byte is the guest-driven INTA */
+    const uint8_t prog[] = {
+        0xB0,0xFD, 0xE6,0x21,          /* unmask irq1 */
+        0xB0,0x0C, 0xE6,0x20,          /* OCW3 poll */
+        0xE4,0x20, 0xA2,0x40,0x20,     /* poll byte -> [0x2040] */
+        0xB0,0x0C, 0xE6,0x20,          /* poll again (empty now) */
+        0xE4,0x20, 0xA2,0x41,0x20,     /* -> [0x2041] */
+        0xF4 };
+    pic_raise_irq(&f.m, 1);
+    memcpy(f.m.ram, prog, sizeof prog);
+    f.m.cpu.rip = 0;
+    fx_steps(&f, 16);
+    assert(mem_read(&f.m, 0x2040, 1) == 0x81);     /* bit7 + line 1 */
+    assert(f.m.pic.master.isr == 0x02);            /* poll acks like INTA */
+    assert(f.m.pic.master.irr == 0);
+    assert(mem_read(&f.m, 0x2041, 1) == 0x00);     /* nothing pending */
+}
+
+static void test_level_retrigger_while_held(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x21, PH0);  /* irq1 */
+    memcpy(f.m.ram + PH0, H_B_CNT, sizeof H_B_CNT); /* reuse: inc [0x2021]; eoi; iret */
+    /* note: counter cell 0x2021 this time */
+    fx_load_run(&f, INIT_MASTER_LTIM, sizeof INIT_MASTER_LTIM,
+                0xFD, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64);
+    pic_set_irq(&f.m, 1, 1);                        /* hold the line high */
+    assert(fx_until(&f, 0x2021, 3, 64));            /* re-asserted twice more */
+    pic_set_irq(&f.m, 1, 0);                        /* release */
+    fx_steps(&f, 24);
+    assert(mem_read(&f.m, 0x2021, 1) == 3);         /* exactly 3 deliveries */
+    assert(f.m.pic.master.isr == 0);
+}
+
+static void test_aeoi_leaves_no_isr(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x20, PH0);
+    memcpy(f.m.ram + PH0, H_MARK_IRET, sizeof H_MARK_IRET); /* no guest EOI */
+    fx_load_run(&f, INIT_MASTER_AEOI, sizeof INIT_MASTER_AEOI,
+                0xFE, 0xFF, 1, TAIL_SPIN, sizeof TAIL_SPIN, 64);
+    pic_raise_irq(&f.m, 0);
+    assert(fx_until(&f, 0x2000, 1, 32));
+    assert(f.m.pic.master.isr == 0);                /* auto-EOI consumed it */
+    assert(f.m.pic.master.irr == 0);
+}
+
 int main(void) {
     test_defaults();
     test_cli_gate_blocks_delivery();
@@ -278,6 +528,16 @@ int main(void) {
     test_irr_readback_via_ocw3();
     test_hlt_wakes_and_delivers();
     test_sti_shadow_delays_one_instruction();
+    test_fn_nesting_blocks_lower();
+    test_fn_nesting_allows_higher();
+    test_smm_unblocks_lower();
+    test_rotate_on_eoi_changes_order();
+    test_set_priority_command();
+    test_spurious_vectors_api();
+    test_idle_guest_never_sees_spurious();
+    test_poll_command();
+    test_level_retrigger_while_held();
+    test_aeoi_leaves_no_isr();
     puts("pic tests: ok");
     return 0;
 }

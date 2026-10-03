@@ -155,6 +155,18 @@ static const char *vecname(int v){
     switch(v){case 0:return "#DE";case 6:return "#UD";case 8:return "#DF";
         case 13:return "#GP";case 14:return "#PF";default:return "#??";}
 }
+/* H6: locate the 64-bit TSS. LTR caches it in tr_base; without an LTR the
+ * fixtures/OS convention is selector 0x10 in the GDT. Returns 0 when no
+ * present 64-bit TSS descriptor can be found (IST then falls back to the
+ * interrupted RSP, documented). */
+static uint64_t tss_base_from_gdt(machine_t *m, cpu_t *c) {
+    uint64_t lo = mem_read(m, c->gdtr_base + 0x10, 8);
+    if (!((lo >> 47) & 1)) return 0;              /* present bit */
+    uint64_t hi32 = mem_read(m, c->gdtr_base + 0x18, 4);
+    return ((lo >> 16) & 0xFFFFFFULL) | (((lo >> 56) & 0xFFULL) << 24) |
+           ((uint64_t)hi32 << 32);
+}
+
 static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err) {
     cpu_t *c = &m->cpu;
     if (c->in_exception) {
@@ -210,6 +222,20 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
     int is64 = ((c->efer>>10)&1) && c->seg[SEG_CS].l;
     int stacksz = is64 ? 8 : (c->seg[SEG_CS].d_b ? 4 : 2);
     uint64_t rsp = c->gpr[RSP];
+    /* CHIPSET H6: a 64-bit IDT gate with nonzero IST switches the handler
+     * onto the matching TSS IST stack. Without this, a delivery that
+     * lands while RSP still points at a register window (mid-EOI is the
+     * classic case) would push the IRET frame over that window and the
+     * next dereference corrupts the machine -- measured in the H6
+     * long-mode vector (read: #PF loop) before IST existed. */
+    if (is64) {
+        int ist = (int)mem_read(m, gate_addr + 4, 1) & 7;
+        if (ist) {
+            uint64_t tss = c->tr_base ? c->tr_base : tss_base_from_gdt(m, c);
+            uint64_t ns = tss ? mem_read(m, tss + 4 + (uint64_t)(ist - 1) * 8, 8) : 0;
+            if (ns) rsp = ns;
+        }
+    }
     /* Hardware pushes (highest address first): RFLAGS, CS, RIP, and the
      * error code LAST (lowest address). The baseline pushed the error code
      * first, which would have made any future IRET pop the wrong slots
@@ -505,25 +531,51 @@ void cpu_reset(cpu_t *c) {
     c->rflags = 0x2;
     c->cr0 = 0x60000010ULL;
     c->halted = 0; c->fault = 0; c->intr_delay = 0;
+    /* CHIPSET H6: IA32_APIC_BASE resets to base|EN|BSP (the xAPIC comes
+     * out of reset hardware-enabled and software-disabled at SVR). */
+    cpu_set_msr(c, LAPIC_MSR_APICBASE, LAPIC_MSR_DEFAULT);
 }
 
 /* ============================== main stepper ============================== */
 int cpu_step(cpu_t *c) {
     machine_t *m = c->mach;
 
+    /* ---- CHIPSET H5: a requested system reset (KBC 0xFE / output-port
+     * bit0 / port 0x92 bit0 / port 0xCF9) takes effect at the next
+     * instruction boundary, modeling reset-line propagation and keeping
+     * a reset out of the middle of an executing instruction. */
+    if (m->chipset.reset_pending) {
+        machine_reset(m);          /* clears the request via chipset_init */
+        return 0;
+    }
+
     /* ---- CHIPSET H0: hardware INTR sampling at the instruction boundary ----
      * A pending unmasked PIC line wakes HLT even with IF=0 (matching
      * silicon); the actual vector delivery still requires IF=1 and the
      * post-STI / post-MOV-SS one-instruction shadow to have expired. */
     if (c->halted) {
-        if (!pic_pending(m)) return -1;
+        if (!pic_pending(m) && lapic_deliverable(m) < 0) return -1;
         c->halted = 0;
     }
     if (c->fault) return -1;
     if (c->intr_delay) c->intr_delay--;
     else if (c->rflags & FLAG_IF) {
-        int vec = pic_intack(m);
-        if (vec >= 0) raise_exception(m, vec, 0, 0);
+        /* CHIPSET H6: the LAPIC arbitrates first; with the LAPIC soft-
+         * disabled (or nothing deliverable) the 8259 INTR path is
+         * byte-for-byte the H0/H1 design (plan D7). The CPU only issues
+         * INTA while INTR is asserted, so the spurious vector
+         * pic_intack() returns on an empty PIC (H1) is never delivered
+         * from the step loop -- the silicon race it models (line
+         * deasserted between INTR and INTA) is below our instruction-
+         * boundary time resolution. */
+        int vec = lapic_deliverable(m);
+        if (vec >= 0) {
+            lapic_intack(m);
+            raise_exception(m, vec, 0, 0);
+        } else if (pic_pending(m)) {
+            int pvec = pic_intack(m);
+            if (pvec >= 0) raise_exception(m, pvec, 0, 0);
+        }
     }
 
     c->exception_taken = 0;
@@ -835,6 +887,23 @@ really_slow:
                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
                      }
                      else if (crn==2) c->cr2=v; else if (crn==3) c->cr3=v; else if (crn==4) c->cr4=v;
+                     break; }
+        case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
+                     rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
+                     if (ext==3) {          /* LTR r/m16 (H6): cache TR, set busy */
+                         uint16_t sel = (uint16_t)rm_read(&d,&rm,2) & ~7u;
+                         uint64_t lo = mem_read(m, c->gdtr_base + sel, 8);
+                         uint64_t hi32 = mem_read(m, c->gdtr_base + sel + 8, 4);
+                         c->tr_base = ((lo >> 16) & 0xFFFFFFULL) |
+                                      (((lo >> 56) & 0xFFULL) << 24) | (hi32 << 32);
+                         c->tr_limit = (uint16_t)(lo & 0xFFFF);
+                         mem_write(m, c->gdtr_base + sel + 5, 1,
+                                   (uint8_t)((((lo >> 40) & 0xFFu)) | 0x2)); /* busy */
+                     } else if (ext==1) {   /* STR: single fixed TSS, raw selector stored as 0 */
+                         rm_write(&d,&rm,2,0);
+                     } else {
+                         faultf(c, "#UD unsupported 0F opcode 0x0F 0x00 /%d", ext);
+                     }
                      break; }
         case 0x01: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
                      rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
@@ -1343,6 +1412,9 @@ really_slow:
 done:
     if (!c->fault && !c->exception_taken) c->rip = d.pc;
     c->instr_count++;
+    pit_tick(m);   /* CHIPSET H2: virtual-time advance; no-op until pit_init */
+    rtc_tick(m);   /* CHIPSET H3: same D6 timebase; update-ended IRQ8 here */
+    lapic_tick(m); /* CHIPSET H6: LAPIC timer on the same virtual TSC */
     if (c->fault) { mlog(&m->log, "[cpu] FAULT: %s", c->fault_msg); return -1; }
     if (c->halted) return -1;
     return 0;
