@@ -202,6 +202,10 @@ static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
 void devices_init_common(machine_t *m) {
     pci_init(m);
 
+    /* CHIPSET H0: the 8259A pair exists identically on all five platforms */
+    pic_init(m);
+    pic_io_register(m);
+
     memset(&g_serial, 0, sizeof g_serial);
     g_serial.m = m;
     io_register(m, 0x3F8, 1, serial_read, serial_write, &g_serial, "COM1");

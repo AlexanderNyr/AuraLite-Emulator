@@ -53,6 +53,7 @@ typedef struct cpu {
 
     int halted;
     int in_exception;        /* re-entrancy guard against exception-during-exception (double fault) */
+    uint8_t intr_delay;      /* H0: INTR shadow after STI / MOV SS / POP SS (one instruction) */
     int exception_taken;     /* set when raise_exception() redirected RIP mid-instruction */
     int fault;              /* set on unrecoverable decode/exec error */
     char fault_msg[256];

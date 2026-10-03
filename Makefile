@@ -29,16 +29,18 @@ disk/disk.img: disk/test_kernel.bin
 demo: x86emu firmware/firmware.bin disk/disk.img
 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
 
-test-unit: tests/test_cpu.c tests/test_usb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-cpu
+test-unit: tests/test_cpu.c tests/test_usb.c tests/test_pic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/pic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c -o test-cpu
 	./test-cpu
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/devices.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c -o test-usb -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/devices.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c -o test-usb -lm
 	./test-usb
-	rm -f test-cpu test-usb
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic
+	./test-pic
+	rm -f test-cpu test-usb test-pic
 
 # C10: table-driven ISA vectors (>=300 rows; row count printed by the runner)
-test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-table
+test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c -o test-table
 	./test-table
 	rm -f test-table
 
@@ -55,10 +57,10 @@ test-sanitize:
 
 # C11 differential fuzzer vs the host CPU (ptrace single-step) + crash
 # invariant sweep. Deliberately NOT part of 'make test': needs ptrace.
-fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c -o diff_fuzz
+fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c -o diff_fuzz
 	./diff_fuzz $(FUZZ_PROGRAMS) $(FUZZ_INSTR)
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu test-cpu test-usb test-table framebuffer.ppm
+	rm -f x86emu test-cpu test-usb test-table test-pic framebuffer.ppm

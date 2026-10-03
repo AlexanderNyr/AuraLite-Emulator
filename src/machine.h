@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "cpu.h"
+#include "pic.h"
 
 #define RAM_SIZE   (128u*1024*1024)   /* matches bochsrc "megs:128" */
 #define ROM_SIZE   (128u*1024)        /* 0x20000, matches firmware.bin size */
@@ -53,6 +54,9 @@ struct machine {
 
     mmio_region_t *mmio_list;
     io_port_t io[65536];
+
+    /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
+    pic_t pic;
 
     /* PCI mechanism #1 state */
     uint32_t pci_config_address;

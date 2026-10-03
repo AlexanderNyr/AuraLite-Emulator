@@ -25,7 +25,7 @@ maps to exactly one plan below.
 | Plan | Status | Scope | Phases |
 |---|---|---|---|
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
-| `docs/plans/CHIPSET_PLAN.md` | 📋 planned | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+| [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0 done ✅, H1–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
 | `docs/plans/STORE_PLAN.md` | 📋 planned | real AHCI HBA (command lists, FIS, IDENTIFY, READ/WRITE DMA EXT); disk geometry; second-disk support | S0–S5 |
 | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
@@ -57,4 +57,5 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 - ~~`0010` — CORE C9: CPUID leaves, RDTSC, PAUSE/fences~~ shipped
 - ~~`0011` — CORE C10: test rig, ASan/UBSan CI lanes, Makefile hygiene, CHANGELOG~~ shipped
 - ~~`0012` — CORE C11: differential fuzzer vs host CPU, crash-invariant~~ shipped
-- `0013` — CHIPSET H0: IRQ delivery scaffold + PIC 8259 (sketch)  ← next
+- ~~`0013` — CHIPSET H0: IRQ delivery scaffold + PIC 8259 (sketch)~~ shipped
+- `0014` — CHIPSET H1: full PIC (priorities/rotation, special mask, spurious IRQ, poll, level lines)  ← next

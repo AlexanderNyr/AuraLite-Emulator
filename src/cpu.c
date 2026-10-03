@@ -504,13 +504,27 @@ void cpu_reset(cpu_t *c) {
     c->rip = 0xFFF0;
     c->rflags = 0x2;
     c->cr0 = 0x60000010ULL;
-    c->halted = 0; c->fault = 0;
+    c->halted = 0; c->fault = 0; c->intr_delay = 0;
 }
 
 /* ============================== main stepper ============================== */
 int cpu_step(cpu_t *c) {
     machine_t *m = c->mach;
-    if (c->fault || c->halted) return -1;
+
+    /* ---- CHIPSET H0: hardware INTR sampling at the instruction boundary ----
+     * A pending unmasked PIC line wakes HLT even with IF=0 (matching
+     * silicon); the actual vector delivery still requires IF=1 and the
+     * post-STI / post-MOV-SS one-instruction shadow to have expired. */
+    if (c->halted) {
+        if (!pic_pending(m)) return -1;
+        c->halted = 0;
+    }
+    if (c->fault) return -1;
+    if (c->intr_delay) c->intr_delay--;
+    else if (c->rflags & FLAG_IF) {
+        int vec = pic_intack(m);
+        if (vec >= 0) raise_exception(m, vec, 0, 0);
+    }
 
     c->exception_taken = 0;
     dctx_t d; memset(&d,0,sizeof d);
@@ -567,7 +581,7 @@ int cpu_step(cpu_t *c) {
     case 0xF8: c->rflags &= ~FLAG_CF; break; /* CLC */
     case 0xF9: c->rflags |= FLAG_CF; break;  /* STC */
     case 0xFA: c->rflags &= ~FLAG_IF; break; /* CLI */
-    case 0xFB: c->rflags |= FLAG_IF; break;  /* STI */
+    case 0xFB: c->rflags |= FLAG_IF; c->intr_delay = 1; break;  /* STI (INTR held off one more instruction) */
     case 0xFC: c->rflags &= ~FLAG_DF; break; /* CLD */
     case 0xFD: c->rflags |= FLAG_DF; break;  /* STD */
 
@@ -686,6 +700,7 @@ really_slow:
     case 0x8D: { rm_t rm=MODRM(); FIXUP(rm); /* LEA: address itself (no segment base) is the value */
         set_reg(c, rm.reg_field, osz, d.has_rex, rm.addr); break; }
     case 0x8E: { rm_t rm=MODRM(); FIXUP(rm); int segidx = rm.reg_field & 7;
+        if (segidx == SEG_SS) c->intr_delay = 1;
         uint16_t sel = (uint16_t)rm_read(&d,&rm,2);
         if (!(c->cr0&1)) { c->seg[segidx].sel = sel; c->seg[segidx].base = (uint64_t)sel<<4; c->seg[segidx].limit=0xFFFF; }
         else { desc_t dsc; read_descriptor(m, c->gdtr_base, sel, &dsc); load_seg_from_desc(c, segidx, sel, &dsc); if (segidx==SEG_CS) {} }
@@ -1136,6 +1151,7 @@ really_slow:
         break; }
     case 0x07: case 0x17: case 0x1F: {
         int s = (op==0x07)?SEG_ES : (op==0x17)?SEG_SS : SEG_DS;
+        if (s == SEG_SS) c->intr_delay = 1;
         uint16_t sel = (uint16_t)do_pop(&d, stack_unit(&d));
         if (!(c->cr0&1)) { c->seg[s].sel = sel; c->seg[s].base = (uint64_t)sel<<4; c->seg[s].limit = 0xFFFF; }
         else { desc_t dsc; read_descriptor(m, c->gdtr_base, sel, &dsc); load_seg_from_desc(c, s, sel, &dsc); }

@@ -9,6 +9,10 @@
 - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
 - A framebuffer is available as `framebuffer.ppm`.
 - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+- A PC-compatible dual 8259A PIC (ports 0x20/0x21/0xA0/0xA1) delivers maskable hardware
+  interrupts at instruction boundaries: ICW1-4 init, OCW1 mask, OCW2 EOI, OCW3 IRR/ISR
+  readback, fixed priority, slave cascade through master IRQ2, plus STI shadow and HLT
+  wake semantics (CHIPSET H0; `pic_raise_irq()` is the device-side line API).
 
 ## Current limits
 
