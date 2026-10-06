@@ -69,6 +69,81 @@
   redelivering held lines after each EOI. Fixed delivery targets the
   single vCPU's LAPIC; the PAIR-TEST vectors the full
   8254 -> IOAPIC -> LAPIC -> CPU chain with the 8259 pair masked out.
+- The `--kernel=path` lane boots an AuraLite-OS `kernel.elf` directly,
+  no firmware in between (KERNEL-BOOT K1): ELF64 segments placed at
+  physical (p_paddr - kernel VMA), a seven-page paging hierarchy the
+  kernel's boot contract demands (identity + HHDM of the low 4 GiB as
+  shared 1 GiB pages, kernel VMA as 4 KiB pages), a fabricated
+  `boot_info_t` handoff (magic-pinned ABI mirror, framebuffer window,
+  E820-style memmap, HHDM offset, one BSP), and the CPU parked at
+  `_start` in long mode per the measured contract. The run log marks
+  `kmain` reached (18 instructions in, measured on AuraLite-OS @
+  0ed0d29); the measured frontier and the next phases live in
+  `docs/plans/KERNEL_BOOT_PLAN.md`.
+
+- The K4 lane brings ring-3 userspace up: `--initrd=` publishes a USTAR
+  rootfs through `boot_info_t`, the kernel mounts it, /hello runs to
+  exit(0), the execve argv/envp self-test passes, and the interactive
+  shell banner prints on COM1. The path forced four measured CPU-core
+  fixes: descriptor-table reads (GDT/IDT inside SYSCALL/exception
+  delivery) are implicit supervisor accesses; the IDT gate IST byte is
+  fetched through the linear IDTR base; ISTn slots live at
+  TSS+0x24+(n-1)*8; WRMSR IA32_FS_BASE keeps the FS shadow in sync so
+  userspace TLS (`%fs:0` errno) works. New test_ring3 suite pins every
+  one of them (verified red without each fix).
+
+- COM1 is a 16550 subset register file (CHIPSET K4): LSR reports
+  TX-idle/RX-empty, RBR is silent, IER/LCR/MCR/SCR store, IIR says
+  "no pending", DLAB detaches THR/RBR onto the divisor latch. The
+  K4-measured consequence of the old one-port model was an infinite
+  space storm into the guest shell's stdin. Scancode injection can be
+  scheduled by instruction count: `--keys-at=N` (the PS/2 driver's
+  boot-time drain consumes anything queued before its init).
+
+- The K5 lane meters the kernel's SMP bring-up against the emulator's
+  single vCPU: `--cpus=N` publishes N CPUs in `boot_info_t` and the
+  fabricated MADT (`acpi_build_table_set_smp`), so smp_init() runs its
+  real path — LAPIC-timer calibration against the PIT (measured
+  1317458400 Hz, 99.982% of the virtual-time ideal), then the classic
+  INIT-SIPI-SIPI ICR sequence per would-be AP, which the LAPIC model now
+  accepts and traces (delivery modes INIT/SIPI are legal sends, not
+  ESR-illegal). With one vCPU no AP answers; the kernel's bounded wait
+  falls back to BSP-only and the boot reaches the shell unimpaired.
+  Measured verdicts: the loader `goto_address` wake mechanism is unused
+  by the kernel (zero source references — it self-serves via the ICR);
+  the BSP's scheduler tick stays on the PIT by kernel design (periodic
+  LAPIC ticks are armed per-AP only), so scheduler preemption is
+  observable through the kernel's tick-paced `[sched]` self-test, and
+  true per-AP LAPIC scheduling needs a second vCPU (future phase).
+
+- The K6 lane wires that second vCPU: `--smp=2` parks a second
+  `cpu_state_t` context in wait-for-SIPI (LAPIC id from the fabricated
+  MADT/boot_cpu_t), runs a strict 1:1 round-robin where one step = one
+  instruction of the current context, and keeps the m->cpu/m->lapic
+  pair as "the current context" by swapping in/out around each step —
+  every device and exception path keeps its existing shape.  INIT resets
+  and parks the target context (SDM 8.4), SIPI starts it in real mode at
+  vector<<12; a single virtual master clock (+1 per retired instruction
+  from any vCPU, +512 per HLT idle quantum — identity when n_vcpus==1)
+  drives PIT/RTC/LAPIC timers and RDTSC for both contexts.  Measured
+  with kernel 0.0.1: the INIT-SIPI walk wakes the real AP, which reaches
+  `[smp] AP #0 online` in ~20 ms of virtual time; the AP's periodic
+  LAPIC timer interrupt (vector 32) is delivered into its hlt-ed idle
+  loop and EOI'd back every ~143k vtime (100 Hz) — per-CPU preemption
+  ticks on the AP are real; `PASS: multi-core system detected`; a full
+  boot to the shell.  Debugging lanes kept: `--smp-probe` (AP wake-window
+  vital signs, PIT ch2/udelay cadence, LAPIC intack/EOI trace) and
+  `--watch-phys=addr` (single-address store probe).  Measured boundary,
+  recorded honestly: the kernel's 100 ms bounded wait after SIPI#1
+  expires before the AP's `cpus_online` increment lands, because the
+  kernel queues its "[smp] AP online" report on an async UART TX ring
+  that drains at emulated-COM1 pace behind the BSP's boot-chatter
+  backlog — the wait-window protocol assumption, not machine state (the
+  next printk reads cpus_online == 2).  The MC146818A periodic
+  interrupt chain (register-A RS rate, PF+PIE) is modeled now so the
+  kernel's AP-wake receipt test (SYS_IRQ_AP_WAKE, an RTC IRQ8 storm
+  routed to the AP through the I/O APIC) can run; see the plan for the
+  receipt lines.
 
 ## Current limits
 

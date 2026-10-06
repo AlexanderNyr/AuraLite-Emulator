@@ -52,6 +52,25 @@ typedef struct {
 } logring_t;
 void mlog(logring_t *lr, const char *fmt, ...);
 
+/* ---- KERNEL-BOOT K6 (real SMP): second vCPU by context multiplexing --
+ * m->cpu and m->lapic always hold the CURRENTLY-RUNNING context; with
+ * --smp=2 the other context waits its turn in vcpu[] between steps.
+ * The main loop runs a strict 1:1 round-robin, so every stat stays
+ * deterministic (C9).  n_vcpus==1 (all unit tests, all firmware lanes)
+ * never touches this machinery: vcpu_load/store are no-ops and
+ * vtime_instr advances exactly like the old cpu.instr_count time base,
+ * which keeps every UP behavior bit-exact. */
+#define EM_MAX_VCPU   2
+#define VCPU_OFF      0               /* slot unused entirely         */
+#define VCPU_WAIT_SIPI 1              /* parked after INIT, waits SIPI */
+#define VCPU_RUN      2               /* executing in the round-robin  */
+typedef struct vcpu_slot {
+    cpu_t    c;
+    lapic_t  l;
+    int      state;
+    uint64_t sipi_cs_base;            /* CS base of the accepted SIPI (trace) */
+} vcpu_slot_t;
+
 struct machine {
     cpu_t cpu;
     uint8_t *ram;
@@ -92,8 +111,54 @@ struct machine {
     int running;
     int stop_requested;
     int guest_entry_seen; /* conventional guest entry at physical 0x00100000 */
+    /* KERNEL-BOOT K1 (--kernel): the direct kernel-load lane's run markers */
+    uint64_t kmain_va;   /* `kmain` symbol from the loaded ELF, 0 = no symtab */
+    int kmain_seen;      /* logged once when RIP first reaches kmain_va */
+    /* KERNEL-BOOT K5 (--cpus): how many boot_cpu_t entries the kloader
+     * publishes; the emulator still has exactly ONE vCPU, so entries > 1
+     * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
+    int cfg_cpus;
+
+    /* KERNEL-BOOT K6 (--smp): real executing contexts.  0/1 = one vCPU
+     * (all historical behavior).  The virtual master clock: +1 per
+     * retired instruction from ANY vcpu and +512 per HLT idle quantum
+     * (K3), so it equals cpu.instr_count exactly when n_vcpus==1.
+     * PIT/RTC/LAPIC-timer/RDTSC are all driven off this clock. */
+    int cfg_smp;
+    int dbg_pit1;             /* --smp-probe: PIT ch2 load/OUT-flip trace */
+    int n_vcpus;
+    int cur_vcpu;          /* context currently loaded in m->cpu/m->lapic */
+    uint64_t vtime_instr;
+    uint64_t watch_phys;      /* --watch-phys=addr: DW store probe, 0=off */
+    vcpu_slot_t vcpu[EM_MAX_VCPU];
 };
 typedef struct machine machine_t;
+
+/* K6: swap a vcpu context between its slot and the live m->cpu/m->lapic
+ * pair.  Both are complete no-ops when n_vcpus == 1, so every existing
+ * code path (unit suites included) keeps its byte-exact behavior and
+ * never pays for the multiplexing. */
+static inline void vcpu_load(machine_t *m, int i) {
+    if (m->n_vcpus > 1) {
+        m->cpu = m->vcpu[i].c;
+        m->lapic = m->vcpu[i].l;
+        m->cur_vcpu = i;
+    }
+}
+static inline void vcpu_store(machine_t *m, int i) {
+    if (m->n_vcpus > 1) {
+        m->vcpu[i].c = m->cpu;
+        m->vcpu[i].l = m->lapic;
+    }
+}
+/* LAPIC of context i.  With one vCPU the identity mapping keeps the
+ * live m->lapic pair as context 0 at ALL times (nothing ever swaps);
+ * otherwise the running context's LAPIC is the live pair and parked
+ * contexts answer from their slots. */
+static inline lapic_t *vcpu_lapic(machine_t *m, int i) {
+    if (m->n_vcpus <= 1) return &m->lapic;
+    return i == m->cur_vcpu ? &m->lapic : &m->vcpu[i].l;
+}
 
 /* memory.c */
 void      mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len);

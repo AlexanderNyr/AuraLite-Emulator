@@ -25,16 +25,22 @@ static void rte_evaluate(machine_t *m, int pin) {
     int vec = (int)(e->lo & RTE_VECTOR);
     if (vec < 16) return;                      /* reserved, like the LAPIC */
 
+    /* K6: rte.hi carries the physical destination LAPIC-id; with one vCPU
+     * (or an rte left at its reset hi=0) this resolves to the BSP context
+     * exactly like before.  Logical destination mode (DSTM bit) is not
+     * modeled -- documented; those deliveries also land on the LAPIC-id in
+     * hi>>24, which our guests program identically. */
+    uint32_t dest = (e->hi >> 24) & 0xFF;
     if (e->lo & RTE_TRIGGER) {                 /* level */
         int asserted = ((ia->lines & (1u << pin)) != 0) ^ ((e->lo & RTE_POLARITY) != 0);
         if (!asserted) return;
         if (ia->remote_irr & (1u << pin)) return;         /* awaiting EOI */
         ia->remote_irr |= (1u << pin);
-        lapic_set_irr(m, vec);
+        lapic_set_irr_dest(m, dest, vec);
     } else {                                   /* edge */
         if (!(ia->edge_pend & (1u << pin))) return;       /* nothing latched */
         ia->edge_pend &= ~(1u << pin);
-        lapic_set_irr(m, vec);
+        lapic_set_irr_dest(m, dest, vec);
     }
 }
 

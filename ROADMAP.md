@@ -26,6 +26,7 @@ maps to exactly one plan below.
 |---|---|---|---|
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
 | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+| [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | 🔵 **IN PROGRESS** (K0–K3 done ✅, K4–K5 planned) | the north-star path made direct: `--kernel=` lane loads AuraLite-OS `kernel.elf` itself (boot_info_t handoff measured from source); ISA-gap closure to the klog banner (measured: banner + PMM/VMM/timer self-tests PASS + IRQs delivered), probe-path hardware (MADT/hypervisor/fw_cfg receipts measured, sched PASS), initrd → shell, LAPIC-timer scheduler | K0–K5 |
 | `docs/plans/STORE_PLAN.md` | 📋 planned | real AHCI HBA (command lists, FIS, IDENTIFY, READ/WRITE DMA EXT); disk geometry; second-disk support | S0–S5 |
 | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
@@ -65,3 +66,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 - ~~`0018` — CHIPSET H5: A20 gate + warm reset (A20 = 8042-outport-bit1 OR port-0x92-bit1, masked on the bus; 0x92 bit0 + 0xCF9 + KBC 0xFE/outport-bit0 → boundary-consumed full warm reset)~~ shipped
 - ~~`0019` — CHIPSET H6: LAPIC (MMIO 0xFEE00000, SVR, TPR/PPR, self-IPI, timer; +IST/LTR CPU support)~~ shipped
 - ~~`0020` — CHIPSET H7: IOAPIC (IOREGSEL/IOWIN, 24 RTEs, edge-latch + level remote-IRR, LAPIC delivery; PIC-line fan-out; PAIR-TEST 8254→IOAPIC→LAPIC→CPU)~~ shipped — CHIPSET plan complete H0–H7
+- ~~`0021` — KERNEL-BOOT K1: direct kernel-load lane (`--kernel=` ELF64 placement, loader-built paging w/ identity+HHDM, fabricated boot_info_t, measured to `kmain` @ instr 18)~~ shipped

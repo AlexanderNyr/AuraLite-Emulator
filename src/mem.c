@@ -100,6 +100,19 @@ uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
 }
 
 void mem_write(machine_t *m, uint64_t phys, int size, uint64_t val) {
+    /* --watch-phys=addr: one-address DW store probe.  Runs BEFORE the A20
+     * mask on purpose (the probe address is a raw guest physical in the
+     * pre-A20 namespace, matching what the store instruction targeted). */
+    if (m->watch_phys && phys <= m->watch_phys &&
+        phys + (uint64_t)size > m->watch_phys) {
+        mlog(&m->log, "[watch] STORE phys=0x%llx size=%d val=0x%llx "
+             "vcpu%d rip=0x%llx vtime=%llu",
+             (unsigned long long)phys, size,
+             (unsigned long long)(val & ((size >= 8) ? ~0ULL
+                                          : ((1ULL << (size*8)) - 1))),
+             m->cur_vcpu, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
+    }
     /* CHIPSET H5: A20 mask, same bus rule as mem_read. */
     if (!m->chipset.a20) phys &= ~0x100000ULL;
     if (phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE) return; /* ROM: read-only */

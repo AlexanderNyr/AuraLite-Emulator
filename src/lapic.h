@@ -91,6 +91,9 @@ int  lapic_deliverable(struct machine *m);
 int  lapic_intack(struct machine *m);
 /* Latches a vector into IRR (H7: the IOAPIC's delivery endpoint). */
 void lapic_set_irr(struct machine *m, int vector);
+/* K6: same, targeted at the context owning LAPIC-id `dest` (I/O APIC
+ * rte.hi, physical destination mode; unroutable dest falls back to BSP). */
+void lapic_set_irr_dest(struct machine *m, uint32_t dest, int vector);
 /* Timer: advance on virtual time; no-op until programmed. */
 void lapic_tick(struct machine *m);
 

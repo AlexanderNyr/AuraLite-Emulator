@@ -2,6 +2,8 @@
 // machine for a chosen chipset-generation profile, runs the CPU, and
 // reports what happened (registers, mode, PCI/log trail, optional
 // framebuffer dump) -- a debugging tool for the firmware as much as a demo.
+#include <signal.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +11,7 @@
 #include "devices.h"
 #include "pci.h"
 #include "platform.h"
-#include "pci.h"
-#include "devices.h"
-#include "pci.h"
+#include "kloader.h"
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -58,6 +58,25 @@ enum {
     EXIT_CPU_FAULT = 2
 };
 
+/* K4: the --log= ring used to flush only on clean exit, so any run stopped
+ * externally (timeout kills, stop signals) took the entire boot history with
+ * it. Stash the flush context and flush on SIGTERM/SIGINT too. */
+static machine_t *sig_m;
+static const char *sig_log;
+static void flush_on_signal(int sig) {
+    if (sig_m && sig_log) {
+        FILE *f = fopen(sig_log, "w");
+        if (f) {
+            for (int i = 0; i < sig_m->log.count; i++) {
+                int idx = (sig_m->log.head - sig_m->log.count + i + LOG_RING) % LOG_RING;
+                fprintf(f, "%s\n", sig_m->log.lines[idx]);
+            }
+            fclose(f);
+        }
+    }
+    _exit(128 + sig);
+}
+
 int main(int argc, char **argv) {
     const char *rom_path = "firmware/firmware.bin";
     const char *disk_path = "disk/disk.img";
@@ -65,6 +84,19 @@ int main(int argc, char **argv) {
     const char *fb_out = NULL;
     const char *log_out = NULL;
     const char *keys_list = NULL;   /* --keys=1E,9E: scancode set-1 bytes (H4) */
+    uint64_t keys_at = 0;           /* --keys-at=N: delay injection to instr N
+                                     * (K4: the PS/2 driver's boot drain
+                                     * `while (STATUS.OBF) read DATA` eats any
+                                     * pre-boot keys verbatim -- measured) */
+    const char *kernel_path = NULL; /* --kernel=path: KERNEL-BOOT K1 direct-load lane */
+    const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
+    int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+                                     * publishes N CPUs while the emulator still
+                                     * runs one vCPU (0/1 = historical UP) */
+    int cfg_smp = 0;                /* --smp=N: K6 real execution contexts
+                                     * (currently max 2; 0/1 = one vCPU) */
+    int smp_probe = 0;              /* EMU_DBG_SMP: vcpu1 vital-signs probe */
+    uint64_t watch_phys = 0;        /* --watch-phys=addr: store probe */
     uint64_t max_instr = 50ull*1000*1000;
     int trace = 0;
 
@@ -76,27 +108,49 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
+        else if (!strncmp(argv[i], "--keys-at=", 10)) keys_at = strtoull(argv[i]+10, NULL, 0);
+        else if (!strncmp(argv[i], "--kernel=", 9)) kernel_path = argv[i]+9;
+        else if (!strncmp(argv[i], "--initrd=", 9)) initrd_path = argv[i]+9;
+        else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
+        else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
+        else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
+        else if (!strncmp(argv[i], "--watch-phys=", 13))
+            watch_phys = strtoull(argv[i]+13, NULL, 0);
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
                    "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--log=out.txt]\n"
-                   "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n", argv[0]);
+                   "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n"
+                   "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
+                   "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
+                   "          [--cpus=N] publish N CPUs in boot_info/MADT with ONE vCPU (KERNEL-BOOT K5 metering)\n"
+                   "          [--smp=N] run N real vCPUs (max 2; use with --cpus=N for kernel SMP bring-up, K6)\n"
+                   "                      skips --rom entirely and starts at the ELF entry\n", argv[0]);
             return 0;
         }
     }
 
     size_t rom_len = 0;
-    uint8_t *rom = read_file(rom_path, &rom_len);
-    if (!rom) return 1;
+    uint8_t *rom = NULL;
+    if (!kernel_path) {
+        rom = read_file(rom_path, &rom_len);
+        if (!rom) return 1;
+    }
 
     machine_t *m = calloc(1, sizeof *m);
     m->cpu.mach = m;
+    m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
+    m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
+    m->dbg_pit1 = smp_probe;  /* --smp-probe also arms the PIT ch2 trace */
+    m->watch_phys = watch_phys;
+    sig_m = m; sig_log = log_out;
+    if (log_out) { signal(SIGTERM, flush_on_signal); signal(SIGINT, flush_on_signal); }
     mem_init(m, rom, rom_len);
     io_init(m);
     m->plat = (struct platform *)platform_by_name(platform_name);
     devices_init_common(m);
     devices_init_platform(m);
-    if (keys_list && kbc_queue_keys(m, keys_list) < 0) {
+    if (keys_list && !keys_at && kbc_queue_keys(m, keys_list) < 0) {
         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
         return 1;
     }
@@ -104,17 +158,53 @@ int main(int argc, char **argv) {
     size_t disk_len = 0;
     uint8_t *disk = read_file(disk_path, &disk_len);
     if (disk) { m->disk = disk; m->disk_len = disk_len; }
-    else { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
+    else if (!kernel_path) { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
 
-    cpu_reset(&m->cpu);
+    if (kernel_path) {
+        /* KERNEL-BOOT K1: the loader owns CPU initial state; cpu_reset()
+         * happens inside kload_boot() before the contract overrides. */
+        if (kload_boot(m, kernel_path, initrd_path) != 0) {
+            devices_done(m);
+            pci_done(m);
+            mem_done(m);
+            free(disk);
+            free(m);
+            return EXIT_INPUT_ERROR;
+        }
+    } else {
+        cpu_reset(&m->cpu);
+    }
     m->cpu.trace = trace;
 
-    mlog(&m->log, "[boot] platform=%s rom=%s (%zu bytes) disk=%s (%zu bytes)",
-         platform_by_name(platform_name)->name, rom_path, rom_len, disk_path, disk_len);
+    if (kernel_path)
+        mlog(&m->log, "[boot] platform=%s kernel=%s (--kernel direct load; firmware skipped)",
+             platform_by_name(platform_name)->name, kernel_path);
+    else
+        mlog(&m->log, "[boot] platform=%s rom=%s (%zu bytes) disk=%s (%zu bytes)",
+             platform_by_name(platform_name)->name, rom_path, rom_len, disk_path, disk_len);
+
+    /* K6 (--smp=2): wire the second execution context BEFORE the run.
+     * Pristine power-on CPU image + the H6-reset LAPIC image with ID 1
+     * (matching --cpus=2 kload/MADT metadata); parked in wait-for-SIPI,
+     * exactly the MP spec's boot-time AP state. */
+    if (cfg_smp >= 2) {
+        m->n_vcpus = 2;
+        m->vcpu[0].c = m->cpu; m->vcpu[0].l = m->lapic;
+        m->vcpu[0].state = VCPU_RUN;
+        m->vcpu[1].c.mach = m;
+        cpu_reset(&m->vcpu[1].c);
+        m->vcpu[1].l = m->lapic;
+        m->vcpu[1].l.id = 1u << 24;
+        m->vcpu[1].state = VCPU_WAIT_SIPI;
+        m->cur_vcpu = 0;
+        mlog(&m->log, "[smp] K6: 2 vCPU contexts live; vcpu1 parked in "
+             "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
+    }
 
     uint64_t n = 0;
     int step_result = 0;
     while (n < max_instr) {
+        if (m->n_vcpus <= 1) {
         if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
             m->guest_entry_seen = 1;
             mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
@@ -123,14 +213,94 @@ int main(int argc, char **argv) {
         if (step_result != 0)
             break;
         n++;
-        if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
-            m->guest_entry_seen = 1;
-            mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
+        if (!m->kmain_seen && m->kmain_va && m->cpu.rip == m->kmain_va) {
+            m->kmain_seen = 1;
+            mlog(&m->log, "[kernel] kmain reached -- AuraLite-OS C entry "
+                 "(%llu instructions in)", (unsigned long long)n);
+        }
+        if (keys_list && keys_at && m->vtime_instr >= keys_at) {
+            if (kbc_queue_keys(m, keys_list) < 0)
+                mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
+            else
+                mlog(&m->log, "[kbc] --keys-at fired (instr=%llu)",
+                     (unsigned long long)m->vtime_instr);
+            keys_at = 0;
         }
         if (m->stop_requested)
             break;
+        } else {
+        /* K6 dual-context: strict 1:1 round-robin.  A vcpu that hard-
+         * stops (hlt+cli or a cpu fault) is parked off the rotation; the
+         * run ends only when EVERY active context has stopped -- the same
+         * endpoint semantics as UP, where there is one context. */
+        if (smp_probe) {
+            /* dbg probe (--smp-probe): the AP wake window only -- from the
+             * WAIT_SIPI->RUN transition onward.  Tight + sparse on purpose:
+             * a uniform probe in steady state flooded the 4096-line log
+             * ring before flush (measured), hiding the exact window this
+             * probe exists to see. */
+            static int last1 = 0, wcount = 0;
+            static uint64_t w0 = 0, wnext = 0;
+            if (m->vcpu[1].state == VCPU_RUN && last1 != VCPU_RUN) {
+                w0 = m->vtime_instr; wnext = w0;
+                mlog(&m->log, "[smp-probe] AP wake window opens: vtime=%llu",
+                     (unsigned long long)w0);
+            }
+            last1 = m->vcpu[1].state;
+            /* First 2000 wake-window probes at 2^17 vtime spacing: the
+             * race against the kernel's 100 ms bounded wait (~1.43M
+             * vtime) needs sub-window resolution, but the ring must not
+             * flood (measured k6-probe1). */
+            if (w0 && wcount < 2000 && m->vtime_instr >= wnext &&
+                m->vcpu[1].state == VCPU_RUN) {
+                wcount++;
+                vcpu_slot_t *s = &m->vcpu[1];
+                mlog(&m->log, "[smp-probe] vt=%llu ap.i=%llu rip=%llx "
+                     "ccr=%u ict=%u irr=%02x%02x",
+                     (unsigned long long)(m->vtime_instr - w0),
+                     (unsigned long long)s->c.instr_count,
+                     (unsigned long long)s->c.rip,
+                     s->l.tmccur, s->l.tmict, s->l.irr[4], s->l.irr[3]);
+                wnext = m->vtime_instr + (1ull << 17);
+            }
+        }
+        int ran = 0;
+        for (int i = 0; i < m->n_vcpus; i++) {
+            if (m->vcpu[i].state != VCPU_RUN) continue;
+            vcpu_load(m, i);
+            step_result = cpu_step(&m->cpu);
+            vcpu_store(m, i);
+            n++;
+            ran = 1;
+            if (step_result != 0) {
+                mlog(&m->log, "[smp] vcpu%d stopped (rc=%d) -- parked; "
+                     "%d context(s) still live", i, step_result,
+                     m->vcpu[1-i].state == VCPU_RUN ? 1 : 0);
+                m->vcpu[i].state = VCPU_OFF;
+            }
+            if (keys_list && keys_at && m->vtime_instr >= keys_at) {
+                if (kbc_queue_keys(m, keys_list) < 0)
+                    mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
+                else
+                    mlog(&m->log, "[kbc] --keys-at fired (instr=%llu)",
+                         (unsigned long long)m->vtime_instr);
+                keys_at = 0;
+            }
+            if (m->stop_requested)
+                break;
+        }
+        if (!ran) {
+            mlog(&m->log, "[smp] all vCPU contexts stopped/parked -- run ends");
+            break;               /* step_result stays whatever it was */
+        }
+        if (m->stop_requested)
+            break;
+        }
     }
 
+    /* K6: bring the BSP context back into the live pair for the final
+     * register dump / fault verdict (its slot copy is authoritative). */
+    if (m->n_vcpus > 1) vcpu_load(m, 0);
     if (m->guest_entry_seen && m->fb && m->fb[0] == 0x00200000u)
         mlog(&m->log, "[guest] framebuffer marker OK: pixel[0]=0x%08x", m->fb[0]);
     dump_regs(&m->cpu);

@@ -510,9 +510,63 @@ static const vec_t VECTORS[] = {
     V("cpuid max ext",   "66 B8 00 00 00 80 0F A2", "", "eax=0x80000008"),
     V("rdtsc t0",        "0F 31", "", "eax=0,edx=0"),
     V("rdtsc t1 ratio",  "90 0F 31", "", "eax=92"),
+
+    /* -- O: hint block 0F 18-1F (PREFETCHh / multibyte NOP), KERNEL-BOOT K2 --
+     * decode-only: no memory access, no flag writes, never a fault -- first
+     * measured need: clang's 0F 1F /0 alignment NOPs in the AuraLite kernel */
+    V("hint nop [bx+si]",  "0F 1F 00",           "rax=0x1234", "rax=0x1234"),
+    V("hint nop disp16",   "0F 1F 84 78 56",     "cf=1", "cf=1"),
+    V("hint nop disp8",    "0F 1F 43 10",        "zf=0", "zf=0"),
+    V("hint nop 0f1d",     "0F 1D 00",           "", "rax=0"),
+    V("prefetchh 0f18",    "0F 18 00",           "mb[0x200]=0x5A", "mb[0x200]=0x5A"),
+    V("hint nop flags",    "0F 1F 40 20",        "cf=1,of=1,zf=1", "cf=1,of=1,zf=1"),
+
+    /* -- P: BT/BTS/BTR/BTC bit-string family + 0F BA group, KERNEL-BOOT K2 --
+     * CF := old bit; other arithmetic flags architecturally undefined (left) */
+    V("bt reg set",        "0F A3 C1",           "rcx=0xF0,rax=4,cf=0", "cf=1"),
+    V("bt reg clear",      "0F A3 C1",           "rcx=0,rax=2,cf=1", "cf=0"),
+    V("bt mem word",       "0F A3 06 00 02",     "rax=3,mw[0x200]=0xFFFF", "cf=1"),
+    V("bt mem neg sel",    "0F A3 06 00 02",     "rax=0xFFFFFFFC,mw[0x1FE]=0x0002", "cf=0"),
+    V("bts reg sets",      "0F AB C1",           "rcx=0,rax=5,cf=1", "rcx=0x20,cf=0"),
+    V("btr reg clears",    "0F B3 C1",           "rcx=0xFF,rax=3,cf=0", "rcx=0xF7,cf=1"),
+    V("btc reg toggles",   "0F BB C1",           "rcx=0xFF,rax=3", "rcx=0xF7,cf=1"),
+    V("bts mem",           "0F AB 06 00 02",     "rax=9,mw[0x200]=0", "mw[0x200]=0x0200,cf=0"),
+    V("grp bt imm",        "0F BA E1 03",        "rcx=0x8,cf=0", "cf=1"),
+    V("grp bts imm",       "0F BA E9 01",        "rcx=0", "rcx=0x2,cf=0"),
+    V("grp btr imm set",   "0F BA F1 02",        "rcx=0xF", "rcx=0xB,cf=1"),
+    V("grp btc imm",       "0F BA F9 05",        "rcx=0x20,cf=1", "rcx=0,cf=1"),
+
+    /* -- Q: MOVSXD long-mode form boundary (K2) -- in real16/prot the byte
+     * 0x63 is ARPL, documented out of scope: a deliberate #UD, pinned here. */
+    V("arpl scope pin",    "63 C1",              "", "fault=1"),
+
+    /* -- R: BSF/BSR (K3) -- scan direction, zero source keeps the
+     * destination register (silicon-real, SDM "undefined") and raises ZF;
+     * a set source always clears ZF. */
+    V("bsf eax,ebx",       "66 0F BC C3",        "ebx=0x40", "eax=6,zf=0"),
+    V("bsr eax,ebx",       "66 0F BD C3",        "ebx=0x80000000", "eax=31,zf=0"),
+    V("bsf zero keeps",    "66 0F BC C3",        "ebx=0,eax=0x11", "eax=0x11,zf=1"),
+    V("bsr zero keeps",    "66 0F BD C3",        "ebx=0,eax=0x22", "eax=0x22,zf=1"),
+    V("bsf 16-bit src",    "0F BC C3",           "bx=0x10", "ax=4,zf=0"),
+    V("bsr low bit",       "66 0F BD C3",        "ebx=0x1", "eax=0,zf=0"),
+
+    /* -- T: x87 control subset (K3) -- FNINIT/FNCLEX are pure no-ops
+     * (flags preserved), and the data-op boundary is a pinned #UD. */
+    V("fninit preserves",  "DB E3",              "cf=1", "cf=1"),
+    V("fnclex preserves",  "DB E2",              "zf=1", "zf=1"),
+    V("x87 data stays #UD","D9 C0",              "", "fault=1"),
+
+    /* SWAPGS is 64-bit only; the legacy pin guards the deliberate #UD. */
+    V("swapgs legacy pin", "0F 01 F8",           "", "fault=1"),
+
+    /* -- S: group-15 memory forms (K3) -- FXSAVE/FXRSTOR/LDMXCSR/STMXCSR
+     * decode; the XSAVE side is CPUID-gated so #UD is the architected
+     * answer here, and the mod==3 /0..3 space is reserved. */
+    V("xm/xsave #UD",      "0F AE 2C 24",        "", "fault=1"),
+    V("grp15 mod3 resv",   "0F AE C0",           "", "fault=1"),
     V("ud2 faults",      "0F 0B", "", "fault=1"),
     V("0F FF faults",    "0F FF", "", "fault=1"),
-    V("0F AE bad faults","0F AE 08", "", "fault=1"),
+    V("0F AE bad faults","0F AE 30", "", "fault=1"),
 
     /* -- O: imul forms --------------------------------------------------------- */
     V("imul ax,bx small", "0F AF C3", "ax=7,bx=9", "ax=63,cf=0,of=0"),

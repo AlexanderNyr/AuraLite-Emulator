@@ -12,7 +12,7 @@
 void pit_init(machine_t *m) {
     memset(&m->pit, 0, sizeof m->pit);
     m->pit.instr_per_tick = PIT_DEFAULT_IPT;
-    m->pit.last_instr = m->cpu.instr_count;
+    m->pit.last_instr = m->vtime_instr; /* K6 master clock */
 }
 
 /* Effective mode for behavior: 6->2, 7->3 (clone-compatible); 1/4/5 run
@@ -31,10 +31,17 @@ static int64_t period_of(const pit_counter_t *c) {
 
 /* One terminal event on counter 0: IRQ0 edge strobe (modes with IRQ
  * semantics only). Collapses to one latched IRR per strobe; the `fired`
- * counter keeps the full count for debug. */
+ * counter keeps the full count for debug.
+ * K2: the pin is wired to BOTH legacy sink (8259 IRQ0) and I/O APIC INTIN2
+ * (GSI2) -- the standard MADT IRQ0->GSI2 override every PC carries, and
+ * exactly how the AuraLite kernel routes "PIT@GSI2" once it masks the PIC
+ * and switches to APIC delivery. Pulse both. */
 static void fire_once(machine_t *m, pit_counter_t *c) {
     c->fired++;
-    if (c == &m->pit.ch[0]) pic_raise_irq(m, 0);
+    if (c == &m->pit.ch[0]) {
+        pic_raise_irq(m, 0);
+        ioapic_edge_gsi(m, 2);
+    }
 }
 
 /* Advance one counter by `t` ticks. Mode 3 also refreshes its OUT level:
@@ -48,7 +55,14 @@ static void advance(machine_t *m, pit_counter_t *c, uint64_t t) {
     switch (me) {
     case 0: { /* interrupt on terminal count: one edge, then hold OUT high */
         if (c->out) { c->rem -= (int64_t)t; while (c->rem <= 0) c->rem += P; return; }
-        if ((int64_t)t >= c->rem) { c->out = 1; fire_once(m, c); }
+        if ((int64_t)t >= c->rem) {
+            c->out = 1;
+            if (c == &m->pit.ch[2] && m->dbg_pit1)
+                mlog(&m->log, "[pit-dbg] ch2 OUT=1 rem=%lld t=%llu vtime=%llu",
+                     (long long)c->rem, (unsigned long long)t,
+                     (unsigned long long)m->vtime_instr);
+            fire_once(m, c);
+        }
         c->rem -= (int64_t)t;
         while (c->rem <= 0) c->rem += P;
         return; }
@@ -74,7 +88,7 @@ static void advance(machine_t *m, pit_counter_t *c, uint64_t t) {
 
 void pit_tick(machine_t *m) {
     if (!m->pit.instr_per_tick) return;   /* pit not initialized */
-    uint64_t now = m->cpu.instr_count;
+    uint64_t now = m->vtime_instr;  /* K6: machine-wide master clock (== instr_count UP) */
     uint64_t delta = now - m->pit.last_instr;
     if (!delta) return;
     m->pit.last_instr = now;
@@ -123,6 +137,9 @@ static void pit_ch_write(machine_t *m, int ch, uint8_t v) {
         if (meff(c) == 0) c->out = 0;       /* OUT low while counting */
         else c->out = 1;
         pit_tick(m);                        /* settle virtual time now */
+        if (ch == 2 && m->dbg_pit1)
+            mlog(&m->log, "[pit-dbg] ch2 load P=%lld vtime=%llu",
+                 (long long)period_of(c), (unsigned long long)m->vtime_instr);
     }
 }
 

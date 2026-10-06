@@ -45,12 +45,19 @@ int lapic_intack(machine_t *m) {
     if (v < 0) return -1;
     map_clear(m->lapic.irr, v);
     map_set(m->lapic.isr, v);
+    if (m->dbg_pit1 && v == 32)
+        mlog(&m->log, "[lapic-dbg] intack vec32 vcpu%d rip=0x%llx vtime=%llu",
+             m->cur_vcpu, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
     return v;
 }
 
 static void lapic_eoi(machine_t *m) {
     int v = map_highest(m->lapic.isr);
     if (v >= 0) {
+        if (m->dbg_pit1 && v == 32)
+            mlog(&m->log, "[lapic-dbg] EOI vec32 vcpu%d vtime=%llu",
+                 m->cur_vcpu, (unsigned long long)m->vtime_instr);
         map_clear(m->lapic.isr, v);
         /* H7: level-triggered IOAPIC entries on this vector un-latch
          * their remote_IRR and may redeliver a still-asserted line. */
@@ -72,8 +79,12 @@ static uint32_t dcr_div(uint32_t v) {
 
 void lapic_tick(machine_t *m) {
     lapic_t *l = &m->lapic;
-    /* D6 virtual time: identical to what RDTSC reads (deterministic). */
-    uint64_t now = m->cpu.instr_count * (uint64_t)m->plat->tsc_per_instr;
+    /* D6 virtual time: identical to what RDTSC reads (deterministic).
+     * K6: the master clock is vtime_instr; with n_vcpus==1 it equals
+     * instr_count bit-for-bit, so UP behavior is unchanged.  Because the
+     * delta accumulator is per-context, a suspended vcpu's timer simply
+     * catches up with the whole elapsed window at its next turn. */
+    uint64_t now = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
     uint64_t delta = now - l->last_tsu;
     l->last_tsu = now;
     if (!l->tmict || !delta) return;
@@ -102,21 +113,133 @@ void lapic_tick(machine_t *m) {
 
 /* ------------------------------------------------------ ICR / IPI */
 
+/* K6: locate the running slot that owns a LAPIC-id (-1 = nobody). */
+static int lapic_index_by_id(machine_t *m, uint32_t apic_id) {
+    for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++) {
+        lapic_t *li = vcpu_lapic(m, i);
+        if (((li->id >> 24) & 0xFF) == apic_id) return i;
+    }
+    return -1;
+}
+
+/* K6: latch a vector into the context owning LAPIC-id `dest` (the I/O
+ * APIC's rte.hi endpoint); an unroutable destination falls back to the
+ * BSP context, documented. */
+void lapic_set_irr_dest(machine_t *m, uint32_t dest, int vector) {
+    if (vector < 16) { m->lapic.esr |= (1u << 6); return; }
+    int idx = lapic_index_by_id(m, dest);
+    if (idx < 0) idx = 0;
+    map_set(vcpu_lapic(m, idx)->irr, vector);
+}
+
+/* K6: an INIT arriving at context idx (Intel MP spec s.8.4: INIT resets
+ * most architectural state and parks the cpu in wait-for-SIPI; the
+ * LAPIC keeps its ID).  INIT asserted at the RUNNING context is the
+ * "INIT self" case -- illegal on real silicon, we log-and-refuse. */
+static void vcpu_take_init(machine_t *m, int idx) {
+    vcpu_slot_t *s = &m->vcpu[idx];
+    if (idx == m->cur_vcpu) {
+        mlog(&m->log, "[lapic] INIT at the RUNNING vcpu%d ignored (self)", idx);
+        return;
+    }
+    cpu_reset(&s->c);
+    lapic_t keep = s->l;                 /* preserve the LAPIC ID value */
+    lapic_t *ll = &s->l;
+    uint32_t id = keep.id;
+    memset(ll, 0, sizeof *ll);
+    ll->id = id;
+    ll->dfr = 0xFFFFFFFFu;
+    ll->svr = 0x00FFu;
+    for (int i = 0; i < 6; i++) ll->lvt[i] = LVT_MASKED;
+    s->state = VCPU_WAIT_SIPI;
+    mlog(&m->log, "[lapic] vcpu%d took INIT: state reset, parked in "
+         "wait-for-SIPI", idx);
+}
+
+/* K6: SIPI lands only on a cpu parked in wait-for-SIPI (SDM Vol.3
+ * s.8.4.2: a SIPI at a cpu in any other state is discarded, which is
+ * also why the spec's duplicate SIPI is safe).  Execution starts in
+ * real mode at (vector<<12):0 with the post-INIT register image. */
+static void vcpu_take_sipi(machine_t *m, int idx, uint8_t vec) {
+    vcpu_slot_t *s = &m->vcpu[idx];
+    if (s->state != VCPU_WAIT_SIPI) {
+        if (idx != m->cur_vcpu && s->state != VCPU_OFF)
+            mlog(&m->log, "[lapic] vcpu%d SIPI vec=0x%02x discarded "
+                 "(not in wait-for-SIPI)", idx, vec);
+        return;
+    }
+    s->c.seg[SEG_CS].sel  = (uint16_t)(vec << 8);
+    s->c.seg[SEG_CS].base = (uint64_t)vec << 12;
+    s->c.rip = 0;
+    s->c.halted = 0;
+    s->sipi_cs_base = (uint64_t)vec << 12;
+    s->state = VCPU_RUN;
+    mlog(&m->log, "[lapic] vcpu%d took SIPI: entering real mode at "
+         "0x%05llx:0", idx, (unsigned long long)s->sipi_cs_base);
+}
+
 static void lapic_icr_write(machine_t *m, uint32_t v) {
     lapic_t *l = &m->lapic;
     uint32_t dm = (v >> 8) & 7;
     int shorthand = (int)((v >> 18) & 3);
-    if (dm != 0) { l->esr |= (1u << 5); return; }   /* send-illegal: NMI/SIPI/... */
-    uint32_t id = (l->id >> 24) & 0xFF;
-    int addressed =
-        shorthand == 1 /* self */ || shorthand == 2 /* all */ ||
-        (shorthand == 0 && ((((l->icr_hi >> 24) & 0xFF) == id) ||
-                            (((l->icr_hi >> 24) & 0xFF) == 0xFF)));
-    /* shorthand 3 (all-excluding-self) on a single-vCPU box: nobody home */
-    if (!addressed) return;
+    if (dm != 0) {
+        /* K5 metering + K6 delivery: INIT (dm=5, assert / level-deassert)
+         * and STARTUP (dm=6) are architecture-legal send modes (Intel MP
+         * spec s.B.4), not ESR "send illegal" material.  On one vCPU
+         * they simply have no receiver (the K5 trace); with --smp=2 an
+         * IPI whose destination LAPIC-id matches our parked AP actually
+         * lands there. */
+        const char *kind =
+            dm == 5 ? ((v & (1u << 14)) ? "INIT-assert" : "INIT-deassert") :
+            dm == 6 ? "SIPI" : "exotic";
+        uint32_t dest = (l->icr_hi >> 24) & 0xFF;
+        if (dm != 5 && dm != 6) {
+            l->esr |= (1u << 5);                 /* genuinely illegal send */
+            return;
+        }
+        if (dm == 5 && !(v & (1u << 14))) {
+            mlog(&m->log, "[lapic] IPI INIT-deassert: dst=%u (no-op; INIT "
+                 "already latched)", dest);
+            return;                              /* level-deassert: nothing resets */
+        }
+        /* INIT-assert / SIPI: shorthand 0 targeted delivery; the kernel's
+         * bring-up never uses the broadcast forms for these modes. */
+        if (shorthand != 0) {
+            mlog(&m->log, "[lapic] IPI %s: vec=0x%02x shorthand=%d "
+                 "(broadcast form not modeled for INIT/SIPI)", kind,
+                 (unsigned)(v & 0xFF), shorthand);
+            return;
+        }
+        int idx = lapic_index_by_id(m, dest);
+        if (idx < 0) {
+            mlog(&m->log, "[lapic] IPI %s: vec=0x%02x dst=%u "
+                 "(no such LAPIC id -- nothing home)",
+                 kind, (unsigned)(v & 0xFF), dest);
+            return;
+        }
+        if (dm == 5) vcpu_take_init(m, idx);
+        else         vcpu_take_sipi(m, idx, (uint8_t)(v & 0xFF));
+        return;                                  /* delivery completes now */
+    }
     int vec = (int)(v & 0xFF);
     if (vec < 16) { l->esr |= (1u << 6); return; }  /* receive-illegal */
-    map_set(l->irr, vec);
+    /* K6: fixed IPIs honor the broadcast shorthands per-context.
+     * shorthand: 0 targeted, 1 self, 2 all, 3 all-excluding-self. */
+    if (shorthand == 2 || shorthand == 3) {
+        for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++)
+            if (shorthand == 2 || i != m->cur_vcpu)
+                map_set(vcpu_lapic(m, i)->irr, vec);
+        return;
+    }
+    if (shorthand == 0) {
+        int idx = lapic_index_by_id(m, (l->icr_hi >> 24) & 0xFF);
+        if (idx < 0 && ((l->icr_hi >> 24) & 0xFF) == 0xFF)
+            idx = m->cur_vcpu;                   /* broadcast-dest reg: us */
+        if (idx < 0) return;                     /* nobody home */
+        map_set(vcpu_lapic(m, idx)->irr, vec);
+        return;
+    }
+    map_set(l->irr, vec);                        /* shorthand 1: self */
 }
 
 /* --------------------------------------------------- MMIO handlers */

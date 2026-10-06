@@ -11,6 +11,7 @@
 #include "pci.h"
 #include "platform.h"
 #include "devices.h"
+#include "serial.h"
 
 /* ============================ generic RAM window ========================== */
 typedef struct { uint8_t *buf; uint64_t base, size; uint32_t clear_bits_on_read; const char *name; } rw2_t;
@@ -160,33 +161,11 @@ static void ehci_doorbell(ehci_t *e) {
 
 static ehci_t g_ehci; /* single controller instance is all the firmware ever needs */
 
-/* COM1 is intentionally small but useful: guest boot markers and diagnostics
- * remain observable even when no framebuffer is attached. */
-typedef struct {
-    machine_t *m;
-    char line[256];
-    size_t len;
-} serial_t;
-static serial_t g_serial;
-
-static uint32_t serial_read(void *ctx, uint16_t port, int size) {
-    (void)ctx; (void)port; (void)size;
-    return 0x20; /* THR empty */
-}
-
-static void serial_write(void *ctx, uint16_t port, int size, uint32_t val) {
-    serial_t *s = ctx;
-    if (port != 0x3F8 || size < 1) return;
-    unsigned char ch = (unsigned char)val;
-    if (ch == '\r') return;
-    if (ch == '\n' || s->len == sizeof(s->line) - 1) {
-        s->line[s->len] = 0;
-        mlog(&s->m->log, "[serial] %s", s->line);
-        s->len = 0;
-        return;
-    }
-    s->line[s->len++] = (char)ch;
-}
+/* K4: COM1 is a real-ish 16550 register file now (src/serial.c -- the
+ * 1-port 0x20-echo baseline made every guest stdin read rain spaces,
+ * measured on the AuraLite shell). g_com1 keeps the lifetime simple:
+ * one instance per machine, matching the rest of this file's globals. */
+static serial_t *g_com1;
 
 static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
     rw2_write(ctx, addr, size, val);
@@ -231,9 +210,8 @@ void devices_init_common(machine_t *m) {
     ioapic_init(m);
     ioapic_mmio_register(m);
 
-    memset(&g_serial, 0, sizeof g_serial);
-    g_serial.m = m;
-    io_register(m, 0x3F8, 1, serial_read, serial_write, &g_serial, "COM1");
+    g_com1 = serial_alloc(m);
+    serial_io_register(m, g_com1);
 
     /* Host bridge: bus0 dev0 func0 */
     pci_add_device(m, 0,0,0, "host-bridge", 0x8086, 0x0100, 0x06, 0x00, 0);
@@ -321,4 +299,5 @@ void devices_done(machine_t *m) {
         r = next;
     }
     m->mmio_list = NULL;
+    if (g_com1) { serial_free(g_com1); g_com1 = NULL; }   /* K5: LSan lane */
 }

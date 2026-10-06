@@ -45,9 +45,19 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
     case 0x1:
         *a = p->cpuid1_eax;
         *b = 0x00040800; /* brand index / CLFLUSH / APIC ID stub */
-        *c = (1u<<0);                 /* SSE3 */
+        *c = (1u<<0)                 /* SSE3 */
+           | (1u<<31);               /* hypervisor present -- we ARE one
+                                        * (KERNEL-BOOT K3: the guest's vmdrv
+                                        * probe prints the vendor string) */
         *d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<9)|(1u<<15)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
         /* FPU,TSC,MSR,CX8,APIC,CMOV,MMX,FXSR,SSE,SSE2 */
+        break;
+    /* ---- hypervisor interface leaf (0x40000000) ---- */
+    case 0x40000000:
+        *a = 0x40000000;             /* highest hypervisor leaf = this one */
+        *b = 0x61727541;             /* "Aura" (little-endian) */
+        *c = 0x6574694C;             /* "Lite" */
+        *d = 0x20564820;             /* " HV " */
         break;
     case 0x80000000:
         *a = 0x80000008; break;

@@ -10,13 +10,15 @@
 #define RTC_UFBIT 0x10
 #define RTC_IRQFBIT 0x80
 #define RTC_UIE 0x10                /* register B bit4 */
+#define RTC_PFBIT 0x40              /* register C bit6: periodic flag   */
+#define RTC_PIE 0x40                /* register B bit6: periodic enable */
 
 static uint8_t bin2bcd(unsigned v) { return (uint8_t)((v / 10 << 4) | (v % 10)); }
 
 void rtc_init(machine_t *m) {
     memset(&m->rtc, 0, sizeof m->rtc);
     m->rtc.instr_per_tick = 12;
-    m->rtc.last_instr = m->cpu.instr_count;
+    m->rtc.last_instr = m->vtime_instr; /* K6 master clock */
     /* pinned power-on CMOS content (rtc.h table) */
     m->rtc.ram[0x0A] = 0x26;                 /* reg A: DV=010, RS=0110 */
     m->rtc.ram[0x0B] = 0x02;                 /* reg B: 24h, BCD */
@@ -34,11 +36,12 @@ void rtc_init(machine_t *m) {
 
 void rtc_tick(machine_t *m) {
     if (!m->rtc.instr_per_tick) return;
-    uint64_t now = m->cpu.instr_count;
+    uint64_t now = m->vtime_instr;  /* K6: machine-wide master clock */
     uint64_t delta = now - m->rtc.last_instr;
     if (!delta) return;
     m->rtc.last_instr = now;
-    uint64_t before = m->rtc.ticks / RTC_TICKS_PER_SEC;
+    uint64_t tb_before = m->rtc.ticks;
+    uint64_t before = tb_before / RTC_TICKS_PER_SEC;
     m->rtc.accum += delta;
     m->rtc.ticks += m->rtc.accum / m->rtc.instr_per_tick;
     m->rtc.accum %= m->rtc.instr_per_tick;
@@ -47,6 +50,21 @@ void rtc_tick(machine_t *m) {
         m->rtc.flags_c |= RTC_UFBIT;
         if (m->rtc.ram[0x0B] & RTC_UIE) {
             m->rtc.flags_c |= RTC_IRQFBIT;
+            pic_raise_irq(m, 8);              /* slave line 0 */
+        }
+    }
+    /* Periodic interrupt chain (MC146818A): rate from register A RS
+     * (3..15), period 2^(RS-1)/32768 s; PF|IRQF + IRQ8 per boundary.
+     * Real HW derives this from a 32 kHz divider chain; we derive it from
+     * the same PIT-tick base as the seconds counter.  Inert unless PIE is
+     * set (power-on: off), so UP/legacy paths keep the K3-pinned 1 Hz
+     * UF-only behavior. */
+    unsigned rs = m->rtc.ram[0x0A] & 0x0F;
+    if ((m->rtc.ram[0x0B] & RTC_PIE) && rs >= 3 && rs <= 15) {
+        /* period in PIT ticks: RTC_TICKS_PER_SEC * 2^(RS-1) / 32768 */
+        uint64_t period = (uint64_t)RTC_TICKS_PER_SEC << (rs - 1) >> 15;
+        if (period && m->rtc.ticks / period != tb_before / period) {
+            m->rtc.flags_c |= RTC_PFBIT | RTC_IRQFBIT;
             pic_raise_irq(m, 8);              /* slave line 0 */
         }
     }

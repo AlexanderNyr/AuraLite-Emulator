@@ -36,7 +36,7 @@
 
 struct machine;
 
-#define KBC_QUEUE 32
+#define KBC_QUEUE 64
 
 typedef struct kbc {
     uint8_t  status;      /* dynamic: OBF|SYS|A2|INH */

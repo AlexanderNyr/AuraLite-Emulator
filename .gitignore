@@ -3,6 +3,7 @@
 /firmware/*.bin
 /disk/*.bin
 /disk/*.img
+/tests/kload_fixture.elf
 
 # Emulator output
 *.ppm
@@ -14,3 +15,4 @@
 .DS_Store
 .vscode/
 .idea/
+x86emu-asan

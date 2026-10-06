@@ -45,6 +45,20 @@ typedef struct cpu {
     segment_t seg[6];
     uint64_t cr0, cr2, cr3, cr4;
     uint64_t efer;
+    uint64_t kgs_base;
+    uint16_t fcw;    /* K3: x87 control word tracked for FLDCW/FNSTCW;
+                          * no x87 data model behind it (deliberate). */
+    uint32_t mxcsr;    /* K3: SSE control/status; FXSAVE/FXRSTOR/LDMXCSR/
+                        * STMXCSR route here. */
+    uint64_t xmm[16][2]; /* K4: the media data file exists now -- the
+                        * measured ring-3 lane (userspace memset/memcpy and
+                        * the AuraLite context switch) runs MOVAPS/UPS, MOVDQA/
+                        * U, scalar moves and PXOR through it. SIMD arithmetic
+                        * is still deliberately out of scope. */   /* IA32_KERNEL_GS_BASE (0xC0000102) -- the SWAPGS
+                          * partner of seg[SEG_GS].base which shadows
+                          * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
+                          * long mode flows through these MSRs (measured:
+                          * AuraLite's cpu_local/scheduler init). */
     uint64_t gdtr_base; uint16_t gdtr_limit;
     uint64_t idtr_base; uint16_t idtr_limit;
     uint64_t tr_base;  uint16_t tr_limit;     /* H6: cached by LTR (0F 00 /3) */
@@ -54,6 +68,19 @@ typedef struct cpu {
 
     int halted;
     int in_exception;        /* re-entrancy guard against exception-during-exception (double fault) */
+    int desc_sv;             /* >0: descriptor-table read window -- CPU-internal
+                              * (implicit) reads of GDT/LDT/IDT descriptors are
+                              * supervisor accesses on real hardware even at CPL3
+                              * (SDM vol.3A s.5.5): the GDT may live on
+                              * supervisor-only pages and SYSCALL/far-control
+                              * transfers must not U/S-fault fetching from it.
+                              * translate() grants supervisor credit while set.
+                              * (K4: measured -- far_load_cs inside our SYSCALL
+                              * case fetched kernel GDT[1] at CPL3 from a
+                              * supervisor page, took #PF err=0x5, and the stale
+                              * delivery pushed 48B onto the user stack before
+                              * LSTAR was latched -> userspace stack clobbered,
+                              * RST returned to address 5.) */
     uint8_t intr_delay;      /* H0: INTR shadow after STI / MOV SS / POP SS (one instruction) */
     int exception_taken;     /* set when raise_exception() redirected RIP mid-instruction */
     int fault;              /* set on unrecoverable decode/exec error */
