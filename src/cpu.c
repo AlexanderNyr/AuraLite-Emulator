@@ -83,7 +83,29 @@ static void page_fault(machine_t *m, uint64_t vaddr, int mode, int present_chain
          (unsigned long long)m->cpu.rip, (unsigned long long)m->cpu.cr3,
          m->cpu.seg[SEG_CS].sel & 3, (unsigned long long)m->cpu.gpr[RSP]);
     mlog(&m->log, "[cpu] #PF v=0x%llx mode=%d err=0x%x", (unsigned long long)vaddr, mode, err);
-    raise_exception(m, 14, 1, err);
+    /* K8 debug guard: a #PF raised while a previous exception delivery is
+     * in flight is architecturally the start of a double-fault sequence.
+     * Catch the recursion the host would otherwise die of (native stack
+     * overflow at CPL3->0 frame push on a broken chain), name it, halt. */
+    {
+        static int in_dlv;
+        static uint64_t pend_cr2;
+        if (in_dlv) {
+            mlog(&m->log, "[cpu] #DF-CHAIN: #PF raised while delivering an "
+                 "exception (new cr2=%llx, in-flight cr2=%llx, cr3=%llx "
+                 "rip=%llx rsp=%llx cpl=%d)",
+                 (unsigned long long)vaddr, (unsigned long long)pend_cr2,
+                 (unsigned long long)m->cpu.cr3,
+                 (unsigned long long)m->cpu.rip,
+                 (unsigned long long)m->cpu.gpr[RSP],
+                 m->cpu.seg[SEG_CS].sel & 3);
+            snprintf(c->fault_msg, sizeof c->fault_msg, "K8 df-chain");
+            c->fault = 1; return;
+        }
+        in_dlv = 1; pend_cr2 = vaddr;
+        raise_exception(m, 14, 1, err);
+        in_dlv = 0;
+    }
 }
 
 /* K4: the walk enforces U/S, R/W (with CR0.WP for CPL0), NX (with EFER.NXE)
@@ -731,12 +753,45 @@ int cpu_step(cpu_t *c) {
         if ((m->cur_vcpu == 0 && pic_pending(m)) ||
             lapic_deliverable(m) >= 0) c->halted = 0;
         else if (c->rflags & FLAG_IF) {
+            /* K8: an hlt-ed vcpu whose peer(s) have runnable work must not
+             * drag the shared clock: on real hardware a halted sibling
+             * consumes ZERO issue slots and the running cpu retires its
+             * instructions at full rate.  The K3 +512 quantum stays ONLY
+             * for the all-halted case (UP included), where it is the sole
+             * way virtual time flows at all.  Measured failure this fixes:
+             * with --smp=2, one vcpu's busy 5.8M-instruction fb scroll
+             * stretched to 6.5 s of PIT wall time while the other sat in
+             * hlt (each busy instruction paid for the sibling's 512-vtime
+             * quantum), inflating 2-CPU boot-to-shell to ~1031 virtual
+             * seconds; with the yield below it returns to scroll-cost only.
+             * Charging nothing here is safe because the wait's wake sources
+             * (PIT/LAPIC/RTC) all tick off the GLOBAL vtime that the busy
+             * peer keeps advancing; this vcpu's LAPIC timer catches up on
+             * its next slot by construction (per-context delta accumulator). */
+            int peer_busy = 0;
+            for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++) {
+                if (i == m->cur_vcpu) continue;
+                if (m->vcpu[i].state != VCPU_RUN) continue;   /* parked: no clock drag either way */
+                if (!m->vcpu[i].c.halted) { peer_busy = 1; break; }
+            }
+            if (!peer_busy) {
                         /* K3: virtual time must not freeze while the CPU idles in HLT
              * -- PIT/LAPIC/RTC all derive from instr_count (K6: vtime). Charge
              * a time quantum (it counts toward --max-instr like retired work)
              * and wake on whatever arrives.  */
-            c->instr_count += 512;
-            m->vtime_instr += 512;   /* K6: master clock advances too */
+                c->instr_count += 512;
+                m->vtime_instr += 512;   /* K6: master clock advances too */
+            }
+            /* K8: the timer SETTLE calls are time bookkeeping, not wall-clock
+             * advancement -- they must run on every idle slot, peer-busy
+             * ones included.  pit/rtc are global and idempotent at delta 0;
+             * lapic_tick computes THIS context's timer from the global vtime
+             * via its per-context delta accumulator, so the halted vcpu's
+             * LAPIC watchdog keeps ticking at true wall rate while a peer
+             * works (measured red: without this, /tests/smpstress deadlocked
+             * -- the AP's TMCCUR froze mid-tick, its scheduler tick never
+             * fired, and a fork child sat unpicked on the AP runqueue while
+             * the parent waited forever). */
             pit_tick(m);
             rtc_tick(m);
             lapic_tick(m);

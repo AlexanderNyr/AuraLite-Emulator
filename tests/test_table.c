@@ -509,7 +509,7 @@ static const vec_t VECTORS[] = {
     V("cpuid leaf0 genu","66 B8 00 00 00 00 0F A2", "", "ebx=0x756E6547"),
     V("cpuid max ext",   "66 B8 00 00 00 80 0F A2", "", "eax=0x80000008"),
     V("rdtsc t0",        "0F 31", "", "eax=0,edx=0"),
-    V("rdtsc t1 ratio",  "90 0F 31", "", "eax=92"),
+    V("rdtsc t1 ratio",  "90 0F 31", "", "eax=1"),   /* K7: tsc_per_instr=1 */
 
     /* -- O: hint block 0F 18-1F (PREFETCHh / multibyte NOP), KERNEL-BOOT K2 --
      * decode-only: no memory access, no flag writes, never a fault -- first

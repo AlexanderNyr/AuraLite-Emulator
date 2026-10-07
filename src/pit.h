@@ -7,8 +7,10 @@
  *
  * Virtual time (CHIPSET_PLAN D6): the machine has no wall clock; the PIT
  * advances instr_per_tick retired instructions per 1193182 Hz tick
- * (default 12 => ~99.4 virtual MIPS). All cadence is therefore
- * deterministic and testable; wall-clock scaling is PERF scope.
+ * (K7 pin: 384 => ~373 virtual MIPS; was 12 => ~14 MIPS, which made the
+ * guest's 100 ms AP-wake handshake a fraction of one framebuffer scroll).
+ * All cadence is therefore deterministic and testable; wall-clock
+ * scaling is PERF scope.
  *
  * IRQ0 (counter 0) is driven to the PIC as an edge strobe on each
  * terminal event (OUT 0->1 in mode 0, one strobe per period in modes
@@ -18,6 +20,22 @@
  */
 #ifndef PIT_H
 #define PIT_H
+
+/* K7: 12->384.  At 12 vtime/PIT-tick the virtual CPU retired ~14
+ * instructions per microsecond of PIT wall time -- a 14 MIPS machine.
+ * The guest's AP-wake handshake (100 ms PIT-ch2 wait) then spanned ~1.5M
+ * vtime while the AP's first framebuffer scroll (three full-screen dword
+ * passes, ~5.5M retired instructions on the AP under 1:1 round-robin)
+ * needed ~11M vtime: on this 14-MIPS model the scroll takes ~370 ms of
+ * PIT wall time and the AP can never report online before the BSP gives
+ * up (measured: 0 AP(s) woken; the cpus_online store landed 11.77M vtime
+ * after wake vs a 1.47M-vtime window).  On any real machine the same
+ * scroll is a couple of ms, far under 100 ms.  Raising the pin to 384
+ * models a ~373-MIPS-class CPU (Pentium-II era): the PIT stays at its
+ * true 1193182 Hz, every in-guest second now spans 384*1193182 vtime,
+ * and PIT-calibrated results (LAPIC bus frequency, udelay()) scale
+ * coherently because PIT-ch2 udelay underlies both. */
+#define PIT_DEFAULT_IPT 384u
 #include <stdint.h>
 
 struct machine;

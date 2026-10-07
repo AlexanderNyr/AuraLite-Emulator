@@ -34,9 +34,18 @@ static void fx_nodes_cleanup(void) {
     for (int i = 0; i < FX_NODES_N; i++) free(FX_NODES[i]);
     FX_NODES_N = 0;
 }
+/* K7: production profiles moved to tsc_per_instr=1 (coherent in-order
+ * single-issue model under the K7 PIT pin).  This suite's timer
+ * arithmetic (step counts vs decrement rate) was built for the legacy
+ * fast-TSC fixture at 92; keep THAT fixture locally so the vectors stay
+ * exact, and let the production profiles be asserted where they live. */
+static platform_t FX_PLAT = {
+    PLAT_HASWELL, "Haswell (K7 test fixture)", 0x3C, 0x000306C3u, 92
+};
 static void fx_init(fx_t *f) {
     if (!FX_NODES_N) atexit(fx_nodes_cleanup);
     setup_machine(&f->m);                 /* cpu_reset seeds MSR 0x1B (H6) */
+    f->m.plat = &FX_PLAT;
     lapic_init(&f->m);
     lapic_mmio_register(&f->m);
     FX_NODES[FX_NODES_N++] = f->m.mmio_list;   /* the one LAPIC node */

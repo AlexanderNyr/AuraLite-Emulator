@@ -4,6 +4,7 @@
 #include "machine.h"
 #include "rtc.h"
 #include "pic.h"
+#include "pit.h"
 
 #define RTC_TICKS_PER_SEC 1193182u
 #define RTC_UIP_TICKS     2048u     /* pinned update window (~1.7 ms) */
@@ -17,7 +18,9 @@ static uint8_t bin2bcd(unsigned v) { return (uint8_t)((v / 10 << 4) | (v % 10));
 
 void rtc_init(machine_t *m) {
     memset(&m->rtc, 0, sizeof m->rtc);
-    m->rtc.instr_per_tick = 12;
+    m->rtc.instr_per_tick = PIT_DEFAULT_IPT; /* K7: stay pinned to the PIT pin
+                                              * (12->384): one coherent virtual
+                                              * CPU frequency across time sources */
     m->rtc.last_instr = m->vtime_instr; /* K6 master clock */
     /* pinned power-on CMOS content (rtc.h table) */
     m->rtc.ram[0x0A] = 0x26;                 /* reg A: DV=010, RS=0110 */

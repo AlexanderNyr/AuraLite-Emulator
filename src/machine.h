@@ -121,9 +121,11 @@ struct machine {
 
     /* KERNEL-BOOT K6 (--smp): real executing contexts.  0/1 = one vCPU
      * (all historical behavior).  The virtual master clock: +1 per
-     * retired instruction from ANY vcpu and +512 per HLT idle quantum
-     * (K3), so it equals cpu.instr_count exactly when n_vcpus==1.
-     * PIT/RTC/LAPIC-timer/RDTSC are all driven off this clock. */
+     * retired instruction from ANY vcpu, +0 for an hlt idle slot while
+     * any peer vcpu has runnable work (K8: a halted sibling consumes no
+     * wall time on real hardware), and the K3 +512 quantum only when
+     * EVERY running vcpu is idle -- so it equals cpu.instr_count exactly
+     * when n_vcpus==1. PIT/RTC/LAPIC-timer/RDTSC all driven off this. */
     int cfg_smp;
     int dbg_pit1;             /* --smp-probe: PIT ch2 load/OUT-flip trace */
     int n_vcpus;

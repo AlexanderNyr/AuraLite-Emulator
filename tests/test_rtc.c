@@ -3,7 +3,7 @@
  * At baseline these ports were unclaimed: writes vanished, reads floated
  * 0xFF (measured). Everything below is exact deterministic virtual time
  * (D6): one second == 1193182 ticks == 14318184 retired instructions
- * (instr_per_tick=12), epoch pinned at 2026-01-01 00:00:00 UTC.
+ * (instr_per_tick=384, K7 pin), epoch pinned at 2026-01-01 00:00:00 UTC.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -16,7 +16,7 @@
 
 /* Tests run the RTC's virtual clock at instr_per_tick=1 (12x faster wall
  * time, EXACT same deterministic semantics -- the divisor is an explicit
- * parameter). The production pin ipt=12 is asserted in the defaults test. */
+ * parameter). The production pin ipt=384 is asserted in the defaults test. */
 #define IPT 1ull
 #define SEC_INSTR (1193182ull * IPT)
 #define UIP_INSTR (2048ull * IPT)
@@ -50,7 +50,7 @@ static void test_cmos_content_and_ports(void) {
     assert(f.m.rtc.instr_per_tick == (uint32_t)IPT);   /* test override */
     { /* the production pin is 12 (D6, pinned in rtc_init) */
         fx_t p; setup_machine(&p.m); rtc_init(&p.m);
-        assert(p.m.rtc.instr_per_tick == 12); }
+        assert(p.m.rtc.instr_per_tick == 384); }
     /* real data where the baseline floated 0xFF */
     assert(cmos(&f, 0x15) == 0x80 && cmos(&f, 0x16) == 0x02);   /* base = 640 KB */
     assert(cmos(&f, 0x14) == 0x10);                            /* equipment byte */

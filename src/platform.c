@@ -10,12 +10,20 @@
 #include <strings.h>
 #include "platform.h"
 
+/* K7: tsc_per_instr 100/96/92/88/140 -> 1 on all profiles.  Those values
+ * modeled a GHz-class TSC on top of the old ~14-MIPS virtual CPU (PIT pin
+ * 12); with the K7 pin (384, ~373 virtual MIPS) they produced a 42.2 GHz
+ * TSC/APIC-bus reading and the guest kernel's LAPIC-timer calibration
+ * sanity bound ([8 MHz, 4 GHz)) rightly rejected it.  tsc_per_instr=1 is
+ * the coherent in-order single-issue model the interpreter actually is:
+ * RDTSC and the LAPIC timer bus both advance once per retired instruction,
+ * i.e. a ~458 MHz virtual clock under the K7 pin (384*1193182/s). */
 static const platform_t PROFILES[PLAT_COUNT] = {
-    { PLAT_SANDYBRIDGE, "Sandy Bridge (LGA1155, model 0x2A)", 0x2A, 0x000206A7u, 100 },
-    { PLAT_IVYBRIDGE,   "Ivy Bridge (LGA1155, model 0x3A)",   0x3A, 0x000306A9u,  96 },
-    { PLAT_HASWELL,     "Haswell (LGA1150, model 0x3C)",      0x3C, 0x000306C3u,  92 },
-    { PLAT_BROADWELL,   "Broadwell (model 0x3D)",             0x3D, 0x000306D4u,  88 },
-    { PLAT_BAYTRAIL,    "Bay Trail / Silvermont (model 0x37)",0x37, 0x00030678u, 140 },
+    { PLAT_SANDYBRIDGE, "Sandy Bridge (LGA1155, model 0x2A)", 0x2A, 0x000206A7u,   1 },
+    { PLAT_IVYBRIDGE,   "Ivy Bridge (LGA1155, model 0x3A)",   0x3A, 0x000306A9u,   1 },
+    { PLAT_HASWELL,     "Haswell (LGA1150, model 0x3C)",      0x3C, 0x000306C3u,   1 },
+    { PLAT_BROADWELL,   "Broadwell (model 0x3D)",             0x3D, 0x000306D4u,   1 },
+    { PLAT_BAYTRAIL,    "Bay Trail / Silvermont (model 0x37)",0x37, 0x00030678u,   1 },
 };
 
 const platform_t *platform_get(platform_id_t id) {

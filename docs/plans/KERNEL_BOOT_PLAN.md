@@ -1,6 +1,6 @@
 # KERNEL-BOOT Plan
 
-**Status: in progress — K0 ✅, K1 ✅, K2 ✅, K3 ✅, K4 ✅, K5 ✅, K6+ 📋**
+**Status: in progress — K0 ✅, K1 ✅, K2 ✅, K3 ✅, K4 ✅, K5 ✅, K6 ✅, K7 ✅, K8+ 📋**
 
 | Phase | Scope | Status | Deliverable |
 |---|---|---|---|
@@ -11,6 +11,8 @@
 | K4 | initrd (USTAR): `--initrd=` lane, `boot_info_t.initrd_*`, first userspace → shell prompt over serial | ✅ done — /hello exit(0), execve argv/envp PASS, `auralite#` prompt stable, typed `help` executes end-to-end | `patches/0024-K4-ring3-userspace.patch`, `patches/0025-K4-serial-keyboard.patch` |
 | K5 | Scheduler-tick receipt paced by virtual time; SMP scoped (`--cpus=N` metering of the kernel's ICR wake-up walk against one vCPU) | ✅ done | `patches/0026-K5-smp-metering.patch` |
 | K6 | Real second vCPU: INIT/SIPI wake of a parked AP context, per-CPU LAPIC/cpu multiplexing, per-CPU LAPIC timer preemption measured on the AP | ✅ done | `patches/0027-K6-second-vcpu.patch` |
+| K7 | Machine-speed honesty for the AP wake window: ~14-MIPS virtual CPU pin lifted to ~373 MIPS (PIT/RTC divisor 12->384, coherent TSC/LAPIC-bus at 1 tick/instruction) — kernel receipt `(1 AP(s) woken)` | ✅ done | `patches/0028-K7-virtual-cpu-speed.patch` |
+| K8 | SMP execution-pacing honesty: hlt-idle vcpu yields the shared clock to busy peers; per-vcpu LAPIC timer keeps ticking at wall rate while halted under a busy peer — the guest's own userspace SMP gates pass (`SMPSTRESS PASS`, `IRQAPWAKE PASS`) | ✅ done | `patches/0029-K8-smp-clock-pacing.patch` |
 
 This document answers: *what does it take for the emulator to boot the
 north-star guest — AuraLite-OS — to a usable shell, and in what order do
@@ -238,6 +240,73 @@ x86emu `--kernel=AuraLite-OS/build/kernel.elf`, 5M-instruction budget:
   UP boot byte-identical to K5 (`[smp] single CPU online`, same shell),
   `--cpus=2 --smp=2` boot to shell.
   `patches/0027-K6-second-vcpu.patch`
+
+- **K7 ✅:** DoD — close K6's `did not respond to SIPI` / `(0 AP(s)
+  woken)` boundary by fixing the machine model that created it, proven
+  by measurement at every step. **Diagnosis (fine-grained `--smp-probe`,
+  4000 RIP samples at 1024-vtime spacing over the wake window, plus
+  `--watch-phys=cpus_online`):** the AP's `cpus_online` store lands
+  11.77M vtime after its wake (vs the BSP's 1.47M-vtime 100 ms wait);
+  in the window the AP is 100% inside `fb_putchar`/`fb_scroll` — three
+  full-screen dword-copy passes ≈ 5.5M retired AP instructions for one
+  kprintf line — while the BSP is 100% in `spinlock_acquire` behind it.
+  Under the D6 pin (12 vtime per 1193182 Hz PIT tick, a ~14-MIPS CPU)
+  that scroll is ~370 ms of PIT wall time; on any real machine it is a
+  couple of ms. The kernel was right; the clock was lying. **Fix:**
+  `PIT_DEFAULT_IPT` 12->384 (~373 virtual MIPS, Pentium-II class), the
+  RTC pinned to the same divisor, and `tsc_per_instr` 92 (and the other
+  profiles' values) -> 1 so RDTSC and the LAPIC timer bus advance once per retired
+  instruction — the coherent in-order single-issue model the interpreter
+  actually is (the old GHz-class TSC would otherwise report a 42.2 GHz
+  APIC bus, outside the kernel's [8 MHz, 4 GHz) calibration sanity
+  window). LAPIC bus calibration re-derives itself against PIT-ch2
+  udelay both ways, so it stays coherent across the pin change by
+  construction. **Measured receipts (deterministic; two runs
+  byte-identical):** `[smp] LAPIC bus frequency: 458163200 Hz
+  (458 MHz)`; `[smp] AP #0 online (lapic_id=1)`; `[smp] 2 CPU(s)
+  online (1 AP(s) woken)`; `PASS: multi-core system detected`; boot
+  proceeds through VFS mount. UP profile boots as before
+  (`[smp] single-CPU system (no APs to wake)`). Test gate: full
+  `make test` RC=0 with exact-step vectors kept on their legacy fast
+  pins *inside* the fixtures (test_pit/test_ioapic override to 12,
+  test_lapic keeps a 92-tsc fixture profile, test_table rdtsc ratio
+  re-pinned to 1) while the production pins (384, tsc=1) are asserted in
+  the defaults tests.
+  `patches/0028-K7-virtual-cpu-speed.patch`
+
+- **K8 ✅:** DoD — the 2-vCPU machine runs the guest's own SMP userspace
+  gates unattended, end-to-end: boot to `auralite#`, type the test over
+  the PS/2 KBC lane, assert the kernel's receipt lines. Reference: the
+  OS repo's own QEMU gate (tests/integration/cases/
+  test_smp_procstress.sh) passes 5/5 on genuine QEMU -smp 2; anything
+  the kernel runs there it must run here. **Red-first findings and
+  their fixes, each measurement-driven:** (1) the K3 +512 HLT quantum,
+  applied per vcpu under K6's strict round-robin, charged every busy
+  instruction for its halted sibling: one 5.8 M-instruction fb scroll
+  cost ~6.5 s of PIT wall time and 2-CPU boot-to-shell measured 102101
+  ticks (~1031 s, guest's own [perf] line) — an hlt-idle vcpu now
+  yields the clock (+0) whenever any RUN-state peer has runnable work,
+  keeping the +512 economic fast-forward ONLY for the all-halted case
+  (identical to K3 behavior when n_vcpus==1). (2) the PIT/RTC/LAPIC
+  settle calls sat behind that same conditional, so a halted vcpu's
+  calibrated LAPIC timer FROZE whenever a peer ran (measured: AP
+  TMCCUR stuck at 141037 across 33 M vtime probes; the AP's scheduler
+  tick never fired; the 15th fork child of /tests/smpstress sat
+  stranded on the AP runqueue — len=1 — while the parent blocked in
+  wq_wait forever: a wake-lost deadlock). The settle calls are time
+  bookkeeping against the global vtime, not wall-clock advancement;
+  they now run on every idle slot, so every vcpu's watchdog expires at
+  true wall rate under any instruction interleaving. **Measured
+  receipts:** `[perf] boot-to-shell: 488 ticks (~4929 ms @ 99 Hz)` —
+  the 205x pacing repair, UP boot content unchanged; `[sched] R5
+  receipt: user thread pid=6 on AP cpu=1`; `/tests/smpstress` →
+  O_APPEND 6x200x32 intact, `100 fork/wait cycles precise`,
+  `8 x 10 signal deliveries counted`, `SMPSTRESS PASS`;
+  `/tests/irqapwake` → `[smpwake] PASS: 13 RTC(GSI8) device IRQs
+  delivered to cpu1 (apic id 1); hlt looper woken 3 times` +
+  `IRQAPWAKE PASS`; two independent full runs byte-identical.
+  Test gate: full `make test` + `make test-sanitize` RC=0.
+  `patches/0029-K8-smp-clock-pacing.patch`
 
 ## What this plan does not do
 

@@ -36,6 +36,10 @@ static void fx_init(fx_t *f) {
     setup_machine(&f->m);
     pic_init(&f->m);  pic_io_register(&f->m);
     pit_init(&f->m);  pit_io_register(&f->m);
+    f->m.pit.instr_per_tick = 12;   /* K7: legacy fast pin -- these vectors
+                                     * pace exact 8254 periods in cpu_step
+                                     * counts; production pin 384 asserted
+                                     * in test_pit_defaults */
     lapic_init(&f->m);  lapic_mmio_register(&f->m);
     ioapic_init(&f->m); ioapic_mmio_register(&f->m);
     FX_NODES[FX_NODES_N++] = f->m.mmio_list;

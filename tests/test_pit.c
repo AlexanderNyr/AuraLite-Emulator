@@ -2,7 +2,7 @@
  *
  * Gate-worthy scenario (plan H2): BIOS-style "mov al,0x36; out 0x43; out
  * 0x40" then wait -- IRQ0 must fire within the programmed period +/-1 tick,
- * repeatedly. All timing is D6 virtual time: instr_per_tick=12 pins ~99.4
+ * repeatedly. All timing is D6/K7 virtual time: instr_per_tick=384 pins ~373
  * virtual MIPS, so expected fire counts are exact windows, not wall time.
  * Latch/counter readback is checked EXACTLY from the same model.
  */
@@ -51,7 +51,7 @@ static void fx_guest(fx_t *f, const uint8_t *body, size_t blen) {
 
 static void test_pit_defaults(void) {
     fx_t f; fx_init(&f);
-    assert(f.m.pit.instr_per_tick == 12);              /* D6 pin */
+    assert(f.m.pit.instr_per_tick == 384);             /* K7 pin */
     /* unprogrammed counters read 0, no IRQ ever */
     assert(io_read(&f.m, 0x40, 1) == 0);
     io_write(&f.m, 0x43, 1, 0x00);                     /* latch counter0 */
@@ -63,9 +63,13 @@ static void test_pit_defaults(void) {
 }
 
 /* plan H2 gate: BIOS-style mode-3 init, IRQ0 within period +/-1 tick,
- * repeatedly. CR=24 ticks => period 24*12 = 288 instructions. */
+ * repeatedly. CR=24 ticks => period 24*12 = 288 instructions at the test
+ * override ipt=12 (production asserts the K7 pin 384 separately). */
 static void test_rate_generator_cadence(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     const uint8_t prog[] = {
         0xB0,0x36, 0xE6,0x43,      /* ctrl: ch0, rw3, mode3 */
         0xB0,0x18, 0xE6,0x40,      /* CR LSB = 24 */
@@ -86,6 +90,9 @@ static void test_rate_generator_cadence(void) {
 
 static void test_mode0_one_shot(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     const uint8_t prog[] = {
         0xB0,0x30, 0xE6,0x43,      /* mode 0, rw3 */
         0xB0,0x24, 0xE6,0x40,      /* CR = 36 ticks = 432 instr */
@@ -109,6 +116,9 @@ static void test_mode0_one_shot(void) {
  * rem is computed EXACTLY from D6 virtual time, no tolerances. */
 static void test_latch_readback_exact(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     fx_guest(&f, NULL, 0);
     io_write(&f.m, 0x43, 1, 0x34);               /* ch0 rw3 mode2 */
     io_write(&f.m, 0x40, 1, 240);                /* CR = 240 */
@@ -138,6 +148,9 @@ static void test_latch_readback_exact(void) {
 
 static void test_lsb_only_quick_fire(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     const uint8_t prog[] = {
         0xB0,0x16, 0xE6,0x43,      /* ch0, LSB only, mode3 */
         0xB0,0x05, 0xE6,0x40,      /* CR=5 -> 60-instr period */
@@ -149,6 +162,9 @@ static void test_lsb_only_quick_fire(void) {
 
 static void test_counter2_gate_and_port61(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     fx_guest(&f, NULL, 0);
     io_write(&f.m, 0x43, 1, 0xB6);               /* ch2 rw3 mode3 */
     io_write(&f.m, 0x42, 1, 24);
@@ -180,6 +196,9 @@ static void test_counter2_gate_and_port61(void) {
 
 static void test_mode_switch_keeps_counting(void) {
     fx_t f; fx_init(&f);
+    f.m.pit.instr_per_tick = 12;   /* K7: tests keep the legacy fast
+                                    * pin for exact-step arithmetic;
+                                    * defaults test asserts 384 */
     const uint8_t prog[] = {
         0xB0,0x34, 0xE6,0x43,      /* ch0 rw3 mode2 */
         0xB0,0x18, 0xE6,0x40,      /* CR=24 */

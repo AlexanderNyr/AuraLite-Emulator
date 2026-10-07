@@ -256,10 +256,11 @@ int main(int argc, char **argv) {
                 wcount++;
                 vcpu_slot_t *s = &m->vcpu[1];
                 mlog(&m->log, "[smp-probe] vt=%llu ap.i=%llu rip=%llx "
-                     "ccr=%u ict=%u irr=%02x%02x",
+                     "brip=%llx ccr=%u ict=%u irr=%02x%02x",
                      (unsigned long long)(m->vtime_instr - w0),
                      (unsigned long long)s->c.instr_count,
                      (unsigned long long)s->c.rip,
+                     (unsigned long long)m->vcpu[0].c.rip,
                      s->l.tmccur, s->l.tmict, s->l.irr[4], s->l.irr[3]);
                 wnext = m->vtime_instr + (1ull << 17);
             }

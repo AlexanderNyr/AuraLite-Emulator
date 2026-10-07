@@ -7,8 +7,6 @@
 #include "pit.h"
 #include "pic.h"
 
-#define PIT_DEFAULT_IPT 12u   /* D6: ~1193182/12 = 99.4 virtual MIPS */
-
 void pit_init(machine_t *m) {
     memset(&m->pit, 0, sizeof m->pit);
     m->pit.instr_per_tick = PIT_DEFAULT_IPT;

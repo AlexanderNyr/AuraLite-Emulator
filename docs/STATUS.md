@@ -133,17 +133,37 @@
   ticks on the AP are real; `PASS: multi-core system detected`; a full
   boot to the shell.  Debugging lanes kept: `--smp-probe` (AP wake-window
   vital signs, PIT ch2/udelay cadence, LAPIC intack/EOI trace) and
-  `--watch-phys=addr` (single-address store probe).  Measured boundary,
-  recorded honestly: the kernel's 100 ms bounded wait after SIPI#1
-  expires before the AP's `cpus_online` increment lands, because the
-  kernel queues its "[smp] AP online" report on an async UART TX ring
-  that drains at emulated-COM1 pace behind the BSP's boot-chatter
-  backlog — the wait-window protocol assumption, not machine state (the
-  next printk reads cpus_online == 2).  The MC146818A periodic
-  interrupt chain (register-A RS rate, PF+PIE) is modeled now so the
-  kernel's AP-wake receipt test (SYS_IRQ_AP_WAKE, an RTC IRQ8 storm
-  routed to the AP through the I/O APIC) can run; see the plan for the
-  receipt lines.
+  `--watch-phys=addr` (single-address store probe).  The MC146818A
+  periodic interrupt chain (register-A RS rate, PF+PIE) is modeled now
+  so the kernel's AP-wake receipt test (SYS_IRQ_AP_WAKE, an RTC IRQ8
+  storm routed to the AP through the I/O APIC) can run.
+
+- The K8 lane made the 2-vCPU machine pass the guest's own userspace
+  SMP gates (`/tests/smpstress` and `/tests/irqapwake` typed into the
+  shell over the KBC lane; the same assertions the OS repo's QEMU
+  -smp 2 integration case makes).  Two machine-side pacing defects
+  were found red-first and fixed: an hlt-idle vcpu no longer charges
+  its K3 512-instruction quantum when a peer has runnable work (busy
+  instruction streams no longer pay for a halted sibling's idle
+  fast-forward; guest-measured 2-CPU boot-to-shell 1031s -> ~5s), and
+  the PIT/RTC/LAPIC time-settle calls now run on every idle slot so a
+  halted vcpu's calibrated LAPIC watchdog still expires at true wall
+  rate while its peer works (was: frozen mid-tick, stranding a fork
+  child on the AP runqueue — a wake-lost deadlock).
+
+- The K7 lane closed the wake-window boundary K6 recorded: fine-grained
+  `--smp-probe` RIP histograms showed the AP spending its entire window
+  in `fb_putchar`/`fb_scroll` (~5.5M retired instructions for one line's
+  full-screen scroll — NOT the UART ring, which drains synchronously on
+  our insta-ready LSR; K6's ring-latency hypothesis is superseded).
+  The D6 pin (12 vtime/PIT tick) models a ~14-MIPS CPU, making that
+  scroll ~370 ms of PIT wall time against the kernel's 100 ms SIPI
+  wait.  K7 lifts the pin to 384 (~373 virtual MIPS), keeps the RTC on
+  the same divisor, and sets `tsc_per_instr` = 1 on all profiles (the
+  in-order single-issue model the interpreter is) — kernel receipts:
+  `LAPIC bus frequency: 458163200 Hz (458 MHz)` and
+  `2 CPU(s) online (1 AP(s) woken)`, deterministic (two runs
+  byte-identical), `PASS: multi-core system detected`.
 
 ## Current limits
 
