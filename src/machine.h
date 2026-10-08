@@ -33,6 +33,9 @@ typedef struct mmio_region {
     struct mmio_region *next;
 } mmio_region_t;
 
+/* STORE S1+: AHCI attach slots (kept in step with AHCI_HW_PORTS in ahci.h) */
+#define AHCI_MAX_ATTACH 6
+
 /* ---- I/O port device model (64K space) ---- */
 typedef uint32_t (*io_read_fn)(void *ctx, uint16_t port, int size);
 typedef void     (*io_write_fn)(void *ctx, uint16_t port, int size, uint32_t val);
@@ -105,6 +108,11 @@ struct machine {
     uint8_t *disk;
     size_t   disk_len;
 
+    /* STORE S1+: SATA/AHCI attachments -- up to AHCI_MAX_ATTACH raw host
+     * images, one per HBA port; NULL = port dark (PxSSTS.DET = 0). */
+    uint8_t *sata_img[AHCI_MAX_ATTACH];
+    size_t   sata_len[AHCI_MAX_ATTACH];
+
     logring_t log;
 
     uint64_t max_instructions; /* safety cap, 0 = unlimited */
@@ -114,6 +122,7 @@ struct machine {
     /* KERNEL-BOOT K1 (--kernel): the direct kernel-load lane's run markers */
     uint64_t kmain_va;   /* `kmain` symbol from the loaded ELF, 0 = no symtab */
     int kmain_seen;      /* logged once when RIP first reaches kmain_va */
+    int shell_prompt_seen; /* STORE/SMP receipts: guest echoed "auralite#" on COM1 */
     /* KERNEL-BOOT K5 (--cpus): how many boot_cpu_t entries the kloader
      * publishes; the emulator still has exactly ONE vCPU, so entries > 1
      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */

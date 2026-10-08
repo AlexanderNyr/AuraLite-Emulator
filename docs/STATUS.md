@@ -138,6 +138,68 @@
   so the kernel's AP-wake receipt test (SYS_IRQ_AP_WAKE, an RTC IRQ8
   storm routed to the AP through the I/O APIC) can run.
 
+- The STORE plan opened (S0 done): baseline measured on machine
+  `b00c4d9` — the AHCI PCI stub at 0:31.2 has no BAR5, so the guest
+  prints `[ahci] controller 0: BAR5 empty, skipping` and every storage
+  mount is offline (`/disk /fat /ext2 /exfat /ext4`); the guest AHCI
+  contract was extracted from `AuraLite-OS/drivers/ahci/ahci.c` (731
+  lines: ABAR regs, port files, polled `PxCI` completion, READ/WRITE
+  DMA EXT over a 128-KiB per-port bounce buffer, self-test LBA0/LBA1
+  semantics); phases S1–S5 mirror the OS repo's QEMU gates
+  (`test_ahci_rw.sh`, `test_ahci_matrix.sh`, `test_ahci_large_read.sh`).
+  Plan: `docs/plans/STORE_PLAN.md`.
+
+- STORE S3 done (patches/0033): WRITE DMA EXT (0x35) shares the S2
+  engine -- one `ahci_dma_xfer(..., w)` PRDT walk moves guest-RAM bytes
+  into the attached image (direction still governed by the command
+  header `W` bit; overflow-guarded like the read leg), so the S2 TFES
+  stub for writes is retired.  Unit ladder 13 -> 16 vectors all green
+  (`make test`, `make test-sanitize`): write+readback, multi-PRDT write,
+  OOB write -> TFES with tails intact.  Guest receipts against the
+  frozen kernel/initrd: marked-image boot prints `PASS: SATA read/write
+  DMA works` (guest's own scratch write/verify/restore), auto-format of
+  AUFS (LBA2) + FAT32 (LBA64) is clean, and a typed script injected at
+  the guest's own prompt round-trips both tokens (`/disk/ci.txt` ->
+  `s3disk1ok`, `/fat/ci.txt` -> `s3fat22ok`) with zero FAIL/unsupported
+  lines; the KBC injection queue grew 64 -> 512 to fit the ~180-byte
+  script (test-lane depth, guest-visible KBC unchanged).  Blank-image
+  lane run twice sequentially: byte-identical 97,406-byte serial logs.
+  Persistence stays copy-on-attach in-memory (host image byte-pristine
+  after the guest formatted it) -- writethrough policy is S5 scope.
+  Harness: `tests/integration/test_ahci_rw.sh`.
+
+- STORE S2 done (patches/0032): the AHCI command engine is online for
+  the read path -- PxCI walks the guest-built command list/table (H2D
+  Register FIS, CFL/PRDTL honoured), READ DMA EXT moves image bytes into
+  guest RAM through the PRDT (multi-entry walk, prdbc write-back), and
+  IDENTIFY DEVICE serves a machine-honest 512-byte block; the error
+  channel is TFES (PxIS bit30) + sticky PxTFD.ERR with the guest's own
+  W1C recovery.  Receipts: UP `--sata=` boot reaches the guest self-test
+  line `blank LBA0 read successfully; write verification skipped`; the
+  same 2-vCPU boot prints R5 + typed `/tests/smpstress` -> `SMPSTRESS
+  PASS` with all three storm assertions (10-minute wall time this
+  run-shape).  New testability lane `--keys-at=prompt` (fires on the
+  guest's own `auralite#` echo) because prompt arrival is measured
+  budget-noisy across machine shapes.  13-vector test_ahci remains
+  LeakSanitizer-clean; determinism: two identical UP boots byte-equal.
+  The S1 2-vCPU caveat is retired with the timeout path gone.
+
+- STORE S1 done (patches/0031): the SATA/AHCI function at 0:31.2 now
+  has a real ABAR MMIO window (0xFEB10000) behind BAR5 with the register
+  model the guest driver consumes -- CAP/PI/VS/GHC, 6 port files with
+  SSTS DET/SIG, CLB/FB bases, CMD ST/FRE mirrored into CR/FR, W1C
+  IS/SERR, COMRESET via SCTL.  CLI: `--sata=` (port 0) and
+  `--sata-portN=`.  Measured receipts: unattached boot -> `1
+  controller(s), 0 SATA device(s) ready` + all mount-skips unchanged;
+  attached blank disk -> `hw port 0: SATA disk (sig=0x00000101)` + the
+  guest's documented timeout receipt (PxCI latch, TFD=0x40) -> shell on
+  both, ~5 s guest wall time.  Tests: 8-vector test_ahci.c; whole
+  `make test` + `make test-sanitize` green.  Caveat carried into S2: on
+  the 2-vCPU lane the guest's ahci_exec timeout does not retire inside
+  the fixed window (it would also need ~3,5% more budget than UP on
+  QEMU -- instruction interleave, not a machine defect); S2's real
+  engine makes the timeout path unreachable anyway.
+
 - The K8 lane made the 2-vCPU machine pass the guest's own userspace
   SMP gates (`/tests/smpstress` and `/tests/irqapwake` typed into the
   shell over the KBC lane; the same assertions the OS repo's QEMU

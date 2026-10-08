@@ -26,8 +26,8 @@ maps to exactly one plan below.
 |---|---|---|---|
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
 | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
-| [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | 🔵 **IN PROGRESS** (K0–K3 done ✅, K4–K5 planned) | the north-star path made direct: `--kernel=` lane loads AuraLite-OS `kernel.elf` itself (boot_info_t handoff measured from source); ISA-gap closure to the klog banner (measured: banner + PMM/VMM/timer self-tests PASS + IRQs delivered), probe-path hardware (MADT/hypervisor/fw_cfg receipts measured, sched PASS), initrd → shell, LAPIC-timer scheduler | K0–K5 |
-| `docs/plans/STORE_PLAN.md` | 📋 planned | real AHCI HBA (command lists, FIS, IDENTIFY, READ/WRITE DMA EXT); disk geometry; second-disk support | S0–S5 |
+| [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | 🔵 **IN PROGRESS** (S0–S3 done ✅, S4–S5 planned) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller | S0–S5 |
 | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
 | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
@@ -67,3 +67,14 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 - ~~`0019` — CHIPSET H6: LAPIC (MMIO 0xFEE00000, SVR, TPR/PPR, self-IPI, timer; +IST/LTR CPU support)~~ shipped
 - ~~`0020` — CHIPSET H7: IOAPIC (IOREGSEL/IOWIN, 24 RTEs, edge-latch + level remote-IRR, LAPIC delivery; PIC-line fan-out; PAIR-TEST 8254→IOAPIC→LAPIC→CPU)~~ shipped — CHIPSET plan complete H0–H7
 - ~~`0021` — KERNEL-BOOT K1: direct kernel-load lane (`--kernel=` ELF64 placement, loader-built paging w/ identity+HHDM, fabricated boot_info_t, measured to `kmain` @ instr 18)~~ shipped
+- ~~`0022` — KERNEL-BOOT K2: ISA-gap closure to the kernel banner (measured ISA/device deltas)~~ shipped
+- ~~`0023` — KERNEL-BOOT K3: probe-path hardware (MADT/hypervisor/fw_cfg receipts, sched PASS)~~ shipped
+- ~~`0024`/`0025` — KERNEL-BOOT K4: Ring-3 userspace + serial-keyboard input lane (initrd → `auralite#`, commands typed over the KBC)~~ shipped
+- ~~`0026` — KERNEL-BOOT K5: SMP metering (deterministic instruction/vtime accounting before multi-vCPU)~~ shipped
+- ~~`0027` — KERNEL-BOOT K6: second vCPU, INIT/SIPI/SIPI wake, strict 1:1 round-robin contexts, AP landing receipt~~ shipped
+- ~~`0028` — KERNEL-BOOT K7: virtual CPU speed honesty (~14 → ~373 virtual MIPS; PIT/RTC pin 12→384, coherent TSC/LAPIC) → guest receipt `(1 AP(s) woken)`~~ shipped
+- ~~`0029` — KERNEL-BOOT K8: SMP clock pacing (hlt-idle clock yield + per-vCPU LAPIC timer settle on idle slots) → guest userspace gates `SMPSTRESS PASS` + `IRQAPWAKE PASS`~~ shipped — KERNEL_BOOT plan closed for the north star (2-vCPU shell + guest SMP gates)
+- ~~`0030` — STORE S0: measured baseline + `docs/plans/STORE_PLAN.md`~~ shipped
+- ~~`0031` — STORE S1: AHCI HBA registers + presence (ABAR 0xFEB10000, `--sata=` CLI, receipt: guest binds controller, attached disk reported)~~ shipped
+- `0032` — STORE S2: command engine + READ DMA EXT (guest self-test blank-LBA0 receipt)
+- `0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical

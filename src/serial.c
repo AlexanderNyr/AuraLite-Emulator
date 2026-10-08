@@ -76,6 +76,7 @@ static void serial_write(void *ctx, uint16_t off, int size, uint32_t val) {
         if (v == '\r') return;
         if (v == '\n' || s->len == sizeof(s->line) - 1) {
             s->line[s->len] = 0;
+            if (strstr(s->line, "auralite#")) s->m->shell_prompt_seen = 1;
             mlog(&s->m->log, "[serial] %s", s->line);
             s->len = 0;
             return;

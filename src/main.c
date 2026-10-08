@@ -84,12 +84,17 @@ int main(int argc, char **argv) {
     const char *fb_out = NULL;
     const char *log_out = NULL;
     const char *keys_list = NULL;   /* --keys=1E,9E: scancode set-1 bytes (H4) */
-    uint64_t keys_at = 0;           /* --keys-at=N: delay injection to instr N
+    uint64_t keys_at = 0;           /* --keys-at=N: delay injection to instr N */
+    int keys_at_prompt = 0;         /* --keys-at=prompt: fire when the guest echoes
+                                     * "auralite#" -- the shell-arrival instant is
+                                     * budget-noisy across machine shapes (measured:
+                                     * storage storms shift the prompt by >0.5G).
                                      * (K4: the PS/2 driver's boot drain
                                      * `while (STATUS.OBF) read DATA` eats any
-                                     * pre-boot keys verbatim -- measured) */
+                                     * pre-boot keys verbatim -- measured.) */
     const char *kernel_path = NULL; /* --kernel=path: KERNEL-BOOT K1 direct-load lane */
     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
+    const char *sata_cfg[AHCI_MAX_ATTACH] = {0}; /* --sata/ --sata-portN (STORE S1+) */
     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
                                      * publishes N CPUs while the emulator still
                                      * runs one vCPU (0/1 = historical UP) */
@@ -108,9 +113,23 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
-        else if (!strncmp(argv[i], "--keys-at=", 10)) keys_at = strtoull(argv[i]+10, NULL, 0);
+        else if (!strncmp(argv[i], "--keys-at=", 10)) {
+            if (!strcmp(argv[i]+10, "prompt")) keys_at_prompt = 1;
+            else keys_at = strtoull(argv[i]+10, NULL, 0);
+        }
         else if (!strncmp(argv[i], "--kernel=", 9)) kernel_path = argv[i]+9;
         else if (!strncmp(argv[i], "--initrd=", 9)) initrd_path = argv[i]+9;
+        /* STORE S1+: SATA attachments.  --sata=path attaches to HBA port 0;
+         * --sata-portN=path pins a specific port (0..AHCI_MAX_ATTACH-1).
+         * --sata-max must not equal --sata prefix wise, so --sata= is tested
+         * after the longer --sata-port prefix. */
+        else if (!strncmp(argv[i], "--sata-port", 11)) {
+            const char *eq = strchr(argv[i] + 11, '=');
+            int port = atoi(argv[i] + 11);
+            if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
+                sata_cfg[port] = eq + 1;
+        }
+        else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0] = argv[i]+7;
         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
@@ -150,7 +169,7 @@ int main(int argc, char **argv) {
     m->plat = (struct platform *)platform_by_name(platform_name);
     devices_init_common(m);
     devices_init_platform(m);
-    if (keys_list && !keys_at && kbc_queue_keys(m, keys_list) < 0) {
+    if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
         return 1;
     }
@@ -160,6 +179,17 @@ int main(int argc, char **argv) {
     if (disk) { m->disk = disk; m->disk_len = disk_len; }
     else if (!kernel_path) { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
 
+    /* STORE S1+: attach SATA port images the same way the USB stick gets its
+     * backing. */
+    for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
+        if (!sata_cfg[i]) continue;
+        size_t len = 0;
+        uint8_t *img = read_file(sata_cfg[i], &len);
+        if (!img) { mlog(&m->log, "[ahci] port %d: cannot read %s -- port stays dark", i, sata_cfg[i]); continue; }
+        m->sata_img[i] = img; m->sata_len[i] = len;
+        mlog(&m->log, "[ahci] port %d: attached %s (%zu bytes)", i, sata_cfg[i], len);
+    }
+
     if (kernel_path) {
         /* KERNEL-BOOT K1: the loader owns CPU initial state; cpu_reset()
          * happens inside kload_boot() before the contract overrides. */
@@ -168,6 +198,7 @@ int main(int argc, char **argv) {
             pci_done(m);
             mem_done(m);
             free(disk);
+            for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
             free(m);
             return EXIT_INPUT_ERROR;
         }
@@ -218,13 +249,14 @@ int main(int argc, char **argv) {
             mlog(&m->log, "[kernel] kmain reached -- AuraLite-OS C entry "
                  "(%llu instructions in)", (unsigned long long)n);
         }
-        if (keys_list && keys_at && m->vtime_instr >= keys_at) {
+        if (keys_list && ((keys_at && m->vtime_instr >= keys_at) ||
+                          (keys_at_prompt && m->shell_prompt_seen))) {
             if (kbc_queue_keys(m, keys_list) < 0)
                 mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
             else
-                mlog(&m->log, "[kbc] --keys-at fired (instr=%llu)",
-                     (unsigned long long)m->vtime_instr);
-            keys_at = 0;
+                mlog(&m->log, "[kbc] --keys-at fired (instr=%llu, prompt=%d)",
+                     (unsigned long long)m->vtime_instr, keys_at_prompt);
+            keys_at = 0; keys_at_prompt = 0;
         }
         if (m->stop_requested)
             break;
@@ -279,13 +311,14 @@ int main(int argc, char **argv) {
                      m->vcpu[1-i].state == VCPU_RUN ? 1 : 0);
                 m->vcpu[i].state = VCPU_OFF;
             }
-            if (keys_list && keys_at && m->vtime_instr >= keys_at) {
+            if (keys_list && ((keys_at && m->vtime_instr >= keys_at) ||
+                              (keys_at_prompt && m->shell_prompt_seen))) {
                 if (kbc_queue_keys(m, keys_list) < 0)
                     mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
                 else
-                    mlog(&m->log, "[kbc] --keys-at fired (instr=%llu)",
-                         (unsigned long long)m->vtime_instr);
-                keys_at = 0;
+                    mlog(&m->log, "[kbc] --keys-at fired (instr=%llu, prompt=%d)",
+                         (unsigned long long)m->vtime_instr, keys_at_prompt);
+                keys_at = 0; keys_at_prompt = 0;
             }
             if (m->stop_requested)
                 break;
@@ -335,6 +368,7 @@ int main(int argc, char **argv) {
     pci_done(m);
     mem_done(m);
     free(disk);
+    for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
     free(rom);
     free(m);
     return rc;

@@ -12,6 +12,7 @@
 #include "platform.h"
 #include "devices.h"
 #include "serial.h"
+#include "ahci.h"
 
 /* ============================ generic RAM window ========================== */
 typedef struct { uint8_t *buf; uint64_t base, size; uint32_t clear_bits_on_read; const char *name; } rw2_t;
@@ -222,8 +223,15 @@ void devices_init_common(machine_t *m) {
     /* LPC bridge: real Intel convention dev31/func0 */
     pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086, 0x1E55, 0x06, 0x01, 0);
 
-    /* SATA/AHCI: real Intel convention dev31/func2 */
-    pci_add_device(m, 0,31,2, "sata-ahci", 0x8086, 0x1E03, 0x01, 0x06, 1);
+    /* SATA/AHCI: real Intel convention dev31/func2.  STORE S1: BAR5 is a
+     * real MMIO window now (was an empty stub -- the guest's own boot
+     * receipt "controller 0: BAR5 empty, skipping" measured the gap). */
+    pci_dev_t *sata_pci = pci_add_device(m, 0,31,2, "sata-ahci", 0x8086, 0x1E03, 0x01, 0x06, 1);
+    sata_pci->cfg[0x24] = (uint8_t)(AHCI_ABAR);
+    sata_pci->cfg[0x25] = (uint8_t)(AHCI_ABAR >> 8);
+    sata_pci->cfg[0x26] = (uint8_t)(AHCI_ABAR >> 16);
+    sata_pci->cfg[0x27] = (uint8_t)(AHCI_ABAR >> 24);
+    ahci_register(m);
 
     /* GPU: dev2/func0 (real Intel iGPU convention) */
     pci_dev_t *gpu = pci_add_device(m, 0,2,0, "igpu", 0x8086, 0x0412, 0x03, 0x00, 0);

@@ -36,7 +36,10 @@
 
 struct machine;
 
-#define KBC_QUEUE 64
+/* STORE S3 receipt lanes inject multi-command scripts (write/cat round-trips,
+ * ~200 bytes); 64\. only fit a single-line command.  The size is a test-lane
+ * depth, not a silicon contract: the guest only ever sees one byte at a time. */
+#define KBC_QUEUE 512
 
 typedef struct kbc {
     uint8_t  status;      /* dynamic: OBF|SYS|A2|INH */

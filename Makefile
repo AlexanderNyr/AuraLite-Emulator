@@ -32,7 +32,7 @@ demo: x86emu firmware/firmware.bin disk/disk.img
 test-unit: tests/test_cpu.c tests/test_usb.c tests/test_pic.c tests/test_pit.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
 	./test-cpu
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/devices.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
 	./test-usb
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
 	./test-pic
@@ -52,7 +52,9 @@ test-unit: tests/test_cpu.c tests/test_usb.c tests/test_pic.c tests/test_pit.c t
 	./test-ioapic
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_acpi.c src/acpi.c -o test-acpi
 	./test-acpi
-	rm -f test-cpu test-usb test-pic test-pit test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ahci.c src/ahci.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c -o test-ahci -lm
+	./test-ahci
+	rm -f test-cpu test-usb test-pic test-pit test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
 
 # KERNEL-BOOT K1: direct kernel-load lane. The fixture is a synthetic
 # higher-half kernel linked at the real AuraLite VMA (tests/kload_fixture.ld);
