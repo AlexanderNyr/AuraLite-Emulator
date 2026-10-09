@@ -227,6 +227,59 @@
   `2 CPU(s) online (1 AP(s) woken)`, deterministic (two runs
   byte-identical), `PASS: multi-core system detected`.
 
+- STORE S4 done (patches/0034): the breadth matrix the guest's own QEMU
+  gate (`test_ahci_matrix.sh`) exercises is reproduced guest-side on the
+  emulator.  Machine half first (measured): `machine_t` attach rows are
+  per controller now (`[ctrl][port]`, `AHCI_CTRLS=2`), `src/ahci.c` runs
+  one register instance per controller (ctrl 0 = onboard 0:31:2 keeps
+  every historical `[ahci]` receipt; ctrl 1 = `--ahci2` at 0:31:3 logs as
+  `[ahci2]`), second ABAR window at 0xFEB12000 (the guest maps 8 KiB per
+  BAR5 -- measured), CLI `--ahci2` / `--sata2=` / `--sata2-portN=`
+  (images on row 1 imply the controller).  Placement at 0:31:3 is not
+  arbitrary: the guest's class scan is bus-0 dev/func ASCENDING (measured
+  `pci_find_class_after`), so 31:3 binds second and "controller 0 at PCI
+  0:31.2" stays the S1-S3 receipt.  Unit suite 15 -> 18 vectors (second
+  window does not alias the first, port placement honoured by the engine
+  incl. TFES on a dark port, cross-controller images never bleed).
+  Guest receipts (`tests/integration/test_ahci_matrix.sh`, frozen
+  kernel@0ed0d29 + initrd): lane A port-0 token round-trip `laneaok` +
+  `PASS: SATA read/write DMA works`; lane B `hw port 1: SATA disk` with
+  the empty port 0 skipped + `lanebok` + byte-identical determinism pair;
+  lane C `controller 1 at PCI 0:31.3` + `2 controller(s), 2 SATA
+  device(s) ready` + `[ext2] blkdev 1 mounted at /ext2` (2-disk boot) +
+  `lanecok`; lane E (no attachment) `1 controller(s), 0 SATA device(s)
+  ready` + `self-test: no devices`.  Prompt arrival is deterministic and
+  measured (2680097588 / 2680082155 / 2748891330 instructions).
+
+- STORE S5 done (patches/0035): the STORE plan's hardening phase.  128-KiB
+  transfers first: the engine always walked PRDTs of any size, but the
+  guest's own per-port DMA bounce ceiling (128 KiB, measured in
+  AuraLite-OS drivers/ahci/ahci.c) had no vector -- unit suite 18 -> 22
+  pins the full 256-sector READ/WRITE DMA EXT shape (two 64-KiB PRDTs,
+  `prdbc == 131072`, golden bytes) and
+  `tests/integration/test_ahci_large_read.sh` mirrors the QEMU
+  large-read gate guest-side: a pre-built FAT32 at LBA 64 (64 leading
+  zero sectors so the kernel cannot mistake the disk for blank) carrying
+  a 16 MiB payload -- the QEMU-side MEASURED size a bounce leak cannot
+  survive -- read to EOF via typed `run /apps/filesize
+  /fat/payload.bin`, asserting `FILESIZE /fat/payload.bin 16777216`,
+  no reformat, no leak-ceiling truncation, byte-identical on re-run.
+  Writethrough: `--sata-writethrough` moves every guest WRITE DMA EXT
+  byte into the host image file at the same offset (unit vector `ok
+  writethrough` + `tests/integration/test_ahci_writethrough.sh` -- the
+  same typed token is byte-pristine on the host under the default
+  copy-on-attach policy and visible on the host with the flag).  Honest
+  INTx: the AHCI 1.3 interrupt condition ((PxIS & PxIE) | (HBA IS &
+  GHC.IE)) drives board line AHCI_IRQ0+ctrl (14/15) through
+  pic_set_irq() into the PIC and the I/O APIC fan-out; HBA IS is a live
+  PxIS aggregation now; the guest polls with PxIE=0 and never sets
+  GHC.IE (measured), so receipts cannot move and `ok intx line` pins the
+  line behavior (edge latch on assert, LTIM level follow on deassert).
+  Hardening receipts: full-matrix determinism (`MATRIX_DETERMINISM=1`
+  re-runs lanes A/B/C/E sequentially, byte-identical), the unattached
+  negative-control lane is byte-identical on re-run and prints the
+  unattached receipt verbatim, `make test` + `make test-sanitize` green.
+
 ## Current limits
 
 This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.

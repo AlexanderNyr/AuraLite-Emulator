@@ -12,6 +12,7 @@
 #include "pci.h"
 #include "platform.h"
 #include "kloader.h"
+#include "ahci.h"
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -94,7 +95,10 @@ int main(int argc, char **argv) {
                                      * pre-boot keys verbatim -- measured.) */
     const char *kernel_path = NULL; /* --kernel=path: KERNEL-BOOT K1 direct-load lane */
     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
-    const char *sata_cfg[AHCI_MAX_ATTACH] = {0}; /* --sata/ --sata-portN (STORE S1+) */
+    const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
+    int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
+    int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
+                                     * land in the host image files too */
     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
                                      * publishes N CPUs while the emulator still
                                      * runs one vCPU (0/1 = historical UP) */
@@ -122,14 +126,26 @@ int main(int argc, char **argv) {
         /* STORE S1+: SATA attachments.  --sata=path attaches to HBA port 0;
          * --sata-portN=path pins a specific port (0..AHCI_MAX_ATTACH-1).
          * --sata-max must not equal --sata prefix wise, so --sata= is tested
-         * after the longer --sata-port prefix. */
+         * after the longer --sata-port prefix.  S4: the --sata2 family
+         * attaches to the --ahci2 controller the same way (longest
+         * prefixes first so --sata2-portN cannot fall into --sata2= or
+         * --sata=). */
+        else if (!strncmp(argv[i], "--sata2-port", 12)) {
+            const char *eq = strchr(argv[i] + 12, '=');
+            int port = atoi(argv[i] + 12);
+            if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
+                sata_cfg[1][port] = eq + 1;
+        }
+        else if (!strncmp(argv[i], "--sata2=", 8)) sata_cfg[1][0] = argv[i]+8;
+        else if (!strcmp(argv[i], "--ahci2")) cfg_ahci2 = 1;
+        else if (!strcmp(argv[i], "--sata-writethrough")) sata_wt = 1;   /* S5 */
         else if (!strncmp(argv[i], "--sata-port", 11)) {
             const char *eq = strchr(argv[i] + 11, '=');
             int port = atoi(argv[i] + 11);
             if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
-                sata_cfg[port] = eq + 1;
+                sata_cfg[0][port] = eq + 1;
         }
-        else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0] = argv[i]+7;
+        else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
@@ -144,7 +160,11 @@ int main(int argc, char **argv) {
                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
                    "          [--cpus=N] publish N CPUs in boot_info/MADT with ONE vCPU (KERNEL-BOOT K5 metering)\n"
                    "          [--smp=N] run N real vCPUs (max 2; use with --cpus=N for kernel SMP bring-up, K6)\n"
-                   "                      skips --rom entirely and starts at the ELF entry\n", argv[0]);
+                   "                      skips --rom entirely and starts at the ELF entry\n"
+                   "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                   "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+                   "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
+                   "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n", argv[0]);
             return 0;
         }
     }
@@ -180,14 +200,38 @@ int main(int argc, char **argv) {
     else if (!kernel_path) { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
 
     /* STORE S1+: attach SATA port images the same way the USB stick gets its
-     * backing. */
-    for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
-        if (!sata_cfg[i]) continue;
-        size_t len = 0;
-        uint8_t *img = read_file(sata_cfg[i], &len);
-        if (!img) { mlog(&m->log, "[ahci] port %d: cannot read %s -- port stays dark", i, sata_cfg[i]); continue; }
-        m->sata_img[i] = img; m->sata_len[i] = len;
-        mlog(&m->log, "[ahci] port %d: attached %s (%zu bytes)", i, sata_cfg[i], len);
+     * backing.  S4: row 1 feeds the --ahci2 controller; bring the second
+     * controller up only when asked (or when its ports carry images). */
+    for (int c = 0; c < AHCI_CTRLS; c++) {
+        if (c == 1 && !cfg_ahci2) {
+            int any2 = 0;
+            for (int i = 0; i < AHCI_MAX_ATTACH; i++) if (sata_cfg[1][i]) any2 = 1;
+            if (!any2) continue;
+            cfg_ahci2 = 1;   /* --sata2 without --ahci2: imply the controller */
+        }
+        if (c == 1) devices_add_ahci2(m);
+        for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
+            if (!sata_cfg[c][i]) continue;
+            size_t len = 0;
+            uint8_t *img = read_file(sata_cfg[c][i], &len);
+            if (!img) {
+                mlog(&m->log, "[ahci%s] port %d: cannot read %s -- port stays dark",
+                     c ? "2" : "", i, sata_cfg[c][i]);
+                continue;
+            }
+            m->sata_img[c][i] = img; m->sata_len[c][i] = len;
+            mlog(&m->log, "[ahci%s] port %d: attached %s (%zu bytes)",
+                 c ? "2" : "", i, sata_cfg[c][i], len);
+            /* S5: opt-in host write-through (default: copy-on-attach). */
+            if (sata_wt) {
+                if (ahci_wt_attach(m, c, i, sata_cfg[c][i]) != 0)
+                    mlog(&m->log, "[ahci%s] port %d: writethrough open %s failed -- staying copy-on-attach",
+                         c ? "2" : "", i, sata_cfg[c][i]);
+                else
+                    mlog(&m->log, "[ahci%s] port %d: writethrough -> %s",
+                         c ? "2" : "", i, sata_cfg[c][i]);
+            }
+        }
     }
 
     if (kernel_path) {
@@ -198,7 +242,9 @@ int main(int argc, char **argv) {
             pci_done(m);
             mem_done(m);
             free(disk);
-            for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
+            ahci_wt_close_all();                    /* S5 */
+            for (int c = 0; c < AHCI_CTRLS; c++)
+                for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[c][i]);
             free(m);
             return EXIT_INPUT_ERROR;
         }
@@ -368,7 +414,9 @@ int main(int argc, char **argv) {
     pci_done(m);
     mem_done(m);
     free(disk);
-    for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
+    ahci_wt_close_all();                            /* S5 */
+    for (int c = 0; c < AHCI_CTRLS; c++)
+        for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[c][i]);
     free(rom);
     free(m);
     return rc;

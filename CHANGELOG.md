@@ -6,6 +6,74 @@ entry names its patch and the measured defect(s) it repaired.
 
 ## [Unreleased]
 
+### Added — patch 0035 (STORE S5, large transfers + hardening)
+- `--sata-writethrough`: opt-in host write-through -- every guest WRITE
+  DMA EXT byte also lands in the host image file at the same offset
+  (`ahci_wt_attach`/`ahci_wt_close_all`).  The default policy stays
+  copy-on-attach in-memory (S3's pristine-host receipt is asserted by
+  both harnesses).  NEW `tests/integration/test_ahci_writethrough.sh`
+  proves both policies with the same typed guest token.
+- Honest INTx: the AHCI 1.3 interrupt condition ((PxIS & PxIE) on any
+  port, or HBA IS nonzero with GHC.IE) drives board line AHCI_IRQ0+ctrl
+  (14/15, legacy IDE pairing) through `pic_set_irq()` -- which fans the
+  line out to the I/O APIC (CHIPSET H7 board wire).  HBA IS is now a
+  live per-port PxIS aggregation.  The guest driver polls with PxIE=0
+  and never sets GHC.IE (measured), so no historical receipt changes.
+- NEW `tests/integration/test_ahci_large_read.sh`: the QEMU
+  `test_ahci_large_read.sh` gate reproduced guest-side -- 16 MiB payload
+  (the measured size a bounce leak cannot survive) on a pre-built FAT32
+  at LBA 64 behind 64 zero sectors, typed `run /apps/filesize
+  /fat/payload.bin`, asserting `FILESIZE /fat/payload.bin 16777216` and
+  no reformat / leak-ceiling truncation / read error.
+- `tests/integration/test_ahci_matrix.sh` grows `MATRIX_DETERMINISM=1`:
+  lanes A, B, C and the unattached lane E re-run sequentially and must
+  be byte-identical (the S5 full-matrix determinism gate).
+
+### Fixed / measured — patch 0035
+- 18 -> 22 unit vectors: 256-sector (128 KiB) READ and WRITE DMA EXT
+  through two 64-KiB PRDTs with `prdbc == 131072` golden bytes (the
+  guest's measured bounce-buffer ceiling had no vector), writethrough
+  host-file bytes, and the INTx line lifecycle (quiet under the guest's
+  polled PxIE=0 contract; assert on unmask; W1C drop; GHC.IE aggregate
+  path; LTIM level-follow on deassert).
+
+### Backfill — patches 0031–0033 (STORE S1–S3, recorded here for the
+### ledger; shipped with the S0-S3 tree)
+- 0031: AHCI HBA registers + disk presence -- ABAR MMIO @0xFEB10000,
+  CAP/PI/VS/GHC, per-port register files, `--sata=`/`--sata-portN=` CLI,
+  COMRESET path, stop/start handshake (8 vectors).
+- 0032: command engine (CL/TBL/CFIS/PRDT walk), READ DMA EXT, IDENTIFY
+  DEVICE, TFES error channel, `--keys-at=prompt` testability; 13 vectors.
+- 0033: WRITE DMA EXT shares the engine (`ahci_dma_xfer(..., w)`),
+  guest `/disk`+`/fat` token round-trips typed via KBC, sequential
+  determinism pair byte-identical, `tests/integration/test_ahci_rw.sh`;
+  16 vectors.
+
+### Added — patch 0034 (STORE S4, breadth matrix)
+- Second AHCI controller (`--ahci2`): PCI function 0:31:3 (8086:2922,
+  class 01/06/01) with its own ABAR window at `0xFEB12000` (the guest
+  maps 8 KiB per BAR5 -- measured) and its own six port files.  CLI
+  `--sata2=` / `--sata2-portN=` attach images to it; an image on that row
+  implies the controller.  Placement at 0:31:3 is deliberate: the guest
+  class scan is bus-0 dev/func ascending (measured), so the onboard
+  0:31:2 keeps the `controller 0` receipt.
+- `machine_t` attach rows became `[AHCI_CTRLS][AHCI_MAX_ATTACH]`;
+  `ahci_register_ctrl(m, ctrl)` registers per-controller instances
+  (`ahci_register()` stays the controller-0 entry point; controller-1
+  logs are tagged `[ahci2]`, controller-0 keeps the exact historical
+  `[ahci]` spelling).
+- `tests/integration/test_ahci_matrix.sh`: the QEMU `test_ahci_matrix.sh`
+  lanes A/B/C reproduced guest-side through the emulator's `--keys-at`
+  lane, plus an unattached negative-control lane and a sequential
+  determinism pair (lane B always; `MATRIX_DETERMINISM=1` for the full
+  matrix).
+
+### Fixed / measured — patch 0034
+- 15 -> 18 unit vectors: second-window independence (ABAR/ABAR2 do not
+  alias, per-controller GHC), port placement through the command engine
+  (TFES on a dark port, clean DMA on port 3), cross-controller image
+  isolation (READ/WRITE never bleed between rows).
+
 ### Added — patch 0023 (KERNEL-BOOT K3, probe-path hardware)
 - `src/acpi.[ch]`: a fabricated ACPI set (RSDP rev 2 with both RSDT and
   XSDT, one MADT: LAPIC 0, I/O APIC @0xFEC00000 GSI base 0, ISA IRQ0→GSI2

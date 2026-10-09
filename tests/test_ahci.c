@@ -1,4 +1,6 @@
-/* tests/test_ahci.c -- STORE S1 vectors: AHCI ABAR register model.
+/* tests/test_ahci.c -- STORE S1-S5 vectors: AHCI ABAR register model,
+ * command engine, breadth matrix machine half, large transfers,
+ * writethrough and the honest INTx line.
  *
  * Baseline before S1 (measured 2026-10-07 on b00c4d9): the PCI function
  * 0:31.2 existed but BAR5 was empty; the guest printed "controller 0:
@@ -35,13 +37,20 @@ static void fx_done(fx_t *f) {
     f->m.mmio_list = NULL;
 }
 
-/* 1 MiB synthetic disk image attached to the fixture. */
+/* 1 MiB synthetic disk image attached to the fixture.  S4: attach rows are
+ * per controller -- the historical helper pins controller 0; the S4
+ * vectors use fx_attach_disk_c with a second image on controller 1. */
 static uint8_t *gx_disk;
-static void fx_attach_disk(fx_t *f, int port, size_t bytes) {
-    if (!gx_disk) { gx_disk = calloc(1, 4 * 1024 * 1024); }
+static uint8_t *gx_disk2;
+static void fx_attach_disk_c(fx_t *f, int ctrl, int port, size_t bytes, uint8_t *img) {
+    if (!img) { img = calloc(1, 4 * 1024 * 1024); }
     assert(port >= 0 && port < AHCI_MAX_ATTACH && bytes <= 4 * 1024 * 1024);
-    f->m.sata_img[port] = gx_disk;
-    f->m.sata_len[port] = bytes;
+    f->m.sata_img[ctrl][port] = img;
+    f->m.sata_len[ctrl][port] = bytes;
+}
+static void fx_attach_disk(fx_t *f, int port, size_t bytes) {
+    if (!gx_disk) gx_disk = calloc(1, 4 * 1024 * 1024);
+    fx_attach_disk_c(f, 0, port, bytes, gx_disk);
 }
 
 static void test_global_regs(void) {
@@ -350,6 +359,252 @@ static void test_engine_write_oob_tfes(void) {
     printf("ok engine write oob tfes\n");
 }
 
+/* ---- S4: breadth vectors (controller matrix, port placement) ----
+ *
+ * The guest's class scan is bus-0 dev/func ASCENDING (measured:
+ * AuraLite-OS drivers/pci/pci.c pci_find_class_after), so controller
+ * numbering follows slot order: onboard 0:31:2 is controller 0, the
+ * --ahci2 function at 0:31:3 is controller 1.  These vectors pin the
+ * machine half of the matrix lanes: the second ABAR window does not
+ * alias the first, port placement is honoured by the engine, and the
+ * two controllers' engines never cross images. */
+
+#define ABAR2 AHCI_ABAR2
+#define P2(p, sub) (ABAR2 + 0x100u + (p) * 0x80u + (sub))
+
+static void test_ctrl1_window_independent(void) {
+    fx_t f; fx_init(&f);
+    ahci_register_ctrl(&f.m, 1);
+    /* Controller 1 answers with its own identical HBA identity... */
+    assert(mem_read(&f.m, ABAR2 + 0x00, 4) == 0x80040005u);
+    assert(mem_read(&f.m, ABAR2 + 0x0C, 4) == 0x3Fu);
+    assert(mem_read(&f.m, ABAR2 + 0x10, 4) == 0x00010300u);
+    /* ...but its ports are independent: attach on ctrl0 p0 must NOT
+     * light up ctrl1 p0 (no window aliasing between ABAR and ABAR2). */
+    fx_attach_disk(&f, 0, 1024 * 1024);
+    assert((mem_read(&f.m, P(0, 0x28), 4) & 0x0Fu) == 3u);        /* ctrl0 p0 present */
+    assert((mem_read(&f.m, P2(0, 0x28), 4) & 0x0Fu) == 0u);       /* ctrl1 p0 dark */
+    assert(mem_read(&f.m, P2(0, 0x24), 4) == 0xFFFFFFFFu);
+    /* attach on ctrl1 p2 lights only that port */
+    if (!gx_disk2) gx_disk2 = calloc(1, 4 * 1024 * 1024);
+    fx_attach_disk_c(&f, 1, 2, 512 * 1024, gx_disk2);
+    assert((mem_read(&f.m, P2(2, 0x28), 4) & 0x0Fu) == 3u);
+    assert((mem_read(&f.m, P2(0, 0x28), 4) & 0x0Fu) == 0u);       /* sibling port stays dark */
+    /* GHC state is per controller */
+    mem_write(&f.m, ABAR + 0x04, 4, 0x80000001u);
+    assert(mem_read(&f.m, ABAR2 + 0x04, 4) == 0u);
+    fx_done(&f);
+    printf("ok ctrl1 window independent\n");
+}
+
+static void test_port_placement_engine(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 3, 4 * 1024 * 1024);      /* disk on port 3 only */
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = (uint8_t)(i * 3 + 1);
+    /* port 0 is dark: a command issued there must take the TFES path even
+     * though the machine has a disk elsewhere (placement is per port). */
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
+    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u);  /* TFES on dark port */
+    /* the very same command on port 3 runs clean and returns its image */
+    mem_write(&f.m, P(3, 0x10), 4, 0xFFFFFFFFu);  /* W1C any stray state on p3 */
+    mem_write(&f.m, P(3, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(3, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(3, 0x38), 4) & 1u) == 0u);
+    assert((mem_read(&f.m, P(3, 0x10), 4) & (1u << 30)) == 0u);  /* clean */
+    int bad = 0;
+    for (int i = 0; i < 512; i++)
+        if (mem_read(&f.m, T_BUF1 + i, 1) != gx_disk[i]) { bad = i + 1; break; }
+    assert(bad == 0);
+    fx_done(&f);
+    printf("ok port placement engine\n");
+}
+
+static void test_cross_controller_isolation(void) {
+    fx_t f; fx_init(&f);
+    ahci_register_ctrl(&f.m, 1);
+    if (!gx_disk2) gx_disk2 = calloc(1, 4 * 1024 * 1024);
+    fx_attach_disk(&f, 0, 4 * 1024 * 1024);                    /* ctrl0 p0 */
+    fx_attach_disk_c(&f, 1, 0, 4 * 1024 * 1024, gx_disk2);     /* ctrl1 p0 */
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) {
+        gx_disk[i]  = 0xA0;                                    /* distinct patterns */
+        gx_disk2[i] = 0xB1;
+    }
+    /* ctrl0 READ LBA0 -> gx_disk pattern */
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) == 0u);
+    assert(mem_read(&f.m, T_BUF1, 1) == 0xA0);
+    /* ctrl1 READ LBA0 -> gx_disk2 pattern (no bleed through the shared
+     * command-list address: each controller has its own PxCLB slot) */
+    mem_write(&f.m, P2(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF2, 512);
+    mem_write(&f.m, P2(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P2(0, 0x10), 4) & (1u << 30)) == 0u);
+    assert(mem_read(&f.m, T_BUF2, 1) == 0xB1);
+    /* WRITE on ctrl1 must land in gx_disk2 and leave gx_disk pristine */
+    for (int i = 0; i < 512; i++) mem_write(&f.m, T_BUF3 + i, 1, 0x5Au);
+    mem_write(&f.m, P2(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 1);
+    t_fis(&f.m, 0x35, 2, 1);
+    t_prdt(&f.m, 0, T_BUF3, 512);
+    mem_write(&f.m, P2(0, 0x38), 4, 1);
+    assert(gx_disk2[2 * 512] == 0x5Au);
+    assert(gx_disk[2 * 512] == 0xA0u);
+    fx_done(&f);
+    printf("ok cross-controller isolation\n");
+}
+
+/* ---- S5: large transfers, writethrough, honest INTx ----
+ *
+ * 128 KiB is the guest driver's per-port DMA bounce ceiling (measured:
+ * AuraLite-OS drivers/ahci/ahci.c bounce buffer; the STORE_PLAN S2
+ * contract records "buf_len <= 4 MiB, guest hosts a 128-KiB per-port
+ * bounce buffer as its largest transfer").  These vectors pin the full
+ * 256-sector READ/WRITE DMA EXT shape the large-file lane exercises. */
+#define T_BIG1 0x40000u
+#define T_BIG2 0x50000u
+#define T_BIGSZ (128u * 1024u)
+
+static void test_engine_read_128k(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 4 * 1024 * 1024);
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = (uint8_t)(i * 5 + 3);
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 2, 0);
+    t_fis(&f.m, 0x25, 16, 256);                 /* READ DMA EXT: 256 sectors */
+    t_prdt(&f.m, 0, T_BIG1, T_BIGSZ / 2);       /* two 64 KiB halves */
+    t_prdt(&f.m, 1, T_BIG2, T_BIGSZ / 2);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
+    assert(mem_read(&f.m, T_CLB + 4, 4) == T_BIGSZ);            /* prdbc */
+    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) == 0u);
+    int bad = 0;
+    for (uint32_t i = 0; i < T_BIGSZ / 2; i++) {
+        if (mem_read(&f.m, T_BIG1 + i, 1) != gx_disk[16 * 512 + i]) { bad = 1; break; }
+        if (mem_read(&f.m, T_BIG2 + i, 1) != gx_disk[16 * 512 + T_BIGSZ / 2 + i]) { bad = 2; break; }
+    }
+    assert(bad == 0);
+    fx_done(&f);
+    printf("ok engine read 128k\n");
+}
+
+static void test_engine_write_128k(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 4 * 1024 * 1024);
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = 0;
+    for (uint32_t i = 0; i < T_BIGSZ / 2; i++) {
+        mem_write(&f.m, T_BIG1 + i, 1, (uint8_t)(i * 7 + 1));
+        mem_write(&f.m, T_BIG2 + i, 1, (uint8_t)(i * 11 + 2));
+    }
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 2, 1);
+    t_fis(&f.m, 0x35, 32, 256);                 /* WRITE DMA EXT: 256 sectors */
+    t_prdt(&f.m, 0, T_BIG1, T_BIGSZ / 2);
+    t_prdt(&f.m, 1, T_BIG2, T_BIGSZ / 2);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
+    assert(mem_read(&f.m, T_CLB + 4, 4) == T_BIGSZ);
+    int bad = 0;
+    for (uint32_t i = 0; i < T_BIGSZ / 2; i++) {
+        if (gx_disk[32 * 512 + i] != (uint8_t)(i * 7 + 1)) { bad = 1; break; }
+        if (gx_disk[32 * 512 + T_BIGSZ / 2 + i] != (uint8_t)(i * 11 + 2)) { bad = 2; break; }
+    }
+    assert(bad == 0);
+    fx_done(&f);
+    printf("ok engine write 128k\n");
+}
+
+/* S5: --sata-writethrough -- a WRITE DMA EXT must reach the host file,
+ * not only the in-memory image (the S3 policy kept the host pristine). */
+static void test_writethrough(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 1024 * 1024);
+    const char *path = "test_ahci_wt.img";
+    FILE *fp = fopen(path, "wb");
+    assert(fp);
+    assert(fwrite(gx_disk, 1, 1024 * 1024, fp) == 1024 * 1024);
+    fclose(fp);
+    assert(ahci_wt_attach(&f.m, 0, 0, path) == 0);
+    for (int i = 0; i < 512; i++) mem_write(&f.m, T_BUF1 + i, 1, (uint8_t)(i * 3 + 7));
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 1);
+    t_fis(&f.m, 0x35, 9, 1);                    /* WRITE LBA9 1 sector */
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x20), 4) & 1u) == 0u);
+    ahci_wt_close_all();                         /* flush + close */
+    fp = fopen(path, "rb");
+    assert(fp);
+    assert(fseek(fp, 9 * 512, SEEK_SET) == 0);
+    int bad = 0;
+    for (int i = 0; i < 512; i++) {
+        int ch = fgetc(fp);
+        if (ch != (uint8_t)(i * 3 + 7)) { bad = i + 1; break; }
+    }
+    fclose(fp);
+    remove(path);
+    assert(bad == 0);                            /* host file bytes moved */
+    fx_done(&f);
+    printf("ok writethrough\n");
+}
+
+/* S5: honest INTx.  (PxIS & PxIE) | (HBA IS & GHC.IE) drives the board
+ * line AHCI_IRQ0+ctrl through pic_set_irq (which fans out to the I/O
+ * APIC).  The guest's own driver polls with PxIE=0 and never sets
+ * GHC.IE (measured) -- its receipts must be unchanged -- so this line is
+ * machine honesty, pinned here. */
+static void test_intx_line(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 1024 * 1024);
+    /* completion with PxIE=0 (guest contract): line must stay quiet */
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert(mem_read(&f.m, P(0, 0x10), 4) & 1u);          /* PxIS.DHRS latched */
+    assert(!(f.m.pic.slave.lines & (1u << 6)));          /* IRQ14 quiet */
+    assert(!(f.m.pic.slave.irr & (1u << 6)));
+    /* enable PxIE.DHRS: the latched-but-masked interrupt asserts the line */
+    mem_write(&f.m, P(0, 0x14), 4, 1u);
+    assert(f.m.pic.slave.lines & (1u << 6));             /* asserted */
+    assert(f.m.pic.slave.irr & (1u << 6));               /* edge latch into IRR */
+    /* W1C PxIS drops the line again */
+    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+    assert(!(f.m.pic.slave.lines & (1u << 6)));
+    /* GHC.IE + HBA IS aggregate path: completion asserts with GHC.IE
+     * alone (no PxIE) */
+    mem_write(&f.m, P(0, 0x14), 4, 0u);
+    mem_write(&f.m, ABAR + 0x04, 4, 2u);                 /* GHC.IE */
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0x25, 0, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert(mem_read(&f.m, ABAR + 0x08, 4) & 1u);         /* HBA IS bit0 */
+    assert(f.m.pic.slave.lines & (1u << 6));
+    /* level-mode guests see IRR follow the pin down (LTIM on the slave) */
+    f.m.pic.slave.ltim = 1;
+    mem_write(&f.m, ABAR + 0x04, 4, 0u);                 /* GHC.IE off -> drop */
+    assert(!(f.m.pic.slave.lines & (1u << 6)));
+    assert(!(f.m.pic.slave.irr & (1u << 6)));            /* level: IRR follows */
+    fx_done(&f);
+    printf("ok intx line\n");
+}
+
 int main(void) {
     test_global_regs();
     test_dark_ports();
@@ -366,6 +621,13 @@ int main(void) {
     test_engine_write_single_readback();
     test_engine_write_multi_prdt();
     test_engine_write_oob_tfes();
+    test_ctrl1_window_independent();
+    test_port_placement_engine();
+    test_cross_controller_isolation();
+    test_engine_read_128k();
+    test_engine_write_128k();
+    test_writethrough();
+    test_intx_line();
     printf("test_ahci: ALL PASS\n");
     return 0;
 }

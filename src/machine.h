@@ -33,8 +33,12 @@ typedef struct mmio_region {
     struct mmio_region *next;
 } mmio_region_t;
 
-/* STORE S1+: AHCI attach slots (kept in step with AHCI_HW_PORTS in ahci.h) */
+/* STORE S1+: AHCI attach slots (kept in step with AHCI_HW_PORTS in ahci.h).
+ * STORE S4: slots are per controller -- [ctrl][port], ctrl < AHCI_CTRLS
+ * (the second controller appears only under --ahci2; ctrl 0 is the
+ * onboard 0:31:2 function every historical lane uses). */
 #define AHCI_MAX_ATTACH 6
+#define AHCI_CTRLS      2
 
 /* ---- I/O port device model (64K space) ---- */
 typedef uint32_t (*io_read_fn)(void *ctx, uint16_t port, int size);
@@ -109,9 +113,11 @@ struct machine {
     size_t   disk_len;
 
     /* STORE S1+: SATA/AHCI attachments -- up to AHCI_MAX_ATTACH raw host
-     * images, one per HBA port; NULL = port dark (PxSSTS.DET = 0). */
-    uint8_t *sata_img[AHCI_MAX_ATTACH];
-    size_t   sata_len[AHCI_MAX_ATTACH];
+     * images per controller, one per HBA port; NULL = port dark
+     * (PxSSTS.DET = 0).  STORE S4: row 0 = onboard controller (0:31:2),
+     * row 1 = the --ahci2 controller (0:31:3). */
+    uint8_t *sata_img[AHCI_CTRLS][AHCI_MAX_ATTACH];
+    size_t   sata_len[AHCI_CTRLS][AHCI_MAX_ATTACH];
 
     logring_t log;
 

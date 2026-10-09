@@ -268,6 +268,23 @@ void devices_init_common(machine_t *m) {
 
 }
 
+/* STORE S4: optional second AHCI controller (--ahci2).  QEMU's
+ * `-device ahci,id=ahci1` parity: a second class-01/06 function so the
+ * guest's multi-scan `ctrl_count` path (RESIDUE2 T3) runs.  Placement at
+ * 0:31:3 is deliberate and measured: the guest class scan is bus-0
+ * dev/func ASCENDING (drivers/pci/pci.c pci_find_class_after), so 0:31:3
+ * binds AFTER the onboard 0:31:2 and every S1-S3 receipt ("controller 0
+ * at PCI 0:31.2") keeps its numbering.  BAR5 -> AHCI_ABAR2 (8 KiB apart
+ * from ABAR because the guest maps 8 KiB per BAR5). */
+void devices_add_ahci2(machine_t *m) {
+    pci_dev_t *p = pci_add_device(m, 0,31,3, "sata-ahci2", 0x8086, 0x2922, 0x01, 0x06, 1);
+    p->cfg[0x24] = (uint8_t)(AHCI_ABAR2);
+    p->cfg[0x25] = (uint8_t)(AHCI_ABAR2 >> 8);
+    p->cfg[0x26] = (uint8_t)(AHCI_ABAR2 >> 16);
+    p->cfg[0x27] = (uint8_t)(AHCI_ABAR2 >> 24);
+    ahci_register_ctrl(m, 1);
+}
+
 void devices_init_platform(machine_t *m) {
     const platform_t *p = m->plat;
     switch (p->id) {

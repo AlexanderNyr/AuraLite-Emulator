@@ -7,7 +7,7 @@
 > `AuraLite-Emulator@b00c4d9` (== upstream tip, K7-K8 absorbed) with
 > `AuraLite-OS@0ed0d29`.
 
-**Status: in progress — S0 ✅, S1 ✅, S2 ✅, S3 ✅, S4–S5 planned 📋**
+**Status: complete — S0–S5 done ✅**
 
 | Phase | Scope | Status | Deliverable |
 |---|---|---|---|
@@ -15,8 +15,8 @@
 | S1 | HBA registers + disk presence: BAR5/ABAR MMIO @0xFEB10000, CAP/PI/VS/GHC, port register files, `--sata=`/`--sata-portN=` CLI, COMRESET path, stop/start handshake | ✅ done | `patches/0031-STORE-S1-ahci-hba.patch` |
 | S2 | DMA read: command engine (CL/TBL/CFIS/PRDT), READ DMA EXT, IDENTIFY DEVICE, read-only guest path, TFES error channel, `--keys-at=prompt` testability | ✅ done | `patches/0032-STORE-S2-ahci-read.patch` |
 | S3 | DMA write: WRITE DMA EXT, guest `/disk` + `/fat` write→read round-trip (QEMU `test_ahci_rw.sh` parity) | ✅ done | `patches/0033-STORE-S3-ahci-write.patch` |
-| S4 | Breadth: up to 4 disks, port placement, second controller (QEMU `test_ahci_matrix.sh` parity) | 📋 | `patches/0034-STORE-S4-ahci-matrix.patch` |
-| S5 | Large transfers + hardening (QEMU `test_ahci_large_read.sh` parity), IRQ honesty, determinism, docs | 📋 | `patches/0035-STORE-S5-ahci-hardening.patch` |
+| S4 | Breadth: up to 4 disks, port placement, second controller (QEMU `test_ahci_matrix.sh` parity) | ✅ done | `patches/0034-STORE-S4-ahci-matrix.patch` |
+| S5 | Large transfers + hardening (QEMU `test_ahci_large_read.sh` parity), IRQ honesty, determinism, docs | ✅ done | `patches/0035-STORE-S5-ahci-hardening.patch` |
 
 ## 1. Measured baseline
 
@@ -229,33 +229,119 @@ byte-identical.
 - Harness: `tests/integration/test_ahci_rw.sh` automates lanes A+B and
   the byte-compare.
 
-### S4 — Breadth matrix
+### S4 — Breadth matrix — ✅ done (patches/0034-STORE-S4-ahci-matrix.patch)
 
-Multiple `--disk-portN=` attachments (0..5 exposed of NP=6), optional second
+Multiple `--sata-portN=` attachments (0..5 exposed of NP=6), optional second
 controller (`--ahci2` adds a second PCI function so the guest's multi-scan
 `ctrl_count` path runs), up to 4 guest-visible volumes (`/disk /fat` on
 disk 1, `/ext2 /exfat /ext4` per further disks).
 
-**DoD (measured):** the three `test_ahci_matrix.sh` lanes reproduced
-guest-side: A port 0 r/w token; B port 1 only (empty port 0 skipped —
-guest log shows no port-0 disk); C two controllers one disk each, guest
-`controller 1` line + both tokens round-trip; 2-disk boot shows
-`[ext2]` mounted.
-**Gate:** matrix receipts + tests.
+**Measured machine facts (baseline `ab6f08d`, S0–S3):**
+- `machine_t.sata_img/sata_len` were one flat row (`[port]`) and
+  `src/ahci.c` had a single global `g_ahci` on one ABAR window -- a second
+  controller was impossible by construction.
+- The guest's class scan is **bus-0 dev/func ASCENDING** (measured:
+  AuraLite-OS `drivers/pci/pci.c` `pci_find_class_after`, `for (dev = 0;
+  dev < 32; ...)`): a second controller at any slot below 31:2 would bind
+  as "controller 0" and renumber every S1-S3 receipt.  Placement is
+  therefore **0:31:3** (QEMU's free-slot placement is not reproducible on
+  this fixed topology and would break "controller 0 at PCI 0:31.2").
+- The guest maps **8 KiB per BAR5** (measured `ahci.c` map size), so the
+  second ABAR sits 8 KiB clear of the first: `AHCI_ABAR2 = 0xFEB12000`.
 
-### S5 — Large transfers + hardening
+**Implementation:** `machine_t.sata_img/sata_len` became
+`[AHCI_CTRLS][AHCI_MAX_ATTACH]`; `ahci_register_ctrl(m, ctrl)` brings up
+per-controller instances (ctrl 0 keeps the historical `ahci_register()`
+entry point and the exact `[ahci]` log spelling; ctrl 1 logs as
+`[ahci2]`); `devices_add_ahci2()` adds the PCI function (0:31:3,
+8086:2922, class 01/06/01, BAR5=ABAR2); CLI `--ahci2` plus `--sata2=` /
+`--sata2-portN=` (an image on row 1 implies the controller).  Unit suite
+15 → 18 vectors (controller-window independence, port placement through
+the engine, cross-controller image isolation).
+
+**DoD (measured, captured in `tests/integration/test_ahci_matrix.sh`
+lanes, frozen kernel `AuraLite-OS@0ed0d29` + initrd (bin/init +
+apps/filesize), 3.2G-instr lanes; prompt arrival measured at instr
+2680097588 (A) / 2680082155 (B) / 2748891330 (C -- ext2 mount on the
+second disk):**
+- **Lane A** (port 0): `PASS: SATA read/write DMA works`, typed
+  `write /fat/matrix.txt laneaok` -> `wrote /fat/matrix.txt` -> `cat`
+  echoes `laneaok`, `[fat32] PASS: FAT32 read/write`, zero
+  `unsupported ATA cmd` / `[ahci|diskfs|fat32] FAIL`.
+- **Lane B** (port 1 only): `hw port 1: SATA disk (sig=0x00000101)` +
+  `1 controller(s), 1 SATA device(s) ready`, **no** `hw port 0: SATA
+  disk` line (empty port 0 skipped), `lanebok` round-trip; sequential
+  determinism pair **byte-identical**.
+- **Lane C** (`--ahci2`, one disk each): `controller 0 at PCI 0:31.2` +
+  `controller 1 at PCI 0:31.3` + `2 controller(s), 2 SATA device(s)
+  ready`, `[ext2] blkdev 1 mounted at /ext2` + `[ext2] PASS: ext2
+  read/write/dir/indirect works` (2-disk boot shows `[ext2]` mounted),
+  `lanecok` round-trip on `/fat` (controller-0 disk).
+- **Lane E** (no `--sata`, negative control): `1 controller(s), 0 SATA
+  device(s) ready` + `self-test: no devices`, zero `hw port` lines.
+
+**Gate:** matrix receipts above (harness prints `S4 matrix receipts: ALL
+PASS`) + 18-vector `tests/test_ahci.c` green + `make test` +
+`make test-sanitize` green.
+
+### S5 — Large transfers + hardening — ✅ done (patches/0035-STORE-S5-ahci-hardening.patch)
 
 128-KiB multi-sector reads (mirror `test_ahci_large_read.sh`: a multi-MB
 file the guest reads fully), dirty-image writethrough semantics,
-honest INTx line (PxIS.IPS → PIC/IOAPIC, currently documented-not-wired),
-negative-control run without `--disk=` (S0 receipt verbatim), determinism
-×2 on the full matrix, sanitize lanes, docs refresh
-(`ROADMAP.md` ledger row, `docs/STATUS.md` evidence, cumulative patch
-regeneration).
+honest INTx line (PxIS.IPS → PIC/IOAPIC), negative-control run without
+storage attachment (the unattached receipt), determinism ×2 on the full
+matrix, sanitize lanes, docs refresh (`ROADMAP.md` ledger row,
+`docs/STATUS.md` evidence, cumulative patch regeneration).
 
-**DoD:** large-read token fully round-tripped; two identical runs; the no
-`--disk=` boot byte-identical to the S0 baseline receipt.
-**Gate:** all above + `make test` + `make test-sanitize`.
+**Implementation (all measured, see receipts):**
+- **128-KiB transfers:** the S2/S3 engine already walked PRDTs of any
+  size; the gap was test coverage of the guest's own bounce ceiling
+  (measured: AuraLite-OS `drivers/ahci/ahci.c` hosts a 128-KiB per-port
+  bounce buffer).  Unit vectors 18 -> 22 pin the full 256-sector READ
+  DMA EXT and WRITE DMA EXT shapes (two 64-KiB PRDTs, golden bytes,
+  `prdbc == 131072`).
+- **Writethrough (`--sata-writethrough`):** opt-in per-run policy; every
+  guest WRITE DMA EXT byte now also lands in the host image file at the
+  same offset (`ahci_wt_attach`/`ahci_wt_close_all`, `fseek+fwrite` per
+  PRDT piece).  Default policy is unchanged copy-on-attach -- the S3
+  pristine-host receipt stays true without the flag, and the S3 harness
+  still asserts it.
+- **Honest INTx:** the AHCI 1.3 interrupt condition ((PxIS & PxIE) on any
+  port, or HBA IS nonzero with GHC.IE) drives board line
+  `AHCI_IRQ0 + ctrl` (14/15, legacy IDE pairing) through `pic_set_irq()`,
+  which fans the same line out to the I/O APIC (CHIPSET H7 board wire).
+  HBA IS is now a live per-port PxIS aggregation.  The guest driver polls
+  with PxIE=0 and never sets GHC.IE (measured), so the line is machine
+  honesty: the unit vectors pin it, guest receipts cannot change.
+- **Testability:** `MATRIX_DETERMINISM=1` re-runs lanes A, C and the
+  unattached lane E sequentially and byte-compares (lane B's pair is
+  always on); `tests/integration/test_ahci_large_read.sh` mirrors the
+  QEMU large-read gate (16 MiB payload -- the QEMU-side MEASURED size a
+  bounce leak cannot survive -- over a pre-built FAT32 at LBA 64 with 64
+  leading zero sectors, typed `run /apps/filesize /fat/payload.bin`).
+
+**DoD (measured, frozen kernel `AuraLite-OS@0ed0d29` + initrd):**
+- Large-read: `[fat32] mounted FAT32 at /fat` with **no**
+  `formatting default FAT32 volume` (the kernel must not reformat the
+  test disk), `FILESIZE /fat/payload.bin 16777216` read to EOF through
+  the 128-KiB bounce path, no `FILESIZE-READ-ERROR` / `FILESIZE-OPEN-FAIL`
+  / truncation at the original 173824-byte leak ceiling; the sequential
+  determinism pair is byte-identical.
+- Full-matrix determinism (`MATRIX_DETERMINISM=1`): lanes A, B, C, E all
+  byte-identical on sequential re-runs.
+- Negative control: the no-attachment boot (lane E) prints the unattached
+  receipt verbatim (`1 controller(s), 0 SATA device(s) ready` +
+  `self-test: no devices`, zero `hw port` lines) and is byte-identical on
+  re-run.
+- Writethrough machine+guest receipts: unit vector `ok writethrough`
+  (WRITE DMA EXT bytes land in the host file) and
+  `tests/integration/test_ahci_writethrough.sh`: the same typed
+  `/fat/wt.txt writethrok` round-trip with copy-on-attach leaves the host
+  image byte-pristine (S3 policy intact) and with `--sata-writethrough`
+  the host image carries the guest token.
+
+**Gate:** all above + 22-vector `tests/test_ahci.c` + `make test` +
+`make test-sanitize` green.
 
 ## 3. Standing constraints (all phases)
 

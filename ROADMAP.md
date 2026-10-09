@@ -27,7 +27,7 @@ maps to exactly one plan below.
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
 | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
 | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
-| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | 🔵 **IN PROGRESS** (S0–S3 done ✅, S4–S5 planned) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller | S0–S5 |
+| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
 | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
 | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
@@ -76,5 +76,7 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 - ~~`0029` — KERNEL-BOOT K8: SMP clock pacing (hlt-idle clock yield + per-vCPU LAPIC timer settle on idle slots) → guest userspace gates `SMPSTRESS PASS` + `IRQAPWAKE PASS`~~ shipped — KERNEL_BOOT plan closed for the north star (2-vCPU shell + guest SMP gates)
 - ~~`0030` — STORE S0: measured baseline + `docs/plans/STORE_PLAN.md`~~ shipped
 - ~~`0031` — STORE S1: AHCI HBA registers + presence (ABAR 0xFEB10000, `--sata=` CLI, receipt: guest binds controller, attached disk reported)~~ shipped
-- `0032` — STORE S2: command engine + READ DMA EXT (guest self-test blank-LBA0 receipt)
-- `0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical
+- ~~`0032` — STORE S2: command engine + READ DMA EXT (guest self-test blank-LBA0 receipt)~~ shipped
+- ~~`0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical~~ shipped
+- ~~`0034` — STORE S4: breadth matrix -- `--sata-portN=` placement, `--ahci2` second controller (0:31:3, ABAR2 0xFEB12000), QEMU `test_ahci_matrix.sh` lanes A/B/C reproduced guest-side + unattached negative control~~ shipped
+- ~~`0035` — STORE S5: large transfers + hardening -- 128-KiB PRDT vectors + QEMU `test_ahci_large_read.sh` guest parity (16 MiB payload through the 128-KiB bounce), `--sata-writethrough` dirty-image semantics, honest INTx (PxIS→PIC/IOAPIC), full-matrix determinism ×2~~ shipped — STORE plan complete S0–S5
