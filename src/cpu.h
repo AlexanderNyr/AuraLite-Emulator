@@ -104,4 +104,8 @@ const char *cpu_mode_name(cpu_t *c);
 int cpu_addr_size(cpu_t *c);
 int cpu_op_size_default(cpu_t *c);
 
+/* USB U3: device-cadence hook installed by devices_init.  Narrow unit
+ * harnesses link cpu.c without devices.c and leave it NULL. */
+extern void (*cpu_devices_tick)(machine_t *m);
+
 #endif

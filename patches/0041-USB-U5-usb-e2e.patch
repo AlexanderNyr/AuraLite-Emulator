@@ -1,0 +1,382 @@
+From 5da032e91f9a7b952fb6acdb32ebf27a82351e30 Mon Sep 17 00:00:00 2001
+From: AuraLite Dev <dev@auralite.local>
+Date: Fri, 9 Oct 2026 22:57:34 +0000
+Subject: [PATCH] U5 update
+
+USB end-to-end + hardening close-out. --no-usb-uhci (machine_t.
+cfg_no_uhci) omits the UHCI companion -- the test_usb_ehci.sh
+EHCI-only machine shape (-device usb-ehci, no -usb); unit vector
+ok uhci omitted (open-bus I/O, no halt handshake, EHCI intact).
+Both sticks through the guest's MSC path with /usb info + a sector
+read typed over the KBC (run /apps/filesize /usb/sector0.bin):
+UHCI companion lane (AURALUSB 8 MiB) and EHCI high-speed lane
+(AURALEHC 8 MiB), each x2 sequential byte-identical (tests 25->26
+vectors). test_ahci_matrix.sh MATRIX_DETERMINISM=1 green with all
+four pairs byte-identical; AHCI/fs receipt lines byte-identical to
+the S5-era lane logs (vmdrv PCI scan grows the intended U4
+companion entry -- documented). Frozen-kernel reproducibility:
+SOURCE_DATE_EPOCH=1791484814 banner + 92160-byte trimmed initrd
+reconstruction. Measured: 8 MiB /usb/disk.img over the UHCI 64-byte
+chunk path costs ~21G instr (3880/16384 sectors per 8G) -- media
+correctness stays pinned by ok uhci td walk. Docs: USB_PLAN U5
+closed (U0-U5 done), CHANGELOG U1-U5, ROADMAP ledger, STATUS.
+---
+ CHANGELOG.md           | 63 +++++++++++++++++++++++++++++++++++++
+ ROADMAP.md             |  3 +-
+ docs/STATUS.md         |  7 +++++
+ docs/plans/USB_PLAN.md | 71 ++++++++++++++++++++++++++++++++++++++++--
+ src/devices.c          | 24 ++++++++------
+ src/machine.h          |  6 ++++
+ src/main.c             |  4 +++
+ tests/test_usb.c       | 27 ++++++++++++++++
+ 8 files changed, 191 insertions(+), 14 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 278d2fd..949daa4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,69 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0041 (USB U5, end-to-end + hardening close-out)
++- `--no-usb-uhci` CLI (`machine_t.cfg_no_uhci`): omits the UHCI companion
++  (PCI 0:1.2 + I/O window) so the guest's `test_usb_ehci.sh` QEMU lane
++  (`-device usb-ehci`, no `-usb`) is reproducible as a machine shape;
++  unit vector `ok uhci omitted` pins the open-bus absence and the intact
++  EHCI register file. The guest's own probe still prints
++  `[uhci] no UHCI controller found` — the historical receipt.
++- Both sticks through the guest's MSC path with `/usb` info + a sector
++  read typed over the KBC (`run /apps/filesize /usb/sector0.bin`): the
++  UHCI companion lane (AURALUSB 8 MiB) and the EHCI high-speed lane
++  (AURALEHC 8 MiB), each run twice sequentially with byte-identical
++  serial logs. `tests/test_usb.c` 25 -> 26 vectors.
++
++### Fixed / measured — patch 0041
++- `test_ahci_matrix.sh` with `MATRIX_DETERMINISM=1` (S5 gate) stays
++  green with USB present; every lane pair byte-identical, and the
++  AHCI/filesystem receipt lines are byte-identical to the S5-era lane
++  logs (the guest's vmdrv PCI-scan line grows the intended U4
++  companion entry — recorded in `docs/plans/USB_PLAN.md`).
++- Frozen-kernel reproducibility: `SOURCE_DATE_EPOCH=1791484814`
++  reproduces the historical `build: Oct 8 2026 18:40:14` banner; the
++  92160-byte trimmed initrd (bin/init + apps/filesize) is reconstructed
++  from the `tools/mkinitrd.sh` recipe.
++- Measured budget: an 8 MiB `/usb/disk.img` read over the UHCI 64-byte
++  chunk path costs ~21G instructions (3880/16384 sectors per 8G) —
++  media byte-correctness stays pinned by `ok uhci td walk`.
++
++### Added — patch 0040 (USB U4, UHCI root host controller)
++- A first-class UHCI companion: PCI 0:1.2 `8086:0x7020` (piix3 identity),
++  I/O BAR4 `0xC040` register file in the guest's measured bit map
++  (USBSTS.HCHALTED = bit 5), frame list + QH/TD walker on USBCMD.RUN
++  (doorbell + cadence sampler), TD completion with the
++  `ctrl[10:0] = bytes-1` actual-length contract (0x7FF = 0) and
++  IOC->USBINT, control + bulk through a per-controller BOT state over
++  the shared device model (`usb_serve()` refactor; the U3 qTD path is
++  byte-identical). `tests/test_usb.c` 22 -> 25 vectors.
++
++### Fixed / measured — patch 0040
++- Real model bug: the disk-data path did not advance the media offset by
++  the consumed bytes — 64-byte UHCI chunks re-read LBA 0 forever (the
++  512-byte E32 chunks hid it). `disk_off = lba*512 + st->moved`;
++  regression vector `ok uhci td walk` (byte-for-byte sector + CSW
++  residue 0). Negative control: reverting the RUN-gating reddens
++  `tests/test_usb.c:556` (`[uhci] halted: TD still Active`), abort 134.
++- Guest parity run x2 byte-identical: `[uhci] controller at PCI 0:1.2`
++  + `I/O base = 0xc040`, stick enumerated UHCI full-speed, MSC binds
++  the UHCI instance, `test_usbfs.sh` receipts over 64-byte bulk.
++
++### Added — patch 0039 (USB U3, EHCI register file honesty + control)
++- The EHCI model answers a real driver: CAPLENGTH/HCIVERSION/HCSPARAMS/
++  HCCPARAMS, USBCMD RUN/stop/HCRESET walk gate with doorbell on USBCMD
++  writes only, USBSTS USBINT/IHS/SEmpty/HCHALTED, USBINTR, PORTSC
++  power/reset/enable/owner with CSC latching, and per-qTD SETUP control
++  transfers (device/config/string descriptors, SET_ADDRESS,
++  SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN). `tests/test_usb.c`
++  14 -> 22 vectors.
++
++### Fixed / measured — patch 0039
++- Guest boot parity with QEMU `run_qemu_usb_msc.sh` receipts
++  (`1 high-speed device(s) ready`, `[msc] mass storage candidate`)
++  against `AuraLite-OS@0ed0d29`; negative control: an unconditional
++  walk reddens `tests/test_usb.c:352` (abort 134).
++
+ ### Added — patch 0038 (USB U2, SCSI enumeration set)
+ - The four SCSI commands the AuraLite-OS `msc.c` enumeration sends are
+   answered from the attached image over the honest BOT channel: INQUIRY
+diff --git a/ROADMAP.md b/ROADMAP.md
+index ac3932e..aedf392 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -28,7 +28,7 @@ maps to exactly one plan below.
+ | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | ✅ **CLOSED** (H0–H7 done ✅) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+-| [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | 🔵 **IN PROGRESS** (U0–U4 done ✅, U5 planned) | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
++| [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+@@ -85,3 +85,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0038` — USB U2: SCSI enumeration set -- INQUIRY (36-byte descriptor), READ CAPACITY(10) (`disk_len/512-1`), TEST UNIT READY (FAILED + sense 2/3A without image), REQUEST SENSE (18-byte, consumed), ILLEGAL REQUEST 5/20; 14 machine vectors~~ shipped
+ - ~~`0039` — USB U3: EHCI register-file honesty + control -- CAPLENGTH/HCIVERSION/HCSPARAMS/HCCPARAMS, USBCMD RUN/stop/HCRESET walk gate + doorbell on USBCMD only, USBSTS USBINT/IHS/SEmpty/HCHALTED map, USBINTR, per-qTD SETUP with Data/Status stages; 22 vectors + QEMU `run_qemu_usb_msc.sh` boot-parity receipts + negative control (unconditional walk reddens `test_usb.c:352`)~~ shipped
+ - ~~`0040` — USB U4: UHCI root host controller -- PCI 0:1.2 `8086:0x7020`, I/O BAR4 `0xC040` register file (USBSTS.HCHALTED = bit 5), frame list + QH/TD walk (ctrl[10:0] actual-length contract, IOC→USBINT), control+bulk through the shared device model (fix: disk path advances media offset by `st->moved`), QEMU `run_qemu_usb_msc.sh` parity (`[uhci] controller at PCI 0:1.2` + `I/O base = 0xc040` + usbfs receipts over UHCI bulk), 25 vectors + negative control (halted controller runs no frames)~~ shipped
++- ~~`0041` — USB U5: end-to-end + hardening close-out -- `--no-usb-uhci` (the `test_usb_ehci.sh` EHCI-only machine shape, `ok uhci omitted`), both sticks through the guest's MSC path (`/usb` info + `run /apps/filesize /usb/sector0.bin` typed over the KBC) with byte-identical x2 lane pairs (UHCI/AURALUSB + EHCI/AURALEHC), `MATRIX_DETERMINISM=1` matrix green with pairs byte-identical and AHCI/fs receipts byte-identical to the S5-era lanes, frozen-kernel reproducibility (`SOURCE_DATE_EPOCH` banner + 92160-byte trimmed initrd reconstruction), CHANGELOG U1–U5, 26 vectors~~ shipped — USB plan closed for both-stick MSC parity (U0–U5)
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 48b2e4c..3c7a610 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -21,6 +21,13 @@
+   the shared device model — the stick enumerates as a second, full-speed device and
+   the MSC binds the UHCI instance (`[uhci] 1 device(s) ready`,
+   `[usbfs] device available at /usb` over 64-byte bulk chunks).
++- USB end-to-end close-out (U5): `--no-usb-uhci` reproduces the guest's
++  `test_usb_ehci.sh` EHCI-only machine shape; both sticks (UHCI companion
++  AURALUSB + EHCI high-speed AURALEHC) run the `/usb` info + typed sector-read
++  tokens through the guest's MSC path with byte-identical x2 lane pairs; the AHCI
++  matrix stays green with USB present (`MATRIX_DETERMINISM=1`, all pairs
++  byte-identical) and its AHCI/fs receipt lines are byte-identical to the S5-era
++  lane logs. The USB plan (U0–U5) is closed.
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+index 49118fa..8bffff1 100644
+--- a/docs/plans/USB_PLAN.md
++++ b/docs/plans/USB_PLAN.md
+@@ -8,7 +8,7 @@
+ > + initrd.tar built from that tree) and the sample firmware
+ > (`firmware/sample_firmware.nas`).
+ 
+-**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3 ✅, U4 ✅, U5 planned 📋**
++**Status: complete — U0 ✅, U1 ✅, U2 ✅, U3 ✅, U4 ✅, U5 ✅ (plan closed; VIDEO / NET / COMPAT follow in their own plans)**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -17,7 +17,7 @@
+ | U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | ✅ done | `patches/0038-USB-U2-scsi-opcodes.patch` |
+ | U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | ✅ done | `patches/0039-USB-U3-ehci-usbcmd.patch` |
+ | U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | ✅ done | `patches/0040-USB-U4-uhci.patch` |
+-| U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | 📋 | `patches/0041-USB-U5-usb-e2e.patch` |
++| U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | ✅ done | `patches/0041-USB-U5-usb-e2e.patch` |
+ 
+ Note: the *guest* has its own `USB_PLAN.md` (phases U0–U9, AuraLite-OS
+ repo) that closes the **driver** gaps. This plan closes the **emulator's
+@@ -309,7 +309,7 @@ byte-identical (firmware lane stdout+stderr; kernel boot log through
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+-### U4 — UHCI controller model (AuraLite-OS parity)
++### U4 — UHCI controller model (AuraLite-OS parity) — ✅ done (patches/0040-USB-U4-uhci.patch)
+ 
+ A real UHCI companion: PCI function with class `0x0C/0x03/0x00` (the
+ guest's probe prints vendor:device), I/O BAR4 register file (USBCMD/
+@@ -449,6 +449,71 @@ historical receipt moves (firmware lane + AHCI lanes byte-stable).
+ 
+ **Gate:** all above + `make test` + `make test-sanitize` green.
+ 
++**U5 — end-to-end + hardening close-out (measured, complete)**
++
++- **`--no-usb-uhci`** (`machine_t.cfg_no_uhci`): omits the UHCI companion
++  entirely (PCI 0:1.2 + its I/O window) — the machine shape of the
++  guest's `test_usb_ehci.sh` QEMU lane (`-device usb-ehci`, no `-usb`).
++  Unit vector `ok uhci omitted` pins the absence (open-bus I/O per the
++  `io.c` float-high rule, no halt handshake after a USBCMD write, EHCI
++  register file intact). The guest still probes: `[uhci] no UHCI
++  controller found` / `self-test: no controller` — the same receipts the
++  historical lanes carry.
++- **Both sticks through the guest's MSC path with `/usb` info + sector
++  reads typed over the KBC** (`run /apps/filesize /usb/sector0.bin` —
++  the `test_ahci_large_read.sh` analog over BOT), each lane run twice
++  sequentially with byte-identical serial logs:
++  - **UHCI companion lane** (AURALUSB 8 MiB): `[usb] addr 1: UHCI port 0,
++    full (12 Mbps)` (same stick also at `addr 2: EHCI port 0, high`),
++    MSC binds the UHCI instance (`mass storage candidate: addr=1 …`),
++    sector 0 `41 55 52 41 4c 55 53 42` (`AURALUSB`).
++  - **EHCI high-speed lane** (AURALEHC 8 MiB, `test_usb_ehci.sh`
++    parity): `[ehci] controller at PCI 0:3.0` + `HCI version 2.00, 1
++    ports` + `port 0: high-speed device` + `1 high-speed device(s)
++    ready`, `[usb] addr 1: EHCI port 0, high (480 Mbps)`, MSC binds the
++    EHCI instance, sector 0 `41 55 52 41 4c 45 48 43` (`AURALEHC`), zero
++    `Page Fault|kernel panic|[ehci].*FAIL|[msc].*FAIL`.
++  - Both lanes type the same tokens over the KBC and reproduce the
++    `test_usbfs.sh` receipts over their transport: `ls /usb` → `info /
++    sector0.bin / disk.img`, `cat /usb/info` → `AuraLite usbfs`,
++    `status: ready`, `sectors: 16384`, `FILESIZE /usb/sector0.bin 512`,
++    `[usbfs] device available at /usb`, `[vfs] mounted '/usb'`.
++- **`test_ahci_matrix.sh` kept green (USB is additive)** with
++  `MATRIX_DETERMINISM=1` (S5 gate, 3.2G-instr lanes): lanes A/B/C/E all
++  green and all four sequential pairs byte-identical
++  (57400/57400/56363/29623 B) — `S4/S5 matrix + full determinism
++  receipts: ALL PASS`.
++- **No historical receipt moves (firmware lane + AHCI lanes):** the
++  AHCI/filesystem receipt lines (`[ahci]`, `[fat32]`, `[diskfs]`,
++  `[ext2]`, the typed token round-trips) of the fresh lane A are
++  **byte-identical to the S5-era lane log**, line for line with matching
++  multiplicities. Two measured caveats of any full-log cross-era compare
++  (recorded, not assumed): (1) the guest's vmdrv PCI scan now prints the
++  companion — `PCI 0:1.2 8086:7020 Intel PIIX3 UHCI driver=uhci
++  status=active` + `summary: 7 PCI devices, 1 active/bootfb` vs the
++  historical `6 PCI devices, 0 active/bootfb` — the intended U4
++  PCI-topology receipt; (2) the S5-era logs carry the pre-U3 EHCI stub
++  receipts (`HCI version 0.00, 0 ports, …` + `controller did not halt`),
++  which U3's honest register file replaced by design, so full-log
++  equality across the USB phase boundary is not the freeze line — the
++  firmware-lane greps (`make test`) and the AHCI receipts are.
++- **Frozen-kernel reproducibility (measured):** the guest banner embeds
++  `__DATE__/__TIME__` (`build: Oct 8 2026 18:40:14` in the historical
++  lanes); the U5 matrix lanes rebuilt that exact kernel with
++  `SOURCE_DATE_EPOCH=1791484814` (banner + 3051512-byte size
++  reproduced) and reconstructed the historical 92160-byte trimmed
++  initrd (`bin/init` + `apps/filesize`, 2 files / 4 dirs,
++  `tools/mkinitrd.sh` USTAR recipe) the S3–S5 lanes used.
++- **Measured budget fact:** a full 8 MiB `/usb/disk.img` read through
++  the UHCI 64-byte chunk discipline costs ~21G instructions (measured:
++  3880/16384 sectors per 8G-instr budget) — outside a sane lane; media
++  byte-correctness stays pinned by `ok uhci td walk` (512 bytes
++  byte-for-byte across 8×64-byte chunks + CSW residue 0) and the typed
++  `sector0.bin` read.
++
++**Gate:** all above + `make test` + `make test-sanitize` green (26 usb
++vectors).
++
+ ## 3. Standing constraints
+ 
+ - The sample firmware's guest-visible contract is fixed: its boot recipe
+diff --git a/src/devices.c b/src/devices.c
+index 56bed4a..4e584f5 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -854,16 +854,20 @@ void devices_init_common(machine_t *m) {
+     /* UHCI USB1.1 companion: 0:1.2 with the piix3-usb-uhci identity
+      * (QEMU parity: run_qemu_usb_msc.sh / test_usb_msc.sh attach their
+      * usb-storage here).  BAR4 is an I/O window -- the guest reads the
+-     * BAR, masks ~0xF and uses it as the register file base. */
+-    pci_dev_t *uhci_pci = pci_add_device(m, 0,1,2, "uhci", 0x8086, 0x7020, 0x0C, 0x03, 0x00);
+-    uint32_t uhci_bar = UHCI_IOBASE | 0x1u;
+-    uhci_pci->cfg[0x20] = (uint8_t)(uhci_bar);
+-    uhci_pci->cfg[0x21] = (uint8_t)(uhci_bar>>8);
+-    uhci_pci->cfg[0x22] = (uint8_t)(uhci_bar>>16);
+-    uhci_pci->cfg[0x23] = (uint8_t)(uhci_bar>>24);
+-    uhci_reset();
+-    g_uhci.m = m;
+-    io_register(m, UHCI_IOBASE, 32, uhci_io_read32, uhci_io_write32, NULL, "UHCI BAR4");
++     * BAR, masks ~0xF and uses it as the register file base.  USB U5:
++     * --no-usb-uhci omits the whole function (the EHCI-only QEMU shape
++     * of test_usb_ehci.sh). */
++    if (!m->cfg_no_uhci) {
++        pci_dev_t *uhci_pci = pci_add_device(m, 0,1,2, "uhci", 0x8086, 0x7020, 0x0C, 0x03, 0x00);
++        uint32_t uhci_bar = UHCI_IOBASE | 0x1u;
++        uhci_pci->cfg[0x20] = (uint8_t)(uhci_bar);
++        uhci_pci->cfg[0x21] = (uint8_t)(uhci_bar>>8);
++        uhci_pci->cfg[0x22] = (uint8_t)(uhci_bar>>16);
++        uhci_pci->cfg[0x23] = (uint8_t)(uhci_bar>>24);
++        uhci_reset();
++        g_uhci.m = m;
++        io_register(m, UHCI_IOBASE, 32, uhci_io_read32, uhci_io_write32, NULL, "UHCI BAR4");
++    }
+ 
+     /* EHCI USB2 controller: dev3/func0 (matches the mechanism#1 probe
+      * 0x80001810 the firmware issues: bus0 dev3 func0 reg0x10 = BAR0) */
+diff --git a/src/machine.h b/src/machine.h
+index be21eb9..b088182 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -134,6 +134,12 @@ struct machine {
+      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
+     int cfg_cpus;
+ 
++    /* USB U5 (--no-usb-uhci): omit the UHCI companion entirely so the
++     * EHCI-only machine shape of the guest's test_usb_ehci.sh QEMU lane
++     * (-device usb-ehci, no -usb) is reproducible.  0 = UHCI present
++     * (all historical behavior). */
++    int cfg_no_uhci;
++
+     /* KERNEL-BOOT K6 (--smp): real executing contexts.  0/1 = one vCPU
+      * (all historical behavior).  The virtual master clock: +1 per
+      * retired instruction from ANY vcpu, +0 for an hlt idle slot while
+diff --git a/src/main.c b/src/main.c
+index fdf2ff9..ea65f76 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -97,6 +97,7 @@ int main(int argc, char **argv) {
+     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
+     const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
+     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
++    int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
+     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
+                                      * land in the host image files too */
+     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
+         }
+         else if (!strncmp(argv[i], "--sata2=", 8)) sata_cfg[1][0] = argv[i]+8;
+         else if (!strcmp(argv[i], "--ahci2")) cfg_ahci2 = 1;
++        else if (!strcmp(argv[i], "--no-usb-uhci")) cfg_no_uhci = 1;
+         else if (!strcmp(argv[i], "--sata-writethrough")) sata_wt = 1;   /* S5 */
+         else if (!strncmp(argv[i], "--sata-port", 11)) {
+             const char *eq = strchr(argv[i] + 11, '=');
+@@ -163,6 +165,7 @@ int main(int argc, char **argv) {
+                    "                      skips --rom entirely and starts at the ELF entry\n"
+                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
++                   "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
+                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
+                    "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n", argv[0]);
+             return 0;
+@@ -179,6 +182,7 @@ int main(int argc, char **argv) {
+     machine_t *m = calloc(1, sizeof *m);
+     m->cpu.mach = m;
+     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
++    m->cfg_no_uhci = cfg_no_uhci; /* USB U5: EHCI-only machine shape */
+     m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
+     m->dbg_pit1 = smp_probe;  /* --smp-probe also arms the PIT ch2 trace */
+     m->watch_phys = watch_phys;
+diff --git a/tests/test_usb.c b/tests/test_usb.c
+index d650a3d..7dd2c62 100644
+--- a/tests/test_usb.c
++++ b/tests/test_usb.c
+@@ -563,6 +563,32 @@ static void test_uhci_halted_no_frames(void) {
+     printf("ok uhci halted runs no frames\n");
+ }
+ 
++static void test_uhci_omitted(void) {
++    /* USB U5: --no-usb-uhci machine shape -- the EHCI-only QEMU lane of
++     * test_usb_ehci.sh (-device usb-ehci, no -usb).  The companion
++     * function and its I/O window are absent: the port floats high like
++     * unconnected hardware (io.c open-bus), no register file consumes
++     * USBCMD writes, and EHCI keeps its full model. */
++    fx_t f;
++    setup_machine(&f.m);
++    f.m.cfg_no_uhci = 1;
++    devices_init_common(&f.m);
++    for (int i = 0; i < (int)sizeof f.stick; i++)
++        f.stick[i] = (uint8_t)(i * 3 + 7);
++    f.m.disk = f.stick;
++    f.m.disk_len = sizeof f.stick;
++    assert(io_read(&f.m, UHCI_IO + 0x00, 2) == 0xFFFF);   /* open bus */
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) == 0xFFFF);
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x00C1);            /* RUN: nobody listens */
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) == 0xFFFF);   /* no halt handshake */
++    assert(io_read(&f.m, UHCI_IO + 0x10, 2) == 0xFFFF);   /* no port model */
++    assert(mem_read(&f.m, EHCI_BASE + 0x02, 2) == 0x0200); /* EHCI alive */
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x21);            /* Run|ASE */
++    assert(!(mem_read(&f.m, EHCI_BASE + 0x04, 4) & (1u << 12)));
++    fx_done(&f);
++    printf("ok uhci omitted\n");
++}
++
+ int main(void) {
+     test_be16();
+     test_csw_tag_echo();
+@@ -589,6 +615,7 @@ int main(void) {
+     test_uhci_regs();
+     test_uhci_td_walk();
+     test_uhci_halted_no_frames();
++    test_uhci_omitted();
+     printf("test_usb: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+

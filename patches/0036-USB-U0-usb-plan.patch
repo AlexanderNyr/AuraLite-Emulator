@@ -1,0 +1,312 @@
+From 5c2382b307115df0218066e5ea0110a9a7378ea0 Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Fri, 9 Oct 2026 10:04:17 +0000
+Subject: [PATCH] U0 update
+
+USB U0: measured baseline + docs/plans/USB_PLAN.md.
+
+Baseline measured 2026-10-09 on AuraLite-Emulator@fbbc8bd with
+AuraLite-OS@0ed0d29 (kernel.elf + initrd.tar built from that tree) and
+the sample firmware. What the machine presents today: a behavioural
+EHCI block (PCI 0:3.0, scratch BAR0 window, zeroed capability
+registers, doorbell on every register write, one CBW special case --
+READ(10)/READ(12) plus a fabricated CSW with tag=0/residue=0/status=OK,
+SETUP ignored). What the guest expects (measured): msc.c validates
+dCSWTag/residue/status and enumerates with INQUIRY, READ CAPACITY(10),
+TEST UNIT READY, REQUEST SENSE; ehci.c runs the halt handshake and the
+PORTSC/companion path; uhci.c needs an I/O BAR4 + frame list. The U0
+kernel-lane receipts capture the honest state: HCI version 0.00,
+0 ports, controller did not halt, 0 device(s) enumerated, no UHCI
+controller. Eleven measured defects drive U1-U5 (BOT/CSW, SCSI opcodes,
+USBCMD-only doorbell + caps/PORTSC/control, UHCI parity with the QEMU
+run_qemu_usb_msc.sh/test_usbfs.sh contract, end-to-end receipts).
+
+ROADMAP: USB row -> IN PROGRESS (U0 done); stale CORE/CHIPSET ledger
+rows corrected to match their plan files (C0-C11, H0-H7 done).
+---
+ ROADMAP.md             |   7 +-
+ docs/plans/USB_PLAN.md | 248 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 252 insertions(+), 3 deletions(-)
+ create mode 100644 docs/plans/USB_PLAN.md
+
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 3a9b713..5f04fa0 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -24,11 +24,11 @@ maps to exactly one plan below.
+ 
+ | Plan | Status | Scope | Phases |
+ |---|---|---|---|
+-| [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
+-| [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
++| [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | ✅ **CLOSED** (C0–C11 done ✅) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
++| [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | ✅ **CLOSED** (H0–H7 done ✅) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+-| `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
++| [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | 🔵 **IN PROGRESS** (U0 done ✅, U1–U5 planned) | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+@@ -80,3 +80,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical~~ shipped
+ - ~~`0034` — STORE S4: breadth matrix -- `--sata-portN=` placement, `--ahci2` second controller (0:31:3, ABAR2 0xFEB12000), QEMU `test_ahci_matrix.sh` lanes A/B/C reproduced guest-side + unattached negative control~~ shipped
+ - ~~`0035` — STORE S5: large transfers + hardening -- 128-KiB PRDT vectors + QEMU `test_ahci_large_read.sh` guest parity (16 MiB payload through the 128-KiB bounce), `--sata-writethrough` dirty-image semantics, honest INTx (PxIS→PIC/IOAPIC), full-matrix determinism ×2~~ shipped — STORE plan complete S0–S5
++- ~~`0036` — USB U0: measured baseline + `docs/plans/USB_PLAN.md` (defect ledger: CSW tag/residue/status, ignored SCSI opcodes, doorbell on every write, zeroed caps, no control/UHCI)~~ shipped
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+new file mode 100644
+index 0000000..ccd4981
+--- /dev/null
++++ b/docs/plans/USB_PLAN.md
+@@ -0,0 +1,248 @@
++# USB Plan — honest USB host models for the emulator
++
++> House style (AuraLite-OS/docs/plans): dependency-ordered phases, each with
++> a definition of done and a test gate, shipping as **one `.patch` per
++> phase** under `patches/`. Everything below is measured against the trees,
++> not assumed. Baseline measured 2026-10-09 on
++> `AuraLite-Emulator@fbbc8bd` with `AuraLite-OS@0ed0d29` (guest kernel.elf
++> + initrd.tar built from that tree) and the sample firmware
++> (`firmware/sample_firmware.nas`).
++
++**Status: in progress — U0 ✅, U1–U5 planned 📋**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| U0 | Measured baseline + this plan | ✅ done | `patches/0036-USB-U0-usb-plan.patch` |
++| U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | 📋 | `patches/0037-USB-U1-bot-csw.patch` |
++| U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | 📋 | `patches/0038-USB-U2-scsi-opcodes.patch` |
++| U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | 📋 | `patches/0039-USB-U3-ehci-usbcmd.patch` |
++| U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | 📋 | `patches/0040-USB-U4-uhci.patch` |
++| U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | 📋 | `patches/0041-USB-U5-usb-e2e.patch` |
++
++Note: the *guest* has its own `USB_PLAN.md` (phases U0–U9, AuraLite-OS
++repo) that closes the **driver** gaps. This plan closes the **emulator's
++host-controller model** gaps so those drivers have honest hardware to talk
++to. The guest's `docs/usb.md` claims table is the acceptance contract.
++
++## 1. Measured baseline
++
++### 1.1 What the machine presents today (`src/devices.c`)
++
++A behavioural EHCI block, written for the sample firmware's fixed boot
++recipe, not for a real driver:
++
++- PCI 0:3.0, `8086:1E26`, class `0x0C/0x03/0x20`, BAR0 `0xFEB00000`
++  (4 KiB `rw2` window) — the window is **scratch RAM**: capability
++  registers are not modelled and read back zero.
++- One doorbell hook (`ehci_write2`) fires `ehci_doorbell()` on **every**
++  register write, not on USBCMD writes.
++- `ehci_process_qtd()` walks at most 32 qTDs from `ASYNCLISTADDR`
++  (0x18). One special case is implemented: pid=OUT, total=31, signature
++  `'USBC'` — a Bulk-Only CBW; `READ(10)`/`READ(12)` set a pending
++  LBA/blocks, every other opcode is logged
++  `SCSI opcode 0x%02x (ignored by behavioural model)`. pid=IN serves
++  image bytes (clipped to `disk_len` / RAM end) or, with no pending
++  command, fabricates a CSW: `'USBS'`, **dCSWTag=0**, **residue=0**,
++  **status=0** always. pid=SETUP (control) is ignored.
++- Static single-LUN state (`s_lba/s_blocks/s_have`) persists across
++  doorbells. No USBSTS/PORTSC/USBCMD semantics, no reset, no device
++  presence, no interrupt line to the PIC/IOAPIC, no UHCI/OHCI/xHCI.
++- The sample firmware contract (measured `firmware/sample_firmware.nas`):
++  CBW with **dCBWTag=1**, READ(10) LBA=0 blocks=1, 512 bytes to
++  `0x00100000`, CSW to `0x00020200`, then `USBCMD |= 0x21` (Run +
++  Doorbell) and poll qTD Active clear. The boot-integration gate greps
++  exactly `READ(10) LBA=0 blocks=1`, `bulk-IN 512 bytes -> guest
++  0x00100000`, `synthesized CSW (status=OK)`.
++
++### 1.2 What the guest expects (measured `AuraLite-OS@0ed0d29`)
++
++- `drivers/usb/msc.c` (BOT): `dCBWTag = ++msc_tag` from `0x12345678`;
++  the CSW is **validated** — signature, **`dCSWTag` (mismatch receipt:
++  `CSW tag mismatch got 0x%x want 0x%x`)**, `dCSWDataResidue`,
++  `bCSWStatus` (OK=0 / FAILED=1 / PHASE=2).
++- SCSI commands the enumeration path actually sends (all five are in the
++  request helpers): `TEST_UNIT_READY` (0x00), `REQUEST_SENSE` (0x03),
++  `INQUIRY` (0x12), `READ_CAPACITY` (0x25), `READ_10` (0x28);
++  `WRITE(10)` is exposed on the media path.
++- `drivers/usb/ehci.c`: reads CAPLENGTH/HCIVERSION/HCSPARAMS/HCCPARAMS
++  (receipt `HCI version %x.%02x, %d ports, PPC=%d, 64-bit=%d,
++  companions=%d`), halt handshake via USBSTS.HCHALTED (`controller did
++  not halt`), HCRESET with timeout, PERIODICLISTBASE/ASYNCLISTADDR/
++  CTRLDSSEGMENT, USBCMD RS/HCRESET/PSE/ASE/ITC, PORTSC reset/speed/
++  companion release (`%d high-speed device(s) ready`), async qTD with
++  token timeout, control transfers (SETUP stage), periodic QH.
++- `drivers/usb/uhci.c`: class probe (receipt `controller at PCI
++  %u:%u.%u (0x%04x:0x%04x)`), **BAR4 must be I/O space**, frame list +
++  TD chains (timeout/error receipts), USBSTS.HCHALTED start check.
++- QEMU parity gates (what "AuraLite-OS parity" means): 
++  `tools/run_qemu_usb_msc.sh` — `-usb` + `usb-storage` (a **UHCI**
++  companion) with a 16 MiB stick (`'AURALUSB'` + MBR `55 AA`); 
++  `tests/integration/cases/test_usbfs.sh` — `usb-storage` on
++  `piix3-usb-uhci` with `qemu-xhci` present, asserting
++  `[vfs] mounted '/usb'`, `[usbfs] device available at /usb`,
++  `sector0.bin`, `disk.img`, `AuraLite usbfs`, `status: ready`,
++  `sectors: 16384`, and an MSC hex read of the stick's magic.
++
++### 1.3 Measured receipts on this machine (U0 baseline run)
++
++Firmware lane (600k instr, `x86emu` default):
++
++```
++[usb-msc] READ(10) LBA=0 blocks=1
++[usb-msc] bulk-IN 512 bytes -> guest 0x00100000 (from LBA 0)
++[usb-msc] synthesized CSW (status=OK) -> guest 0x00020200
++[guest] conventional entry reached at 0x00100000
++```
++
++Kernel lane (`--kernel=` + 12 MiB initrd, `AuraLite-OS@0ed0d29`):
++
++```
++[usbfs] ready: mount at /usb for hotplug USB mass storage
++[uhci] no UHCI controller found
++[uhci] self-test: no controller
++[ohci] no OHCI controller found
++[ohci] self-test: no controller
++[ehci] controller at PCI 0:3.0
++[ehci] HCI version 0.00, 0 ports, PPC=0, 64-bit=0, companions=0
++[ehci] controller did not halt
++[ehci] self-test: halted=0 async=0 periodic=0 — full support mode
++[ehci] frame index: 0 -> 0 (delta=0)
++[ehci] async qTD + periodic QH real; 0 interrupt endpoint(s) on the periodic schedule
++[ehci] NOT IMPLEMENTED: iTD/siTD isochronous (USB_PLAN.md U9)
++[ehci] PASS: 0 USB device(s) ready
++[xhci] no xHCI controller found
++[xhci] self-test: no controller
++[usb] enumerating devices across all controllers...
++[usb] 0 device(s) enumerated
++[usb] SKIP: no USB devices attached
++[msc] no enumerated USB mass storage device found
++[msc] hint: attach usb-storage on UHCI/OHCI/EHCI/xHCI to test I/O
++[msc] self-test: no ready mass storage device
++```
++
++### 1.4 Defect ledger (measured, drives U1–U5)
++
++| # | Defect | Evidence | Phase |
++|---|---|---|---|
++| 1 | CSW `dCSWTag` always 0 — the guest validates it | `msc.c` tag check + our `wr32(buf+4, 0)` | U1 |
++| 2 | CSW `dCSWDataResidue` always 0 (clip/short/absent transfers disagree) | `wr32(buf+8, 0)` vs `msc.c` residue field | U1 |
++| 3 | `bCSWStatus` always OK — no FAILED/PHASE path | `wr32(buf+8, 0); /* status = good */` | U1 |
++| 4 | INQUIRY / READ CAPACITY / TEST UNIT READY / REQUEST SENSE produce no data ("ignored") | `opcode == 0x28 \|\| 0xA8` only | U2 |
++| 5 | Doorbell fires on every register write | `ehci_write2` wraps all of `rw2_write` | U3 |
++| 6 | Capability registers read zero (`HCI version 0.00, 0 ports`) | baseline receipt | U3 |
++| 7 | USBSTS.HCHALTED unmodelled (`controller did not halt`) | baseline receipt | U3 |
++| 8 | No PORTSC / device presence — nothing to enumerate (`0 device(s)`) | baseline receipt | U3 |
++| 9 | pid=SETUP ignored — control transfers impossible | `ehci_process_qtd` has no SETUP case | U3 |
++| 10 | No UHCI model (the QEMU parity bus) | `[uhci] no UHCI controller found` | U4 |
++| 11 | No guest-visible USB receipts end-to-end (usbfs/MSC lanes) | `[msc] SKIP` baseline | U5 |
++
++## 2. Phases
++
++### U0 — Baseline + this plan — ✅ done
++
++**DoD:** the §1 receipts captured verbatim from frozen trees; defect
++ledger measured against `src/devices.c` and the guest sources; phase
++table with named deliverables.
++
++### U1 — BOT/CSW correctness
++
++Tag echo (CSW.dCSWTag = CBW.dCBWTag, measured against the guest's
++check), residue = dCBWDataTransferLength − bytes actually moved (0 for
++no-data commands), honest status byte: OK / FAILED (command failed or
++unsupported) / PHASE (bad signature, wrong direction, overrun) — plus
++the reset-critical: a malformed CBW must not desynchronise the next one.
++
++**DoD (machine, `tests/test_usb.c` grows vectors with qTD/CBW/CSW
++fixtures and negative controls):** tag echo unit vector; residue on a
++clipped short read; residue on a no-data command; FAILED on an
++unsupported opcode; PHASE on a bad CBW signature; the firmware lane
++receipts byte-identical (it ignores tags — its greps must not move).
++
++**Gate:** `make test` + `make test-sanitize` green; the boot-integration
++gate strings unchanged.
++
++### U2 — SCSI: INQUIRY / READ CAPACITY / TEST UNIT READY / REQUEST SENSE
++
++Answer the four commands the guest's enumeration sends, from the attached
++image: INQUIRY (direct-access, removable, vendor/product from the CLI),
++READ CAPACITY(10) (last LBA + 512 from `disk_len`), TEST UNIT READY
++(ready while an image is attached, FAILED otherwise), REQUEST SENSE
++(sense data consistent with the last failure). READ(10)/READ(12) keep
++the U1 channel.
++
++**DoD:** unit vectors per opcode (bytes compared against the spec-shaped
++response, incl. capacity math at 1- and N-block images); negative control
++— with no image attached TUR fails and the CSW carries FAILED, not OK;
++firmware receipts unchanged.
++
++**Gate:** `make test` + `make test-sanitize` green.
++
++### U3 — EHCI register file + USBCMD-only doorbell + control transfers
++
++Capability registers (CAPLENGTH, HCIVERSION 2.00, HCSPARAMS with N_PORTS
++and companion routing, HCCPARAMS), USBSTS (HCHALTED/HSE/…), USBCMD
++(RS/HCRESET/PSE/ASE/ITC) with the halt handshake the guest times out on
++today, FRINDEX, CTRLDSSEGMENT, PERIODICLISTBASE, ASYNCLISTADDR, PORTSC
++(connect status for the attached image, port power, reset sequence,
++speed, enable, companion release) — the doorbell runs **on USBCMD
++writes only**. SETUP qTDs perform real control transfers against a
++minimal device model (device/config/string descriptors, SET_ADDRESS,
++SET_CONFIGURATION, GET_MAX_LUN) so the guest can enumerate a stick.
++
++**DoD (measured):** guest receipt moves from `HCI version 0.00, 0 ports`
++to the modelled caps and from `controller did not halt` to a passed halt
++handshake; `1 high-speed device(s) ready` with an image attached;
++enumeration reaches the MSC candidate receipt with the QEMU-parity
++stick image (`'AURALUSB'`); unit vectors for caps/USBSTS/USBCMD/PORTSC
++and the doorbell-on-USBCMD-only negative control (writes to other
++registers run no schedule); determinism pair byte-identical.
++
++**Gate:** `make test` + `make test-sanitize` green.
++
++### U4 — UHCI controller model (AuraLite-OS parity)
++
++A real UHCI companion: PCI function with class `0x0C/0x03/0x00` (the
++guest's probe prints vendor:device), I/O BAR4 register file (USBCMD/
++USBSTS/USBINTR/SOFMOD/PORTSC1-2, frame number), frame list + TD/QH
++walker with the guest's timeout/error semantics, control + bulk
++transfers, interrupt transfer support (TD completion → USBSTS), and
++the same device model / BOT channel as U3 so `usb-storage` on UHCI
++reaches the guest's MSC exactly as in `run_qemu_usb_msc.sh`.
++
++**DoD (measured):** `[uhci] controller at PCI …` + `I/O base = …` receipts;
++the QEMU-parity stick enumerated over UHCI; `test_usbfs.sh`-parity
++receipts (`[usbfs] device available at /usb`, `sector0.bin`, `disk.img`,
++`AuraLite usbfs`, `status: ready`, `sectors: 16384`) reproduced guest-side
++in a new harness lane; unit vectors for the register file + TD walk +
++negative control (halted controller runs no frames).
++
++**Gate:** `make test` + `make test-sanitize` green.
++
++### U5 — Guest end-to-end + hardening close-out
++
++Both sticks (EHCI high-speed and UHCI companion) through the guest's
++MSC path: `/usb` info + sector reads typed over the KBC, the
++`test_ahci_matrix.sh` lanes kept green (USB is additive), determinism
++×2 across the new lanes, sanitize lanes, `MATRIX_DETERMINISM`-style
++byte compares, docs refresh (`ROADMAP.md` ledger row, `docs/STATUS.md`
++evidence, CHANGELOG entries for U1–U5).
++
++**DoD:** the U4 parity receipts + an EHCI lane with the same token
++round-trip through `/usb`; two identical runs of each lane; no
++historical receipt moves (firmware lane + AHCI lanes byte-stable).
++
++**Gate:** all above + `make test` + `make test-sanitize` green.
++
++## 3. Standing constraints
++
++- The sample firmware's guest-visible contract is fixed: its boot recipe
++  (CBW tag=1, READ(10) LBA 0, CSW at `0x00020200`, `USBCMD |= 0x21`)
++  and its receipt strings never move — U1–U5 treat
++  `tests/test_ahci_matrix.sh` / boot-integration greps as frozen.
++- Guest-visible changes are additive: receipts that say "no UHCI
++  controller found" today may gain a controller (U4) — the *string*
++  stays valid when the option is off; the default run grows the new
++  receipts, documented in the same patch.
++- K0–K8 KERNEL-BOOT receipts are not touched.
++- One `.patch` per phase under `patches/`, fix + regression vector in
++  the same patch with a once-per-phase negative control.
+-- 
+2.47.3
+

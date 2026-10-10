@@ -97,6 +97,7 @@ int main(int argc, char **argv) {
     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
     const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
+    int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
                                      * land in the host image files too */
     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
         }
         else if (!strncmp(argv[i], "--sata2=", 8)) sata_cfg[1][0] = argv[i]+8;
         else if (!strcmp(argv[i], "--ahci2")) cfg_ahci2 = 1;
+        else if (!strcmp(argv[i], "--no-usb-uhci")) cfg_no_uhci = 1;
         else if (!strcmp(argv[i], "--sata-writethrough")) sata_wt = 1;   /* S5 */
         else if (!strncmp(argv[i], "--sata-port", 11)) {
             const char *eq = strchr(argv[i] + 11, '=');
@@ -163,6 +165,7 @@ int main(int argc, char **argv) {
                    "                      skips --rom entirely and starts at the ELF entry\n"
                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+                   "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
                    "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n", argv[0]);
             return 0;
@@ -179,6 +182,7 @@ int main(int argc, char **argv) {
     machine_t *m = calloc(1, sizeof *m);
     m->cpu.mach = m;
     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
+    m->cfg_no_uhci = cfg_no_uhci; /* USB U5: EHCI-only machine shape */
     m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
     m->dbg_pit1 = smp_probe;  /* --smp-probe also arms the PIT ch2 trace */
     m->watch_phys = watch_phys;

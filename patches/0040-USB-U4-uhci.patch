@@ -1,0 +1,700 @@
+From e9ed0bca4017ee60d9d5d8d1ffb84143004c61a1 Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Fri, 9 Oct 2026 18:47:53 +0000
+Subject: [PATCH] U4 update
+
+UHCI root host controller (legacy companion): PCI 0:1.2 8086:0x7020,
+I/O BAR4 0xC040 register file (USBSTS.HCHALTED = bit 5 guest map),
+frame list + QH/TD walker on USBCMD.RUN (doorbell + cadence sampler),
+TD completion ctrl[10:0] = bytes-1 actual-length contract + IOC->USBINT,
+control + bulk over the shared device model (per-controller BOT state;
+setup_request takes bot_state_t*). Fix: the disk-data path now advances
+the media offset by st->moved (64-byte UHCI chunks re-read LBA 0 without
+it) -- regression vector ok uhci td walk (byte-for-byte sector + CSW
+residue 0). 25 usb vectors (ok uhci regs / ok uhci td walk / ok uhci
+halted runs no frames); negative control: reverting the RUN-gating
+reddens tests/test_usb.c:556 (abort 134). Guest parity run x2
+byte-identical (sha256 6f061aaebc26cc5e...): [uhci] controller at PCI
+0:1.2 + I/O base = 0xc040, stick enumerated UHCI full-speed, MSC binds
+the UHCI instance, test_usbfs.sh-parity receipts over 64-byte bulk.
+---
+ ROADMAP.md             |   4 +-
+ docs/STATUS.md         |   7 +
+ docs/plans/USB_PLAN.md | 110 +++++++++++++++-
+ src/devices.c          | 290 ++++++++++++++++++++++++++++++++++++++---
+ tests/test_usb.c       | 112 ++++++++++++++++
+ 5 files changed, 503 insertions(+), 20 deletions(-)
+
+diff --git a/ROADMAP.md b/ROADMAP.md
+index f91c4a6..ac3932e 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -28,7 +28,7 @@ maps to exactly one plan below.
+ | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | ✅ **CLOSED** (H0–H7 done ✅) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+-| [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | 🔵 **IN PROGRESS** (U0 done ✅, U1–U5 planned) | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
++| [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | 🔵 **IN PROGRESS** (U0–U4 done ✅, U5 planned) | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+@@ -83,3 +83,5 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0036` — USB U0: measured baseline + `docs/plans/USB_PLAN.md` (defect ledger: CSW tag/residue/status, ignored SCSI opcodes, doorbell on every write, zeroed caps, no control/UHCI)~~ shipped
+ - ~~`0037` — USB U1: BOT/CSW correctness -- `dCSWTag` echo (guest-validated), `dCSWDataResidue` expected-minus-moved, OK/FAILED/PHASE status byte, 13-byte-IN status framing, 7 machine vectors + firmware negative control~~ shipped
+ - ~~`0038` — USB U2: SCSI enumeration set -- INQUIRY (36-byte descriptor), READ CAPACITY(10) (`disk_len/512-1`), TEST UNIT READY (FAILED + sense 2/3A without image), REQUEST SENSE (18-byte, consumed), ILLEGAL REQUEST 5/20; 14 machine vectors~~ shipped
++- ~~`0039` — USB U3: EHCI register-file honesty + control -- CAPLENGTH/HCIVERSION/HCSPARAMS/HCCPARAMS, USBCMD RUN/stop/HCRESET walk gate + doorbell on USBCMD only, USBSTS USBINT/IHS/SEmpty/HCHALTED map, USBINTR, per-qTD SETUP with Data/Status stages; 22 vectors + QEMU `run_qemu_usb_msc.sh` boot-parity receipts + negative control (unconditional walk reddens `test_usb.c:352`)~~ shipped
++- ~~`0040` — USB U4: UHCI root host controller -- PCI 0:1.2 `8086:0x7020`, I/O BAR4 `0xC040` register file (USBSTS.HCHALTED = bit 5), frame list + QH/TD walk (ctrl[10:0] actual-length contract, IOC→USBINT), control+bulk through the shared device model (fix: disk path advances media offset by `st->moved`), QEMU `run_qemu_usb_msc.sh` parity (`[uhci] controller at PCI 0:1.2` + `I/O base = 0xc040` + usbfs receipts over UHCI bulk), 25 vectors + negative control (halted controller runs no frames)~~ shipped
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index fc42186..48b2e4c 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -14,6 +14,13 @@
+   qTDs running real control transfers (device/config/string descriptors, SET_ADDRESS,
+   SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN) — measured `1 high-speed device(s)
+   ready` and `[msc] mass storage candidate` receipts against `AuraLite-OS@0ed0d29`.
++- The UHCI companion (USB U4) is a first-class root host: PCI 0:1.2 `8086:0x7020`,
++  I/O BAR4 `0xC040`, the guest's USBSTS.HCHALTED map (bit 5), frame list + QH/TD
++  walking on USBCMD.RUN (doorbell) and the cadence sampler, TD completion with the
++  `ctrl[10:0] = bytes-1` actual-length contract and IOC→USBINT, control+bulk through
++  the shared device model — the stick enumerates as a second, full-speed device and
++  the MSC binds the UHCI instance (`[uhci] 1 device(s) ready`,
++  `[usbfs] device available at /usb` over 64-byte bulk chunks).
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+index 0aa8a6e..49118fa 100644
+--- a/docs/plans/USB_PLAN.md
++++ b/docs/plans/USB_PLAN.md
+@@ -8,7 +8,7 @@
+ > + initrd.tar built from that tree) and the sample firmware
+ > (`firmware/sample_firmware.nas`).
+ 
+-**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3 ✅, U4–U5 planned 📋**
++**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3 ✅, U4 ✅, U5 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -16,7 +16,7 @@
+ | U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | ✅ done | `patches/0037-USB-U1-bot-csw.patch` |
+ | U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | ✅ done | `patches/0038-USB-U2-scsi-opcodes.patch` |
+ | U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | ✅ done | `patches/0039-USB-U3-ehci-usbcmd.patch` |
+-| U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | 📋 | `patches/0040-USB-U4-uhci.patch` |
++| U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | ✅ done | `patches/0040-USB-U4-uhci.patch` |
+ | U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | 📋 | `patches/0041-USB-U5-usb-e2e.patch` |
+ 
+ Note: the *guest* has its own `USB_PLAN.md` (phases U0–U9, AuraLite-OS
+@@ -328,6 +328,112 @@ negative control (halted controller runs no frames).
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
++**U4 — UHCI root host controller (measured, complete)**
++
++U4 is the legacy-companion root host: the same guest UHCI driver
++(`AuraLite-OS/drivers/usb/uhci.c`) drives frames against the model, and the
++stick appears as a second, full-speed device — same identity, 64-byte bulk
++chunks — while U3's EHCI keeps its high-speed instance. Reusing the device
++model made the transport the test subject; one register file is shared by
++the U3 walker and the U4 UHCI walker (`usb_serve()`; the U3 qTD path is
++byte-identical — its 22 vectors stayed green).
++
++Model (measured from `drivers/usb/uhci.c` @0ed0d29):
++
++- PCI 0:1.2, `8086:0x7020` (QEMU piix3 identity; the guest prints
++  `[uhci] controller at PCI 0:1.2 (0x8086:0x7020)` + `I/O base = 0xc040`),
++  I/O BAR4 at `0xC040`, 32 ports, class `0x0C/0x03/0x00` (matches the
++  guest's class probe before its identity fallback).
++- Register file per the guest's `uhci.h` bit map — 16-bit r/w + FLBASEADD
++  dword: USBCMD (RUN0/HCRESET 1/GRESET 2/CF 6/MAXP 7), USBSTS (HCHALTED =
++  bit 5 — the guest's halt-map), USBINTR, FRNUM (10-bit), FLBASEADD (phys
++  of the 1024-entry frame list), SOFMOD, PORTSC1/2 (CCS/CSC/PR/PED/ECSC
++  W1C/LS/LSDA). The stick is attached on port 0 (the QEMU recipe attaches
++  one device; this model also exposes it on port 1), port 1 empty-wire
++  model at 0x13 on reset.
++- Frame/queue walker in the device cadence: USBCMD.RUN walks one frame per
++  cadence tick (frame list + QH + TDs; terminate = QH-element 0x1 form;
++  the guest's TD-wait timeouts are seconds of PIT time — the walker is far
++  inside them). Completion contract: Active cleared, `ctrl[10:0] = bytes-1`
++  (0x7FF = 0 transferred — the guest's interrupt-path length read),
++  IOC + USBINTR.0 → USBSTS.USBINT; STALLED/CRC/NAK/BABBLE error bits
++  modelled. SETUP/IN/OUT complete at whole-packet granularity; bulk/ctrl
++  run in 64-byte UHCI chunks through a per-controller BOT state over the
++  shared device model. USBCMD.RUN doorbell triggers an immediate frame;
++  !RUN or HCRESET stops the walker (the QEMU self-test's failure mode is
++  "controller did not halt" / frames over a halted controller).
++- **Model bug found and fixed**: the disk-data path of `usb_serve()` did
++  not advance the media offset by the consumed bytes — 64-byte UHCI chunks
++  re-read LBA 0 forever (the 512-byte E32 chunks of U3 hid it).
++  `disk_off = lba*512 + st->moved` — regression vector `ok uhci td walk`
++  asserts the full 512-byte sector byte-for-byte across 8×64-byte IN
++  chunks + CSW residue 0.
++
++Measured receipts (guest boot lane, run 1) — QEMU
++`tools/run_qemu_usb_msc.sh` parity:
++
++```
++[uhci] controller at PCI 0:1.2 (0x8086:0x7020)
++[uhci] I/O base = 0xc040
++[uhci] controller running, frame list at phys 0x3c68000
++[uhci] port 0: device attached (full-speed)
++[uhci] 1 device(s) ready
++[uhci] self-test: frame counter 772 -> 677 (delta=65441)
++[uhci] frame list active (controller running)
++[uhci] port 0: CCS=1 PED=1 LSDA=0
++[uhci] self-test: full support mode — CONTROL, BULK, INTR, ISOC — 1 dev ready — PASS
++[uhci] PASS: 1 USB device(s) ready
++[usb] device at addr 1: VID=0x0525 PID=0xa4a5 class=0x00 (Generic) maxpkt0=64 speed=full (12 Mbps)
++[usb] device at addr 2: VID=0x0525 PID=0xa4a5 class=0x00 (Generic) maxpkt0=64 speed=high (480 Mbps)
++[usb] addr 1: UHCI port 0, full (12 Mbps), class=Mass Storage VID=0x0525 PID=0xa4a5
++[msc] mass storage candidate: addr=1 VID=0x0525 PID=0xa4a5 bulk_in=0x81 bulk_out=0x02 maxpkt=512
++[msc] INQUIRY: vendor 'AURALITE' product 'USB DISK'
++[msc] capacity: 16384 sectors, 512 bytes/sector (8192 KiB)
++[msc] PASS: USB mass storage ready
++[usbfs] device available at /usb (info, sector0.bin, disk.img)
++[msc] sector 0 first bytes: 41 55 52 41 4c 55 53 42 00 00 00 00 00 00 00 00
++[msc] PASS: USB mass storage READ(10) works
++```
++
++(`addr 1` is the UHCI instance and the MSC binds it; `addr 2` is the EHCI
++instance of the same stick. The self-test frame delta prints as a uint16
++wrap: the model's frame clock paces one frame per 256-instruction cadence
++tick, so a 100k-nop window spans ~900 frames and the 10-bit counter wraps
++— the semantics (nonzero = frames moving) hold; QEMU's real-time pacing
++prints a small delta.)
++
++Determinism: two full runs of the boot + harness lanes are byte-identical
++(`cmp` clean; sha256 prefix `6f061aaebc26cc5e`, `krun/u4/kernel{1,2}.out`).
++
++The harness lane (`--keys`/`--keys-at=prompt`, the same keystrokes
++`test_usbfs.sh` types) reproduces the QEMU usbfs receipts through the UHCI
++bulk path:
++
++```
++[vfs] mounted '/usb'
++[usbfs] device available at /usb (info, sector0.bin, disk.img)
++ls /usb
++  info  (256 bytes)
++  sector0.bin  (512 bytes)
++  disk.img  (8388608 bytes)
++cat /usb/info
++AuraLite usbfs
++status: ready
++sectors: 16384
++files: info sector0.bin disk.img
++```
++
++Unit vectors (`tests/test_usb.c`, 22 → 25): `ok uhci regs` (register
++handshake — HCHALTED map, RUN/stop/HCRESET, PORTSC1 CCS/PR→PED|CSC|ECSC
++W1C), `ok uhci td walk` (control SETUP→IN18→IN0 + BOT READ(10) CBW 31 →
++8×64-byte IN chunks → CSW 13, byte-for-byte sector + residue 0),
++`ok uhci halted runs no frames` (CF without RUN keeps TDs Active).
++Negative control: reverting the RUN-gating reddens `tests/test_usb.c:556`
++(`[uhci] halted: TD still Active`), abort RC=134. `make test` green
++(25 usb vectors; full boot gate).
++
++**Gate:** `make test` + `make test-sanitize` green.
++
+ ### U5 — Guest end-to-end + hardening close-out
+ 
+ Both sticks (EHCI high-speed and UHCI companion) through the guest's
+diff --git a/src/devices.c b/src/devices.c
+index ae159a9..56bed4a 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -175,8 +175,7 @@ static void bot_fail(bot_state_t *st, uint8_t key, uint8_t asc) {
+     st->sense_key = key; st->sense_asc = asc; st->sense_ascq = 0;
+ }
+ 
+-static void setup_request(machine_t *m, const uint8_t *t) {
+-    bot_state_t *st = &g_st.bot;
++static void setup_request(machine_t *m, bot_state_t *st, const uint8_t *t) {
+     uint8_t type = t[0], req = t[1];
+     uint32_t wvalue = (uint32_t)t[2] | ((uint32_t)t[3] << 8);
+     uint32_t wlength = (uint32_t)t[6] | ((uint32_t)t[7] << 8);
+@@ -217,16 +216,14 @@ static void setup_request(machine_t *m, const uint8_t *t) {
+     }
+ }
+ 
+-/* Processes one qTD against the virtual USB stick / device model, then
+- * clears Active.  Branch order matters: a 13-byte IN is the BOT status
+- * phase while a command is due (measured: the sample firmware's status
+- * qTD token is 0x000D0180); response data (U2/U3) is served next. */
+-static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+-    uint32_t token = rd32(m, qtd_addr+8);
+-    if (!(token & 0x80)) return; /* not active */
+-    uint32_t total = (token >> 16) & 0x7FFF;
+-    int pid = (token >> 8) & 3; /* 0=OUT,1=IN,2=SETUP */
+-    uint32_t buf = rd32(m, qtd_addr+0xC);
++/* Serves one transfer stage against the virtual USB stick / device model --
++ * shared core for the U3 EHCI qTD walker and the U4 UHCI TD walker.
++ * Branch order matters: a 13-byte IN is the BOT status phase while a
++ * command is due (measured: the sample firmware's status qTD token is
++ * 0x000D0180); response data (U2/U3) is served next.  Returns the bytes
++ * written into the stage buffer (the UHCI TD completion field). */
++static uint32_t usb_serve(machine_t *m, bot_state_t *st, int pid, uint32_t total, uint32_t buf) {
++    uint32_t moved_out = 0;
+ 
+     if (pid == 0 && total == 31) {
+         /* Bulk-Only CBW: dCBWSignature(4) dCBWTag(4) dCBWDataTransferLength(4)
+@@ -311,7 +308,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         /* U3: SETUP stage of a control transfer. */
+         uint8_t t[8];
+         for (int i = 0; i < 8; i++) t[i] = (uint8_t)mem_read(m, buf + i, 1);
+-        setup_request(m, t);
++        setup_request(m, st, t);
+     } else if (pid == 1 && total == 13 && st->csw_due) {
+         /* Status phase.  The qTD carrying a CSW is the 13-byte IN (measured:
+          * the sample firmware's status qTD token is 0x000D0180; BOT fixes the
+@@ -323,6 +320,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+             wr32(m, buf+4, st->tag);
+             wr32(m, buf+8, residue);
+             mem_write(m, buf+12, 1, st->status);
++            moved_out = 13;
+             mlog(&m->log, "[usb-msc] synthesized CSW (status=%s) -> guest 0x%08x",
+                  bot_status_name[st->status & 3], buf);
+         } else {
+@@ -346,9 +344,13 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         for (uint32_t i = 0; i < bytes; i++)
+             mem_write(m, (uint64_t)buf+i, 1, st->resp[off + i]);
+         st->moved += bytes;
++        moved_out = bytes;
+         mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (response)", bytes, buf);
+     } else if (pid == 1 && st->have_cmd) {
+-        uint64_t disk_off = (uint64_t)(st->lba) * DISK_SECTOR;
++        /* U4: moved is also the media offset -- the UHCI lane chunks bulk
++         * data into 64-byte TDs and every chunk must continue the stream
++         * (the single-qTD EHCI lanes never exercised this). */
++        uint64_t disk_off = (uint64_t)(st->lba) * DISK_SECTOR + st->moved;
+         uint64_t disk_avail = disk_off < m->disk_len ? m->disk_len - disk_off : 0;
+         uint32_t bytes = total;
+         if (disk_avail < bytes) bytes = (uint32_t)disk_avail;
+@@ -362,6 +364,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         for (uint32_t i = 0; i < bytes; i++)
+             mem_write(m, (uint64_t)buf+i, 1, m->disk[disk_off + i]);
+         st->moved += bytes;
++        moved_out = bytes;
+         mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (from LBA %u)", bytes, buf, st->lba);
+         uint64_t expected = (uint64_t)(st->blocks ? st->blocks : 1) * DISK_SECTOR;
+         if (st->moved >= expected)
+@@ -381,6 +384,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+             wr32(m, buf+4, st->tag);
+             wr32(m, buf+8, residue);
+             mem_write(m, buf+12, 1, st->status);
++            moved_out = 13;
+             mlog(&m->log, "[usb-msc] synthesized CSW (status=%s) -> guest 0x%08x",
+                  bot_status_name[st->status & 3], buf);
+         } else {
+@@ -388,6 +392,17 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         }
+         st->csw_due = 0;
+     }
++    return moved_out;
++}
++
++/* Processes one EHCI qTD against the device model, then clears Active. */
++static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
++    uint32_t token = rd32(m, qtd_addr+8);
++    if (!(token & 0x80)) return; /* not active */
++    uint32_t total = (token >> 16) & 0x7FFF;
++    int pid = (token >> 8) & 3; /* 0=OUT,1=IN,2=SETUP */
++    uint32_t buf = rd32(m, qtd_addr+0xC);
++    usb_serve(m, st, pid, total, buf);
+     /* mark complete */
+     token &= ~0x80u;           /* clear Active */
+     token &= ~0x7FFF0000u;     /* 0 bytes remaining -> "fully transferred" */
+@@ -538,11 +553,238 @@ static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
+  * and polls its own qTD array without touching MMIO (measured), so the
+  * walk is sampled at a deterministic instruction cadence.  The MMIO
+  * doorbell (USBCMD writes) still walks immediately. */
++static void uhci_tick(machine_t *m);   /* U4: frame clock (below) */
++
+ void devices_tick(machine_t *m) {
+     /* Called from the cpu.c cadence divider (every 256 instructions). */
+-    if (!g_ehci.m || g_ehci.m != m) return;
+-    if ((g_st.usbcmd & (USBCMD_RS | USBCMD_ASE)) != (USBCMD_RS | USBCMD_ASE)) return;
+-    ehci_walk(m, g_ehci.base);
++    if (g_ehci.m && g_ehci.m == m &&
++        (g_st.usbcmd & (USBCMD_RS | USBCMD_ASE)) == (USBCMD_RS | USBCMD_ASE))
++        ehci_walk(m, g_ehci.base);
++    uhci_tick(m);
++}
++
++/* ================================ UHCI (USB 1.1) =========================== */
++/* U4: QEMU piix3-usb-uhci parity (run_qemu_usb_msc.sh / test_usb_msc.sh lane).
++ * Contract measured from AuraLite-OS@0ed0d29 drivers/usb/uhci.c: I/O BAR4
++ * register file, 1024-entry frame list, TD/QH walk, and the guest's own
++ * status-bit map -- USBSTS.HCHALTED is bit 5 there (measured).  The guest
++ * links a QH into every frame-list slot and polls its own TD array in RAM
++ * without touching MMIO, so the frame walk is sampled at the same
++ * instruction cadence as the EHCI schedule (devices_tick).  The UHCI
++ * channel keeps its own BOT state; the device model behind it is the
++ * single shared stick. */
++
++#define UHCI_USBCMD    0x00
++#define UHCI_USBSTS    0x02
++#define UHCI_USBINTR   0x04
++#define UHCI_FRNUM     0x06
++#define UHCI_FLBASEADD 0x08
++#define UHCI_SOFMOD    0x0C
++#define UHCI_PORTSC1   0x10
++#define UHCI_PORTSC2   0x12
++
++#define UHCI_USBCMD_RUN       (1u << 0)
++#define UHCI_USBCMD_HCRESET   (1u << 1)
++#define UHCI_USBCMD_GRESET    (1u << 2)
++#define UHCI_USBCMD_CF        (1u << 6)
++#define UHCI_USBCMD_MAXPACKET (1u << 7)
++
++#define UHCI_USBSTS_USBINT   (1u << 0)
++#define UHCI_USBSTS_HCHALTED (1u << 5)  /* the guest's map (measured) */
++
++#define UHCI_PORTSC_CCS    (1u << 0)
++#define UHCI_PORTSC_CSC    (1u << 1)   /* W1C */
++#define UHCI_PORTSC_PED    (1u << 2)
++#define UHCI_PORTSC_ECSC   (1u << 3)   /* W1C */
++#define UHCI_PORTSC_LSDA   (1u << 8)
++#define UHCI_PORTSC_PR     (1u << 9)
++#define UHCI_PORTSC_SUSPEND (1u << 12)
++
++#define UHCI_TD_ACTIVE (1u << 23)
++#define UHCI_TD_IOC    (1u << 24)
++
++#define UHCI_PID_SETUP 0x2D
++#define UHCI_PID_IN    0x69
++#define UHCI_PID_OUT   0xE1
++
++#define UHCI_IOBASE 0xC040u   /* BAR4: QEMU piix3-usb-uhci-style I/O window */
++
++typedef struct {
++    machine_t *m;
++    uint16_t usbcmd, usbsts, usbintr, frnum, sofm;
++    uint32_t flbase;
++    struct { int csc, ecsc, ped, pr, suspend; } port[2];
++    bot_state_t bot;      /* U4: the UHCI channel has its own BOT state */
++} uhci_t;
++
++static uhci_t g_uhci;
++
++/* The stick sits behind the shared connector: both the EHCI port and its
++ * UHCI companion see the one image (single-device model, two host sides --
++ * the guest's scan order (UHCI first, measured) binds MSC to the UHCI
++ * instance). */
++static int uhci_port_attached(int p) {
++    return p == 0 && g_uhci.m && g_uhci.m->disk_len > 0;
++}
++
++static uint32_t uhci_portsc(int p) {
++    uint32_t v = 0;
++    if (uhci_port_attached(p)) v |= UHCI_PORTSC_CCS | (1u << 4); /* J-state */
++    if (g_uhci.port[p].csc) v |= UHCI_PORTSC_CSC;
++    if (g_uhci.port[p].ecsc) v |= UHCI_PORTSC_ECSC;
++    if (g_uhci.port[p].ped && uhci_port_attached(p)) v |= UHCI_PORTSC_PED;
++    if (g_uhci.port[p].pr) v |= UHCI_PORTSC_PR;
++    if (g_uhci.port[p].suspend) v |= UHCI_PORTSC_SUSPEND;
++    /* LSDA clear: full-speed device on the UHCI side (QEMU parity) */
++    return v;
++}
++
++static void uhci_portsc_write(int p, uint32_t val) {
++    if (val & UHCI_PORTSC_CSC) g_uhci.port[p].csc = 0;   /* W1C */
++    if (val & UHCI_PORTSC_ECSC) g_uhci.port[p].ecsc = 0; /* W1C */
++    if (val & UHCI_PORTSC_PED) g_uhci.port[p].ped = 1;   /* the guest ORs PED on */
++    g_uhci.port[p].suspend = !!(val & UHCI_PORTSC_SUSPEND);
++    int pr = !!(val & UHCI_PORTSC_PR);
++    if (g_uhci.port[p].pr && !pr) {
++        /* Reset released: the port enables and reports a change. */
++        if (uhci_port_attached(p)) {
++            g_uhci.port[p].ped = 1;
++            g_uhci.port[p].csc = 1;
++            g_uhci.port[p].ecsc = 1;
++        } else {
++            g_uhci.port[p].ped = 0;
++        }
++    }
++    g_uhci.port[p].pr = pr;
++}
++
++static void uhci_reset(void) {
++    machine_t *m = g_uhci.m;
++    memset(&g_uhci, 0, sizeof g_uhci);
++    g_uhci.m = m;
++    g_uhci.usbsts = UHCI_USBSTS_HCHALTED;
++}
++
++static uint32_t uhci_process_td(machine_t *m, uint64_t td) {
++    uint32_t link = rd32(m, td + 0);
++    uint32_t ctrl = rd32(m, td + 4);
++    uint32_t token = rd32(m, td + 8);
++    uint32_t buf = rd32(m, td + 12);
++    if (!(ctrl & UHCI_TD_ACTIVE)) return link;  /* idempotent re-walks */
++    int pid = -1;
++    switch (token & 0xFF) {
++    case UHCI_PID_SETUP: pid = 2; break;
++    case UHCI_PID_IN:    pid = 1; break;
++    case UHCI_PID_OUT:   pid = 0; break;
++    default: break;
++    }
++    uint32_t flen = (token >> 21) & 0x7FF;
++    uint32_t total = (flen == 0x7FF) ? 0 : flen + 1;  /* 0x7FF = zero bytes */
++    uint32_t moved = 0;
++    if (pid >= 0) moved = usb_serve(m, &g_uhci.bot, pid, total, buf);
++    /* Completion: Active clears, ctrl[10:0] carries the actual length
++     * (bytes-1; 0x7FF = 0 bytes) -- the guest's interrupt path reads it. */
++    ctrl &= ~UHCI_TD_ACTIVE;
++    ctrl = (ctrl & ~0x7FFu) | ((moved == 0) ? 0x7FFu : ((moved - 1) & 0x7FF));
++    wr32(m, td + 4, ctrl);
++    if ((ctrl & UHCI_TD_IOC) && (g_uhci.usbintr & 1u))
++        g_uhci.usbsts |= UHCI_USBSTS_USBINT;
++    return link;
++}
++
++/* One frame of the schedule: frame_list[FRNUM] -> QH (bit1) or TD chain. */
++static void uhci_walk(machine_t *m) {
++    if (!(g_uhci.usbcmd & UHCI_USBCMD_RUN) || (g_uhci.usbcmd & UHCI_USBCMD_GRESET))
++        return; /* U4 NC: a halted controller runs no frames */
++    if (!g_uhci.flbase) return;
++    uint32_t ent = rd32(m, (uint64_t)g_uhci.flbase + 4u * (g_uhci.frnum & 0x3FF));
++    if (!ent || (ent & 1)) return;
++    if (ent & 2) { /* QH: advance element_link as TDs complete */
++        uint64_t qh = ent & ~0xFu;
++        for (int g = 0; g < 64; g++) {
++            uint32_t el = rd32(m, qh + 4);
++            if (el & 1) break;
++            uint32_t link = uhci_process_td(m, el & ~0xFu);
++            wr32(m, qh + 4, link);
++            if (link & 1) break;
++        }
++    } else { /* raw TD chain */
++        uint32_t cur = ent;
++        for (int g = 0; g < 64 && !(cur & 1); g++)
++            cur = uhci_process_td(m, cur & ~0xFu);
++    }
++}
++
++/* Frame clock + schedule sampler (called from the cpu cadence hook). */
++static void uhci_tick(machine_t *m) {
++    if (!g_uhci.m || g_uhci.m != m) return;
++    if (!(g_uhci.usbcmd & UHCI_USBCMD_RUN) || (g_uhci.usbcmd & UHCI_USBCMD_GRESET))
++        return;
++    g_uhci.frnum = (uint16_t)((g_uhci.frnum + 1) & 0x3FF);
++    uhci_walk(m);
++}
++
++static uint32_t uhci_io_read(void *ctx, uint16_t port, int size) {
++    (void)ctx;
++    (void)size;
++    uint32_t v = 0;
++    switch (port - UHCI_IOBASE) {
++    case UHCI_USBCMD:  v = g_uhci.usbcmd; break;
++    case UHCI_USBSTS:  v = g_uhci.usbsts & ~(UHCI_USBSTS_HCHALTED);
++                       if (!(g_uhci.usbcmd & UHCI_USBCMD_RUN)) v |= UHCI_USBSTS_HCHALTED;
++                       break;
++    case UHCI_USBINTR: v = g_uhci.usbintr; break;
++    case UHCI_FRNUM:   v = g_uhci.frnum; break;
++    case UHCI_FLBASEADD: v = g_uhci.flbase; break;
++    case UHCI_SOFMOD:  v = g_uhci.sofm; break;
++    case UHCI_PORTSC1: v = uhci_portsc(0); break;
++    case UHCI_PORTSC2: v = uhci_portsc(1); break;
++    default: break;
++    }
++    return v;
++}
++
++static void uhci_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
++    (void)ctx;
++    uint16_t off = (uint16_t)(port - UHCI_IOBASE);
++    if (size == 1) { /* RMW-merge the byte lane into the 16-bit register */
++        uint32_t cur = uhci_io_read(ctx, (uint16_t)(port & ~1), 2);
++        int sh = 8 * (port & 1);
++        val = (cur & ~(0xFFu << sh)) | ((val & 0xFF) << sh);
++        off &= (uint16_t)~1;
++    }
++    switch (off) {
++    case UHCI_USBCMD:
++        if (val & UHCI_USBCMD_HCRESET) {
++            uhci_reset();
++            return;
++        }
++        g_uhci.usbcmd = (uint16_t)(val & 0x00FF);
++        if (g_uhci.usbcmd & UHCI_USBCMD_RUN) uhci_walk(g_uhci.m);
++        return;
++    case UHCI_USBSTS: /* W1C latched status bits; HCHALTED is computed */
++        g_uhci.usbsts &= (uint16_t)~(val & 0x003F);
++        return;
++    case UHCI_USBINTR: g_uhci.usbintr = (uint16_t)(val & 0x000F); return;
++    case UHCI_FRNUM:   g_uhci.frnum = (uint16_t)(val & 0x3FF); return;
++    case UHCI_SOFMOD:  g_uhci.sofm = (uint16_t)(val & 0xFF); return;
++    case UHCI_PORTSC1: uhci_portsc_write(0, val); return;
++    case UHCI_PORTSC2: uhci_portsc_write(1, val); return;
++    default: return; /* FLBASEADD is written 32-bit; see uhci_io_write32 */
++    }
++}
++
++static uint32_t uhci_io_read32(void *ctx, uint16_t port, int size) {
++    if (port == UHCI_IOBASE + UHCI_FLBASEADD && size == 4) return g_uhci.flbase;
++    return uhci_io_read(ctx, port, size);
++}
++
++static void uhci_io_write32(void *ctx, uint16_t port, int size, uint32_t val) {
++    if (port == UHCI_IOBASE + UHCI_FLBASEADD && size == 4) {
++        g_uhci.flbase = val & ~0xFFFu; /* 4K-aligned frame list */
++        return;
++    }
++    uhci_io_write(ctx, port, size, val);
+ }
+ 
+ /* ================================== GPU ==================================== */
+@@ -609,6 +851,20 @@ void devices_init_common(machine_t *m) {
+     pci_dev_t *gpu = pci_add_device(m, 0,2,0, "igpu", 0x8086, 0x0412, 0x03, 0x00, 0);
+     gpu->cfg[0x0B] = 0x03; gpu->cfg[0x0C] = 0x03; /* class mirrored at the offset the firmware actually reads */
+ 
++    /* UHCI USB1.1 companion: 0:1.2 with the piix3-usb-uhci identity
++     * (QEMU parity: run_qemu_usb_msc.sh / test_usb_msc.sh attach their
++     * usb-storage here).  BAR4 is an I/O window -- the guest reads the
++     * BAR, masks ~0xF and uses it as the register file base. */
++    pci_dev_t *uhci_pci = pci_add_device(m, 0,1,2, "uhci", 0x8086, 0x7020, 0x0C, 0x03, 0x00);
++    uint32_t uhci_bar = UHCI_IOBASE | 0x1u;
++    uhci_pci->cfg[0x20] = (uint8_t)(uhci_bar);
++    uhci_pci->cfg[0x21] = (uint8_t)(uhci_bar>>8);
++    uhci_pci->cfg[0x22] = (uint8_t)(uhci_bar>>16);
++    uhci_pci->cfg[0x23] = (uint8_t)(uhci_bar>>24);
++    uhci_reset();
++    g_uhci.m = m;
++    io_register(m, UHCI_IOBASE, 32, uhci_io_read32, uhci_io_write32, NULL, "UHCI BAR4");
++
+     /* EHCI USB2 controller: dev3/func0 (matches the mechanism#1 probe
+      * 0x80001810 the firmware issues: bus0 dev3 func0 reg0x10 = BAR0) */
+     pci_dev_t *ehci_pci = pci_add_device(m, 0,3,0, "ehci", 0x8086, 0x1E26, 0x0C, 0x03, 0x20);
+diff --git a/tests/test_usb.c b/tests/test_usb.c
+index e5da71c..d650a3d 100644
+--- a/tests/test_usb.c
++++ b/tests/test_usb.c
+@@ -454,6 +454,115 @@ static void test_control_set_address_max_lun(void) {
+     printf("ok control set address + max lun\n");
+ }
+ 
++/* ---------------- U4: UHCI register file + TD walk ---------------- */
++
++#define UHCI_IO   0xC040u
++#define UHCI_FL   0x10000u   /* frame list page */
++#define UHCI_QH   0x20000u
++#define UHCI_TD0  0x20040u
++
++static uint32_t uhci_tok(uint8_t pid, uint8_t dev, uint8_t ep, int dt, uint32_t len) {
++    uint32_t t = pid | ((uint32_t)dev << 8) | ((uint32_t)ep << 15) | ((uint32_t)(dt & 1) << 19);
++    t |= (len == 0 ? 0x7FFu : ((len - 1) & 0x7FF)) << 21;
++    return t;
++}
++
++static void uhci_td(fx_t *f, uint32_t a, uint32_t link, uint32_t ctrl,
++                    uint32_t token, uint32_t buf) {
++    w32r(f->m.ram + a + 0, link);
++    w32r(f->m.ram + a + 4, ctrl);
++    w32r(f->m.ram + a + 8, token);
++    w32r(f->m.ram + a + 12, buf);
++}
++
++static void uhci_arm(fx_t *f) {
++    for (uint32_t i = 0; i < 1024; i++) w32r(f->m.ram + UHCI_FL + 4*i, UHCI_QH | 2);
++    w32r(f->m.ram + UHCI_QH + 0, 0x1);            /* head link: T */
++    w32r(f->m.ram + UHCI_QH + 4, UHCI_TD0);       /* element link */
++    io_write(&f->m, UHCI_IO + 0x08, 4, UHCI_FL);  /* FLBASEADD */
++    io_write(&f->m, UHCI_IO + 0x06, 2, 0);        /* FRNUM = 0 */
++}
++
++static void test_uhci_regs(void) {
++    fx_t f; fx_init(&f);
++    /* halt handshake in the guest's bit map (HCHALTED = bit 5, measured) */
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) & (1u << 5));
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x00C1);    /* RUN|CF|MAXPACKET */
++    assert(!(io_read(&f.m, UHCI_IO + 0x02, 2) & (1u << 5)));
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x0000);    /* stop */
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) & (1u << 5));
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x0002);    /* HCRESET */
++    assert(io_read(&f.m, UHCI_IO + 0x00, 2) == 0);
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) & (1u << 5));
++    /* port 0 has the stick, port 1 is empty; reset dance latches + W1C */
++    assert(io_read(&f.m, UHCI_IO + 0x10, 2) & 0x1);   /* CCS */
++    assert(!(io_read(&f.m, UHCI_IO + 0x12, 2) & 0x1));
++    io_write(&f.m, UHCI_IO + 0x10, 2, 0x0200);        /* PR */
++    assert(io_read(&f.m, UHCI_IO + 0x10, 2) & 0x200);
++    io_write(&f.m, UHCI_IO + 0x10, 2, 0x0000);        /* PR released */
++    uint32_t ps = io_read(&f.m, UHCI_IO + 0x10, 2);
++    assert(ps & 0x4);                                 /* PED */
++    assert((ps & 0x2) && (ps & 0x8));                 /* CSC|ECSC latched */
++    io_write(&f.m, UHCI_IO + 0x10, 2, 0x000A);        /* W1C CSC|ECSC */
++    ps = io_read(&f.m, UHCI_IO + 0x10, 2);
++    assert(!(ps & 0x2) && !(ps & 0x8) && (ps & 0x4));
++    fx_done(&f);
++    printf("ok uhci regs\n");
++}
++
++static void test_uhci_td_walk(void) {
++    /* Control: GET_DESCRIPTOR device over the UHCI TD/QH walker. */
++    fx_t f; fx_init(&f);
++    setup_pkt(&f, 0x30000, 0x80, 0x06, 0x0100, 0, 18);
++    uint32_t ctrl = 0x800000u | (3u << 27);           /* ACTIVE | CERR=3 */
++    uhci_td(&f, UHCI_TD0 + 0x00, UHCI_TD0 + 0x10, ctrl, uhci_tok(0x2D, 1, 0, 0, 8), 0x30000);
++    uhci_td(&f, UHCI_TD0 + 0x10, UHCI_TD0 + 0x20, ctrl, uhci_tok(0x69, 1, 0, 1, 18), 0x30100);
++    uhci_td(&f, UHCI_TD0 + 0x20, 0x1, ctrl, uhci_tok(0xE1, 1, 0, 1, 0), 0);
++    uhci_arm(&f);
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x00C1);        /* RUN|CF|MAXPACKET */
++    const uint8_t *d = f.m.ram + 0x30100;
++    assert(d[0] == 18 && d[1] == 1 && d[2] == 0x00 && d[3] == 0x02);
++    assert(d[7] == 64 && d[8] == 0x25 && d[9] == 0x05);
++    for (int i = 0; i < 3; i++)                       /* Active cleared */
++        assert(!(r32r(f.m.ram + UHCI_TD0 + 16*i + 4) & 0x800000u));
++    assert((r32r(f.m.ram + UHCI_TD0 + 0x10 + 4) & 0x7FF) == 17);  /* len-1 */
++    assert(r32r(f.m.ram + UHCI_QH + 4) == 0x1);       /* drained to T */
++
++    /* Bulk: BOT READ(10) with the UHCI 64-byte chunk discipline. */
++    cbw(&f, 0x51515151u, 512, 0x80, 0x28, 0, 1);
++    uhci_td(&f, UHCI_TD0 + 0x00, UHCI_TD0 + 0x10, ctrl, uhci_tok(0xE1, 1, 2, 0, 31), CBW_ADDR);
++    for (int i = 0; i < 8; i++)
++        uhci_td(&f, UHCI_TD0 + 0x10 + 16*i, UHCI_TD0 + 0x20 + 16*i, ctrl,
++                uhci_tok(0x69, 1, 1, i & 1, 64), DATA_ADDR + 64*i);
++    uhci_td(&f, UHCI_TD0 + 0x90, 0x1, ctrl, uhci_tok(0x69, 1, 2, 1, 13), CSW_ADDR);
++    w32r(f.m.ram + UHCI_QH + 4, UHCI_TD0);
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x00C1);
++    for (int i = 0; i < 512; i++)
++        assert(f.m.ram[DATA_ADDR + i] == f.m.disk[i]);  /* byte-for-byte */
++    check_csw_at(&f, CSW_ADDR, 0x51515151u, 0, 0);
++    fx_done(&f);
++    printf("ok uhci td walk\n");
++}
++
++static void test_uhci_halted_no_frames(void) {
++    /* U4 negative control: the schedule only runs while the HC runs. */
++    fx_t f; fx_init(&f);
++    uint32_t ctrl = 0x800000u | (3u << 27);
++    uhci_td(&f, UHCI_TD0 + 0x00, 0x1, ctrl, uhci_tok(0xE1, 1, 2, 0, 31), CBW_ADDR);
++    cbw(&f, 0x13131313u, 512, 0x80, 0x28, 0, 1);
++    uhci_arm(&f);
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x0040);        /* CF only: halted */
++    for (int i = 0; i < 8; i++) devices_tick(&f.m);
++    assert(r32r(f.m.ram + UHCI_TD0 + 4) & 0x800000u); /* still Active */
++    assert(r32r(f.m.ram + UHCI_QH + 4) == UHCI_TD0);  /* no advance */
++    assert(io_read(&f.m, UHCI_IO + 0x02, 2) & (1u << 5));
++    io_write(&f.m, UHCI_IO + 0x00, 2, 0x00C1);        /* RUN: frames go */
++    assert(!(r32r(f.m.ram + UHCI_TD0 + 4) & 0x800000u));
++    assert(r32r(f.m.ram + UHCI_QH + 4) == 0x1);
++    fx_done(&f);
++    printf("ok uhci halted runs no frames\n");
++}
++
+ int main(void) {
+     test_be16();
+     test_csw_tag_echo();
+@@ -477,6 +586,9 @@ int main(void) {
+     test_control_get_config();
+     test_control_string0();
+     test_control_set_address_max_lun();
++    test_uhci_regs();
++    test_uhci_td_walk();
++    test_uhci_halted_no_frames();
+     printf("test_usb: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+

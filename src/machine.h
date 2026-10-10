@@ -134,6 +134,12 @@ struct machine {
      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
     int cfg_cpus;
 
+    /* USB U5 (--no-usb-uhci): omit the UHCI companion entirely so the
+     * EHCI-only machine shape of the guest's test_usb_ehci.sh QEMU lane
+     * (-device usb-ehci, no -usb) is reproducible.  0 = UHCI present
+     * (all historical behavior). */
+    int cfg_no_uhci;
+
     /* KERNEL-BOOT K6 (--smp): real executing contexts.  0/1 = one vCPU
      * (all historical behavior).  The virtual master clock: +1 per
      * retired instruction from ANY vcpu, +0 for an hlt idle slot while

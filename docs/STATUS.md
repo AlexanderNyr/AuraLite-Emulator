@@ -5,7 +5,29 @@
 - The sample 128 KiB firmware image can be loaded at the x86 reset vector.
 - Reset execution supports real mode, protected mode, compatibility mode and long mode.
 - All five selectable Intel-style platform profiles are available.
-- The EHCI model reaches virtual USB Mass Storage transfers when the loaded firmware requests them.
+- The EHCI model reaches virtual USB Mass Storage transfers when the loaded firmware
+  requests them, and since USB U3 the register file is honest enough for the guest
+  driver to enumerate: capability registers (CAPLENGTH/HCIVERSION 2.00/HCSPARAMS/
+  HCCPARAMS with the measured firmware window quirks), USBSTS/USBCMD halt handshake
+  with HCRESET, PORTSC power/reset/enable/owner with CSC latching, the async schedule
+  walked on USBCMD writes plus a deterministic instruction-cadence sampler, and SETUP
+  qTDs running real control transfers (device/config/string descriptors, SET_ADDRESS,
+  SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN) — measured `1 high-speed device(s)
+  ready` and `[msc] mass storage candidate` receipts against `AuraLite-OS@0ed0d29`.
+- The UHCI companion (USB U4) is a first-class root host: PCI 0:1.2 `8086:0x7020`,
+  I/O BAR4 `0xC040`, the guest's USBSTS.HCHALTED map (bit 5), frame list + QH/TD
+  walking on USBCMD.RUN (doorbell) and the cadence sampler, TD completion with the
+  `ctrl[10:0] = bytes-1` actual-length contract and IOC→USBINT, control+bulk through
+  the shared device model — the stick enumerates as a second, full-speed device and
+  the MSC binds the UHCI instance (`[uhci] 1 device(s) ready`,
+  `[usbfs] device available at /usb` over 64-byte bulk chunks).
+- USB end-to-end close-out (U5): `--no-usb-uhci` reproduces the guest's
+  `test_usb_ehci.sh` EHCI-only machine shape; both sticks (UHCI companion
+  AURALUSB + EHCI high-speed AURALEHC) run the `/usb` info + typed sector-read
+  tokens through the guest's MSC path with byte-identical x2 lane pairs; the AHCI
+  matrix stays green with USB present (`MATRIX_DETERMINISM=1`, all pairs
+  byte-identical) and its AHCI/fs receipt lines are byte-identical to the S5-era
+  lane logs. The USB plan (U0–U5) is closed.
 - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
 - A framebuffer is available as `framebuffer.ppm`.
 - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.

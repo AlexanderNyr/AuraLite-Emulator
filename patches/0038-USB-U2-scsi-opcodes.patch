@@ -1,0 +1,441 @@
+From 537bff1e543203eaacac0e5ceea1be3c53674e1c Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Fri, 9 Oct 2026 11:34:55 +0000
+Subject: [PATCH] U2 update
+
+USB U2: SCSI enumeration set over the honest BOT channel.
+
+The four commands AuraLite-OS@0ed0d29 drivers/usb/msc.c actually sends
+(measured: TUR x5 with REQUEST SENSE retries, INQUIRY allocation 36
+with vendor at +8 / product at +16, READ CAPACITY(10) parsed be32 +
+be32 and rejected unless 512) are answered from the attached image:
+
+- INQUIRY: 36-byte direct-access (0x00), removable (RMB 0x80), SPC-3,
+  RDF-2, vendor 'AURALITE', product 'USB DISK', revision '1.0 '.
+- READ CAPACITY(10): last LBA = disk_len/512 - 1, block length 512 --
+  pinned at both 1-block and N-block images.
+- TEST UNIT READY: OK with an image; FAILED + sense 2/3A (NOT READY /
+  MEDIUM NOT PRESENT) without one, and the guest's retry loop reads it
+  back via REQUEST SENSE.
+- REQUEST SENSE: 18-byte fixed format (0x70, key/ASC/ASCQ, additional
+  length 0x0A), consumed on read; the U1 FAILED path saves
+  ILLEGAL REQUEST 5/20 for unsupported opcodes.
+
+tests/test_usb.c grows 7 -> 14 machine vectors: ok tur ready,
+ok tur no image failed (U2 negative control: FAILED, not OK),
+ok request sense not ready (2/3A returned then consumed), ok inquiry
+response (36 bytes compared), ok read capacity n-block (8 sectors ->
+last LBA 7), ok read capacity 1-block (last LBA 0), ok illegal opcode
+sense (5/20).
+
+Once-per-phase negative control (measured): breaking the capacity math
+(disk_len/512 without the -1) reddens exactly ok read capacity n-block
+(assert r[3] == 7).
+
+READ(10)/READ(12) keep the U1 channel; firmware receipts byte-stable
+(make test boot gate green).
+
+Gate: make test + make test-sanitize green; docs synced (USB_PLAN U2
+receipts, CHANGELOG 0038, ROADMAP queue).
+---
+ CHANGELOG.md           |  17 +++++
+ ROADMAP.md             |   1 +
+ docs/plans/USB_PLAN.md |  55 +++++++++++-----
+ src/devices.c          |  78 ++++++++++++++++++++++-
+ tests/test_usb.c       | 139 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 272 insertions(+), 18 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c184ebd..278d2fd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,23 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0038 (USB U2, SCSI enumeration set)
++- The four SCSI commands the AuraLite-OS `msc.c` enumeration sends are
++  answered from the attached image over the honest BOT channel: INQUIRY
++  (36-byte direct-access/removable descriptor: vendor `AURALITE`,
++  product `USB DISK`, revision `1.0 `), READ CAPACITY(10) (last LBA =
++  `disk_len/512 − 1`, block length 512), TEST UNIT READY (OK with an
++  image, FAILED + sense `2/3A` MEDIUM NOT PRESENT without), and
++  REQUEST SENSE (18-byte fixed format `0x70`, consumed on read;
++  ILLEGAL REQUEST `5/20` for unsupported opcodes).
++- `tests/test_usb.c` grows 7 -> 14 machine vectors (TUR ready/failed,
++  sense reported then consumed, INQUIRY bytes, capacity at 1- and
++  N-block images, illegal-opcode sense).
++
++### Fixed / measured — patch 0038
++- Negative control measured: breaking the capacity math reddens exactly
++  `ok read capacity n-block` (assert `r[3] == 7`).
++
+ ### Added — patch 0037 (USB U1, BOT/CSW correctness)
+ - Honest Bulk-Only status channel: the CSW carries `dCSWTag` echoed from
+   the CBW (the AuraLite-OS `msc.c` validates it), `dCSWDataResidue`
+diff --git a/ROADMAP.md b/ROADMAP.md
+index f02f396..f91c4a6 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -82,3 +82,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0035` — STORE S5: large transfers + hardening -- 128-KiB PRDT vectors + QEMU `test_ahci_large_read.sh` guest parity (16 MiB payload through the 128-KiB bounce), `--sata-writethrough` dirty-image semantics, honest INTx (PxIS→PIC/IOAPIC), full-matrix determinism ×2~~ shipped — STORE plan complete S0–S5
+ - ~~`0036` — USB U0: measured baseline + `docs/plans/USB_PLAN.md` (defect ledger: CSW tag/residue/status, ignored SCSI opcodes, doorbell on every write, zeroed caps, no control/UHCI)~~ shipped
+ - ~~`0037` — USB U1: BOT/CSW correctness -- `dCSWTag` echo (guest-validated), `dCSWDataResidue` expected-minus-moved, OK/FAILED/PHASE status byte, 13-byte-IN status framing, 7 machine vectors + firmware negative control~~ shipped
++- ~~`0038` — USB U2: SCSI enumeration set -- INQUIRY (36-byte descriptor), READ CAPACITY(10) (`disk_len/512-1`), TEST UNIT READY (FAILED + sense 2/3A without image), REQUEST SENSE (18-byte, consumed), ILLEGAL REQUEST 5/20; 14 machine vectors~~ shipped
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+index 93a81a3..07c8bdf 100644
+--- a/docs/plans/USB_PLAN.md
++++ b/docs/plans/USB_PLAN.md
+@@ -8,13 +8,13 @@
+ > + initrd.tar built from that tree) and the sample firmware
+ > (`firmware/sample_firmware.nas`).
+ 
+-**Status: in progress — U0 ✅, U1 ✅, U2–U5 planned 📋**
++**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3–U5 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | U0 | Measured baseline + this plan | ✅ done | `patches/0036-USB-U0-usb-plan.patch` |
+ | U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | ✅ done | `patches/0037-USB-U1-bot-csw.patch` |
+-| U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | 📋 | `patches/0038-USB-U2-scsi-opcodes.patch` |
++| U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | ✅ done | `patches/0038-USB-U2-scsi-opcodes.patch` |
+ | U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | 📋 | `patches/0039-USB-U3-ehci-usbcmd.patch` |
+ | U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | 📋 | `patches/0040-USB-U4-uhci.patch` |
+ | U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | 📋 | `patches/0041-USB-U5-usb-e2e.patch` |
+@@ -185,19 +185,44 @@ clean).
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+-### U2 — SCSI: INQUIRY / READ CAPACITY / TEST UNIT READY / REQUEST SENSE
+-
+-Answer the four commands the guest's enumeration sends, from the attached
+-image: INQUIRY (direct-access, removable, vendor/product from the CLI),
+-READ CAPACITY(10) (last LBA + 512 from `disk_len`), TEST UNIT READY
+-(ready while an image is attached, FAILED otherwise), REQUEST SENSE
+-(sense data consistent with the last failure). READ(10)/READ(12) keep
+-the U1 channel.
+-
+-**DoD:** unit vectors per opcode (bytes compared against the spec-shaped
+-response, incl. capacity math at 1- and N-block images); negative control
+-— with no image attached TUR fails and the CSW carries FAILED, not OK;
+-firmware receipts unchanged.
++### U2 — SCSI: INQUIRY / READ CAPACITY / TEST UNIT READY / REQUEST SENSE — ✅ done (patches/0038-USB-U2-scsi-opcodes.patch)
++
++The four commands the guest's enumeration sends (measured shape from
++`AuraLite-OS@0ed0d29` `drivers/usb/msc.c`: TUR x5 with REQUEST SENSE
++retries, INQUIRY allocation 36 with vendor at +8 / product at +16,
++READ CAPACITY(10) parsed as be32 last-LBA + be32 block length and
++**rejected unless 512**) are answered from the attached image:
++
++- INQUIRY: 36-byte direct-access (`0x00`), removable (`RMB 0x80`),
++  SPC-3/RDF-2, vendor `AURALITE`, product `USB DISK`, revision `1.0 `
++  (fixed model strings; the guest prints
++  `[msc] INQUIRY: vendor '...' product '...'`).
++- READ CAPACITY(10): last LBA = `disk_len/512 − 1`, block length 512
++  (measured at both 1-block and N-block images).
++- TEST UNIT READY: OK while an image is attached; FAILED + sense
++  `2/3A` (NOT READY / MEDIUM NOT PRESENT) otherwise — the guest's
++  retry loop then reads it back via REQUEST SENSE.
++- REQUEST SENSE: 18-byte fixed-format (`0x70`, key/ASC/ASCQ, additional
++  length `0x0A`), consumed on read; ILLEGAL REQUEST `5/20` for
++  unsupported opcodes (the U1 FAILED path now saves sense).
++
++**Measured (7 new vectors in `tests/test_usb.c`, 7 -> 14):**
++`ok tur ready`, `ok tur no image failed` (negative control: FAILED,
++not OK), `ok request sense not ready` (2/3A returned then consumed),
++`ok inquiry response` (byte-compared 36-byte descriptor),
++`ok read capacity n-block` (8 sectors -> last LBA 7), `ok read capacity
++1-block` (last LBA 0), `ok illegal opcode sense` (5/20).
++
++Once-per-phase negative control (measured): breaking the capacity math
++(`disk_len/512` without the `− 1`) reddens exactly `ok read
++capacity n-block` (assert `r[3] == 7`).
++
++READ(10)/READ(12) keep the U1 channel; firmware receipts byte-stable
++(`make test` boot gate green).
++
++**DoD (measured):** the seven vectors green; capacity math pinned at
++1- and N-block images; no-image TUR carries FAILED with sense; firmware
++receipts unchanged; `make test` + `make test-sanitize` green.
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+diff --git a/src/devices.c b/src/devices.c
+index 7859cca..e516b0c 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -80,6 +80,11 @@ typedef struct {
+     uint8_t  status;    /* 0=OK 1=FAILED 2=PHASE */
+     int      have_cmd;  /* READ(10)/READ(12) data phase pending */
+     int      csw_due;   /* a command finished; next status phase settles it */
++    /* U2: pending response data (INQUIRY / READ CAPACITY / REQUEST SENSE)
++     * and the saved fixed-format sense triple (key/ASC/ASCQ). */
++    uint8_t  resp[64];
++    uint32_t resp_len;
++    uint8_t  sense_key, sense_asc, sense_ascq;
+ } bot_state_t;
+ 
+ static const char *bot_status_name[] = { "OK", "FAILED", "PHASE" };
+@@ -105,6 +110,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         st->have_cmd = 0;
+         if (sig == 0x43425355u) { /* 'USBC' */
+             uint8_t opcode = (uint8_t)mem_read(m, buf+15, 1);
++            st->resp_len = 0;
+             if (opcode == 0x28 || opcode == 0xA8) { /* READ(10)/READ(12) */
+                 uint32_t lba = (uint32_t)mem_read(m, buf+17, 1) << 24 |
+                                (uint32_t)mem_read(m, buf+18, 1) << 16 |
+@@ -118,8 +124,56 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+                 if (blocks == 0) blocks = 1;
+                 st->lba = lba; st->blocks = blocks; st->have_cmd = 1;
+                 mlog(&m->log, "[usb-msc] READ(10) LBA=%u blocks=%u", lba, blocks);
++            } else if (opcode == 0x00) { /* TEST UNIT READY */
++                if (m->disk_len > 0) {
++                    st->sense_key = st->sense_asc = st->sense_ascq = 0;
++                    mlog(&m->log, "[usb-msc] TEST UNIT READY (ready)");
++                } else {
++                    st->status = 1;
++                    st->sense_key = 0x02; st->sense_asc = 0x3A; st->sense_ascq = 0x00;
++                    mlog(&m->log, "[usb-msc] TEST UNIT READY failed (CSW status=FAILED)");
++                }
++            } else if (opcode == 0x03) { /* REQUEST SENSE */
++                memset(st->resp, 0, 18);
++                st->resp[0] = 0x70;  /* current errors, fixed format */
++                st->resp[2] = st->sense_key;
++                st->resp[7] = 0x0A;  /* additional sense length */
++                st->resp[12] = st->sense_asc;
++                st->resp[13] = st->sense_ascq;
++                st->resp_len = 18;
++                mlog(&m->log, "[usb-msc] REQUEST SENSE (key=0x%02x asc=0x%02x)",
++                     st->sense_key, st->sense_asc);
++                /* sense is consumed by the read */
++                st->sense_key = st->sense_asc = st->sense_ascq = 0;
++            } else if (opcode == 0x12) { /* INQUIRY */
++                memset(st->resp, 0, 36);
++                st->resp[0] = 0x00;  /* direct-access block device */
++                st->resp[1] = 0x80;  /* RMB: removable */
++                st->resp[2] = 0x05;  /* SPC-3 */
++                st->resp[3] = 0x02;  /* response data format 2 */
++                st->resp[4] = 31;    /* additional length */
++                memcpy(st->resp + 8,  "AURALITE", 8);
++                memcpy(st->resp + 16, "USB DISK        ", 16);
++                memcpy(st->resp + 32, "1.0 ", 4);
++                st->resp_len = 36;
++                mlog(&m->log, "[usb-msc] INQUIRY: vendor 'AURALITE' product 'USB DISK'");
++            } else if (opcode == 0x25) { /* READ CAPACITY(10) */
++                if (m->disk_len >= DISK_SECTOR) {
++                    uint32_t last = (uint32_t)(m->disk_len / DISK_SECTOR) - 1;
++                    st->resp[0] = (uint8_t)(last >> 24); st->resp[1] = (uint8_t)(last >> 16);
++                    st->resp[2] = (uint8_t)(last >> 8);  st->resp[3] = (uint8_t)last;
++                    st->resp[4] = 0; st->resp[5] = 0; st->resp[6] = 0x02; st->resp[7] = 0x00;
++                    st->resp_len = 8;
++                    st->sense_key = st->sense_asc = st->sense_ascq = 0;
++                    mlog(&m->log, "[usb-msc] READ CAPACITY: %u sectors x 512", last + 1);
++                } else {
++                    st->status = 1;
++                    st->sense_key = 0x02; st->sense_asc = 0x3A; st->sense_ascq = 0x00;
++                    mlog(&m->log, "[usb-msc] READ CAPACITY failed (CSW status=FAILED)");
++                }
+             } else {
+                 st->status = 1; /* FAILED: no data phase will move */
++                st->sense_key = 0x05; st->sense_asc = 0x20; st->sense_ascq = 0x00;
+                 mlog(&m->log, "[usb-msc] SCSI opcode 0x%02x failed (CSW status=FAILED)", opcode);
+             }
+         } else {
+@@ -145,6 +199,23 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         }
+         st->csw_due = 0;
+         st->have_cmd = 0;
++    } else if (pid == 1 && st->resp_len > st->moved) {
++        /* U2: response data phase (INQUIRY / READ CAPACITY / REQUEST SENSE).
++         * moved doubles as the response offset for the current command. */
++        uint32_t off = st->moved;
++        uint32_t avail = st->resp_len - off;
++        uint32_t bytes = total < avail ? total : avail;
++        if (buf >= RAM_SIZE) {
++            bytes = 0;
++            mlog(&m->log, "[usb-msc] rejected qTD buffer 0x%08x outside guest RAM", buf);
++        } else if ((uint64_t)buf + bytes > RAM_SIZE) {
++            bytes = (uint32_t)(RAM_SIZE - buf);
++            mlog(&m->log, "[usb-msc] clipped qTD transfer at guest RAM end");
++        }
++        for (uint32_t i = 0; i < bytes; i++)
++            mem_write(m, (uint64_t)buf+i, 1, st->resp[off + i]);
++        st->moved += bytes;
++        mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (response)", bytes, buf);
+     } else if (pid == 1 && st->have_cmd) {
+         uint64_t disk_off = (uint64_t)(st->lba) * DISK_SECTOR;
+         uint64_t disk_avail = disk_off < m->disk_len ? m->disk_len - disk_off : 0;
+@@ -167,9 +238,10 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         if (st->moved >= expected)
+             st->have_cmd = 0;
+     } else if (pid == 1 && st->csw_due) {
+-        /* Data IN for a command that has no data to deliver (FAILED CBW):
+-         * honest short transfer, 0 bytes -- residue accounts for the rest. */
+-        mlog(&m->log, "[usb-msc] no data for failed command (%u bytes requested)", total);
++        /* Data IN with nothing left to deliver (FAILED CBW, or a response
++         * already drained): honest short transfer, 0 bytes -- residue
++         * accounts for the rest. */
++        mlog(&m->log, "[usb-msc] no data left for command (%u bytes requested)", total);
+     } else if (pid == 1) {
+         /* Unframed IN with no live command: legacy fallback -- settle a CSW. */
+         if (buf <= RAM_SIZE - 13) {
+diff --git a/tests/test_usb.c b/tests/test_usb.c
+index 283b0d8..a2b01a0 100644
+--- a/tests/test_usb.c
++++ b/tests/test_usb.c
+@@ -175,6 +175,138 @@ static void test_firmware_shaped_cbw(void) {
+     printf("ok firmware shaped cbw\n");
+ }
+ 
++static void test_tur_ready(void) {
++    fx_t f; fx_init(&f);
++    cbw(&f, 0x55555555u, 0, 0, 0x00, 0, 0); /* TEST UNIT READY: no data */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x55555555u, 0, 0);
++    fx_done(&f);
++    printf("ok tur ready\n");
++}
++
++static void test_tur_no_image(void) {
++    /* U2 negative control: no image -> TUR must FAIL, not OK. */
++    fx_t f; fx_init(&f);
++    f.m.disk_len = 0;
++    cbw(&f, 0x66666666u, 0, 0, 0x00, 0, 0);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x66666666u, 0, 1); /* FAILED */
++    fx_done(&f);
++    printf("ok tur no image failed\n");
++}
++
++static void test_request_sense(void) {
++    /* The guest's retry loop: TUR fails -> REQUEST SENSE reports
++     * NOT READY / MEDIUM NOT PRESENT (2/3A), then the sense is consumed. */
++    fx_t f; fx_init(&f);
++    f.m.disk_len = 0;
++    cbw(&f, 1, 0, 0, 0x00, 0, 0);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 1, 0, 1);
++
++    cbw(&f, 2, 18, 0x80, 0x03, 0, 0); /* REQUEST SENSE */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 18, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 2, 0, 0);
++    const uint8_t *s = f.m.ram + DATA_ADDR;
++    assert(s[0] == 0x70);
++    assert(s[2] == 0x02);  /* NOT READY */
++    assert(s[7] == 0x0A);
++    assert(s[12] == 0x3A); /* MEDIUM NOT PRESENT */
++    assert(s[13] == 0x00);
++
++    cbw(&f, 3, 18, 0x80, 0x03, 0, 0); /* second read: sense consumed */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 18, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 3, 0, 0);
++    assert(f.m.ram[DATA_ADDR + 2] == 0x00);
++    fx_done(&f);
++    printf("ok request sense not ready\n");
++}
++
++static void test_inquiry_response(void) {
++    fx_t f; fx_init(&f);
++    cbw(&f, 0x77777777u, 36, 0x80, 0x12, 0, 0); /* INQUIRY */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 36, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x77777777u, 0, 0);
++    const uint8_t *r = f.m.ram + DATA_ADDR;
++    assert(r[0] == 0x00);   /* direct-access */
++    assert(r[1] == 0x80);   /* removable */
++    assert(r[2] == 0x05);   /* SPC-3 */
++    assert(r[3] == 0x02);   /* response data format 2 */
++    assert(r[4] == 31);     /* additional length */
++    assert(memcmp(r + 8, "AURALITE", 8) == 0);
++    assert(memcmp(r + 16, "USB DISK        ", 16) == 0);
++    assert(memcmp(r + 32, "1.0 ", 4) == 0);
++    fx_done(&f);
++    printf("ok inquiry response\n");
++}
++
++static void test_read_capacity_n(void) {
++    fx_t f; fx_init(&f); /* 4096 bytes = 8 sectors */
++    cbw(&f, 0x88888888u, 8, 0x80, 0x25, 0, 0); /* READ CAPACITY(10) */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 8, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x88888888u, 0, 0);
++    const uint8_t *r = f.m.ram + DATA_ADDR;
++    assert(r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] == 7); /* last LBA 7 */
++    assert(r[4] == 0 && r[5] == 0 && r[6] == 0x02 && r[7] == 0); /* 512 */
++    fx_done(&f);
++    printf("ok read capacity n-block\n");
++}
++
++static void test_read_capacity_one(void) {
++    fx_t f; fx_init(&f);
++    f.m.disk_len = 512; /* exactly one block */
++    cbw(&f, 0x99999999u, 8, 0x80, 0x25, 0, 0);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 8, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x99999999u, 0, 0);
++    const uint8_t *r = f.m.ram + DATA_ADDR;
++    assert(r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] == 0); /* last LBA 0 */
++    fx_done(&f);
++    printf("ok read capacity 1-block\n");
++}
++
++static void test_illegal_opcode_sense(void) {
++    /* Unsupported opcode -> FAILED + ILLEGAL REQUEST sense (5/20). */
++    fx_t f; fx_init(&f);
++    cbw(&f, 0xAAAAAAAAu, 0, 0, 0xA0, 0, 0); /* REPORT LUNS, no data */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0xAAAAAAAAu, 0, 1);
++
++    cbw(&f, 0xBBBBBBBBu, 18, 0x80, 0x03, 0, 0);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 18, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0xBBBBBBBBu, 0, 0);
++    const uint8_t *s = f.m.ram + DATA_ADDR;
++    assert(s[2] == 0x05);  /* ILLEGAL REQUEST */
++    assert(s[12] == 0x20); /* INVALID COMMAND OPERATION CODE */
++    fx_done(&f);
++    printf("ok illegal opcode sense\n");
++}
++
+ int main(void) {
+     test_be16();
+     test_csw_tag_echo();
+@@ -183,6 +315,13 @@ int main(void) {
+     test_csw_failed_opcode();
+     test_csw_phase_bad_cbw();
+     test_firmware_shaped_cbw();
++    test_tur_ready();
++    test_tur_no_image();
++    test_request_sense();
++    test_inquiry_response();
++    test_read_capacity_n();
++    test_read_capacity_one();
++    test_illegal_opcode_sense();
+     printf("test_usb: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+

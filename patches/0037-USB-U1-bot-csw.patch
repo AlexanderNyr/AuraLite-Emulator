@@ -1,0 +1,564 @@
+From ab1a6e974d720f53bbcc273e8bd312e0d7769f83 Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Fri, 9 Oct 2026 10:19:04 +0000
+Subject: [PATCH] U1 update
+
+USB U1: BOT/CSW correctness.
+
+The status channel is honest now (all measured against the guest's own
+validator, AuraLite-OS@0ed0d29 drivers/usb/msc.c):
+- dCSWTag echoes dCBWTag (the guest rejects mismatches with
+  `CSW tag mismatch got/want`; the old model wrote 0).
+- dCSWDataResidue is expected-minus-moved: measured on short data
+  (expected 1024, one 512-byte qTD -> residue 512) and on an absent
+  image (disk_len 0 -> residue 512).
+- bCSWStatus distinguishes OK / FAILED (unsupported SCSI opcode: data
+  phase moves nothing, residue stays) / PHASE (malformed CBW signature,
+  and the next command stays in sync).
+- Status-phase framing is BOT-shaped: the CSW is the 13-byte IN
+  (measured: the sample firmware's status qTD token is 0x000D0180), so
+  a cut-short data phase still settles residue.
+
+tests/test_usb.c grows 2 -> 7 machine vectors driving QH/qTD chains
+through the doorbell: tag echo, residue x2, FAILED, PHASE, and the
+firmware-shaped negative control (tag=1, READ(10) LBA 0, data at
+0x00100000, CSW at 0x00020200) -- the boot-integration gate strings do
+not move (make test green).
+
+Once-per-phase negative control (measured): reverting the tag echo
+reddens exactly `ok csw tag echo` (assert r32r(c + 4) == tag, RC=134).
+
+Teardown fix in the same patch: devices_done() calls pci_done() -- the
+PCI device list leaked 11232 bytes / 36 allocations under LSan as soon
+as a fixture built the full device set (measured by make test-sanitize;
+now leak-clean).
+
+Gate: make test + make test-sanitize green; docs synced (USB_PLAN U1
+receipts, CHANGELOG 0037, ROADMAP queue).
+---
+ CHANGELOG.md           |  19 ++++
+ ROADMAP.md             |   1 +
+ docs/plans/USB_PLAN.md |  58 +++++++++----
+ src/devices.c          | 124 ++++++++++++++++++--------
+ src/devices.h          |   2 +-
+ tests/test_usb.c       | 193 ++++++++++++++++++++++++++++++++++++++---
+ 6 files changed, 328 insertions(+), 69 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2df94b..c184ebd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,25 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0037 (USB U1, BOT/CSW correctness)
++- Honest Bulk-Only status channel: the CSW carries `dCSWTag` echoed from
++  the CBW (the AuraLite-OS `msc.c` validates it), `dCSWDataResidue`
++  computed as expected-minus-moved, and `bCSWStatus` distinguishes
++  OK / FAILED (unsupported SCSI opcode) / PHASE (malformed CBW).
++  Status-phase framing is BOT-shaped: the CSW is the 13-byte IN (the
++  sample firmware's status qTD token measures `0x000D0180`), so a data
++  phase cut short still settles residue honestly.
++- `tests/test_usb.c` grows from the be16 smoke to 7 machine vectors
++  (QH/qTD fixtures driven through the doorbell): tag echo, residue on
++  short data and on an absent image, FAILED opcode, PHASE bad CBW, and
++  the firmware-shaped negative control (tag=1 recipe, receipts stable).
++- `devices_done()` frees the PCI device list (`pci_done()`) — LSan
++  measured 11232 bytes / 36 allocations leaked per full-device fixture.
++
++### Fixed / measured — patch 0037
++- Negative control measured: reverting the tag echo reddens exactly
++  `ok csw tag echo` (assert `r32r(c + 4) == tag`, RC=134).
++
+ ### Added — patch 0035 (STORE S5, large transfers + hardening)
+ - `--sata-writethrough`: opt-in host write-through -- every guest WRITE
+   DMA EXT byte also lands in the host image file at the same offset
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 5f04fa0..f02f396 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -81,3 +81,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0034` — STORE S4: breadth matrix -- `--sata-portN=` placement, `--ahci2` second controller (0:31:3, ABAR2 0xFEB12000), QEMU `test_ahci_matrix.sh` lanes A/B/C reproduced guest-side + unattached negative control~~ shipped
+ - ~~`0035` — STORE S5: large transfers + hardening -- 128-KiB PRDT vectors + QEMU `test_ahci_large_read.sh` guest parity (16 MiB payload through the 128-KiB bounce), `--sata-writethrough` dirty-image semantics, honest INTx (PxIS→PIC/IOAPIC), full-matrix determinism ×2~~ shipped — STORE plan complete S0–S5
+ - ~~`0036` — USB U0: measured baseline + `docs/plans/USB_PLAN.md` (defect ledger: CSW tag/residue/status, ignored SCSI opcodes, doorbell on every write, zeroed caps, no control/UHCI)~~ shipped
++- ~~`0037` — USB U1: BOT/CSW correctness -- `dCSWTag` echo (guest-validated), `dCSWDataResidue` expected-minus-moved, OK/FAILED/PHASE status byte, 13-byte-IN status framing, 7 machine vectors + firmware negative control~~ shipped
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+index ccd4981..93a81a3 100644
+--- a/docs/plans/USB_PLAN.md
++++ b/docs/plans/USB_PLAN.md
+@@ -8,12 +8,12 @@
+ > + initrd.tar built from that tree) and the sample firmware
+ > (`firmware/sample_firmware.nas`).
+ 
+-**Status: in progress — U0 ✅, U1–U5 planned 📋**
++**Status: in progress — U0 ✅, U1 ✅, U2–U5 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | U0 | Measured baseline + this plan | ✅ done | `patches/0036-USB-U0-usb-plan.patch` |
+-| U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | 📋 | `patches/0037-USB-U1-bot-csw.patch` |
++| U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | ✅ done | `patches/0037-USB-U1-bot-csw.patch` |
+ | U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | 📋 | `patches/0038-USB-U2-scsi-opcodes.patch` |
+ | U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | 📋 | `patches/0039-USB-U3-ehci-usbcmd.patch` |
+ | U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | 📋 | `patches/0040-USB-U4-uhci.patch` |
+@@ -144,22 +144,46 @@ Kernel lane (`--kernel=` + 12 MiB initrd, `AuraLite-OS@0ed0d29`):
+ ledger measured against `src/devices.c` and the guest sources; phase
+ table with named deliverables.
+ 
+-### U1 — BOT/CSW correctness
++### U1 — BOT/CSW correctness — ✅ done (patches/0037-USB-U1-bot-csw.patch)
++
++Tag echo (CSW.dCSWTag = CBW.dCBWTag), residue = dCBWDataTransferLength −
++bytes actually moved (0 for no-data commands), honest status byte: OK /
++FAILED (command not supported) / PHASE (bad CBW signature), and a
++malformed CBW cannot desynchronise the next one.  Status-phase framing:
++the CSW is the 13-byte IN (measured: the sample firmware's status qTD
++token is `0x000D0180`; BOT fixes the CSW at 13 bytes), so a data phase
++cut short still settles residue honestly.
++
++**Measured (all in `tests/test_usb.c`, 2 -> 7 vectors):**
++- `ok csw tag echo` — READ(10) golden bytes + CSW carries the CBW tag
++  (`0xA5A5A5A5`), residue 0, status OK.
++- `ok csw residue short data` — expected 1024 with one 512-byte data
++  qTD -> residue 512.
++- `ok csw residue no image` — `disk_len = 0` -> 0 bytes moved, residue
++  512.
++- `ok csw failed opcode` — REPORT LUNS (0xA0) -> data phase moves
++  nothing, CSW status FAILED, residue 36 (receipt: `SCSI opcode 0xa0
++  failed (CSW status=FAILED)`).
++- `ok csw phase bad cbw` — signature `'XXXX'` -> CSW status PHASE.
++- `ok firmware shaped cbw` — negative control: the sample firmware's
++  exact recipe (tag=1, READ(10) LBA 0, data `0x00100000`, CSW
++  `0x00020200`) round-trips with status OK; the boot-integration gate
++  strings cannot move (verified `make test` green).
++
++Once-per-phase negative control (measured): reverting the tag echo
++(`wr32(buf+4, 0)`) reddens `ok csw tag echo` exactly
++(`Assertion 'r32r(c + 4) == tag' failed`, RC=134).
++
++Teardown fix riding the same patch: `devices_done()` now calls
++`pci_done()` (the PCI device list leaked 11232 bytes / 36 allocations
++under LSan as soon as a test built a full device set — measured with
++`make test-sanitize`).
++
++**DoD (measured):** the six vectors above green; the firmware lane
++receipts byte-stable; `make test` + `make test-sanitize` green (LSan
++clean).
+ 
+-Tag echo (CSW.dCSWTag = CBW.dCBWTag, measured against the guest's
+-check), residue = dCBWDataTransferLength − bytes actually moved (0 for
+-no-data commands), honest status byte: OK / FAILED (command failed or
+-unsupported) / PHASE (bad signature, wrong direction, overrun) — plus
+-the reset-critical: a malformed CBW must not desynchronise the next one.
+-
+-**DoD (machine, `tests/test_usb.c` grows vectors with qTD/CBW/CSW
+-fixtures and negative controls):** tag echo unit vector; residue on a
+-clipped short read; residue on a no-data command; FAILED on an
+-unsupported opcode; PHASE on a bad CBW signature; the firmware lane
+-receipts byte-identical (it ignores tags — its greps must not move).
+-
+-**Gate:** `make test` + `make test-sanitize` green; the boot-integration
+-gate strings unchanged.
++**Gate:** `make test` + `make test-sanitize` green.
+ 
+ ### U2 — SCSI: INQUIRY / READ CAPACITY / TEST UNIT READY / REQUEST SENSE
+ 
+diff --git a/src/devices.c b/src/devices.c
+index ab3ebd2..7859cca 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -70,9 +70,23 @@ typedef struct {
+ static uint32_t rd32(machine_t *m, uint64_t a){ return (uint32_t)mem_read(m,a,4); }
+ static void     wr32(machine_t *m, uint64_t a, uint32_t v){ mem_write(m,a,4,v); }
+ 
++/* Bulk-Only Transport state for the single-LUN stick.  U1: the CSW is
++ * honest now -- dCSWTag echoes dCBWTag (the guest driver validates it),
++ * dCSWDataResidue is the expected-vs-moved difference, and bCSWStatus
++ * distinguishes OK / FAILED / PHASE. */
++typedef struct {
++    uint32_t lba, blocks;
++    uint32_t tag, expected, moved;
++    uint8_t  status;    /* 0=OK 1=FAILED 2=PHASE */
++    int      have_cmd;  /* READ(10)/READ(12) data phase pending */
++    int      csw_due;   /* a command finished; next status phase settles it */
++} bot_state_t;
++
++static const char *bot_status_name[] = { "OK", "FAILED", "PHASE" };
++
+ /* Processes one qTD: performs the data phase against the virtual USB stick
+- * (bulk-only transport CBW/CSW handled generically), then clears Active. */
+-static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, uint32_t *pending_lba, uint32_t *pending_blocks, int *have_cmd) {
++ * (bulk-only transport CBW/CSW), then clears Active. */
++static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+     uint32_t token = rd32(m, qtd_addr+8);
+     if (!(token & 0x80)) return; /* not active */
+     uint32_t total = (token >> 16) & 0x7FFF;
+@@ -83,6 +97,12 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, uint32_t *pending_
+         /* Bulk-Only CBW: dCBWSignature(4) dCBWTag(4) dCBWDataTransferLength(4)
+          * bmCBWFlags(1) bCBWLUN(1) bCBWCBLength(1) CBWCB(16) */
+         uint32_t sig = rd32(m, buf+0);
++        st->tag      = rd32(m, buf+4);
++        st->expected = rd32(m, buf+8);
++        st->moved    = 0;
++        st->status   = 0;
++        st->csw_due  = 1;
++        st->have_cmd = 0;
+         if (sig == 0x43425355u) { /* 'USBC' */
+             uint8_t opcode = (uint8_t)mem_read(m, buf+15, 1);
+             if (opcode == 0x28 || opcode == 0xA8) { /* READ(10)/READ(12) */
+@@ -96,44 +116,74 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, uint32_t *pending_
+                 };
+                 uint32_t blocks = usb_msc_be16(transfer_len);
+                 if (blocks == 0) blocks = 1;
+-                *pending_lba = lba; *pending_blocks = blocks; *have_cmd = 1;
++                st->lba = lba; st->blocks = blocks; st->have_cmd = 1;
+                 mlog(&m->log, "[usb-msc] READ(10) LBA=%u blocks=%u", lba, blocks);
+             } else {
+-                mlog(&m->log, "[usb-msc] SCSI opcode 0x%02x (ignored by behavioural model)", opcode);
++                st->status = 1; /* FAILED: no data phase will move */
++                mlog(&m->log, "[usb-msc] SCSI opcode 0x%02x failed (CSW status=FAILED)", opcode);
+             }
++        } else {
++            /* Malformed CBW: BOT says stall + PHASE on the status phase. */
++            st->status = 2; /* PHASE */
++            mlog(&m->log, "[usb-msc] malformed CBW signature 0x%08x (CSW status=PHASE)", sig);
++        }
++    } else if (pid == 1 && total == 13) {
++        /* Status phase.  The qTD carrying a CSW is the 13-byte IN (measured:
++         * the sample firmware's status qTD token is 0x000D0180; BOT fixes the
++         * CSW at 13 bytes, so a 13-byte IN is the status phase even when a
++         * data phase was cut short). */
++        if (buf <= RAM_SIZE - 13) {
++            uint32_t residue = st->expected > st->moved ? st->expected - st->moved : 0;
++            wr32(m, buf+0, 0x53425355u); /* 'USBS' */
++            wr32(m, buf+4, st->tag);
++            wr32(m, buf+8, residue);
++            mem_write(m, buf+12, 1, st->status);
++            mlog(&m->log, "[usb-msc] synthesized CSW (status=%s) -> guest 0x%08x",
++                 bot_status_name[st->status & 3], buf);
++        } else {
++            mlog(&m->log, "[usb-msc] rejected CSW buffer 0x%08x outside guest RAM", buf);
++        }
++        st->csw_due = 0;
++        st->have_cmd = 0;
++    } else if (pid == 1 && st->have_cmd) {
++        uint64_t disk_off = (uint64_t)(st->lba) * DISK_SECTOR;
++        uint64_t disk_avail = disk_off < m->disk_len ? m->disk_len - disk_off : 0;
++        uint32_t bytes = total;
++        if (disk_avail < bytes) bytes = (uint32_t)disk_avail;
++        if (buf >= RAM_SIZE) {
++            bytes = 0;
++            mlog(&m->log, "[usb-msc] rejected qTD buffer 0x%08x outside guest RAM", buf);
++        } else if ((uint64_t)buf + bytes > RAM_SIZE) {
++            bytes = (uint32_t)(RAM_SIZE - buf);
++            mlog(&m->log, "[usb-msc] clipped qTD transfer at guest RAM end");
+         }
++        for (uint32_t i = 0; i < bytes; i++)
++            mem_write(m, (uint64_t)buf+i, 1, m->disk[disk_off + i]);
++        st->moved += bytes;
++        mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (from LBA %u)", bytes, buf, st->lba);
++        /* Once the requested data phase is complete, the next short IN
++         * transfer is the CSW, not another disk read. */
++        uint64_t expected = (uint64_t)(st->blocks ? st->blocks : 1) * DISK_SECTOR;
++        if (st->moved >= expected)
++            st->have_cmd = 0;
++    } else if (pid == 1 && st->csw_due) {
++        /* Data IN for a command that has no data to deliver (FAILED CBW):
++         * honest short transfer, 0 bytes -- residue accounts for the rest. */
++        mlog(&m->log, "[usb-msc] no data for failed command (%u bytes requested)", total);
+     } else if (pid == 1) {
+-        if (*have_cmd) {
+-            uint64_t disk_off = (uint64_t)(*pending_lba) * DISK_SECTOR;
+-            uint64_t disk_avail = disk_off < m->disk_len ? m->disk_len - disk_off : 0;
+-            uint32_t bytes = total;
+-            if (disk_avail < bytes) bytes = (uint32_t)disk_avail;
+-            if (buf >= RAM_SIZE) {
+-                bytes = 0;
+-                mlog(&m->log, "[usb-msc] rejected qTD buffer 0x%08x outside guest RAM", buf);
+-            } else if ((uint64_t)buf + bytes > RAM_SIZE) {
+-                bytes = (uint32_t)(RAM_SIZE - buf);
+-                mlog(&m->log, "[usb-msc] clipped qTD transfer at guest RAM end");
+-            }
+-            for (uint32_t i = 0; i < bytes; i++)
+-                mem_write(m, (uint64_t)buf+i, 1, m->disk[disk_off + i]);
+-            mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (from LBA %u)", bytes, buf, *pending_lba);
+-            /* Once the requested data phase is complete, the next short IN
+-             * transfer is the CSW, not another disk read. */
+-            uint64_t expected = (uint64_t)(*pending_blocks ? *pending_blocks : 1) * DISK_SECTOR;
+-            if (bytes >= expected)
+-                *have_cmd = 0;
++        /* Unframed IN with no live command: legacy fallback -- settle a CSW. */
++        if (buf <= RAM_SIZE - 13) {
++            uint32_t residue = st->expected > st->moved ? st->expected - st->moved : 0;
++            wr32(m, buf+0, 0x53425355u); /* 'USBS' */
++            wr32(m, buf+4, st->tag);
++            wr32(m, buf+8, residue);
++            mem_write(m, buf+12, 1, st->status);
++            mlog(&m->log, "[usb-msc] synthesized CSW (status=%s) -> guest 0x%08x",
++                 bot_status_name[st->status & 3], buf);
+         } else {
+-            /* Likely the CSW (status) phase -- fabricate a successful one. */
+-            if (buf <= RAM_SIZE - 12) {
+-                wr32(m, buf+0, 0x53425355u); /* 'USBS' */
+-                wr32(m, buf+4, 0);
+-                wr32(m, buf+8, 0); /* status = good */
+-                mlog(&m->log, "[usb-msc] synthesized CSW (status=OK) -> guest 0x%08x", buf);
+-            } else {
+-                mlog(&m->log, "[usb-msc] rejected CSW buffer 0x%08x outside guest RAM", buf);
+-            }
++            mlog(&m->log, "[usb-msc] rejected CSW buffer 0x%08x outside guest RAM", buf);
+         }
++        st->csw_due = 0;
+     }
+     /* mark complete */
+     token &= ~0x80u;           /* clear Active */
+@@ -147,17 +197,14 @@ static void ehci_doorbell(ehci_t *e) {
+     if (!asynclist) return;
+     uint32_t qh = asynclist & ~0x1Fu;
+     uint32_t cur = rd32(m, qh + 0x0C);
+-    uint32_t pending_lba = 0, pending_blocks = 0; int have_cmd = 0;
+-    static uint32_t s_lba=0, s_blocks=0; static int s_have=0; /* persists across doorbell calls for this simple single-LUN model */
+-    pending_lba = s_lba; pending_blocks = s_blocks; have_cmd = s_have;
++    static bot_state_t s_st; /* persists across doorbell calls for this simple single-LUN model */
+     for (int guard = 0; guard < 32 && cur && !(cur & 1); guard++) {
+-        ehci_process_qtd(m, cur, &pending_lba, &pending_blocks, &have_cmd);
++        ehci_process_qtd(m, cur, &s_st);
+         uint32_t next = rd32(m, cur + 0x00);
+         if (next & 1) break;
+         if (next == cur) break;
+         cur = next;
+     }
+-    s_lba = pending_lba; s_blocks = pending_blocks; s_have = have_cmd;
+ }
+ 
+ static ehci_t g_ehci; /* single controller instance is all the firmware ever needs */
+@@ -324,5 +371,6 @@ void devices_done(machine_t *m) {
+         r = next;
+     }
+     m->mmio_list = NULL;
++    pci_done(m);                                   /* USB U1: LSan lane */
+     if (g_com1) { serial_free(g_com1); g_com1 = NULL; }   /* K5: LSan lane */
+ }
+diff --git a/src/devices.h b/src/devices.h
+index aae0f2b..078c0a1 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -5,7 +5,7 @@
+ void devices_init_common(machine_t *m);     /* LPC, SATA, GPU, EHCI, CMOS, SuperIO, CAR window */
+ void devices_init_platform(machine_t *m);   /* DDR controller models for the selected platform */
+ void devices_add_ahci2(machine_t *m);       /* STORE S4: second AHCI controller (--ahci2) */
+-void devices_done(machine_t *m);            /* C10: frees every mmio region + rw2 window */
++void devices_done(machine_t *m);            /* C10: frees every mmio region + rw2 window + PCI list */
+ 
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+ uint16_t usb_msc_be16(const uint8_t *p);
+diff --git a/tests/test_usb.c b/tests/test_usb.c
+index d4ab88a..283b0d8 100644
+--- a/tests/test_usb.c
++++ b/tests/test_usb.c
+@@ -1,21 +1,188 @@
++/* tests/test_usb.c -- USB U1 vectors: Bulk-Only Transport CBW/CSW channel.
++ *
++ * The fixture drives the same behavioural EHCI block the sample firmware
++ * boots through: build a QH + qTD chain in guest RAM, ring the doorbell
++ * (a write to ASYNCLISTADDR), then read the CSW back out of RAM.
++ * U1 pins the honest CSW fields: dCSWTag echoes dCBWTag (the AuraLite-OS
++ * msc.c validates it), dCSWDataResidue is expected-minus-moved, and
++ * bCSWStatus distinguishes OK / FAILED / PHASE.  The firmware-shaped
++ * vector is the negative control: its recipe (tag=1, READ(10) LBA 0)
++ * must keep round-tripping with status=OK.
++ */
+ #include <assert.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <string.h>
+ #include "devices.h"
++#include "harness.h"
++
++#define EHCI_BASE   0xFEB00000u
++#define CBW_ADDR    0x00002000u
++#define QH_ADDR     0x00003000u
++#define QTD0        0x00003100u
++#define DATA_ADDR   0x00010000u
++#define CSW_ADDR    0x00003800u
++
++typedef struct { machine_t m; uint8_t stick[4096]; } fx_t;
++
++static void fx_init(fx_t *f) {
++    setup_machine(&f->m);
++    devices_init_common(&f->m);
++    for (int i = 0; i < (int)sizeof f->stick; i++)
++        f->stick[i] = (uint8_t)(i * 3 + 7);
++    f->m.disk = f->stick;
++    f->m.disk_len = sizeof f->stick;
++}
++
++static void fx_done(fx_t *f) { devices_done(&f->m); }
++
++static void w32r(uint8_t *p, uint32_t v) {
++    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++static uint32_t r32r(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void cbw(fx_t *f, uint32_t tag, uint32_t expected, uint8_t flags,
++                uint8_t opcode, uint32_t lba, uint16_t blocks) {
++    uint8_t *p = f->m.ram + CBW_ADDR;
++    memset(p, 0, 31);
++    p[0] = 0x55; p[1] = 0x53; p[2] = 0x42; p[3] = 0x43; /* 'USBC' */
++    w32r(p + 4, tag);
++    w32r(p + 8, expected);
++    p[12] = flags;      /* bmCBWFlags: 0x80 = IN */
++    p[13] = 0;          /* bCBWLUN */
++    p[14] = 10;         /* bCBWCBLength */
++    p[15] = opcode;
++    p[17] = (uint8_t)(lba >> 24); p[18] = (uint8_t)(lba >> 16);
++    p[19] = (uint8_t)(lba >> 8);  p[20] = (uint8_t)lba;
++    p[22] = (uint8_t)(blocks >> 8); p[23] = (uint8_t)blocks;
++}
++
++static void qtd(fx_t *f, uint32_t addr, uint32_t next, uint32_t total,
++                int pid, uint32_t buf) {
++    uint8_t *p = f->m.ram + addr;
++    w32r(p + 0, next);                  /* bit0 set = terminate */
++    w32r(p + 4, 0);
++    w32r(p + 8, (total << 16) | ((uint32_t)pid << 8) | 0x80);
++    w32r(p + 0xC, buf);
++}
++
++static void fire(fx_t *f) {
++    uint8_t *qh = f->m.ram + QH_ADDR;
++    w32r(qh + 0x0C, QTD0);
++    mem_write(&f->m, EHCI_BASE + 0x18, 4, QH_ADDR); /* ASYNCLISTADDR = doorbell */
++}
++
++static void check_csw_at(fx_t *f, uint32_t addr, uint32_t tag,
++                         uint32_t residue, uint8_t status) {
++    const uint8_t *c = f->m.ram + addr;
++    assert(r32r(c + 0) == 0x53425355u); /* 'USBS' */
++    assert(r32r(c + 4) == tag);
++    assert(r32r(c + 8) == residue);
++    assert(c[12] == status);
++}
++
++static void test_be16(void) {
++    uint8_t cb[31] = {0};
++    cb[22] = 0x00; cb[23] = 0x01;
++    assert(usb_msc_be16(&cb[22]) == 1);
++    cb[22] = 0x01; cb[23] = 0x00;
++    assert(usb_msc_be16(&cb[22]) == 256);
++    printf("ok be16\n");
++}
++
++static void test_csw_tag_echo(void) {
++    fx_t f; fx_init(&f);
++    cbw(&f, 0xA5A5A5A5u, 512, 0x80, 0x28, 0, 1);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 512, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0xA5A5A5A5u, 0, 0);
++    assert(f.m.ram[DATA_ADDR] == 7);
++    assert(f.m.ram[DATA_ADDR + 511] == (uint8_t)(511 * 3 + 7));
++    fx_done(&f);
++    printf("ok csw tag echo\n");
++}
++
++static void test_csw_residue_short_data(void) {
++    fx_t f; fx_init(&f);
++    /* Host expects 2 blocks but only one data qTD is posted. */
++    cbw(&f, 0x22222222u, 1024, 0x80, 0x28, 0, 2);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 512, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x22222222u, 512, 0);
++    fx_done(&f);
++    printf("ok csw residue short data\n");
++}
++
++static void test_csw_residue_no_image(void) {
++    fx_t f; fx_init(&f);
++    f.m.disk_len = 0; /* nothing behind the read */
++    cbw(&f, 0x33333333u, 512, 0x80, 0x28, 0, 1);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 512, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x33333333u, 512, 0);
++    fx_done(&f);
++    printf("ok csw residue no image\n");
++}
++
++static void test_csw_failed_opcode(void) {
++    fx_t f; fx_init(&f);
++    cbw(&f, 0x44444444u, 36, 0x80, 0xA0, 0, 0); /* REPORT LUNS: unsupported */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 36, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x44444444u, 36, 1); /* FAILED */
++    for (int i = 0; i < 36; i++) assert(f.m.ram[DATA_ADDR + i] == 0);
++    fx_done(&f);
++    printf("ok csw failed opcode\n");
++}
++
++static void test_csw_phase_bad_cbw(void) {
++    fx_t f; fx_init(&f);
++    cbw(&f, 0x11111111u, 0, 0x80, 0x28, 0, 1);
++    uint8_t *p = f.m.ram + CBW_ADDR;
++    p[0] = 0x58; p[1] = 0x58; p[2] = 0x58; p[3] = 0x58; /* 'XXXX' */
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, 1, 13, 1, CSW_ADDR);
++    fire(&f);
++    check_csw_at(&f, CSW_ADDR, 0x11111111u, 0, 2); /* PHASE */
++    fx_done(&f);
++    printf("ok csw phase bad cbw\n");
++}
++
++static void test_firmware_shaped_cbw(void) {
++    /* Negative control: the sample firmware's exact recipe (tag=1,
++     * READ(10) LBA=0 blocks=1, data at 0x00100000, CSW at 0x00020200). */
++    fx_t f; fx_init(&f);
++    cbw(&f, 1, 512, 0x80, 0x28, 0, 1);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 512, 1, 0x00100000u);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, 0x00020200u);
++    fire(&f);
++    check_csw_at(&f, 0x00020200u, 1, 0, 0);
++    assert(f.m.ram[0x00100000] == 7);
++    fx_done(&f);
++    printf("ok firmware shaped cbw\n");
++}
+ 
+ int main(void) {
+-    uint8_t cbw[31] = {0};
+-    cbw[15] = 0x28;       /* READ(10) */
+-    cbw[17] = 0x12;       /* LBA = 0x12345678 */
+-    cbw[18] = 0x34;
+-    cbw[19] = 0x56;
+-    cbw[20] = 0x78;
+-    cbw[22] = 0x00;       /* SCSI transfer length is big-endian */
+-    cbw[23] = 0x01;
+-    assert(usb_msc_be16(&cbw[22]) == 1);
+-    cbw[22] = 0x01;
+-    cbw[23] = 0x00;
+-    assert(usb_msc_be16(&cbw[22]) == 256);
+-    puts("usb tests: ok");
++    test_be16();
++    test_csw_tag_echo();
++    test_csw_residue_short_data();
++    test_csw_residue_no_image();
++    test_csw_failed_opcode();
++    test_csw_phase_bad_cbw();
++    test_firmware_shaped_cbw();
++    printf("test_usb: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+

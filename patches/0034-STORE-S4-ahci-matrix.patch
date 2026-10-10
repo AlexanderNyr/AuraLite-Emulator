@@ -1,0 +1,1038 @@
+From 27579162f45eecd9908e2c280edabb3f1b9dee1e Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Thu, 8 Oct 2026 20:05:22 +0000
+Subject: [PATCH] S4 update
+
+STORE S4: AHCI breadth matrix.
+
+Machine half (all measured against the guest's own contract):
+- machine_t attach rows are per controller now ([AHCI_CTRLS][AHCI_MAX_ATTACH]);
+  src/ahci.c runs one register instance per controller via
+  ahci_register_ctrl(m, ctrl) -- controller 0 keeps the historical
+  ahci_register() entry point and the exact [ahci] log spelling, controller 1
+  logs as [ahci2].
+- Second controller (--ahci2): PCI function 0:31:3 (8086:2922, class
+  01/06/01) with ABAR2 at 0xFEB12000.  Placement is not arbitrary: the
+  guest class scan is bus-0 dev/func ASCENDING (drivers/pci/pci.c
+  pci_find_class_after, measured), so 31:3 binds after 0:31:2 and every
+  S1-S3 'controller 0 at PCI 0:31.2' receipt keeps its numbering.  The
+  guest maps 8 KiB per BAR5 (measured), hence 8 KiB window spacing.
+- CLI: --ahci2, --sata2=img, --sata2-portN=img (an image on row 1 implies
+  the controller).  --help now documents the storage family.
+
+Tests: tests/test_ahci.c 15 -> 18 vectors (second-window independence and
+per-controller GHC, port placement through the engine incl. TFES on a dark
+port, cross-controller image isolation).  NEW
+tests/integration/test_ahci_matrix.sh reproduces the QEMU
+test_ahci_matrix.sh lanes A/B/C guest-side through the --keys-at=prompt
+lane plus an unattached negative-control lane and a sequential determinism
+pair.
+
+Receipts (frozen kernel AuraLite-OS@0ed0d29 + initrd, measured):
+- lane A: PASS: SATA read/write DMA works; typed write/cat round-trip
+  laneaok on /fat; [fat32] PASS; zero FAIL/unsupported lines.
+- lane B: hw port 1: SATA disk (sig=0x00000101); empty port 0 skipped;
+  lanebok round-trip; determinism pair byte-identical.
+- lane C: controller 0 at PCI 0:31.2 + controller 1 at PCI 0:31.3 +
+  2 controller(s), 2 SATA device(s) ready; [ext2] blkdev 1 mounted at /ext2
+  (2-disk boot); lanecok round-trip.
+- lane E: 1 controller(s), 0 SATA device(s) ready + self-test: no devices.
+make test + make test-sanitize green.
+---
+ CHANGELOG.md                          |  25 ++++
+ ROADMAP.md                            |   7 +-
+ docs/STATUS.md                        |  24 ++++
+ docs/plans/STORE_PLAN.md              |  57 +++++++--
+ src/ahci.c                            |  99 +++++++++------
+ src/ahci.h                            |  18 ++-
+ src/devices.c                         |  17 +++
+ src/devices.h                         |   1 +
+ src/machine.h                         |  14 ++-
+ src/main.c                            |  62 +++++++---
+ tests/integration/test_ahci_matrix.sh | 171 ++++++++++++++++++++++++++
+ tests/test_ahci.c                     | 131 +++++++++++++++++++-
+ 12 files changed, 552 insertions(+), 74 deletions(-)
+ create mode 100755 tests/integration/test_ahci_matrix.sh
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9405621..38984f9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,31 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0034 (STORE S4, breadth matrix)
++- Second AHCI controller (`--ahci2`): PCI function 0:31:3 (8086:2922,
++  class 01/06/01) with its own ABAR window at `0xFEB12000` (the guest
++  maps 8 KiB per BAR5 -- measured) and its own six port files.  CLI
++  `--sata2=` / `--sata2-portN=` attach images to it; an image on that row
++  implies the controller.  Placement at 0:31:3 is deliberate: the guest
++  class scan is bus-0 dev/func ascending (measured), so the onboard
++  0:31:2 keeps the `controller 0` receipt.
++- `machine_t` attach rows became `[AHCI_CTRLS][AHCI_MAX_ATTACH]`;
++  `ahci_register_ctrl(m, ctrl)` registers per-controller instances
++  (`ahci_register()` stays the controller-0 entry point; controller-1
++  logs are tagged `[ahci2]`, controller-0 keeps the exact historical
++  `[ahci]` spelling).
++- `tests/integration/test_ahci_matrix.sh`: the QEMU `test_ahci_matrix.sh`
++  lanes A/B/C reproduced guest-side through the emulator's `--keys-at`
++  lane, plus an unattached negative-control lane and a sequential
++  determinism pair (lane B always; `MATRIX_DETERMINISM=1` for the full
++  matrix).
++
++### Fixed / measured — patch 0034
++- 15 -> 18 unit vectors: second-window independence (ABAR/ABAR2 do not
++  alias, per-controller GHC), port placement through the command engine
++  (TFES on a dark port, clean DMA on port 3), cross-controller image
++  isolation (READ/WRITE never bleed between rows).
++
+ ### Added — patch 0023 (KERNEL-BOOT K3, probe-path hardware)
+ - `src/acpi.[ch]`: a fabricated ACPI set (RSDP rev 2 with both RSDT and
+   XSDT, one MADT: LAPIC 0, I/O APIC @0xFEC00000 GSI base 0, ISA IRQ0→GSI2
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8c933e2..99c1d2d 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -27,7 +27,7 @@ maps to exactly one plan below.
+ | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | 🔵 **IN PROGRESS** (C0–C6 done ✅, C7–C11 planned) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
+ | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | 🔵 **IN PROGRESS** (H0–H4 done ✅, H5–H7 planned) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+-| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | 🔵 **IN PROGRESS** (S0–S3 done ✅, S4–S5 planned) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller | S0–S5 |
++| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | 🔵 **IN PROGRESS** (S0–S4 done ✅, S5 planned) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller | S0–S5 |
+ | `docs/plans/USB_PLAN.md` | 📋 planned | finish BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+@@ -76,5 +76,6 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0029` — KERNEL-BOOT K8: SMP clock pacing (hlt-idle clock yield + per-vCPU LAPIC timer settle on idle slots) → guest userspace gates `SMPSTRESS PASS` + `IRQAPWAKE PASS`~~ shipped — KERNEL_BOOT plan closed for the north star (2-vCPU shell + guest SMP gates)
+ - ~~`0030` — STORE S0: measured baseline + `docs/plans/STORE_PLAN.md`~~ shipped
+ - ~~`0031` — STORE S1: AHCI HBA registers + presence (ABAR 0xFEB10000, `--sata=` CLI, receipt: guest binds controller, attached disk reported)~~ shipped
+-- `0032` — STORE S2: command engine + READ DMA EXT (guest self-test blank-LBA0 receipt)
+-- `0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical
++- ~~`0032` — STORE S2: command engine + READ DMA EXT (guest self-test blank-LBA0 receipt)~~ shipped
++- ~~`0033` — STORE S3: WRITE DMA EXT shares the engine; guest `/disk`+`/fat` token round-trips typed via KBC, determinism pair byte-identical~~ shipped
++- ~~`0034` — STORE S4: breadth matrix -- `--sata-portN=` placement, `--ahci2` second controller (0:31:3, ABAR2 0xFEB12000), QEMU `test_ahci_matrix.sh` lanes A/B/C reproduced guest-side + unattached negative control~~ shipped
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 995116e..bc0b624 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -227,6 +227,30 @@
+   `2 CPU(s) online (1 AP(s) woken)`, deterministic (two runs
+   byte-identical), `PASS: multi-core system detected`.
+ 
++- STORE S4 done (patches/0034): the breadth matrix the guest's own QEMU
++  gate (`test_ahci_matrix.sh`) exercises is reproduced guest-side on the
++  emulator.  Machine half first (measured): `machine_t` attach rows are
++  per controller now (`[ctrl][port]`, `AHCI_CTRLS=2`), `src/ahci.c` runs
++  one register instance per controller (ctrl 0 = onboard 0:31:2 keeps
++  every historical `[ahci]` receipt; ctrl 1 = `--ahci2` at 0:31:3 logs as
++  `[ahci2]`), second ABAR window at 0xFEB12000 (the guest maps 8 KiB per
++  BAR5 -- measured), CLI `--ahci2` / `--sata2=` / `--sata2-portN=`
++  (images on row 1 imply the controller).  Placement at 0:31:3 is not
++  arbitrary: the guest's class scan is bus-0 dev/func ASCENDING (measured
++  `pci_find_class_after`), so 31:3 binds second and "controller 0 at PCI
++  0:31.2" stays the S1-S3 receipt.  Unit suite 15 -> 18 vectors (second
++  window does not alias the first, port placement honoured by the engine
++  incl. TFES on a dark port, cross-controller images never bleed).
++  Guest receipts (`tests/integration/test_ahci_matrix.sh`, frozen
++  kernel@0ed0d29 + initrd): lane A port-0 token round-trip `laneaok` +
++  `PASS: SATA read/write DMA works`; lane B `hw port 1: SATA disk` with
++  the empty port 0 skipped + `lanebok` + byte-identical determinism pair;
++  lane C `controller 1 at PCI 0:31.3` + `2 controller(s), 2 SATA
++  device(s) ready` + `[ext2] blkdev 1 mounted at /ext2` (2-disk boot) +
++  `lanecok`; lane E (no attachment) `1 controller(s), 0 SATA device(s)
++  ready` + `self-test: no devices`.  Prompt arrival is deterministic and
++  measured (2680097588 / 2680082155 / 2748891330 instructions).
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/STORE_PLAN.md b/docs/plans/STORE_PLAN.md
+index f374a3a..d8677a4 100644
+--- a/docs/plans/STORE_PLAN.md
++++ b/docs/plans/STORE_PLAN.md
+@@ -229,19 +229,60 @@ byte-identical.
+ - Harness: `tests/integration/test_ahci_rw.sh` automates lanes A+B and
+   the byte-compare.
+ 
+-### S4 — Breadth matrix
++### S4 — Breadth matrix — ✅ done (patches/0034-STORE-S4-ahci-matrix.patch)
+ 
+-Multiple `--disk-portN=` attachments (0..5 exposed of NP=6), optional second
++Multiple `--sata-portN=` attachments (0..5 exposed of NP=6), optional second
+ controller (`--ahci2` adds a second PCI function so the guest's multi-scan
+ `ctrl_count` path runs), up to 4 guest-visible volumes (`/disk /fat` on
+ disk 1, `/ext2 /exfat /ext4` per further disks).
+ 
+-**DoD (measured):** the three `test_ahci_matrix.sh` lanes reproduced
+-guest-side: A port 0 r/w token; B port 1 only (empty port 0 skipped —
+-guest log shows no port-0 disk); C two controllers one disk each, guest
+-`controller 1` line + both tokens round-trip; 2-disk boot shows
+-`[ext2]` mounted.
+-**Gate:** matrix receipts + tests.
++**Measured machine facts (baseline `ab6f08d`, S0–S3):**
++- `machine_t.sata_img/sata_len` were one flat row (`[port]`) and
++  `src/ahci.c` had a single global `g_ahci` on one ABAR window -- a second
++  controller was impossible by construction.
++- The guest's class scan is **bus-0 dev/func ASCENDING** (measured:
++  AuraLite-OS `drivers/pci/pci.c` `pci_find_class_after`, `for (dev = 0;
++  dev < 32; ...)`): a second controller at any slot below 31:2 would bind
++  as "controller 0" and renumber every S1-S3 receipt.  Placement is
++  therefore **0:31:3** (QEMU's free-slot placement is not reproducible on
++  this fixed topology and would break "controller 0 at PCI 0:31.2").
++- The guest maps **8 KiB per BAR5** (measured `ahci.c` map size), so the
++  second ABAR sits 8 KiB clear of the first: `AHCI_ABAR2 = 0xFEB12000`.
++
++**Implementation:** `machine_t.sata_img/sata_len` became
++`[AHCI_CTRLS][AHCI_MAX_ATTACH]`; `ahci_register_ctrl(m, ctrl)` brings up
++per-controller instances (ctrl 0 keeps the historical `ahci_register()`
++entry point and the exact `[ahci]` log spelling; ctrl 1 logs as
++`[ahci2]`); `devices_add_ahci2()` adds the PCI function (0:31:3,
++8086:2922, class 01/06/01, BAR5=ABAR2); CLI `--ahci2` plus `--sata2=` /
++`--sata2-portN=` (an image on row 1 implies the controller).  Unit suite
++15 → 18 vectors (controller-window independence, port placement through
++the engine, cross-controller image isolation).
++
++**DoD (measured, captured in `tests/integration/test_ahci_matrix.sh`
++lanes, frozen kernel `AuraLite-OS@0ed0d29` + initrd (bin/init +
++apps/filesize), 3.2G-instr lanes; prompt arrival measured at instr
++2680097588 (A) / 2680082155 (B) / 2748891330 (C -- ext2 mount on the
++second disk):**
++- **Lane A** (port 0): `PASS: SATA read/write DMA works`, typed
++  `write /fat/matrix.txt laneaok` -> `wrote /fat/matrix.txt` -> `cat`
++  echoes `laneaok`, `[fat32] PASS: FAT32 read/write`, zero
++  `unsupported ATA cmd` / `[ahci|diskfs|fat32] FAIL`.
++- **Lane B** (port 1 only): `hw port 1: SATA disk (sig=0x00000101)` +
++  `1 controller(s), 1 SATA device(s) ready`, **no** `hw port 0: SATA
++  disk` line (empty port 0 skipped), `lanebok` round-trip; sequential
++  determinism pair **byte-identical**.
++- **Lane C** (`--ahci2`, one disk each): `controller 0 at PCI 0:31.2` +
++  `controller 1 at PCI 0:31.3` + `2 controller(s), 2 SATA device(s)
++  ready`, `[ext2] blkdev 1 mounted at /ext2` + `[ext2] PASS: ext2
++  read/write/dir/indirect works` (2-disk boot shows `[ext2]` mounted),
++  `lanecok` round-trip on `/fat` (controller-0 disk).
++- **Lane E** (no `--sata`, negative control): `1 controller(s), 0 SATA
++  device(s) ready` + `self-test: no devices`, zero `hw port` lines.
++
++**Gate:** matrix receipts above (harness prints `S4 matrix receipts: ALL
++PASS`) + 18-vector `tests/test_ahci.c` green + `make test` +
++`make test-sanitize` green.
+ 
+ ### S5 — Large transfers + hardening
+ 
+diff --git a/src/ahci.c b/src/ahci.c
+index 590b27f..92bc5c3 100644
+--- a/src/ahci.c
++++ b/src/ahci.c
+@@ -7,6 +7,15 @@
+ // PxSIG == 0x00000101 to accept a disk, programs PxCLB/CLBU + PxFB/FBU,
+ // drives PxCMD ST/FRE and spins on CR/FR, W1C-clears PxIS/PxSERR, keeps
+ // PxIE = 0 (polled completion), and issues commands through PxCI.
++//
++// S4: the model is per-controller -- ahci_register_ctrl() brings up ctrl
++// < AHCI_CTRLS, each with its own ABAR window, port files and attach row
++// (machine_t.sata_img[ctrl][port]).  Controller 0 is the onboard 0:31:2
++// function; controller 1 appears under --ahci2 at 0:31:3 (the guest's
++// class scan is bus-0 dev/func ascending -- measured -- so 0:31:3 binds
++// second and "controller 0 at PCI 0:31.2" stays the S1-S3 receipt).
++// Guest-visible log lines: controller 0 keeps the historical
++// "[ahci] port %d" spelling; controller 1 is tagged "[ahci2]".
+ 
+ #include <stdint.h>
+ #include <string.h>
+@@ -50,15 +59,16 @@ typedef struct {
+ 
+ typedef struct {
+     machine_t   *m;
++    int          ctrl;             /* S4: controller index (0..AHCI_CTRLS-1) */
+     uint32_t     ghc;
+-    uint32_t     is;               /* controller HBA IS (engine in S5) */
++    uint32_t     is;               /* controller HBA IS (mirrors PxIS bits, S5) */
+     port_regs_t  port[AHCI_HW_PORTS];
+ } ahci_t;
+ 
+-static ahci_t g_ahci;
++static ahci_t g_ahci[AHCI_CTRLS];
+ 
+-static int port_attached(const machine_t *m, int p) {
+-    return p < AHCI_MAX_ATTACH && m->sata_img[p] != NULL;
++static int port_attached(const ahci_t *a, int p) {
++    return p < AHCI_MAX_ATTACH && a->m->sata_img[a->ctrl][p] != NULL;
+ }
+ 
+ static int port_of(uint64_t off) {
+@@ -66,6 +76,10 @@ static int port_of(uint64_t off) {
+     return (int)((off - 0x100u) / 0x80u);
+ }
+ 
++/* S4: the log tag pins which controller a line belongs to; controller 0
++ * keeps the exact historical spelling so no S1-S3 receipt greps change. */
++static const char *tagc(const ahci_t *a) { return a->ctrl ? "[ahci2]" : "[ahci]"; }
++
+ /* ---- S2 command engine: FIS decode + ATA READ DMA EXT / IDENTIFY ----
+  *
+  * Contract measured from the guest driver: it builds ONE command header
+@@ -97,10 +111,12 @@ static uint64_t fis_u64(const uint8_t *f, int i) {
+ /* Sector DMA between the image and guest RAM.  w=0 device->guest
+  * (READ), w=1 guest->device (WRITE); S5 decides host write-through
+  * (today the image is in-memory, the USB stick's own convention). */
+-static int ahci_dma_xfer(machine_t *m, int p, uint64_t lba, uint32_t bytes,
++static int ahci_dma_xfer(ahci_t *a, int p, uint64_t lba, uint32_t bytes,
+                          uint32_t prdtl, uint64_t ct, int w) {
++    machine_t *m = a->m;
++    uint8_t *img = m->sata_img[a->ctrl][p];
+     uint64_t off = lba * 512ull;
+-    if (lba > UINT64_MAX / 512 || off + bytes > m->sata_len[p]) return -1; /* OOB: TFES */
++    if (lba > UINT64_MAX / 512 || off + bytes > m->sata_len[a->ctrl][p]) return -1; /* OOB: TFES */
+     uint64_t remain = bytes;
+     for (uint32_t i = 0; i < prdtl && remain; i++) {
+         uint64_t dba  = gdr(m, ct + 0x80 + i * 16)
+@@ -109,17 +125,18 @@ static int ahci_dma_xfer(machine_t *m, int p, uint64_t lba, uint32_t bytes,
+         if (dbc > remain) dbc = remain;
+         if (w)
+             for (uint32_t k = 0; k < dbc; k++)
+-                m->sata_img[p][off + k] = (uint8_t)mem_read(m, dba + k, 1);
++                img[off + k] = (uint8_t)mem_read(m, dba + k, 1);
+         else
+             for (uint32_t k = 0; k < dbc; k++)
+-                mem_write(m, dba + k, 1, m->sata_img[p][off + k]);
++                mem_write(m, dba + k, 1, img[off + k]);
+         off += dbc; remain -= dbc;
+     }
+     return (int)(bytes - remain);
+ }
+ 
+ /* IDENTIFY DEVICE: the standard 512-byte block, machine-honest fields. */
+-static void ahci_identify(machine_t *m, int p, uint32_t prdtl, uint64_t ct) {
++static void ahci_identify(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
++    machine_t *m = a->m;
+     static uint8_t idb[512];
+     memset(idb, 0, sizeof idb);
+     idb[0] = 0x40;                                  /* word0: non-removable */
+@@ -130,12 +147,12 @@ static void ahci_identify(machine_t *m, int p, uint32_t prdtl, uint64_t ct) {
+         idb[w * 2 + 1] = model[(w - 27) * 2 + 1];
+     }
+     idb[49 * 2] = 0x00; idb[49 * 2 + 1] = 0x03;     /* word49: LBA + DMA supported */
+-    uint32_t secs28 = (uint32_t)(m->sata_len[p] / 512);
++    uint32_t secs28 = (uint32_t)(m->sata_len[a->ctrl][p] / 512);
+     if (secs28 > 0x0FFFFFFF) secs28 = 0x0FFFFFFF;   /* LBA28 ceiling */
+     idb[60 * 2] = secs28 & 0xFF; idb[60 * 2 + 1] = (secs28 >> 8) & 0xFF;
+     idb[61 * 2] = (secs28 >> 16) & 0xFF; idb[61 * 2 + 1] = (secs28 >> 24) & 0xFF;
+     idb[83 * 2] = 0x00; idb[83 * 2 + 1] = 0x04;     /* word83 bit10: LBA48 */
+-    uint64_t secs48 = m->sata_len[p] / 512;
++    uint64_t secs48 = m->sata_len[a->ctrl][p] / 512;
+     for (int i = 0; i < 4; i++) {
+         idb[(100 + i) * 2]     = (secs48 >> (16 * i)) & 0xFF;
+         idb[(100 + i) * 2 + 1] = (secs48 >> (16 * i + 8)) & 0xFF;
+@@ -151,8 +168,9 @@ static void ahci_identify(machine_t *m, int p, uint32_t prdtl, uint64_t ct) {
+ }
+ 
+ /* Execute whatever the guest latched into PxCI for port p. */
+-static void ahci_engine_port(machine_t *m, int p) {
+-    port_regs_t *r = &g_ahci.port[p];
++static void ahci_engine_port(ahci_t *a, int p) {
++    machine_t *m = a->m;
++    port_regs_t *r = &a->port[p];
+     if (!r->ci) return;
+     uint64_t clb = (uint64_t)r->clb | ((uint64_t)r->clbu << 32);
+     for (int s = 0; s < 32 && r->ci; s++) {
+@@ -179,18 +197,18 @@ static void ahci_engine_port(machine_t *m, int p) {
+         case ATA_CMD_READ_DMA_EXT:
+         case ATA_CMD_WRITE_DMA_EXT: {
+             /* S3: WRITE DMA EXT admitted; guest data travels PRDT -> image. */
+-            done = ahci_dma_xfer(m, p, lba, cnt * 512u, prdtl, ct, wr);
++            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, wr);
+             if (done < 0) goto tfes;
+             break;
+         }
+         case ATA_CMD_IDENTIFY: {
+             if (wr) goto tfes;
+-            ahci_identify(m, p, prdtl, ct);
++            ahci_identify(a, p, prdtl, ct);
+             done = 512;
+             break;
+         }
+         default:
+-            mlog(&m->log, "[ahci] port %d: unsupported ATA cmd 0x%02x (S3 scope)\n", p, cmd);
++            mlog(&m->log, "%s port %d: unsupported ATA cmd 0x%02x (S3 scope)\n", tagc(a), p, cmd);
+             goto tfes;
+         }
+         gdw(m, hdr + 4, (uint32_t)done);       /* prdbc: bytes transferred */
+@@ -205,8 +223,8 @@ static void ahci_engine_port(machine_t *m, int p) {
+     }
+ }
+ 
+-static uint64_t port_read(machine_t *m, int p, uint32_t sub) {
+-    port_regs_t *r = &g_ahci.port[p];
++static uint64_t port_read(ahci_t *a, int p, uint32_t sub) {
++    port_regs_t *r = &a->port[p];
+     switch (sub) {
+     case 0x00: return r->clb;
+     case 0x04: return r->clbu;
+@@ -225,12 +243,12 @@ static uint64_t port_read(machine_t *m, int p, uint32_t sub) {
+     }
+     case 0x1C: return 0;                     /* reserved */
+     case 0x20: {
+-        uint32_t v = port_attached(m, p) ? TFD_ATTACHED : TFD_DARK;
++        uint32_t v = port_attached(a, p) ? TFD_ATTACHED : TFD_DARK;
+         if (r->tfd_err) v |= 1;              /* ERR sticky until next ok */
+         return v;
+     }
+-    case 0x24: return port_attached(m, p) ? SATA_SIG_ATA : SATA_SIG_NONE;
+-    case 0x28: return port_attached(m, p) ? SSTS_ATTACHED : SSTS_DARK;
++    case 0x24: return port_attached(a, p) ? SATA_SIG_ATA : SATA_SIG_NONE;
++    case 0x28: return port_attached(a, p) ? SSTS_ATTACHED : SSTS_DARK;
+     case 0x2C: return r->sctl;
+     case 0x30: return r->serr;
+     case 0x34: return 0;                     /* PxSACT: no queued commands */
+@@ -239,8 +257,9 @@ static uint64_t port_read(machine_t *m, int p, uint32_t sub) {
+     }
+ }
+ 
+-static void port_write(machine_t *m, int p, uint32_t sub, uint32_t v) {
+-    port_regs_t *r = &g_ahci.port[p];
++static void port_write(ahci_t *a, int p, uint32_t sub, uint32_t v) {
++    machine_t *m = a->m;
++    port_regs_t *r = &a->port[p];
+     switch (sub) {
+     case 0x00: r->clb  = v; break;
+     case 0x04: r->clbu = v; break;
+@@ -257,7 +276,7 @@ static void port_write(machine_t *m, int p, uint32_t sub, uint32_t v) {
+          * DET=0 and polls PxSSTS.DET==3.  An attached disk renegotiates
+          * instantly in this model; an absent one stays dark. */
+         r->sctl = v & 0x0Fu;
+-        mlog(&m->log, "[ahci] port %d: COMRESET %s\n", p,
++        mlog(&m->log, "%s port %d: COMRESET %s\n", tagc(a), p,
+              (v & 0xF) == 1 ? "initiate" : "release");
+         break;
+     }
+@@ -265,7 +284,7 @@ static void port_write(machine_t *m, int p, uint32_t sub, uint32_t v) {
+     case 0x38:
+         r->tfd_err = 0;                     /* fresh issue attempt clears sticky ERR */
+         r->ci |= v;
+-        ahci_engine_port(m, p);             /* S2: instant DMA, clears bits */
++        ahci_engine_port(a, p);             /* S2: instant DMA, clears bits */
+         break;
+     default: break;
+     }
+@@ -273,7 +292,7 @@ static void port_write(machine_t *m, int p, uint32_t sub, uint32_t v) {
+ 
+ static uint64_t abar_read(void *ctx, uint64_t addr, int size) {
+     ahci_t *a = ctx;
+-    uint64_t off = addr - AHCI_ABAR;
++    uint64_t off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+     if (size != 4) {
+         /* The guest reads 32-bit only (dword array indexing).  Assemble
+          * byte/other sizes from the containing dword for robustness. */
+@@ -294,18 +313,18 @@ static uint64_t abar_read(void *ctx, uint64_t addr, int size) {
+     }
+     int p = port_of(off);
+     if (p < 0) return 0;
+-    return port_read(a->m, p, (uint32_t)(off & 0x7Fu));
++    return port_read(a, p, (uint32_t)(off & 0x7Fu));
+ }
+ 
+ static void abar_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+     ahci_t *a = ctx;
+-    uint64_t off = addr - AHCI_ABAR;
++    uint64_t off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+     if (size != 4) {
+         uint32_t old = (uint32_t)abar_read(ctx, addr & ~3ull, 4);
+         uint64_t in = addr & 3ull, mask = 0;
+         for (int i = 0; i < size; i++) mask |= 0xFFull << (8 * (in + i));
+         val = (old & ~mask) | ((val << (8 * in)) & mask);
+-        addr &= ~3ull; off = addr - AHCI_ABAR;
++        addr &= ~3ull; off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+     }
+     if (off < 0x100) {
+         switch (off) {
+@@ -316,14 +335,22 @@ static void abar_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+         return;
+     }
+     int p = port_of(off);
+-    if (p >= 0) port_write(a->m, p, (uint32_t)(off & 0x7Fu), (uint32_t)val);
++    if (p >= 0) port_write(a, p, (uint32_t)(off & 0x7Fu), (uint32_t)val);
++}
++
++void ahci_register_ctrl(machine_t *m, int ctrl) {
++    if (ctrl < 0 || ctrl >= AHCI_CTRLS) return;
++    ahci_t *a = &g_ahci[ctrl];
++    memset(a, 0, sizeof *a);
++    a->m = m;
++    a->ctrl = ctrl;
++    uint32_t base = ctrl ? AHCI_ABAR2 : AHCI_ABAR;
++    mem_register_mmio(m, base, AHCI_ABAR_SIZE, abar_read, abar_write,
++                      a, ctrl ? "AHCI ABAR2" : "AHCI ABAR");
++    mlog(&m->log, "%s ABAR registered at 0x%x (%u ports, S1: registers+presence)\n",
++         tagc(a), base, AHCI_HW_PORTS);
+ }
+ 
+ void ahci_register(machine_t *m) {
+-    memset(&g_ahci, 0, sizeof g_ahci);
+-    g_ahci.m = m;
+-    mem_register_mmio(m, AHCI_ABAR, AHCI_ABAR_SIZE, abar_read, abar_write,
+-                      &g_ahci, "AHCI ABAR");
+-    mlog(&m->log, "[ahci] ABAR registered at 0x%x (%u ports, S1: registers+presence)\n",
+-         AHCI_ABAR, AHCI_HW_PORTS);
++    ahci_register_ctrl(m, 0);
+ }
+diff --git a/src/ahci.h b/src/ahci.h
+index 1324057..03e422c 100644
+--- a/src/ahci.h
++++ b/src/ahci.h
+@@ -15,11 +15,25 @@
+ #include "machine.h"
+ 
+ #define AHCI_ABAR        0xFEB10000u
++#define AHCI_ABAR2       0xFEB12000u   /* S4: --ahci2 controller; the guest maps
++                                        * 8 KiB per BAR5 (measured ahci.c), so
++                                        * the two windows sit 8 KiB apart */
+ #define AHCI_ABAR_SIZE   0x1000u
+ #define AHCI_HW_PORTS    6            /* CAP.NP = 5 (0-based) */
+ 
+-/* Registers + window. Idempotent; safe to call from devices_init_common
+- * after the PCI function and BAR5 are wired up by the caller. */
++/* S5: INTx lines.  Board wire: controller N asserts ISA line AHCI_IRQ0+N
++ * (legacy IDE pairing 14/15) through pic_set_irq(), which fans the same
++ * line out to the I/O APIC (CHIPSET H7).  Active-low level semantics live
++ * in pic_set_irq; the line is held while (PxIS & PxIE) is nonzero. */
++#define AHCI_IRQ0        14
++#define AHCI_IRQ1        15
++
++/* Registers + window.  S4: ahci_register() is controller 0 (the historical
++ * entry point, every S1-S3 test calls it); ahci_register_ctrl() brings up
++ * controller ctrl < AHCI_CTRLS with its own ABAR window and port files.
++ * Idempotent per controller; safe to call from devices_init_common after
++ * the PCI function and BAR5 are wired up by the caller. */
+ void ahci_register(machine_t *m);
++void ahci_register_ctrl(machine_t *m, int ctrl);
+ 
+ #endif
+diff --git a/src/devices.c b/src/devices.c
+index 09f830b..ab3ebd2 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -268,6 +268,23 @@ void devices_init_common(machine_t *m) {
+ 
+ }
+ 
++/* STORE S4: optional second AHCI controller (--ahci2).  QEMU's
++ * `-device ahci,id=ahci1` parity: a second class-01/06 function so the
++ * guest's multi-scan `ctrl_count` path (RESIDUE2 T3) runs.  Placement at
++ * 0:31:3 is deliberate and measured: the guest class scan is bus-0
++ * dev/func ASCENDING (drivers/pci/pci.c pci_find_class_after), so 0:31:3
++ * binds AFTER the onboard 0:31:2 and every S1-S3 receipt ("controller 0
++ * at PCI 0:31.2") keeps its numbering.  BAR5 -> AHCI_ABAR2 (8 KiB apart
++ * from ABAR because the guest maps 8 KiB per BAR5). */
++void devices_add_ahci2(machine_t *m) {
++    pci_dev_t *p = pci_add_device(m, 0,31,3, "sata-ahci2", 0x8086, 0x2922, 0x01, 0x06, 1);
++    p->cfg[0x24] = (uint8_t)(AHCI_ABAR2);
++    p->cfg[0x25] = (uint8_t)(AHCI_ABAR2 >> 8);
++    p->cfg[0x26] = (uint8_t)(AHCI_ABAR2 >> 16);
++    p->cfg[0x27] = (uint8_t)(AHCI_ABAR2 >> 24);
++    ahci_register_ctrl(m, 1);
++}
++
+ void devices_init_platform(machine_t *m) {
+     const platform_t *p = m->plat;
+     switch (p->id) {
+diff --git a/src/devices.h b/src/devices.h
+index e288450..aae0f2b 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -4,6 +4,7 @@
+ 
+ void devices_init_common(machine_t *m);     /* LPC, SATA, GPU, EHCI, CMOS, SuperIO, CAR window */
+ void devices_init_platform(machine_t *m);   /* DDR controller models for the selected platform */
++void devices_add_ahci2(machine_t *m);       /* STORE S4: second AHCI controller (--ahci2) */
+ void devices_done(machine_t *m);            /* C10: frees every mmio region + rw2 window */
+ 
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+diff --git a/src/machine.h b/src/machine.h
+index 56c71dc..be21eb9 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -33,8 +33,12 @@ typedef struct mmio_region {
+     struct mmio_region *next;
+ } mmio_region_t;
+ 
+-/* STORE S1+: AHCI attach slots (kept in step with AHCI_HW_PORTS in ahci.h) */
++/* STORE S1+: AHCI attach slots (kept in step with AHCI_HW_PORTS in ahci.h).
++ * STORE S4: slots are per controller -- [ctrl][port], ctrl < AHCI_CTRLS
++ * (the second controller appears only under --ahci2; ctrl 0 is the
++ * onboard 0:31:2 function every historical lane uses). */
+ #define AHCI_MAX_ATTACH 6
++#define AHCI_CTRLS      2
+ 
+ /* ---- I/O port device model (64K space) ---- */
+ typedef uint32_t (*io_read_fn)(void *ctx, uint16_t port, int size);
+@@ -109,9 +113,11 @@ struct machine {
+     size_t   disk_len;
+ 
+     /* STORE S1+: SATA/AHCI attachments -- up to AHCI_MAX_ATTACH raw host
+-     * images, one per HBA port; NULL = port dark (PxSSTS.DET = 0). */
+-    uint8_t *sata_img[AHCI_MAX_ATTACH];
+-    size_t   sata_len[AHCI_MAX_ATTACH];
++     * images per controller, one per HBA port; NULL = port dark
++     * (PxSSTS.DET = 0).  STORE S4: row 0 = onboard controller (0:31:2),
++     * row 1 = the --ahci2 controller (0:31:3). */
++    uint8_t *sata_img[AHCI_CTRLS][AHCI_MAX_ATTACH];
++    size_t   sata_len[AHCI_CTRLS][AHCI_MAX_ATTACH];
+ 
+     logring_t log;
+ 
+diff --git a/src/main.c b/src/main.c
+index 4846ab2..f0b4939 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -94,7 +94,8 @@ int main(int argc, char **argv) {
+                                      * pre-boot keys verbatim -- measured.) */
+     const char *kernel_path = NULL; /* --kernel=path: KERNEL-BOOT K1 direct-load lane */
+     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
+-    const char *sata_cfg[AHCI_MAX_ATTACH] = {0}; /* --sata/ --sata-portN (STORE S1+) */
++    const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
++    int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
+     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+                                      * publishes N CPUs while the emulator still
+                                      * runs one vCPU (0/1 = historical UP) */
+@@ -122,14 +123,25 @@ int main(int argc, char **argv) {
+         /* STORE S1+: SATA attachments.  --sata=path attaches to HBA port 0;
+          * --sata-portN=path pins a specific port (0..AHCI_MAX_ATTACH-1).
+          * --sata-max must not equal --sata prefix wise, so --sata= is tested
+-         * after the longer --sata-port prefix. */
++         * after the longer --sata-port prefix.  S4: the --sata2 family
++         * attaches to the --ahci2 controller the same way (longest
++         * prefixes first so --sata2-portN cannot fall into --sata2= or
++         * --sata=). */
++        else if (!strncmp(argv[i], "--sata2-port", 12)) {
++            const char *eq = strchr(argv[i] + 12, '=');
++            int port = atoi(argv[i] + 12);
++            if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
++                sata_cfg[1][port] = eq + 1;
++        }
++        else if (!strncmp(argv[i], "--sata2=", 8)) sata_cfg[1][0] = argv[i]+8;
++        else if (!strcmp(argv[i], "--ahci2")) cfg_ahci2 = 1;
+         else if (!strncmp(argv[i], "--sata-port", 11)) {
+             const char *eq = strchr(argv[i] + 11, '=');
+             int port = atoi(argv[i] + 11);
+             if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
+-                sata_cfg[port] = eq + 1;
++                sata_cfg[0][port] = eq + 1;
+         }
+-        else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0] = argv[i]+7;
++        else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
+         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
+         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
+         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
+@@ -144,7 +156,10 @@ int main(int argc, char **argv) {
+                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
+                    "          [--cpus=N] publish N CPUs in boot_info/MADT with ONE vCPU (KERNEL-BOOT K5 metering)\n"
+                    "          [--smp=N] run N real vCPUs (max 2; use with --cpus=N for kernel SMP bring-up, K6)\n"
+-                   "                      skips --rom entirely and starts at the ELF entry\n", argv[0]);
++                   "                      skips --rom entirely and starts at the ELF entry\n"
++                   "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
++                   "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
++                   "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n", argv[0]);
+             return 0;
+         }
+     }
+@@ -180,14 +195,29 @@ int main(int argc, char **argv) {
+     else if (!kernel_path) { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
+ 
+     /* STORE S1+: attach SATA port images the same way the USB stick gets its
+-     * backing. */
+-    for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
+-        if (!sata_cfg[i]) continue;
+-        size_t len = 0;
+-        uint8_t *img = read_file(sata_cfg[i], &len);
+-        if (!img) { mlog(&m->log, "[ahci] port %d: cannot read %s -- port stays dark", i, sata_cfg[i]); continue; }
+-        m->sata_img[i] = img; m->sata_len[i] = len;
+-        mlog(&m->log, "[ahci] port %d: attached %s (%zu bytes)", i, sata_cfg[i], len);
++     * backing.  S4: row 1 feeds the --ahci2 controller; bring the second
++     * controller up only when asked (or when its ports carry images). */
++    for (int c = 0; c < AHCI_CTRLS; c++) {
++        if (c == 1 && !cfg_ahci2) {
++            int any2 = 0;
++            for (int i = 0; i < AHCI_MAX_ATTACH; i++) if (sata_cfg[1][i]) any2 = 1;
++            if (!any2) continue;
++            cfg_ahci2 = 1;   /* --sata2 without --ahci2: imply the controller */
++        }
++        if (c == 1) devices_add_ahci2(m);
++        for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
++            if (!sata_cfg[c][i]) continue;
++            size_t len = 0;
++            uint8_t *img = read_file(sata_cfg[c][i], &len);
++            if (!img) {
++                mlog(&m->log, "[ahci%s] port %d: cannot read %s -- port stays dark",
++                     c ? "2" : "", i, sata_cfg[c][i]);
++                continue;
++            }
++            m->sata_img[c][i] = img; m->sata_len[c][i] = len;
++            mlog(&m->log, "[ahci%s] port %d: attached %s (%zu bytes)",
++                 c ? "2" : "", i, sata_cfg[c][i], len);
++        }
+     }
+ 
+     if (kernel_path) {
+@@ -198,7 +228,8 @@ int main(int argc, char **argv) {
+             pci_done(m);
+             mem_done(m);
+             free(disk);
+-            for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
++            for (int c = 0; c < AHCI_CTRLS; c++)
++                for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[c][i]);
+             free(m);
+             return EXIT_INPUT_ERROR;
+         }
+@@ -368,7 +399,8 @@ int main(int argc, char **argv) {
+     pci_done(m);
+     mem_done(m);
+     free(disk);
+-    for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[i]);
++    for (int c = 0; c < AHCI_CTRLS; c++)
++        for (int i = 0; i < AHCI_MAX_ATTACH; i++) free(m->sata_img[c][i]);
+     free(rom);
+     free(m);
+     return rc;
+diff --git a/tests/integration/test_ahci_matrix.sh b/tests/integration/test_ahci_matrix.sh
+new file mode 100755
+index 0000000..54af32b
+--- /dev/null
++++ b/tests/integration/test_ahci_matrix.sh
+@@ -0,0 +1,171 @@
++#!/bin/sh
++# tests/integration/test_ahci_matrix.sh -- STORE S4 guest receipt harness.
++#
++# Mirrors the QEMU-side test_ahci_matrix.sh contract (AuraLite-OS
++# tests/integration/cases/test_ahci_matrix.sh, lanes A/B/C -- lane D is the
++# q35 *machine* shape and has no emulator equivalent; the emulator's own
++# platform profiles are exercised by `make test`) with the emulator's
++# input lane (--keys-at=prompt).  Every lane boots the frozen AuraLite-OS
++# kernel/initrd to its shell, types a write+cat token round-trip on /fat,
++# and greps the host log for the lane's assertions:
++#
++#   Lane A  onboard controller with a disk at port 0   (baseline shape)
++#   Lane B  disk at port 1 only (empty port 0 skipped by enumeration)
++#   Lane C  --ahci2 + one disk on each controller (multi-controller scan)
++#   Lane E  no --sata at all (negative control: the unattached S1 receipt)
++#
++# Tokens are lower-case + digits only: the KBC injection lane sends bare
++# set-1 make/break pairs with no SHIFT, so '_' cannot be typed (measured
++# on the S3 script, which uses the same alphabet).
++#
++# Determinism: lane B (the cheap lane) runs TWICE sequentially and the two
++# serial logs must be byte-identical.  Set MATRIX_DETERMINISM=1 to run
++# EVERY key-injecting lane twice and byte-compare (the S5 full-matrix
++# determinism gate).
++#
++# Usage:
++#   KERNEL=/path/kernel.elf INITRD=/path/initrd.tar \
++#       tests/integration/test_ahci_matrix.sh [workdir]
++#
++# Required env: KERNEL, INITRD.  Optional: X86EMU (default ./x86emu),
++# MATRIX_DETERMINISM=1, MAX_INSTR (default 6000000000).
++
++set -eu
++
++X86EMU=${X86EMU:-./x86emu}
++WORK=${1:-/tmp/ahci-matrix-$$}
++MAX_INSTR=${MAX_INSTR:-6000000000}
++: "${KERNEL:?set KERNEL to the frozen guest kernel.elf}"
++: "${INITRD:?set INITRD to the frozen guest initrd.tar}"
++
++mkdir -p "$WORK"
++DISK_A="$WORK/disk-a.img"
++DISK_B="$WORK/disk-b.img"
++DISK_C0="$WORK/disk-c0.img"
++DISK_C1="$WORK/disk-c1.img"
++
++# 16 MiB marked images (AURALHCI apex + 55AA).  The marker is not
++# decoration: the guest's DMA WRITE verification only runs on a disk
++# carrying exactly "AURALHCI" + 0x55AA (drivers/ahci/ahci.c "no scratch
++# marker"), and lane A asserts the resulting PASS line.
++mk_marked() { # mk_marked <path> <MiB>
++    dd if=/dev/zero of="$1" bs=1M count="$2" status=none
++    printf 'AURALHCI' | dd of="$1" bs=1 seek=0 conv=notrunc status=none
++    printf '\125\252' | dd of="$1" bs=1 seek=510 conv=notrunc status=none
++}
++mk_marked "$DISK_A" 16
++mk_marked "$DISK_B" 16
++mk_marked "$DISK_C0" 16
++mk_marked "$DISK_C1" 8
++
++# Typed script: write + cat token round-trip on /fat.  Set-1 make/break
++# pairs, Enter=0x1C.  Alphabet: a-z 0-9 '/' '.' '-' ' ' (no SHIFT).
++mk_keys() { # mk_keys <token> -> echoes scancode list
++    tok="$1"
++    out=""
++    word_scancodes() {
++        w="$1"
++        while [ -n "$w" ]; do
++            ch="${w%"${w#?}"}"; w="${w#?}"
++            case "$ch" in
++                a) k=1E;; b) k=30;; c) k=2E;; d) k=20;; e) k=12;; f) k=21;;
++                g) k=22;; h) k=23;; i) k=17;; j) k=24;; k) k=25;; l) k=26;;
++                m) k=32;; n) k=31;; o) k=18;; p) k=19;; q) k=10;; r) k=13;;
++                s) k=1F;; t) k=14;; u) k=16;; v) k=2F;; w) k=11;; x) k=2D;;
++                y) k=15;; z) k=2C;;
++                0) k=0B;; 1) k=02;; 2) k=03;; 3) k=04;; 4) k=05;;
++                5) k=06;; 6) k=07;; 7) k=08;; 8) k=09;; 9) k=0A;;
++                /) k=35;; .) k=34;; -) k=0C;; ' ') k=39;;
++                *) echo "mk_keys: unsupported char '$ch' (no SHIFT lane)" >&2; exit 2;;
++            esac
++            br=$(printf '%02X' $((0x$k | 0x80)))
++            out="$out$k,$br,"
++        done
++    }
++    line() { word_scancodes "$1"; out="${out}1C,9C,"; }
++    line "write /fat/matrix.txt $tok"
++    line "cat /fat/matrix.txt"
++    line "exit"
++    printf '%s' "${out%,}"
++}
++
++fail=0
++need() { # need <pattern> <file> <label>
++    if ! grep -q "$1" "$2"; then echo "  MISSING: $3"; fail=1; fi
++}
++need_no() { # need_no <pattern> <file> <label>
++    if grep -q "$1" "$2"; then echo "  UNWANTED: $3"; fail=1; fi
++}
++
++# run_typed <name> <token> -- <emu args...> : boot, inject the script at the
++# guest's own "auralite#" echo, capture the full serial log to <name>.out.
++run_typed() {
++    name="$1"; tok="$2"; shift 2
++    keys=$(mk_keys "$tok")
++    "$X86EMU" --kernel="$KERNEL" --initrd="$INITRD" \
++        --keys-at=prompt --keys="$keys" --max-instr="$MAX_INSTR" \
++        "$@" > "$WORK/$name.out" 2>&1
++}
++
++# ---------------- Lane A: onboard controller, disk at port 0 ----------------
++echo "== lane A: one controller, disk at port 0"
++run_typed laneA laneaok --sata="$DISK_A"
++need "keys-at fired"                                    "$WORK/laneA.out" "typed-script injection"
++need "PASS: SATA read/write DMA works"                  "$WORK/laneA.out" "lane A: DMA self-test"
++need "laneaok"                                          "$WORK/laneA.out" "lane A: FAT32 token round-trip"
++need "fat32. PASS: FAT32 read/write"                    "$WORK/laneA.out" "lane A: fat32 format+mount"
++need_no "unsupported ATA cmd"                           "$WORK/laneA.out" "lane A: unsupported ATA cmd"
++need_no "\[ahci\] FAIL|\[diskfs\] FAIL|\[fat32\] FAIL" "$WORK/laneA.out" "lane A: FAIL lines"
++
++# ---------------- Lane B: disk at port 1, port 0 empty ----------------
++echo "== lane B: disk at port 1 only (empty port 0 skipped)"
++run_typed laneB lanebok --sata-port1="$DISK_B"
++need "keys-at fired"                                    "$WORK/laneB.out" "typed-script injection"
++need "hw port 1: SATA disk"                             "$WORK/laneB.out" "lane B: disk on hw port 1"
++need_no "hw port 0: SATA disk"                          "$WORK/laneB.out" "lane B: empty port 0 skipped"
++need "lanebok"                                          "$WORK/laneB.out" "lane B: FAT32 works on port 1"
++
++# Determinism pair for lane B (always on): sequential re-run, byte-compare.
++run_typed laneB-rerun lanebok --sata-port1="$DISK_B"
++if ! cmp -s "$WORK/laneB.out" "$WORK/laneB-rerun.out"; then
++    echo "  NONDETERMINISTIC: lane B runs differ"; fail=1
++fi
++
++# ---------------- Lane C: --ahci2, one disk per controller ----------------
++echo "== lane C: two controllers, one disk each"
++run_typed laneC lanecok --ahci2 --sata="$DISK_C0" --sata2="$DISK_C1"
++need "keys-at fired"                                    "$WORK/laneC.out" "typed-script injection"
++need "controller 0 at PCI 0:31.2"                       "$WORK/laneC.out" "lane C: controller 0 bound"
++need "controller 1 at PCI 0:31.3"                       "$WORK/laneC.out" "lane C: controller 1 bound"
++need "2 controller.*2 SATA device.* ready"               "$WORK/laneC.out" "lane C: both controllers yield a device"
++need "fat32. PASS: FAT32 read/write"                    "$WORK/laneC.out" "lane C: FAT32 on controller 0 disk"
++need "ext2"                                             "$WORK/laneC.out" "lane C: ext2 takes controller 1 disk"
++need "lanecok"                                          "$WORK/laneC.out" "lane C: file round-trip"
++
++# ---------------- Lane E: no storage (negative control) ----------------
++echo "== lane E: no --sata (unattached receipt)"
++"$X86EMU" --kernel="$KERNEL" --initrd="$INITRD" \
++    --max-instr="$MAX_INSTR" > "$WORK/laneE.out" 2>&1
++need "1 controller(s), 0 SATA device(s) ready"          "$WORK/laneE.out" "lane E: unattached receipt"
++need "self-test: no devices"                            "$WORK/laneE.out" "lane E: no-device self-test"
++need_no "hw port"                                       "$WORK/laneE.out" "lane E: no disk enumerated"
++
++# ---------------- Optional: full-matrix determinism (S5 gate) ----------------
++if [ "${MATRIX_DETERMINISM:-0}" = "1" ]; then
++    echo "== determinism x2: re-running lanes A and C"
++    run_typed laneA-rerun laneaok --sata="$DISK_A"
++    if ! cmp -s "$WORK/laneA.out" "$WORK/laneA-rerun.out"; then
++        echo "  NONDETERMINISTIC: lane A runs differ"; fail=1
++    fi
++    run_typed laneC-rerun lanecok --ahci2 --sata="$DISK_C0" --sata2="$DISK_C1"
++    if ! cmp -s "$WORK/laneC.out" "$WORK/laneC-rerun.out"; then
++        echo "  NONDETERMINISTIC: lane C runs differ"; fail=1
++    fi
++fi
++
++if [ "$fail" -eq 0 ]; then
++    echo "S4 matrix receipts: ALL PASS"
++else
++    echo "S4 matrix receipts: FAIL (see $WORK)"
++    exit 1
++fi
+diff --git a/tests/test_ahci.c b/tests/test_ahci.c
+index 8c5b604..6b56dae 100644
+--- a/tests/test_ahci.c
++++ b/tests/test_ahci.c
+@@ -1,4 +1,5 @@
+-/* tests/test_ahci.c -- STORE S1 vectors: AHCI ABAR register model.
++/* tests/test_ahci.c -- STORE S1-S4 vectors: AHCI ABAR register model,
++ * command engine, and the breadth matrix machine half.
+  *
+  * Baseline before S1 (measured 2026-10-07 on b00c4d9): the PCI function
+  * 0:31.2 existed but BAR5 was empty; the guest printed "controller 0:
+@@ -35,13 +36,20 @@ static void fx_done(fx_t *f) {
+     f->m.mmio_list = NULL;
+ }
+ 
+-/* 1 MiB synthetic disk image attached to the fixture. */
++/* 1 MiB synthetic disk image attached to the fixture.  S4: attach rows are
++ * per controller -- the historical helper pins controller 0; the S4
++ * vectors use fx_attach_disk_c with a second image on controller 1. */
+ static uint8_t *gx_disk;
+-static void fx_attach_disk(fx_t *f, int port, size_t bytes) {
+-    if (!gx_disk) { gx_disk = calloc(1, 4 * 1024 * 1024); }
++static uint8_t *gx_disk2;
++static void fx_attach_disk_c(fx_t *f, int ctrl, int port, size_t bytes, uint8_t *img) {
++    if (!img) { img = calloc(1, 4 * 1024 * 1024); }
+     assert(port >= 0 && port < AHCI_MAX_ATTACH && bytes <= 4 * 1024 * 1024);
+-    f->m.sata_img[port] = gx_disk;
+-    f->m.sata_len[port] = bytes;
++    f->m.sata_img[ctrl][port] = img;
++    f->m.sata_len[ctrl][port] = bytes;
++}
++static void fx_attach_disk(fx_t *f, int port, size_t bytes) {
++    if (!gx_disk) gx_disk = calloc(1, 4 * 1024 * 1024);
++    fx_attach_disk_c(f, 0, port, bytes, gx_disk);
+ }
+ 
+ static void test_global_regs(void) {
+@@ -350,6 +358,114 @@ static void test_engine_write_oob_tfes(void) {
+     printf("ok engine write oob tfes\n");
+ }
+ 
++/* ---- S4: breadth vectors (controller matrix, port placement) ----
++ *
++ * The guest's class scan is bus-0 dev/func ASCENDING (measured:
++ * AuraLite-OS drivers/pci/pci.c pci_find_class_after), so controller
++ * numbering follows slot order: onboard 0:31:2 is controller 0, the
++ * --ahci2 function at 0:31:3 is controller 1.  These vectors pin the
++ * machine half of the matrix lanes: the second ABAR window does not
++ * alias the first, port placement is honoured by the engine, and the
++ * two controllers' engines never cross images. */
++
++#define ABAR2 AHCI_ABAR2
++#define P2(p, sub) (ABAR2 + 0x100u + (p) * 0x80u + (sub))
++
++static void test_ctrl1_window_independent(void) {
++    fx_t f; fx_init(&f);
++    ahci_register_ctrl(&f.m, 1);
++    /* Controller 1 answers with its own identical HBA identity... */
++    assert(mem_read(&f.m, ABAR2 + 0x00, 4) == 0x80040005u);
++    assert(mem_read(&f.m, ABAR2 + 0x0C, 4) == 0x3Fu);
++    assert(mem_read(&f.m, ABAR2 + 0x10, 4) == 0x00010300u);
++    /* ...but its ports are independent: attach on ctrl0 p0 must NOT
++     * light up ctrl1 p0 (no window aliasing between ABAR and ABAR2). */
++    fx_attach_disk(&f, 0, 1024 * 1024);
++    assert((mem_read(&f.m, P(0, 0x28), 4) & 0x0Fu) == 3u);        /* ctrl0 p0 present */
++    assert((mem_read(&f.m, P2(0, 0x28), 4) & 0x0Fu) == 0u);       /* ctrl1 p0 dark */
++    assert(mem_read(&f.m, P2(0, 0x24), 4) == 0xFFFFFFFFu);
++    /* attach on ctrl1 p2 lights only that port */
++    if (!gx_disk2) gx_disk2 = calloc(1, 4 * 1024 * 1024);
++    fx_attach_disk_c(&f, 1, 2, 512 * 1024, gx_disk2);
++    assert((mem_read(&f.m, P2(2, 0x28), 4) & 0x0Fu) == 3u);
++    assert((mem_read(&f.m, P2(0, 0x28), 4) & 0x0Fu) == 0u);       /* sibling port stays dark */
++    /* GHC state is per controller */
++    mem_write(&f.m, ABAR + 0x04, 4, 0x80000001u);
++    assert(mem_read(&f.m, ABAR2 + 0x04, 4) == 0u);
++    fx_done(&f);
++    printf("ok ctrl1 window independent\n");
++}
++
++static void test_port_placement_engine(void) {
++    fx_t f; fx_init(&f);
++    fx_attach_disk(&f, 3, 4 * 1024 * 1024);      /* disk on port 3 only */
++    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = (uint8_t)(i * 3 + 1);
++    /* port 0 is dark: a command issued there must take the TFES path even
++     * though the machine has a disk elsewhere (placement is per port). */
++    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
++    t_hdr(&f.m, 1, 0);
++    t_fis(&f.m, 0x25, 0, 1);
++    t_prdt(&f.m, 0, T_BUF1, 512);
++    mem_write(&f.m, P(0, 0x38), 4, 1);
++    assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
++    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u);  /* TFES on dark port */
++    /* the very same command on port 3 runs clean and returns its image */
++    mem_write(&f.m, P(3, 0x10), 4, 0xFFFFFFFFu);  /* W1C any stray state on p3 */
++    mem_write(&f.m, P(3, 0x00), 4, T_CLB);
++    t_hdr(&f.m, 1, 0);
++    t_fis(&f.m, 0x25, 0, 1);
++    t_prdt(&f.m, 0, T_BUF1, 512);
++    mem_write(&f.m, P(3, 0x38), 4, 1);
++    assert((mem_read(&f.m, P(3, 0x38), 4) & 1u) == 0u);
++    assert((mem_read(&f.m, P(3, 0x10), 4) & (1u << 30)) == 0u);  /* clean */
++    int bad = 0;
++    for (int i = 0; i < 512; i++)
++        if (mem_read(&f.m, T_BUF1 + i, 1) != gx_disk[i]) { bad = i + 1; break; }
++    assert(bad == 0);
++    fx_done(&f);
++    printf("ok port placement engine\n");
++}
++
++static void test_cross_controller_isolation(void) {
++    fx_t f; fx_init(&f);
++    ahci_register_ctrl(&f.m, 1);
++    if (!gx_disk2) gx_disk2 = calloc(1, 4 * 1024 * 1024);
++    fx_attach_disk(&f, 0, 4 * 1024 * 1024);                    /* ctrl0 p0 */
++    fx_attach_disk_c(&f, 1, 0, 4 * 1024 * 1024, gx_disk2);     /* ctrl1 p0 */
++    for (size_t i = 0; i < 4u * 1024 * 1024; i++) {
++        gx_disk[i]  = 0xA0;                                    /* distinct patterns */
++        gx_disk2[i] = 0xB1;
++    }
++    /* ctrl0 READ LBA0 -> gx_disk pattern */
++    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
++    t_hdr(&f.m, 1, 0);
++    t_fis(&f.m, 0x25, 0, 1);
++    t_prdt(&f.m, 0, T_BUF1, 512);
++    mem_write(&f.m, P(0, 0x38), 4, 1);
++    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) == 0u);
++    assert(mem_read(&f.m, T_BUF1, 1) == 0xA0);
++    /* ctrl1 READ LBA0 -> gx_disk2 pattern (no bleed through the shared
++     * command-list address: each controller has its own PxCLB slot) */
++    mem_write(&f.m, P2(0, 0x00), 4, T_CLB);
++    t_hdr(&f.m, 1, 0);
++    t_fis(&f.m, 0x25, 0, 1);
++    t_prdt(&f.m, 0, T_BUF2, 512);
++    mem_write(&f.m, P2(0, 0x38), 4, 1);
++    assert((mem_read(&f.m, P2(0, 0x10), 4) & (1u << 30)) == 0u);
++    assert(mem_read(&f.m, T_BUF2, 1) == 0xB1);
++    /* WRITE on ctrl1 must land in gx_disk2 and leave gx_disk pristine */
++    for (int i = 0; i < 512; i++) mem_write(&f.m, T_BUF3 + i, 1, 0x5Au);
++    mem_write(&f.m, P2(0, 0x00), 4, T_CLB);
++    t_hdr(&f.m, 1, 1);
++    t_fis(&f.m, 0x35, 2, 1);
++    t_prdt(&f.m, 0, T_BUF3, 512);
++    mem_write(&f.m, P2(0, 0x38), 4, 1);
++    assert(gx_disk2[2 * 512] == 0x5Au);
++    assert(gx_disk[2 * 512] == 0xA0u);
++    fx_done(&f);
++    printf("ok cross-controller isolation\n");
++}
++
+ int main(void) {
+     test_global_regs();
+     test_dark_ports();
+@@ -366,6 +482,9 @@ int main(void) {
+     test_engine_write_single_readback();
+     test_engine_write_multi_prdt();
+     test_engine_write_oob_tfes();
++    test_ctrl1_window_independent();
++    test_port_placement_engine();
++    test_cross_controller_isolation();
+     printf("test_ahci: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+

@@ -11,6 +11,12 @@
 #include <stdint.h>
 #include "machine.h"
 #include "platform.h"
+/* USB U3: device-cadence hook (devices_tick) -- installed by devices_init.
+ * Narrow unit harnesses link cpu.c without devices.c and leave it NULL. */
+void (*cpu_devices_tick)(machine_t *m);
+
+/* USB U3: instruction-cadence divider for devices_tick (deterministic). */
+static uint32_t s_devtick;
 
 /* RFLAGS bits a guest may control via POPF/IRET (IOPL/NT/RF/AC/ID included;
  * VM/VIF/VIP and reserved bits excluded; bit 1 is architecturally 1). */
@@ -732,6 +738,12 @@ int cpu_step(cpu_t *c) {
              (unsigned long long)c->rip, (unsigned long long)c->gpr[RSP],
              (unsigned long long)c->gpr[RCX], (unsigned long long)c->seg[SEG_GS].base,
              (unsigned long long)c->kgs_base);
+
+    /* ---- USB U3: the EHCI async schedule advances with controller time.
+     * Real EHCI walks it continuously while ASE=1; sampled here at a
+     * deterministic instruction cadence so guest poll loops (which spin
+     * on their own qTD array, measured) complete without MMIO kicks. */
+    if ((++s_devtick & 0xFFu) == 0 && cpu_devices_tick) cpu_devices_tick(m);
 
     /* ---- CHIPSET H5: a requested system reset (KBC 0xFE / output-port
      * bit0 / port 0x92 bit0 / port 0xCF9) takes effect at the next

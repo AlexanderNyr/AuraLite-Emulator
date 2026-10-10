@@ -6,6 +6,105 @@ entry names its patch and the measured defect(s) it repaired.
 
 ## [Unreleased]
 
+### Added — patch 0041 (USB U5, end-to-end + hardening close-out)
+- `--no-usb-uhci` CLI (`machine_t.cfg_no_uhci`): omits the UHCI companion
+  (PCI 0:1.2 + I/O window) so the guest's `test_usb_ehci.sh` QEMU lane
+  (`-device usb-ehci`, no `-usb`) is reproducible as a machine shape;
+  unit vector `ok uhci omitted` pins the open-bus absence and the intact
+  EHCI register file. The guest's own probe still prints
+  `[uhci] no UHCI controller found` — the historical receipt.
+- Both sticks through the guest's MSC path with `/usb` info + a sector
+  read typed over the KBC (`run /apps/filesize /usb/sector0.bin`): the
+  UHCI companion lane (AURALUSB 8 MiB) and the EHCI high-speed lane
+  (AURALEHC 8 MiB), each run twice sequentially with byte-identical
+  serial logs. `tests/test_usb.c` 25 -> 26 vectors.
+
+### Fixed / measured — patch 0041
+- `test_ahci_matrix.sh` with `MATRIX_DETERMINISM=1` (S5 gate) stays
+  green with USB present; every lane pair byte-identical, and the
+  AHCI/filesystem receipt lines are byte-identical to the S5-era lane
+  logs (the guest's vmdrv PCI-scan line grows the intended U4
+  companion entry — recorded in `docs/plans/USB_PLAN.md`).
+- Frozen-kernel reproducibility: `SOURCE_DATE_EPOCH=1791484814`
+  reproduces the historical `build: Oct 8 2026 18:40:14` banner; the
+  92160-byte trimmed initrd (bin/init + apps/filesize) is reconstructed
+  from the `tools/mkinitrd.sh` recipe.
+- Measured budget: an 8 MiB `/usb/disk.img` read over the UHCI 64-byte
+  chunk path costs ~21G instructions (3880/16384 sectors per 8G) —
+  media byte-correctness stays pinned by `ok uhci td walk`.
+
+### Added — patch 0040 (USB U4, UHCI root host controller)
+- A first-class UHCI companion: PCI 0:1.2 `8086:0x7020` (piix3 identity),
+  I/O BAR4 `0xC040` register file in the guest's measured bit map
+  (USBSTS.HCHALTED = bit 5), frame list + QH/TD walker on USBCMD.RUN
+  (doorbell + cadence sampler), TD completion with the
+  `ctrl[10:0] = bytes-1` actual-length contract (0x7FF = 0) and
+  IOC->USBINT, control + bulk through a per-controller BOT state over
+  the shared device model (`usb_serve()` refactor; the U3 qTD path is
+  byte-identical). `tests/test_usb.c` 22 -> 25 vectors.
+
+### Fixed / measured — patch 0040
+- Real model bug: the disk-data path did not advance the media offset by
+  the consumed bytes — 64-byte UHCI chunks re-read LBA 0 forever (the
+  512-byte E32 chunks hid it). `disk_off = lba*512 + st->moved`;
+  regression vector `ok uhci td walk` (byte-for-byte sector + CSW
+  residue 0). Negative control: reverting the RUN-gating reddens
+  `tests/test_usb.c:556` (`[uhci] halted: TD still Active`), abort 134.
+- Guest parity run x2 byte-identical: `[uhci] controller at PCI 0:1.2`
+  + `I/O base = 0xc040`, stick enumerated UHCI full-speed, MSC binds
+  the UHCI instance, `test_usbfs.sh` receipts over 64-byte bulk.
+
+### Added — patch 0039 (USB U3, EHCI register file honesty + control)
+- The EHCI model answers a real driver: CAPLENGTH/HCIVERSION/HCSPARAMS/
+  HCCPARAMS, USBCMD RUN/stop/HCRESET walk gate with doorbell on USBCMD
+  writes only, USBSTS USBINT/IHS/SEmpty/HCHALTED, USBINTR, PORTSC
+  power/reset/enable/owner with CSC latching, and per-qTD SETUP control
+  transfers (device/config/string descriptors, SET_ADDRESS,
+  SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN). `tests/test_usb.c`
+  14 -> 22 vectors.
+
+### Fixed / measured — patch 0039
+- Guest boot parity with QEMU `run_qemu_usb_msc.sh` receipts
+  (`1 high-speed device(s) ready`, `[msc] mass storage candidate`)
+  against `AuraLite-OS@0ed0d29`; negative control: an unconditional
+  walk reddens `tests/test_usb.c:352` (abort 134).
+
+### Added — patch 0038 (USB U2, SCSI enumeration set)
+- The four SCSI commands the AuraLite-OS `msc.c` enumeration sends are
+  answered from the attached image over the honest BOT channel: INQUIRY
+  (36-byte direct-access/removable descriptor: vendor `AURALITE`,
+  product `USB DISK`, revision `1.0 `), READ CAPACITY(10) (last LBA =
+  `disk_len/512 − 1`, block length 512), TEST UNIT READY (OK with an
+  image, FAILED + sense `2/3A` MEDIUM NOT PRESENT without), and
+  REQUEST SENSE (18-byte fixed format `0x70`, consumed on read;
+  ILLEGAL REQUEST `5/20` for unsupported opcodes).
+- `tests/test_usb.c` grows 7 -> 14 machine vectors (TUR ready/failed,
+  sense reported then consumed, INQUIRY bytes, capacity at 1- and
+  N-block images, illegal-opcode sense).
+
+### Fixed / measured — patch 0038
+- Negative control measured: breaking the capacity math reddens exactly
+  `ok read capacity n-block` (assert `r[3] == 7`).
+
+### Added — patch 0037 (USB U1, BOT/CSW correctness)
+- Honest Bulk-Only status channel: the CSW carries `dCSWTag` echoed from
+  the CBW (the AuraLite-OS `msc.c` validates it), `dCSWDataResidue`
+  computed as expected-minus-moved, and `bCSWStatus` distinguishes
+  OK / FAILED (unsupported SCSI opcode) / PHASE (malformed CBW).
+  Status-phase framing is BOT-shaped: the CSW is the 13-byte IN (the
+  sample firmware's status qTD token measures `0x000D0180`), so a data
+  phase cut short still settles residue honestly.
+- `tests/test_usb.c` grows from the be16 smoke to 7 machine vectors
+  (QH/qTD fixtures driven through the doorbell): tag echo, residue on
+  short data and on an absent image, FAILED opcode, PHASE bad CBW, and
+  the firmware-shaped negative control (tag=1 recipe, receipts stable).
+- `devices_done()` frees the PCI device list (`pci_done()`) — LSan
+  measured 11232 bytes / 36 allocations leaked per full-device fixture.
+
+### Fixed / measured — patch 0037
+- Negative control measured: reverting the tag echo reddens exactly
+  `ok csw tag echo` (assert `r32r(c + 4) == tag`, RC=134).
+
 ### Added — patch 0035 (STORE S5, large transfers + hardening)
 - `--sata-writethrough`: opt-in host write-through -- every guest WRITE
   DMA EXT byte also lands in the host image file at the same offset

@@ -1,0 +1,889 @@
+From a1110b6a545b5d3a93515b22164049c6d9301b7c Mon Sep 17 00:00:00 2001
+From: AuraLite-Emulator Dev <dev@auralite-emu.local>
+Date: Fri, 9 Oct 2026 13:48:56 +0000
+Subject: [PATCH] U3 update
+
+USB U3: EHCI register file, USBCMD-only doorbell, control transfers.
+
+Capability registers (CAPLENGTH=0 shared BAR map, HCIVERSION 2.00,
+HCSPARAMS N_PORTS=1|PPC, HCCPARAMS), USBSTS (HCHALTED/PSS/ASS) with the
+guest's halt handshake and HCRESET self-clear, USBCMD (RS/HCRESET/
+PSE/ASE/IAAD/ITC), PORTSC (CCS gating attached&&PP&&!OWNER, CSC latched
+on CCS change + W1C, PR->PED+PEC, LS J-state, OWNER release) -- and the
+async schedule now runs on USBCMD writes only.  SETUP qTDs execute real
+control transfers against a minimal device model (device/config/string
+descriptors, SET_ADDRESS, SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN,
+BOT RESET).
+
+Three window quirks are measured against the sample firmware's
+hand-tested dance and the guest driver's 1/2/4-byte access shapes:
+
+- the 8-byte capability-root slurp answers 0 until the first USBCMD
+  write (firmware usb_ff uses the low dword as a scratch pointer; a
+  HCIVERSION at +0x02 would triple-fault it -- measured), after which
+  the offset answers USBCMD for its QWORD RMW dance;
+- +0x04 is HCSPARAMS until the first USBCMD write, USBSTS after (the
+  driver reads caps once at init, then starts the halt handshake);
+- the schedule advances on the USBCMD doorbell and at a deterministic
+  instruction cadence (cpu_devices_tick hook, every 256 instructions),
+  so the guest's RAM-polling ehci_run_async completes without MMIO
+  kicks; qTDs only execute while Active, so re-walks are idempotent.
+
+Measured (8 new unit vectors, 14 -> 22; once-per-phase NC: restoring
+the doorbell-on-every-write defect reddens 'ok doorbell usbcmd only',
+RC=134): guest receipts move from 'HCI version 0.00, 0 ports' /
+'controller did not halt' to 'HCI version 2.00, 1 ports, PPC=1,
+64-bit=0, companions=0' + '1 high-speed device(s) ready', enumeration
+reaches and passes '[msc] mass storage candidate: addr=1 VID=0x0525
+PID=0xa4a5 bulk_in=0x81 bulk_out=0x02 maxpkt=512' on the QEMU-parity
+'AURALUSB' stick (16384 sectors), READ(10) sector 0 sees the magic;
+determinism pairs byte-identical (firmware stdout+stderr; kernel boot
+logs, same sha256).  make test + make test-sanitize green.
+---
+ docs/STATUS.md         |  10 +-
+ docs/plans/USB_PLAN.md |  81 ++++++++--
+ src/cpu.c              |  12 ++
+ src/cpu.h              |   4 +
+ src/devices.c          | 336 ++++++++++++++++++++++++++++++++++++-----
+ src/devices.h          |   1 +
+ tests/test_usb.c       | 157 ++++++++++++++++++-
+ 7 files changed, 551 insertions(+), 50 deletions(-)
+
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index ec93efc..fc42186 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -5,7 +5,15 @@
+ - The sample 128 KiB firmware image can be loaded at the x86 reset vector.
+ - Reset execution supports real mode, protected mode, compatibility mode and long mode.
+ - All five selectable Intel-style platform profiles are available.
+-- The EHCI model reaches virtual USB Mass Storage transfers when the loaded firmware requests them.
++- The EHCI model reaches virtual USB Mass Storage transfers when the loaded firmware
++  requests them, and since USB U3 the register file is honest enough for the guest
++  driver to enumerate: capability registers (CAPLENGTH/HCIVERSION 2.00/HCSPARAMS/
++  HCCPARAMS with the measured firmware window quirks), USBSTS/USBCMD halt handshake
++  with HCRESET, PORTSC power/reset/enable/owner with CSC latching, the async schedule
++  walked on USBCMD writes plus a deterministic instruction-cadence sampler, and SETUP
++  qTDs running real control transfers (device/config/string descriptors, SET_ADDRESS,
++  SET_CONFIGURATION, GET_STATUS, GET_MAX_LUN) — measured `1 high-speed device(s)
++  ready` and `[msc] mass storage candidate` receipts against `AuraLite-OS@0ed0d29`.
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/USB_PLAN.md b/docs/plans/USB_PLAN.md
+index 07c8bdf..0aa8a6e 100644
+--- a/docs/plans/USB_PLAN.md
++++ b/docs/plans/USB_PLAN.md
+@@ -8,14 +8,14 @@
+ > + initrd.tar built from that tree) and the sample firmware
+ > (`firmware/sample_firmware.nas`).
+ 
+-**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3–U5 planned 📋**
++**Status: in progress — U0 ✅, U1 ✅, U2 ✅, U3 ✅, U4–U5 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | U0 | Measured baseline + this plan | ✅ done | `patches/0036-USB-U0-usb-plan.patch` |
+ | U1 | BOT/CSW correctness: tag echo, residue, honest status byte (QEMU `test_ahci_matrix.sh`-style negative controls) | ✅ done | `patches/0037-USB-U1-bot-csw.patch` |
+ | U2 | SCSI command set the guest's MSC actually sends: INQUIRY, READ CAPACITY(10), TEST UNIT READY, REQUEST SENSE | ✅ done | `patches/0038-USB-U2-scsi-opcodes.patch` |
+-| U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | 📋 | `patches/0039-USB-U3-ehci-usbcmd.patch` |
++| U3 | EHCI register file honesty + doorbell on USBCMD only + control transfers (SETUP) so enumeration can bind | ✅ done | `patches/0039-USB-U3-ehci-usbcmd.patch` |
+ | U4 | UHCI controller model (I/O BAR4, frame list, TD/QH walk, control+bulk) — AuraLite-OS QEMU parity | 📋 | `patches/0040-USB-U4-uhci.patch` |
+ | U5 | Guest end-to-end receipts (usbfs/MSC parity lanes), determinism ×2, sanitize, docs close-out | 📋 | `patches/0041-USB-U5-usb-e2e.patch` |
+ 
+@@ -226,7 +226,7 @@ receipts unchanged; `make test` + `make test-sanitize` green.
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+-### U3 — EHCI register file + USBCMD-only doorbell + control transfers
++### U3 — EHCI register file + USBCMD-only doorbell + control transfers — ✅ done (patches/0039-USB-U3-ehci-usbcmd.patch)
+ 
+ Capability registers (CAPLENGTH, HCIVERSION 2.00, HCSPARAMS with N_PORTS
+ and companion routing, HCCPARAMS), USBSTS (HCHALTED/HSE/…), USBCMD
+@@ -238,13 +238,74 @@ writes only**. SETUP qTDs perform real control transfers against a
+ minimal device model (device/config/string descriptors, SET_ADDRESS,
+ SET_CONFIGURATION, GET_MAX_LUN) so the guest can enumerate a stick.
+ 
+-**DoD (measured):** guest receipt moves from `HCI version 0.00, 0 ports`
+-to the modelled caps and from `controller did not halt` to a passed halt
+-handshake; `1 high-speed device(s) ready` with an image attached;
+-enumeration reaches the MSC candidate receipt with the QEMU-parity
+-stick image (`'AURALUSB'`); unit vectors for caps/USBSTS/USBCMD/PORTSC
+-and the doorbell-on-USBCMD-only negative control (writes to other
+-registers run no schedule); determinism pair byte-identical.
++Three window quirks are deliberate and measured against the sample
++firmware's hand-tested dance (`firmware/sample_firmware.nas`) and the
++guest driver's access shapes (`drivers/usb/ehci.c`, 1/2/4-byte only):
++
++- **CAPLENGTH=0 shared BAR map** — the firmware's `usb_ff` re-derives
++  opbase from `movzx rbx,byte [rax]` (the byte it just wrote), so the
++  capability and operational maps must coincide at BAR0.
++- **The 8-byte capability-root slurp answers 0 until the first USBCMD
++  write.** The firmware slurps `mov rbx,[r15]` (QWORD at BAR0) and uses
++  the low dword as a scratch pointer (`mov [rax],r15`); a HCIVERSION
++  living at +0x02 would make that store target `0x02000000` and triple-
++  fault (measured). After the first USBCMD write the same offset answers
++  USBCMD for the firmware's QWORD read-modify-write dance.
++- **+0x04 is HCSPARAMS until the first USBCMD write, USBSTS after.** The
++  driver reads the caps once at init and only then starts the halt
++  handshake (measured). PORTSC.CCS is gated `attached && PP && !OWNER`
++  (an unpowered port has no device — keeps the firmware's
++  `test eax,0x05` poll from spinning) and CSC latches on CCS change.
++
++The async schedule advances two ways (real EHCI walks it while ASE=1):
++the USBCMD doorbell walks immediately, and `devices_tick` (hooked into
++the cpu instruction boundary every 256 instructions) samples the
++schedule so the guest's RAM-polling `ehci_run_async` (no MMIO at all,
++measured) makes progress. A qTD only executes when Active (0x80) is
++set, so re-walks of a chain that already ran are idempotent.
++
++**Measured (8 new vectors in `tests/test_usb.c`, 14 -> 22):**
++`ok ehci caps` (CAPLENGTH 0, HCIVERSION 0x0200, HCSPARAMS `N_PORTS=1|
++PPC`, HCCPARAMS 0), `ok ehci halt handshake` (HCHALTED at rest, cleared
++by Run|ASE with ASS set, back after stop, HCRESET self-clears),
++`ok doorbell usbcmd only`, `ok ehci portsc` (PP gating, CSC latch + W1C,
++PR->PED+PEC, OWNER release), `ok control get device descriptor` (18
++bytes, bcdUSB 2.00, maxpkt0 64, VID 0x0525 / PID 0xa4a5),
++`ok control get config descriptor` (32 bytes, MSC/SCSI/BOT, bulk
++0x81/0x02 at 512), `ok control string0` (`04 03 09 04`),
++`ok control set address + max lun` (SET_ADDRESS + GET_MAX_LUN -> 0).
++
++Once-per-phase negative control (measured): restoring the U2 defect
++(doorbell on **every** register write) reddens exactly `ok doorbell
++usbcmd only` (assert `token & 0x80` "still Active", RC=134).
++
++**Guest receipts (measured, `AuraLite-OS@0ed0d29` kernel.elf +
++initrd.tar, QEMU-parity 8 MiB stick, sector 0 `AURALUSB\x55\xAA`
++(`il_make_disk` shape) = 16384 sectors):**
++
++```
++[ehci] HCI version 2.00, 1 ports, PPC=1, 64-bit=0, companions=0
++[ehci] controller running, async+periodic schedules active
++[ehci] port 0: high-speed device
++[ehci] 1 high-speed device(s) ready
++[ehci] PASS: 1 USB device(s) ready
++[usb] device at addr 1: VID=0x0525 PID=0xa4a5 class=0x00 (Generic) maxpkt0=64 speed=high (480 Mbps)
++[usb] device enumeration complete: addr=1 class=Mass Storage
++[msc] mass storage candidate: addr=1 VID=0x0525 PID=0xa4a5 bulk_in=0x81 bulk_out=0x02 maxpkt=512
++[msc] INQUIRY: vendor 'AURALITE' product 'USB DISK'
++[msc] capacity: 16384 sectors, 512 bytes/sector (8192 KiB)
++[msc] PASS: USB mass storage ready
++[msc] sector 0 first bytes: 41 55 52 41 4c 55 53 42 ...
++[msc] PASS: USB mass storage READ(10) works
++```
++
++**DoD (measured):** the eight vectors above green; guest receipts moved
++from `HCI version 0.00, 0 ports` / `controller did not halt` to the
++modelled caps and a passed halt handshake; `1 high-speed device(s)
++ready` with the image attached; enumeration reaches (and passes) the
++MSC candidate receipt with the `'AURALUSB'` stick; determinism pairs
++byte-identical (firmware lane stdout+stderr; kernel boot log through
++`[kernel] shell active`).
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+diff --git a/src/cpu.c b/src/cpu.c
+index 562ffd4..f39658e 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -11,6 +11,12 @@
+ #include <stdint.h>
+ #include "machine.h"
+ #include "platform.h"
++/* USB U3: device-cadence hook (devices_tick) -- installed by devices_init.
++ * Narrow unit harnesses link cpu.c without devices.c and leave it NULL. */
++void (*cpu_devices_tick)(machine_t *m);
++
++/* USB U3: instruction-cadence divider for devices_tick (deterministic). */
++static uint32_t s_devtick;
+ 
+ /* RFLAGS bits a guest may control via POPF/IRET (IOPL/NT/RF/AC/ID included;
+  * VM/VIF/VIP and reserved bits excluded; bit 1 is architecturally 1). */
+@@ -733,6 +739,12 @@ int cpu_step(cpu_t *c) {
+              (unsigned long long)c->gpr[RCX], (unsigned long long)c->seg[SEG_GS].base,
+              (unsigned long long)c->kgs_base);
+ 
++    /* ---- USB U3: the EHCI async schedule advances with controller time.
++     * Real EHCI walks it continuously while ASE=1; sampled here at a
++     * deterministic instruction cadence so guest poll loops (which spin
++     * on their own qTD array, measured) complete without MMIO kicks. */
++    if ((++s_devtick & 0xFFu) == 0 && cpu_devices_tick) cpu_devices_tick(m);
++
+     /* ---- CHIPSET H5: a requested system reset (KBC 0xFE / output-port
+      * bit0 / port 0x92 bit0 / port 0xCF9) takes effect at the next
+      * instruction boundary, modeling reset-line propagation and keeping
+diff --git a/src/cpu.h b/src/cpu.h
+index f640ddb..b487fa2 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -104,4 +104,8 @@ const char *cpu_mode_name(cpu_t *c);
+ int cpu_addr_size(cpu_t *c);
+ int cpu_op_size_default(cpu_t *c);
+ 
++/* USB U3: device-cadence hook installed by devices_init.  Narrow unit
++ * harnesses link cpu.c without devices.c and leave it NULL. */
++extern void (*cpu_devices_tick)(machine_t *m);
++
+ #endif
+diff --git a/src/devices.c b/src/devices.c
+index e516b0c..ae159a9 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -11,6 +11,7 @@
+ #include "pci.h"
+ #include "platform.h"
+ #include "devices.h"
++#include "cpu.h"    /* USB U3: cpu_devices_tick hook */
+ #include "serial.h"
+ #include "ahci.h"
+ 
+@@ -57,6 +58,48 @@ static rw2_t *make_spd_window(machine_t *m, uint64_t base, uint64_t size, const
+ /* ================================= EHCI/USB ================================ */
+ #define DISK_SECTOR 512
+ 
++/* U3: the register map is real now.  CAPLENGTH stays 0 on purpose: the
++ * sample firmware's hand-tested dance adds the CAPLENGTH byte to BAR0
++ * (and then re-derives opbase = BAR0 + byte[0]) while the AuraLite-OS
++ * driver computes opbase = BAR0 + caplength -- CAPLENGTH=0 is the one
++ * value where both land on the same BAR-relative map (measured U0:
++ * "CAPLENGTH byte (offset 0) small so capability/operational math the
++ * firmware performs stays within this same register window").
++ * The capability bytes share the front of the window and are read once
++ * at driver init, before the operational writes reuse those offsets:
++ *   CAPLENGTH@0x00 HCIVERSION@0x02 HCSPARAMS@0x04 HCCPARAMS@0x08
++ *   USBCMD@0x00 USBSTS@0x04 USBINTR@0x08 FRINDEX@0x0C
++ *   CTRLDSSEGMENT@0x10 PERIODICLISTBASE@0x14 ASYNCLISTADDR@0x18
++ *   CONFIGFLAG@0x40 PORTSC0@0x44                                    */
++#define EHCI_USBCMD        0x00
++#define EHCI_USBSTS        0x04
++#define EHCI_ASYNCLIST     0x18
++#define EHCI_CONFIGFLAG    0x40
++#define EHCI_PORTSC0       0x44
++
++#define USBCMD_RS       (1u << 0)
++#define USBCMD_HCRESET  (1u << 1)
++#define USBCMD_PSE      (1u << 4)
++#define USBCMD_ASE      (1u << 5)
++#define USBCMD_IAAD     (1u << 6)
++
++/* USBSTS bits match the AuraLite-OS driver's map (measured): HCHALTED=12,
++ * RECLAMATION=13, PSS=14, ASS=15. */
++#define USBSTS_HCHALTED (1u << 12)
++#define USBSTS_PSS      (1u << 14)
++#define USBSTS_ASS      (1u << 15)
++
++/* PORTSC bits match the driver's map (measured): CCS0 CSC1 PEC3 OCA4,
++ * PR8, LS=11:10 (K=low-speed), PP12, OWNER13. */
++#define PORTSC_CCS      (1u << 0)
++#define PORTSC_CSC      (1u << 1)   /* W1C */
++#define PORTSC_PED      (1u << 2)
++#define PORTSC_PEC      (1u << 3)   /* W1C */
++#define PORTSC_PR       (1u << 8)
++#define PORTSC_LS_J     (2u << 10)  /* J-state: full/high-speed device */
++#define PORTSC_PP       (1u << 12)
++#define PORTSC_OWNER    (1u << 13)
++
+ uint16_t usb_msc_be16(const uint8_t *p) {
+     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+ }
+@@ -65,32 +108,119 @@ typedef struct {
+     rw2_t *regs;         /* BAR-backed register window, also used as scratch */
+     uint64_t base;
+     machine_t *m;
++    uint32_t hcs;        /* HCSPARAMS snapshot: +0x04 is aliased until op mode */
++    int op;              /* set on first USBCMD write: window switched to op regs */
+ } ehci_t;
+ 
+ static uint32_t rd32(machine_t *m, uint64_t a){ return (uint32_t)mem_read(m,a,4); }
+ static void     wr32(machine_t *m, uint64_t a, uint32_t v){ mem_write(m,a,4,v); }
+ 
+-/* Bulk-Only Transport state for the single-LUN stick.  U1: the CSW is
+- * honest now -- dCSWTag echoes dCBWTag (the guest driver validates it),
+- * dCSWDataResidue is the expected-vs-moved difference, and bCSWStatus
+- * distinguishes OK / FAILED / PHASE. */
++/* Bulk-Only Transport + control state for the single-LUN stick.  U1: the
++ * CSW is honest (tag echo, residue, OK/FAILED/PHASE).  U2: the SCSI
++ * enumeration set answers from the image.  U3: SETUP requests run
++ * against a minimal device model so the guest can enumerate. */
+ typedef struct {
+     uint32_t lba, blocks;
+     uint32_t tag, expected, moved;
+     uint8_t  status;    /* 0=OK 1=FAILED 2=PHASE */
+     int      have_cmd;  /* READ(10)/READ(12) data phase pending */
+     int      csw_due;   /* a command finished; next status phase settles it */
+-    /* U2: pending response data (INQUIRY / READ CAPACITY / REQUEST SENSE)
+-     * and the saved fixed-format sense triple (key/ASC/ASCQ). */
+     uint8_t  resp[64];
+     uint32_t resp_len;
+     uint8_t  sense_key, sense_asc, sense_ascq;
+ } bot_state_t;
+ 
++static struct {
++    bot_state_t bot;
++    uint32_t usbcmd;
++    int      csc, pec, ped;           /* PORTSC latches / enable */
++    int      pp, owner, pr;           /* PORTSC stored RW bits */
++    uint8_t  dev_addr, dev_config;    /* control device model */
++} g_st;
++
+ static const char *bot_status_name[] = { "OK", "FAILED", "PHASE" };
+ 
+-/* Processes one qTD: performs the data phase against the virtual USB stick
+- * (bulk-only transport CBW/CSW), then clears Active. */
++/* ---- U3: minimal device model (control transfers) ---- */
++
++static const uint8_t desc_device[18] = {
++    18, 1,              /* bLength, DEVICE */
++    0x00, 0x02,         /* bcdUSB 2.00 */
++    0, 0, 0,            /* class/subclass/protocol: per interface */
++    64,                 /* bMaxPacketSize0 */
++    0x25, 0x05,         /* idVendor  0x0525 */
++    0xA5, 0xA4,         /* idProduct 0xa4a5 */
++    0x00, 0x01,         /* bcdDevice 1.00 */
++    1, 2, 3,            /* iManufacturer, iProduct, iSerial */
++    1                   /* bNumConfigurations */
++};
++
++static const uint8_t desc_config[32] = {
++    9, 2, 32, 0, 1, 1, 0, 0x80, 50,   /* config: wTotalLength=32, 1 interface */
++    9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0, /* MSC / SCSI / BOT, 2 endpoints */
++    7, 5, 0x81, 2, 0x00, 0x02, 0,     /* EP 0x81 bulk IN  512 */
++    7, 5, 0x02, 2, 0x00, 0x02, 0      /* EP 0x02 bulk OUT 512 */
++};
++
++static const uint8_t desc_string0[4] = { 4, 3, 0x09, 0x04 };
++
++static uint32_t build_string_desc(uint8_t *out, const char *s) {
++    uint32_t n = 0; while (s[n]) n++;
++    out[0] = (uint8_t)(2 + 2 * n); out[1] = 3;
++    for (uint32_t i = 0; i < n; i++) { out[2 + 2*i] = (uint8_t)s[i]; out[3 + 2*i] = 0; }
++    return 2 + 2 * n;
++}
++
++static void bot_fail(bot_state_t *st, uint8_t key, uint8_t asc) {
++    st->status = 1;
++    st->sense_key = key; st->sense_asc = asc; st->sense_ascq = 0;
++}
++
++static void setup_request(machine_t *m, const uint8_t *t) {
++    bot_state_t *st = &g_st.bot;
++    uint8_t type = t[0], req = t[1];
++    uint32_t wvalue = (uint32_t)t[2] | ((uint32_t)t[3] << 8);
++    uint32_t wlength = (uint32_t)t[6] | ((uint32_t)t[7] << 8);
++    st->resp_len = 0; st->moved = 0;
++    st->csw_due = 0; st->have_cmd = 0;
++    if (type == 0x80 && req == 0x06) { /* GET_DESCRIPTOR */
++        uint8_t dtype = (uint8_t)(wvalue >> 8), idx = (uint8_t)wvalue;
++        const uint8_t *src = NULL;
++        uint32_t n = 0;
++        if (dtype == 1) { src = desc_device; n = sizeof desc_device; }
++        else if (dtype == 2) { src = desc_config; n = sizeof desc_config; }
++        else if (dtype == 3 && idx == 0) { src = desc_string0; n = sizeof desc_string0; }
++        else if (dtype == 3) {
++            static const char *strings[3] = { "AURALITE", "USB DISK", "1234567890" };
++            n = build_string_desc(st->resp, strings[(idx - 1) % 3]);
++        }
++        if (src) { memcpy(st->resp, src, n); }
++        if (n > wlength) n = wlength;
++        st->resp_len = n;
++        mlog(&m->log, "[usb-ctl] GET_DESCRIPTOR type=%u idx=%u len=%u", dtype, idx, n);
++    } else if (type == 0x00 && req == 0x05) { /* SET_ADDRESS */
++        g_st.dev_addr = (uint8_t)wvalue;
++        mlog(&m->log, "[usb-ctl] SET_ADDRESS %u", g_st.dev_addr);
++    } else if (type == 0x00 && req == 0x09) { /* SET_CONFIGURATION */
++        g_st.dev_config = (uint8_t)wvalue;
++        mlog(&m->log, "[usb-ctl] SET_CONFIGURATION %u", g_st.dev_config);
++    } else if (type == 0x80 && req == 0x00) { /* GET_STATUS */
++        st->resp[0] = 0; st->resp[1] = 0;
++        st->resp_len = wlength < 2 ? wlength : 2;
++    } else if (type == 0xA1 && req == 0xFE) { /* GET_MAX_LUN (class) */
++        st->resp[0] = 0; /* one LUN */
++        st->resp_len = wlength < 1 ? wlength : 1;
++        mlog(&m->log, "[usb-ctl] GET_MAX_LUN -> 0");
++    } else if (type == 0x21 && req == 0xFF) { /* BOT reset (class) */
++        mlog(&m->log, "[usb-ctl] BOT RESET");
++    } else {
++        mlog(&m->log, "[usb-ctl] unhandled request type=0x%02x req=0x%02x", type, req);
++    }
++}
++
++/* Processes one qTD against the virtual USB stick / device model, then
++ * clears Active.  Branch order matters: a 13-byte IN is the BOT status
++ * phase while a command is due (measured: the sample firmware's status
++ * qTD token is 0x000D0180); response data (U2/U3) is served next. */
+ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+     uint32_t token = rd32(m, qtd_addr+8);
+     if (!(token & 0x80)) return; /* not active */
+@@ -108,9 +238,9 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         st->status   = 0;
+         st->csw_due  = 1;
+         st->have_cmd = 0;
++        st->resp_len = 0;
+         if (sig == 0x43425355u) { /* 'USBC' */
+             uint8_t opcode = (uint8_t)mem_read(m, buf+15, 1);
+-            st->resp_len = 0;
+             if (opcode == 0x28 || opcode == 0xA8) { /* READ(10)/READ(12) */
+                 uint32_t lba = (uint32_t)mem_read(m, buf+17, 1) << 24 |
+                                (uint32_t)mem_read(m, buf+18, 1) << 16 |
+@@ -129,8 +259,7 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+                     st->sense_key = st->sense_asc = st->sense_ascq = 0;
+                     mlog(&m->log, "[usb-msc] TEST UNIT READY (ready)");
+                 } else {
+-                    st->status = 1;
+-                    st->sense_key = 0x02; st->sense_asc = 0x3A; st->sense_ascq = 0x00;
++                    bot_fail(st, 0x02, 0x3A); /* NOT READY / MEDIUM NOT PRESENT */
+                     mlog(&m->log, "[usb-msc] TEST UNIT READY failed (CSW status=FAILED)");
+                 }
+             } else if (opcode == 0x03) { /* REQUEST SENSE */
+@@ -143,7 +272,6 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+                 st->resp_len = 18;
+                 mlog(&m->log, "[usb-msc] REQUEST SENSE (key=0x%02x asc=0x%02x)",
+                      st->sense_key, st->sense_asc);
+-                /* sense is consumed by the read */
+                 st->sense_key = st->sense_asc = st->sense_ascq = 0;
+             } else if (opcode == 0x12) { /* INQUIRY */
+                 memset(st->resp, 0, 36);
+@@ -167,13 +295,11 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+                     st->sense_key = st->sense_asc = st->sense_ascq = 0;
+                     mlog(&m->log, "[usb-msc] READ CAPACITY: %u sectors x 512", last + 1);
+                 } else {
+-                    st->status = 1;
+-                    st->sense_key = 0x02; st->sense_asc = 0x3A; st->sense_ascq = 0x00;
++                    bot_fail(st, 0x02, 0x3A);
+                     mlog(&m->log, "[usb-msc] READ CAPACITY failed (CSW status=FAILED)");
+                 }
+             } else {
+-                st->status = 1; /* FAILED: no data phase will move */
+-                st->sense_key = 0x05; st->sense_asc = 0x20; st->sense_ascq = 0x00;
++                bot_fail(st, 0x05, 0x20); /* ILLEGAL REQUEST */
+                 mlog(&m->log, "[usb-msc] SCSI opcode 0x%02x failed (CSW status=FAILED)", opcode);
+             }
+         } else {
+@@ -181,7 +307,12 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+             st->status = 2; /* PHASE */
+             mlog(&m->log, "[usb-msc] malformed CBW signature 0x%08x (CSW status=PHASE)", sig);
+         }
+-    } else if (pid == 1 && total == 13) {
++    } else if (pid == 2 && total == 8) {
++        /* U3: SETUP stage of a control transfer. */
++        uint8_t t[8];
++        for (int i = 0; i < 8; i++) t[i] = (uint8_t)mem_read(m, buf + i, 1);
++        setup_request(m, t);
++    } else if (pid == 1 && total == 13 && st->csw_due) {
+         /* Status phase.  The qTD carrying a CSW is the 13-byte IN (measured:
+          * the sample firmware's status qTD token is 0x000D0180; BOT fixes the
+          * CSW at 13 bytes, so a 13-byte IN is the status phase even when a
+@@ -200,8 +331,8 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+         st->csw_due = 0;
+         st->have_cmd = 0;
+     } else if (pid == 1 && st->resp_len > st->moved) {
+-        /* U2: response data phase (INQUIRY / READ CAPACITY / REQUEST SENSE).
+-         * moved doubles as the response offset for the current command. */
++        /* Response data phase (INQUIRY / READ CAPACITY / REQUEST SENSE /
++         * control descriptors).  moved doubles as the response offset. */
+         uint32_t off = st->moved;
+         uint32_t avail = st->resp_len - off;
+         uint32_t bytes = total < avail ? total : avail;
+@@ -232,8 +363,6 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+             mem_write(m, (uint64_t)buf+i, 1, m->disk[disk_off + i]);
+         st->moved += bytes;
+         mlog(&m->log, "[usb-msc] bulk-IN %u bytes -> guest 0x%08x (from LBA %u)", bytes, buf, st->lba);
+-        /* Once the requested data phase is complete, the next short IN
+-         * transfer is the CSW, not another disk read. */
+         uint64_t expected = (uint64_t)(st->blocks ? st->blocks : 1) * DISK_SECTOR;
+         if (st->moved >= expected)
+             st->have_cmd = 0;
+@@ -242,6 +371,8 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+          * already drained): honest short transfer, 0 bytes -- residue
+          * accounts for the rest. */
+         mlog(&m->log, "[usb-msc] no data left for command (%u bytes requested)", total);
++    } else if (pid == 1 && total == 0) {
++        /* Control status stage: nothing to move. */
+     } else if (pid == 1) {
+         /* Unframed IN with no live command: legacy fallback -- settle a CSW. */
+         if (buf <= RAM_SIZE - 13) {
+@@ -263,19 +394,29 @@ static void ehci_process_qtd(machine_t *m, uint64_t qtd_addr, bot_state_t *st) {
+     wr32(m, qtd_addr+8, token);
+ }
+ 
+-static void ehci_doorbell(ehci_t *e) {
+-    machine_t *m = e->m;
+-    uint32_t asynclist = rd32(m, e->base + 0x18);
++/* U3: walk the async schedule the way hardware does -- QH horizontal list
++ * first (the guest links a transfer QH behind the head and polls its own
++ * qTD array), then each QH's qTD chain via the CurrentQTD/NextQTD
++ * overlay.  The firmware's chain lives in the head QH's overlay. */
++static void ehci_walk(machine_t *m, uint64_t base) {
++    uint32_t asynclist = rd32(m, base + EHCI_ASYNCLIST);
+     if (!asynclist) return;
+-    uint32_t qh = asynclist & ~0x1Fu;
+-    uint32_t cur = rd32(m, qh + 0x0C);
+-    static bot_state_t s_st; /* persists across doorbell calls for this simple single-LUN model */
+-    for (int guard = 0; guard < 32 && cur && !(cur & 1); guard++) {
+-        ehci_process_qtd(m, cur, &s_st);
+-        uint32_t next = rd32(m, cur + 0x00);
+-        if (next & 1) break;
+-        if (next == cur) break;
+-        cur = next;
++    uint32_t start = asynclist & ~0x1Fu;
++    uint32_t qh = start;
++    for (int qh_guard = 0; qh_guard < 8 && qh; qh_guard++) {
++        uint32_t cur = rd32(m, qh + 0x0C);        /* CurrentQTD overlay */
++        if (!cur || (cur & 1)) cur = rd32(m, qh + 0x10); /* NextQTD */
++        for (int guard = 0; guard < 64 && cur && !(cur & 1); guard++) {
++            ehci_process_qtd(m, cur, &g_st.bot);
++            uint32_t next = rd32(m, cur + 0x00);
++            if (next & 1) break;
++            if (next == cur) break;
++            cur = next;
++        }
++        uint32_t hlink = rd32(m, qh + 0x00);
++        uint32_t next_qh = hlink & ~0x1Fu;
++        if ((hlink & 1) || !next_qh || next_qh == start) break;
++        qh = next_qh;
+     }
+ }
+ 
+@@ -287,9 +428,121 @@ static ehci_t g_ehci; /* single controller instance is all the firmware ever nee
+  * one instance per machine, matching the rest of this file's globals. */
+ static serial_t *g_com1;
+ 
++static uint32_t ehci_usbsts(void) {
++    uint32_t v = 0;
++    if (!(g_st.usbcmd & USBCMD_RS)) v |= USBSTS_HCHALTED;
++    if ((g_st.usbcmd & (USBCMD_RS | USBCMD_ASE)) == (USBCMD_RS | USBCMD_ASE)) v |= USBSTS_ASS;
++    if ((g_st.usbcmd & (USBCMD_RS | USBCMD_PSE)) == (USBCMD_RS | USBCMD_PSE)) v |= USBSTS_PSS;
++    return v;
++}
++
++/* U3: an unpowered port has no device (PPC gating).  This is both
++ * honest EHCI behaviour and what keeps the sample firmware's
++ * hand-tested PORTSC poll (test CCS|PED == 0 before it ever powers
++ * a port) from spinning: measured. */
++static int ehci_ccs(void) {
++    return g_ehci.m && g_ehci.m->disk_len > 0 && g_st.pp && !g_st.owner;
++}
++
++static uint32_t ehci_portsc(void) {
++    uint32_t v = 0;
++    if (ehci_ccs()) v |= PORTSC_CCS | PORTSC_LS_J;
++    if (g_st.csc) v |= PORTSC_CSC;
++    if (g_st.pec) v |= PORTSC_PEC;
++    if (g_st.ped && ehci_ccs()) v |= PORTSC_PED;
++    if (g_st.pr) v |= PORTSC_PR;
++    if (g_st.pp) v |= PORTSC_PP;
++    if (g_st.owner) v |= PORTSC_OWNER;
++    return v;
++}
++
++static void ehci_portsc_write(machine_t *m, uint32_t val) {
++    int before = ehci_ccs();
++    if (val & PORTSC_CSC) g_st.csc = 0;           /* W1C */
++    if (val & PORTSC_PEC) g_st.pec = 0;           /* W1C */
++    g_st.pp = !!(val & PORTSC_PP);
++    g_st.owner = !!(val & PORTSC_OWNER);
++    int pr = !!(val & PORTSC_PR);
++    if (g_st.pr && !pr) {
++        /* Reset released: complete the sequence -- port enabled, change. */
++        if (m->disk_len > 0 && g_st.pp && !g_st.owner) {
++            g_st.ped = 1;
++            g_st.pec = 1;
++        } else {
++            g_st.ped = 0;
++        }
++    }
++    g_st.pr = pr;
++    if (ehci_ccs() != before) g_st.csc = 1;       /* connect-status change */
++}
++
++static void ehci_usbcmd_write(machine_t *m, uint64_t base, uint32_t val) {
++    g_ehci.op = 1; /* first op write retires the capability view of +0x04 */
++    if (val & USBCMD_HCRESET) {
++        /* HCRESET self-clears; the controller comes back halted. */
++        g_st.usbcmd = 0;
++    } else {
++        g_st.usbcmd = val & 0x0000FF7Fu; /* RW bits incl. ITC */
++    }
++    /* U3: the doorbell runs on USBCMD writes only (measured defect: it
++     * used to fire on every register write). */
++    if (g_st.usbcmd & USBCMD_RS)
++        ehci_walk(m, base);
++}
++
++static uint64_t ehci_read2(void *ctx, uint64_t addr, int size) {
++    rw2_t *w = ctx;
++    uint64_t off = addr - w->base;
++    if (size == 8 && off == EHCI_USBCMD) {
++        /* The sample firmware slurps the capability root as a QWORD
++         * (mov rbx,[bar]) and uses the low dword as a scratch pointer: with
++         * the dword reading 0 its usb_ff store lands on RAM 0 and the
++         * byte re-read degenerates opbase to BAR0 (measured baseline).  A
++         * HCIVERSION living at +0x02 would turn that dword into 0x02000000
++         * and the store would triple-fault -- so the 8-byte slurp answers 0
++         * until the first USBCMD write retires the capability root.  After
++         * that the same offset answers USBCMD for the firmware's QWORD
++         * read-modify-write dance; the driver itself only ever does 1/2/4
++         * -byte accesses (measured). */
++        return g_ehci.op ? g_st.usbcmd : 0;
++    }
++    if (size == 4 && off == EHCI_USBSTS) {
++        /* +0x04 is HCSPARAMS in the capability view and USBSTS in the
++         * operational one.  The driver reads the caps once at init and only
++         * then starts writing USBCMD (measured), so the first USBCMD write
++         * retires the capability view; before it, +0x04 answers HCSPARAMS. */
++        return g_ehci.op ? ehci_usbsts() : g_ehci.hcs;
++    }
++    if (size == 4 && off == EHCI_PORTSC0) return ehci_portsc();
++    return rw2_read(ctx, addr, size);
++}
++
+ static void ehci_write2(void *ctx, uint64_t addr, int size, uint64_t val) {
++    rw2_t *w = ctx;
++    uint64_t off = addr - w->base;
++    if ((size == 4 || size == 8) && off == EHCI_USBCMD) {
++        /* size 8: the firmware's `mov [r14],r12` dance (low dword is the
++         * command; the high dword lands on the +0x04 alias and is dropped). */
++        ehci_usbcmd_write(g_ehci.m, w->base, (uint32_t)val);
++        return; /* USBCMD is kept in g_st, not in the scratch window */
++    }
++    if (size == 4 && off == EHCI_PORTSC0) {
++        if (g_ehci.m) ehci_portsc_write(g_ehci.m, (uint32_t)val);
++        return;
++    }
+     rw2_write(ctx, addr, size, val);
+-    ehci_doorbell(&g_ehci);
++}
++
++/* U3: the async schedule advances with controller time (real EHCI walks
++ * it continuously while ASE=1).  The guest's ehci_run_async() links a QH
++ * and polls its own qTD array without touching MMIO (measured), so the
++ * walk is sampled at a deterministic instruction cadence.  The MMIO
++ * doorbell (USBCMD writes) still walks immediately. */
++void devices_tick(machine_t *m) {
++    /* Called from the cpu.c cadence divider (every 256 instructions). */
++    if (!g_ehci.m || g_ehci.m != m) return;
++    if ((g_st.usbcmd & (USBCMD_RS | USBCMD_ASE)) != (USBCMD_RS | USBCMD_ASE)) return;
++    ehci_walk(m, g_ehci.base);
+ }
+ 
+ /* ================================== GPU ==================================== */
+@@ -367,11 +620,18 @@ void devices_init_common(machine_t *m) {
+     g_ehci.base = ehci_bar; g_ehci.m = m;
+     rw2_t *regs = calloc(1, sizeof *regs);
+     regs->buf = calloc(1, 0x1000); regs->base = ehci_bar; regs->size = 0x1000; regs->name = "EHCI BAR0";
+-    mem_register_mmio_owned(m, ehci_bar, 0x1000, rw2_read, ehci_write2, regs, "EHCI BAR0");
++    mem_register_mmio_owned(m, ehci_bar, 0x1000, ehci_read2, ehci_write2, regs, "EHCI BAR0");
+     g_ehci.regs = regs;
+-    /* CAPLENGTH byte (offset 0) small so capability/operational math the firmware
+-     * performs stays within this same register window. */
+-    regs->buf[0] = 0x00;
++    /* U3: capability bytes seeded (read once by the AuraLite-OS driver
++     * before operational writes reuse the offsets).  CAPLENGTH stays 0 so
++     * the firmware's dance and the driver share one BAR-relative map. */
++    memset(&g_st, 0, sizeof g_st);              /* fresh machine: clean latch state */
++    cpu_devices_tick = devices_tick;            /* USB U3: cadence walk hook */
++    regs->buf[0] = 0x00;                    /* CAPLENGTH = 0 */
++    regs->buf[2] = 0x00; regs->buf[3] = 0x02; /* HCIVERSION 2.00 */
++    regs->buf[4] = 0x11;                    /* HCSPARAMS: N_PORTS=1 | PPC */
++    g_ehci.hcs = 0x11; g_ehci.op = 0;       /* +0x04 alias: caps until op mode */
++    /* HCCPARAMS @0x08 = 0: 32-bit addressing only */
+ 
+     /* GPU VRAM / framebuffer, BAR0 = 0xD0000000 as the firmware's own "enable:" code
+      * sets it; this buffer doubles as the pixel buffer shown in the GUI. */
+diff --git a/src/devices.h b/src/devices.h
+index 078c0a1..a8c5e7b 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -6,6 +6,7 @@ void devices_init_common(machine_t *m);     /* LPC, SATA, GPU, EHCI, CMOS, Super
+ void devices_init_platform(machine_t *m);   /* DDR controller models for the selected platform */
+ void devices_add_ahci2(machine_t *m);       /* STORE S4: second AHCI controller (--ahci2) */
+ void devices_done(machine_t *m);            /* C10: frees every mmio region + rw2 window + PCI list */
++void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at the instruction cadence */
+ 
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+ uint16_t usb_msc_be16(const uint8_t *p);
+diff --git a/tests/test_usb.c b/tests/test_usb.c
+index a2b01a0..e5da71c 100644
+--- a/tests/test_usb.c
++++ b/tests/test_usb.c
+@@ -73,7 +73,8 @@ static void qtd(fx_t *f, uint32_t addr, uint32_t next, uint32_t total,
+ static void fire(fx_t *f) {
+     uint8_t *qh = f->m.ram + QH_ADDR;
+     w32r(qh + 0x0C, QTD0);
+-    mem_write(&f->m, EHCI_BASE + 0x18, 4, QH_ADDR); /* ASYNCLISTADDR = doorbell */
++    mem_write(&f->m, EHCI_BASE + 0x18, 4, QH_ADDR); /* ASYNCLISTADDR: stores only */
++    mem_write(&f->m, EHCI_BASE + 0x00, 4, 0x21);    /* USBCMD Run|ASE: the doorbell */
+ }
+ 
+ static void check_csw_at(fx_t *f, uint32_t addr, uint32_t tag,
+@@ -307,6 +308,152 @@ static void test_illegal_opcode_sense(void) {
+     printf("ok illegal opcode sense\n");
+ }
+ 
++/* ---------------- U3: register file, doorbell, control transfers ---------------- */
++
++static void test_ehci_caps(void) {
++    fx_t f; fx_init(&f);
++    assert(mem_read(&f.m, EHCI_BASE + 0x00, 1) == 0x00);       /* CAPLENGTH */
++    assert(mem_read(&f.m, EHCI_BASE + 0x02, 2) == 0x0200);     /* HCIVERSION 2.00 */
++    assert(mem_read(&f.m, EHCI_BASE + 0x04, 4) == 0x11);       /* N_PORTS=1 | PPC */
++    assert(mem_read(&f.m, EHCI_BASE + 0x08, 4) == 0x00);       /* HCCPARAMS: 32-bit */
++    fx_done(&f);
++    printf("ok ehci caps\n");
++}
++
++static void test_ehci_halt_reset(void) {
++    fx_t f; fx_init(&f);
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x00);                /* USBCMD=0 (op mode) */
++    assert(mem_read(&f.m, EHCI_BASE + 0x04, 4) & (1u << 12));  /* HCHALTED at rest */
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x21);                /* Run|ASE */
++    uint32_t st = (uint32_t)mem_read(&f.m, EHCI_BASE + 0x04, 4);
++    assert(!(st & (1u << 12)));                                /* halted cleared */
++    assert(st & (1u << 15));                                   /* ASS: async active */
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x00);                /* stop */
++    assert(mem_read(&f.m, EHCI_BASE + 0x04, 4) & (1u << 12));  /* halted again */
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x02);                /* HCRESET */
++    assert(!(mem_read(&f.m, EHCI_BASE + 0x00, 4) & 0x02));     /* self-cleared */
++    assert(mem_read(&f.m, EHCI_BASE + 0x04, 4) & (1u << 12));  /* halted after reset */
++    fx_done(&f);
++    printf("ok ehci halt handshake\n");
++}
++
++static void test_doorbell_usbcmd_only(void) {
++    /* U3 negative control: non-USBCMD register writes run no schedule. */
++    fx_t f; fx_init(&f);
++    cbw(&f, 0x12121212u, 512, 0x80, 0x28, 0, 1);
++    qtd(&f, QTD0 + 0x00, QTD0 + 0x10, 31, 0, CBW_ADDR);
++    qtd(&f, QTD0 + 0x10, QTD0 + 0x20, 512, 1, DATA_ADDR);
++    qtd(&f, QTD0 + 0x20, 1, 13, 1, CSW_ADDR);
++    uint8_t *qh = f.m.ram + QH_ADDR;
++    w32r(qh + 0x0C, QTD0);
++    mem_write(&f.m, EHCI_BASE + 0x18, 4, QH_ADDR);   /* ASYNCLISTADDR */
++    mem_write(&f.m, EHCI_BASE + 0x04, 4, 0);         /* USBSTS */
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x1000);    /* PORTSC PP */
++    assert(r32r(f.m.ram + QTD0 + 8) & 0x80);         /* still Active: no walk */
++    mem_write(&f.m, EHCI_BASE + 0x00, 4, 0x21);      /* USBCMD: walks now */
++    assert(!(r32r(f.m.ram + QTD0 + 8) & 0x80));      /* completed */
++    check_csw_at(&f, CSW_ADDR, 0x12121212u, 0, 0);
++    fx_done(&f);
++    printf("ok doorbell usbcmd only\n");
++}
++
++static void test_ehci_portsc(void) {
++    fx_t f; fx_init(&f);
++    /* Unpowered port has no device (PPC gating). */
++    assert(!(mem_read(&f.m, EHCI_BASE + 0x44, 4) & 0x1));
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x1000);            /* power on (PP) */
++    uint32_t ps = (uint32_t)mem_read(&f.m, EHCI_BASE + 0x44, 4);
++    assert(ps & 0x1);                                        /* CCS */
++    assert(ps & 0x2);                                        /* CSC latched */
++    assert((ps >> 10 & 3) == 2);                             /* J-state */
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x1002);            /* W1C: clear CSC */
++    assert(!(mem_read(&f.m, EHCI_BASE + 0x44, 4) & 0x2));
++    /* Reset dance: PR set then released -> PED + PEC. */
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x1100);            /* PR */
++    assert(mem_read(&f.m, EHCI_BASE + 0x44, 4) & 0x100);
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x1000);            /* PR released */
++    ps = (uint32_t)mem_read(&f.m, EHCI_BASE + 0x44, 4);
++    assert(ps & 0x4);                                        /* PED */
++    assert(ps & 0x8);                                        /* PEC latched */
++    /* Owner bit releases the port to a companion. */
++    mem_write(&f.m, EHCI_BASE + 0x44, 4, 0x3000);            /* PP|OWNER */
++    ps = (uint32_t)mem_read(&f.m, EHCI_BASE + 0x44, 4);
++    assert(!(ps & 0x1));                                     /* no device */
++    assert(ps & (1u << 13));                                 /* owner */
++    fx_done(&f);
++    printf("ok ehci portsc\n");
++}
++
++static void setup_pkt(fx_t *f, uint32_t addr, uint8_t type, uint8_t req,
++                      uint16_t value, uint16_t index, uint16_t length) {
++    uint8_t *p = f->m.ram + addr;
++    p[0] = type; p[1] = req;
++    p[2] = (uint8_t)value; p[3] = (uint8_t)(value >> 8);
++    p[4] = (uint8_t)index; p[5] = (uint8_t)(index >> 8);
++    p[6] = (uint8_t)length; p[7] = (uint8_t)(length >> 8);
++}
++
++static void run_control(fx_t *f, int with_data, uint32_t data_total, uint32_t data_buf) {
++    qtd(f, QTD0 + 0x00, QTD0 + 0x10, 8, 2, CBW_ADDR);         /* SETUP */
++    if (with_data) {
++        qtd(f, QTD0 + 0x10, QTD0 + 0x20, data_total, 1, data_buf);
++        qtd(f, QTD0 + 0x20, 1, 0, 1, CSW_ADDR);               /* status: 0-byte IN */
++    } else {
++        qtd(f, QTD0 + 0x10, 1, 0, 1, CSW_ADDR);
++    }
++    fire(f);
++}
++
++static void test_control_get_device(void) {
++    fx_t f; fx_init(&f);
++    setup_pkt(&f, CBW_ADDR, 0x80, 0x06, 0x0100, 0, 18);
++    run_control(&f, 1, 18, DATA_ADDR);
++    const uint8_t *d = f.m.ram + DATA_ADDR;
++    assert(d[0] == 18 && d[1] == 1);
++    assert(d[2] == 0x00 && d[3] == 0x02);                     /* bcdUSB 2.00 */
++    assert(d[7] == 64);                                      /* bMaxPacketSize0 */
++    assert(d[8] == 0x25 && d[9] == 0x05);                    /* idVendor 0x0525 */
++    assert(d[10] == 0xA5 && d[11] == 0xA4);                  /* idProduct 0xa4a5 */
++    fx_done(&f);
++    printf("ok control get device descriptor\n");
++}
++
++static void test_control_get_config(void) {
++    fx_t f; fx_init(&f);
++    setup_pkt(&f, CBW_ADDR, 0x80, 0x06, 0x0200, 0, 32);
++    run_control(&f, 1, 32, DATA_ADDR);
++    const uint8_t *d = f.m.ram + DATA_ADDR;
++    assert(d[0] == 9 && d[1] == 2);
++    assert(d[2] == 32 && d[3] == 0);                         /* wTotalLength 32 */
++    assert(d[14] == 0x08 && d[15] == 0x06 && d[16] == 0x50); /* MSC/SCSI/BOT */
++    assert(d[18 + 2] == 0x81 && d[18 + 3] == 2);             /* bulk IN 512 */
++    assert(d[25 + 2] == 0x02 && d[25 + 3] == 2);             /* bulk OUT 512 */
++    fx_done(&f);
++    printf("ok control get config descriptor\n");
++}
++
++static void test_control_string0(void) {
++    fx_t f; fx_init(&f);
++    setup_pkt(&f, CBW_ADDR, 0x80, 0x06, 0x0300, 0, 4);
++    run_control(&f, 1, 4, DATA_ADDR);
++    const uint8_t *d = f.m.ram + DATA_ADDR;
++    assert(d[0] == 4 && d[1] == 3 && d[2] == 0x09 && d[3] == 0x04);
++    fx_done(&f);
++    printf("ok control string0\n");
++}
++
++static void test_control_set_address_max_lun(void) {
++    fx_t f; fx_init(&f);
++    setup_pkt(&f, CBW_ADDR, 0x00, 0x05, 7, 0, 0);            /* SET_ADDRESS 7 */
++    run_control(&f, 0, 0, 0);
++    assert(!(r32r(f.m.ram + QTD0 + 8) & 0x80));              /* completed */
++    setup_pkt(&f, CBW_ADDR, 0xA1, 0xFE, 0, 0, 1);            /* GET_MAX_LUN */
++    run_control(&f, 1, 1, DATA_ADDR);
++    assert(f.m.ram[DATA_ADDR] == 0);                         /* one LUN */
++    fx_done(&f);
++    printf("ok control set address + max lun\n");
++}
++
+ int main(void) {
+     test_be16();
+     test_csw_tag_echo();
+@@ -322,6 +469,14 @@ int main(void) {
+     test_read_capacity_n();
+     test_read_capacity_one();
+     test_illegal_opcode_sense();
++    test_ehci_caps();
++    test_ehci_halt_reset();
++    test_doorbell_usbcmd_only();
++    test_ehci_portsc();
++    test_control_get_device();
++    test_control_get_config();
++    test_control_string0();
++    test_control_set_address_max_lun();
+     printf("test_usb: ALL PASS\n");
+     return 0;
+ }
+-- 
+2.47.3
+
