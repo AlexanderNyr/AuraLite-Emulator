@@ -32,6 +32,12 @@ static void default_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
     }
 }
 
+/* VIDEO V1: exported so device-specific cfg_write hooks (the GPU's
+ * BAR0-enable) can keep the same store semantics as the default path. */
+void pci_default_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
+    default_cfg_write(d, reg, size, val);
+}
+
 pci_dev_t *pci_find(machine_t *m, int bus, int dev, int func) {
     for (pci_dev_t *d = m->pci_devices; d; d = d->next)
         if (d->bus==bus && d->dev==dev && d->func==func) return d;

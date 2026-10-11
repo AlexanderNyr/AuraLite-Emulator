@@ -1,0 +1,240 @@
+From db3f24f77e3a52b88b6085da8831c86b97f1581f Mon Sep 17 00:00:00 2001
+From: AuraLite Dev <dev@auralite.local>
+Date: Sat, 10 Oct 2026 10:55:33 +0000
+Subject: [PATCH] V0 update
+
+VIDEO V0: measured baseline + docs/plans/VIDEO_PLAN.md.
+
+Baseline measured 2026-10-10 on AuraLite-Emulator@39bd235 with
+AuraLite-OS@0ed0d29. What the machine presents today: GPU PCI 0:2:0
+(8086:0412, the sample firmware's probe target) with the VRAM/framebuffer
+RAM window at 0xD0000000 (boot_info.fb + BOOT_MEM_FRAMEBUF + --dump-fb);
+VGA text is absent (0xB8000 is plain RAM, CRTC 0x3D4/0x3D5 float high);
+Bochs VBE is absent (0x1CE/0x1CF float high); no mode state exists.
+What the guest expects (measured): fb.c's BIOS-path fallback writes
+80x25 cells at 0xB8000 with attribute 0x07 and moves the cursor through
+the CRTC index/data pair; stage2_start.asm forces VGA text mode 3 via
+int 0x10; the QEMU recipes run -vga std (Bochs VBE dispi) and the guest's
+own tables name PCI 1234:1111 QEMU/Bochs std VGA. Five measured defects
+drive V1-V3 (text display path, CRTC, dispi, mode state, per-mode
+display output).
+---
+ ROADMAP.md               |   3 +-
+ docs/plans/VIDEO_PLAN.md | 187 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 189 insertions(+), 1 deletion(-)
+ create mode 100644 docs/plans/VIDEO_PLAN.md
+
+diff --git a/ROADMAP.md b/ROADMAP.md
+index aedf392..3f55914 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -29,7 +29,7 @@ maps to exactly one plan below.
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+-| `docs/plans/VIDEO_PLAN.md` | 📋 planned | Bochs VBE (dispi 0x1CE/0x1CF), VGA text mode 0xB8000, mode switching | V0–V3 |
++| `docs/plans/VIDEO_PLAN.md` | 🔵 **IN PROGRESS** (V0 done ✅, V1–V3 planned) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+@@ -86,3 +86,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0039` — USB U3: EHCI register-file honesty + control -- CAPLENGTH/HCIVERSION/HCSPARAMS/HCCPARAMS, USBCMD RUN/stop/HCRESET walk gate + doorbell on USBCMD only, USBSTS USBINT/IHS/SEmpty/HCHALTED map, USBINTR, per-qTD SETUP with Data/Status stages; 22 vectors + QEMU `run_qemu_usb_msc.sh` boot-parity receipts + negative control (unconditional walk reddens `test_usb.c:352`)~~ shipped
+ - ~~`0040` — USB U4: UHCI root host controller -- PCI 0:1.2 `8086:0x7020`, I/O BAR4 `0xC040` register file (USBSTS.HCHALTED = bit 5), frame list + QH/TD walk (ctrl[10:0] actual-length contract, IOC→USBINT), control+bulk through the shared device model (fix: disk path advances media offset by `st->moved`), QEMU `run_qemu_usb_msc.sh` parity (`[uhci] controller at PCI 0:1.2` + `I/O base = 0xc040` + usbfs receipts over UHCI bulk), 25 vectors + negative control (halted controller runs no frames)~~ shipped
+ - ~~`0041` — USB U5: end-to-end + hardening close-out -- `--no-usb-uhci` (the `test_usb_ehci.sh` EHCI-only machine shape, `ok uhci omitted`), both sticks through the guest's MSC path (`/usb` info + `run /apps/filesize /usb/sector0.bin` typed over the KBC) with byte-identical x2 lane pairs (UHCI/AURALUSB + EHCI/AURALEHC), `MATRIX_DETERMINISM=1` matrix green with pairs byte-identical and AHCI/fs receipts byte-identical to the S5-era lanes, frozen-kernel reproducibility (`SOURCE_DATE_EPOCH` banner + 92160-byte trimmed initrd reconstruction), CHANGELOG U1–U5, 26 vectors~~ shipped — USB plan closed for both-stick MSC parity (U0–U5)
++- ~~`0042` — VIDEO V0: measured baseline + `docs/plans/VIDEO_PLAN.md` (defect ledger: `0xB8000` is plain RAM with no display path, no CRTC `0x3D4/0x3D5` cursor pair, no Bochs VBE dispi `0x1CE/0x1CF`, no mode state; guest contract measured from `fb.c` VGA-text fallback + `stage2_start.asm` mode-3 force + QEMU `-vga std`)~~ shipped
+diff --git a/docs/plans/VIDEO_PLAN.md b/docs/plans/VIDEO_PLAN.md
+new file mode 100644
+index 0000000..65dc6b3
+--- /dev/null
++++ b/docs/plans/VIDEO_PLAN.md
+@@ -0,0 +1,187 @@
++# VIDEO plan — display hardware (VGA text + Bochs VBE)
++
++> **House style** (adopted from
++> [`AuraLite-OS/docs/plans`](https://github.com/AlexanderNyr/AuraLite-OS/tree/main/docs/plans)):
++> each effort is a dependency-ordered plan in `docs/plans/` with a
++> definition of done and a test gate per phase, and ships as **one
++> `.patch` per phase** under `patches/`. Every claim in these docs is
++> measured against the tree, not assumed.
++
++The display stack the machine owes the guest, measured from
++`AuraLite-OS@0ed0d29` and the QEMU recipes that gate it (`-vga std` in
++`tools/run_qemu.sh` / `tools/run_qemu_usb_msc.sh`): a **VGA text mode 3**
++console at `0xB8000` (the kernel's BIOS-path fallback writes cells and
++the CRTC cursor there) and the **Bochs VBE dispi** interface (ports
++`0x1CE`/`0x1CF`) behind QEMU's std-VGA identity, with mode switching
++between the two. The linear framebuffer at `0xD0000000` (GPU VRAM,
++published through `boot_info.fb`) is live since the KERNEL-BOOT phases
++and stays the graphics path; this plan makes the *legacy + VBE* surfaces
++honest so the BIOS/stage2 path and any VBE client have real hardware.
++
++**Status: in progress — V0 ✅, V1–V3 planned 📋**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| V0 | Measured baseline + this plan (defect ledger: no VGA text rendering, no CRTC, no Bochs VBE dispi, no mode state) | ✅ done | `patches/0042-VIDEO-V0-video-plan.patch` |
++| V1 | VGA text mode 3: `0xB8000` text window + CRTC cursor pair (0x3D4/0x3D5), glyph rendering into the display output, `--no-fb` lane so the guest's `fb.c` fallback engages | 📋 | `patches/0043-VIDEO-V1-vga-text.patch` |
++| V2 | Bochs VBE dispi (0x1CE/0x1CF): the `VBE_DISPI` register file, LFB window + video-memory sizing (the QEMU `-vga std` contract) | 📋 | `patches/0044-VIDEO-V2-vbe-dispi.patch` |
++| V3 | Mode switching (text 3 ↔ VBE graphics), determinism ×2, sanitize, docs close-out | 📋 | `patches/0045-VIDEO-V3-video-mode-switch.patch` |
++
++Note: the *guest* keeps its own roadmap (`AuraLite-OS/docs/BOOTLOADER_ROADMAP.md`
++BL1–BL8) and its display driver consumes `boot_info.fb` (Limine/GOP or
++the emulator's direct-load lane). This plan closes the **emulator's
++video hardware** gaps those paths assume. The guest's `fb.c` fallback
++and `stage2_start.asm` mode-3 contract are the acceptance surface.
++
++## 1. Measured baseline
++
++### 1.1 What the machine presents today (`src/devices.c`, `src/kloader.c`)
++
++- **GPU PCI 0:2:0** — `0x8086:0x0412`, class `0x03/0x00/0x00` (the
++  comment records the firmware convention: "GPU: dev2/func0 (real Intel
++  iGPU convention)"; class mirrored at the offset the firmware reads).
++- **GPU VRAM / framebuffer** — a RAM window at `0xD0000000`
++  (`make_ramwindow`, `fb_w*fb_h*4` bytes = 800×600×4); `m->fb` points
++  into it; the kloader publishes it in `boot_info.fb` (`fb 800x600 @
++  0xD0000000` in every kernel-lane `[kload]` receipt) and in the e820
++  map as `BOOT_MEM_FRAMEBUF`. The sample firmware's `enable:` code finds
++  the same window (it writes the `0x00200000` pixel marker the boot
++  integration gate pins: `framebuffer marker OK: pixel[0]=0x00200000`).
++  `--dump-fb` writes the LFB out as `framebuffer.ppm`.
++- **VGA text: nothing.** `0xB8000` sits inside the flat 128 MiB RAM
++  map, so guest cell writes survive as ordinary RAM — but no VGA
++  display path exists: nothing renders the buffer, and the kloader's
++  e820 marks `0xA0000–0x100000` reserved ("legacy VGA hole + our
++  ROM-alias shadow window"). No VGA register file: `0x3C0–0x3DF` are
++  unregistered I/O and float high (`io.c` open-bus rule).
++- **Bochs VBE: nothing.** `0x1CE`/`0x1CF` float high; there is no mode
++  state anywhere in the machine.
++
++### 1.2 What the guest expects (measured, `AuraLite-OS@0ed0d29`)
++
++- **VGA text mode 3 console** (`drivers/framebuffer/fb.c:24–34`):
++  "BIOS Stage 2 never programs VBE: boot_info.fb is zeros and the
++  monitor is still in VGA text mode 3" — the fallback writes 80×25
++  `uint16` cells at **`0xB8000`** with attribute `0x07`
++  (`VGA_TEXT_PHYS`, `VGA_COLS 80`, `VGA_ROWS 25`, `VGA_ATTR 0x07`),
++  scrolls by memmove between cells, and moves the hardware cursor
++  through the CRTC index/data pair (`fb.c:129–132`): `outb(0x3D4,
++  0x0F); outb(0x3D5, lo); outb(0x3D4, 0x0E); outb(0x3D5, hi)`.
++  `fb.h:20`: after `paging_init()` the kernel punches a 4 KiB UC map of
++  `0xB8000` "so the BIOS [text console works]".
++- **Stage 2 forces mode 3** (`boot/bios/stage2/stage2_start.asm:78`):
++  "Force VGA text mode 3. SeaBIOS starts there; a leftover graphics
++  mode (or a firmware that never programmed the CRTC) would leave the
++  monitor dark for the entire BIOS path — there is no VBE linear
++  framebuffer in this loader." (`mov ax, 0x0003; int 0x10` — the INT
++  0x10 mode-set is a *firmware* service; the hardware contract is the
++  mode-3 state this plan's V1/V3 provide.)
++- **QEMU `-vga std`** (`tools/run_qemu.sh:51`,
++  `tools/run_qemu_usb_msc.sh:30`) — the Bochs VBE (dispi) machine the
++  guest names in its own tables: `drivers/vm/virtual_drivers.c:57` maps
++  PCI `1234:1111` to `"QEMU/Bochs std VGA"` / `"limine-framebuffer"`, and
++  `drivers/framebuffer/render3d.c:93` identifies the same id before
++  rendering through the LFB.
++- **GUI/3D lanes** (`tests/integration/cases/test_3d_render.sh`,
++  `test_gui_usb.sh`, `test_doom.sh`) render through the linear
++  framebuffer in software (`[3d] demo complete` receipts) — those run
++  against `boot_info.fb` and already work on the direct-load lane; they
++  are non-regression lanes for V1–V3.
++
++### 1.3 The dispi contract to implement (QEMU hw/display/vbe.h)
++
++Ports `0x1CE` (index, with auto-increment select) / `0x1CF` (data);
++registers `VBE_DISPI_INDEX_ID=0x00` (accept `ID0..ID5` = `0xB0C0..0xB0C5`
++and read back the newest supported), `XRES=0x01`, `YRES=0x02`, `BPP=0x03`
++(4/8/15/16/24/32), `ENABLE=0x04` (`ENABLED=0x01`, `LFB_ENABLED=0x40`,
++`NOCLEARMEM=0x80`), `BANK=0x05`, `VIRT_WIDTH=0x06`, `VIRT_HEIGHT=0x07`,
++`X_OFFSET=0x08`, `Y_OFFSET=0x09`, `VIDEO_MEMORY_64K=0x0A`. The LFB is
++the device's video memory — here the existing `0xD0000000` VRAM window.
++
++## 2. Defect ledger (drives V1–V3)
++
++1. **No VGA text display path** — `0xB8000` is plain RAM; the guest's
++   BIOS-path console is invisible (`--dump-fb` shows only the LFB).
++2. **No CRTC register file** — the guest's `vga_move_cursor` I/O
++   (`0x3D4/0x3D5`) hits open bus; the cursor never exists.
++3. **No Bochs VBE dispi** — `0x1CE/0x1CF` float high; any VBE client
++   (stage2-with-VBE, Limine-style loaders, mode-setting tools) sees
++   nothing to talk to.
++4. **No mode state** — text mode 3 vs VBE graphics does not exist as
++   machine state, so nothing can switch between them.
++5. **No text-mode display output** — even with (1), the display surface
++   must show the text console when the machine is in mode 3 and the LFB
++   when VBE is enabled (the visible-display contract `--dump-fb`
++   renders).
++
++## 3. Phases
++
++### V0 — Measured baseline + this plan — ✅ done (patches/0042-VIDEO-V0-video-plan.patch)
++
++This document: baseline (§1) + defect ledger (§2) + the phase ladder.
++
++**Gate:** `make test` green (no code changes).
++
++### V1 — VGA text mode 3
++
++A real mode-3 console: a dedicated `0xB8000` text window (cells,
++attributes), the CRTC index/data pair at `0x3D4/0x3D5` (cursor location
++registers `0x0E/0x0F` at minimum, storing what the guest writes), and
++glyph rendering of the text buffer into the display output (the
++`--dump-fb` / `framebuffer.ppm` surface shows the console when the
++machine is in text mode). New `--no-fb` CLI zeroes `boot_info.fb` so
++the direct-load lane exercises the guest's own `fb.c` fallback.
++
++**DoD (measured):** unit vectors pin the cell window, the CRTC cursor
++pair, and scroll semantics; a `--no-fb` kernel lane shows the guest's
++BIOS-path console in `0xB8000` (the fb fallback engages — measured
++guest receipt plus buffer/display assertions) while the historical
++kernel-lane receipts (`boot_info.fb` path) do not move.
++
++**Gate:** `make test` + `make test-sanitize` green.
++
++### V2 — Bochs VBE dispi (0x1CE/0x1CF)
++
++The `VBE_DISPI` register file per §1.3 over the existing VRAM window:
++ID readback ladder, XRES/YRES/BPP get/set with the QEMU size/bpp
++constraints, `VIDEO_MEMORY_64K` derived from the real VRAM size, BANK
++windowing, ENABLE semantics (disabling returns the machine to the
++previous mode's display).
++
++**DoD (measured):** unit vectors pin every register's behaviour
++including the ID ladder and rejected out-of-range modes (QEMU-parity
++clamping); the LFB stays byte-identical to the current VRAM window
++(KERNEL-BOOT receipts do not move).
++
++**Gate:** `make test` + `make test-sanitize` green.
++
++### V3 — Mode switching + close-out
++
++Text mode 3 ↔ VBE graphics as machine state: ENABLE drives which
++surface the display output shows; mode-set clears/keeps memory per
++`NOCLEARMEM`; the guest's mode-3-forcing path (stage2's INT 0x10
++contract, hardware side) and a VBE client's mode-set both land in the
++documented state. Determinism ×2 across the new lanes (byte-identical
++pairs), sanitize lanes, docs refresh (`ROADMAP.md` ledger row,
++`docs/STATUS.md` evidence, CHANGELOG entries for V1–V3).
++
++**DoD (measured):** the V1 guest lane + a mode-switch lane through the
++dispi interface, each twice, byte-identical; display output assertions
++per mode; no historical receipt moves (firmware lane + the K0–K8
++kernel-lane receipts byte-stable).
++
++**Gate:** all above + `make test` + `make test-sanitize` green.
++
++## 4. Standing constraints
++
++- The guest-visible firmware contract (`firmware/sample_firmware.nas`)
++  does not change; its GPU probe (`0:2:0`, `0x8086:0x0412`, BAR0
++  `0xD0000000`) and the `0x00200000` pixel marker stay put.
++- Historical receipts do not move: K0–K8 kernel-lane receipts, the
++  STORE/USB matrix lanes, and the firmware lane stay byte-stable
++  across V1–V3.
++- Every phase: `fix + regression vector in the same patch`, one
++  negative control per phase (revert → red, RC measured),
++  `make test` + `make test-sanitize` green at the boundary, receipts
++  measured against the tree (`AuraLite-OS@0ed0d29`), docs in the same
++  patch as the code.
+-- 
+2.47.3
+

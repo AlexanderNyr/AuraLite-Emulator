@@ -28,6 +28,42 @@
   matrix stays green with USB present (`MATRIX_DETERMINISM=1`, all pairs
   byte-identical) and its AHCI/fs receipt lines are byte-identical to the S5-era
   lane logs. The USB plan (U0–U5) is closed.
+- The VIDEO plan (V0–V3) is closed.  VGA text mode 3 is a real display now
+  (80x25 cells at `0xB8000`, the CRTC `0x3D4/0x3D5` cursor pair, 8x16 glyphs
+  from the guest's own PSF2 font -- 256/256 byte-identical to
+  `psf2_default_font.inc`, `--dump-text`/`--no-fb` measured on the guest's
+  `fb.c` fallback receipts), the Bochs VBE dispi (`0x1CE/0x1CF`) follows the
+  QEMU `vga.c` contract (ID `0xB0C0..0xB0C5` accept-list, XRES `%8`, BPP
+  set, GETCAPS, `VIDEO_MEMORY_64K=29`, BANK mask 28, ENABLE edge display
+  flip + `VIRT_*` fixup), and mode switching is one machine state (text 3 ↔
+  VBE graphics: the dispi ENABLE edge, the BAR0/kload publishes, and the GC
+  `VGA_GR06_GRAPHICS_MODE` bit at `0x3CE/0x3CF` -- stage2's INT 0x10 (AL=3)
+  lands in mode 3 on the hardware side; mode-set clears `YRES * vbe_line_offset`
+  unless `DISPI_NOCLEARMEM`).  `tests/test_video.c` runs 10 vectors; the
+  V3 mode-switch + V1 guest lanes (`tests/integration/test_video_modes.sh`,
+  `--vbe=WxHxBPP`) run twice each with six byte-identical artifact pairs and
+  display assertions per mode; historical firmware/K0–K8 receipts do not
+  move and `make test` + `make test-sanitize` stay green.
+- The NET plan's N0 (RX-ready e1000 + TAP ingress) is measured.  The
+  NIC is opt-in (`--tap=` only — without it no PCI function exists and
+  the historical no-NIC receipts stay byte-stable): PCI 0:4.0
+  `8086:100E` with BAR0 `0xFEBC0000`/128 KiB seeded into config (the
+  N0 lane measured the pre-fix defect `BAR0 at phys 0x0` /
+  `STATUS=0x00000000 (LU=0)` / `using default QEMU MAC` first), the
+  QEMU `e1000_reset` core (RXCSUM 0, `RAL/RAH` preload
+  `52:54:00:12:34:56`, `STATUS.LU`, `CTRL.RST` self-clear), and RX
+  ring DMA with `RCTL.EN`/`RDH==RDT` drop gates; the TAP socket (UDP
+  datagrams = Ethernet frames at `127.0.0.1:8080`, the emulator
+  connects) drains up to 8 datagrams/tick into the guest RX ring.
+  `tests/test_net.c` runs 2 vectors (incl. the BAR0 readback
+  regression vector over `0xCF8/0xCFC`); the guest lane pair
+  (`--max-instr=4500000000`) is byte-identical (both tapes sha256
+  `82614cd6f896aa9a…`) with the `[net] using NIC: e1000` gate,
+  `BAR0 at phys 0xfebc0000`, `STATUS=0x00000002 (LU=1)` and
+  `MAC from RAL/RAH`.  TX stays N1 (measured `[e1000] TX timeout`
+  receipts; `[dhcp] FAIL: DISCOVER transmit failed` → `[net] fallback
+  IP active`).  NC reddens the ingress vector (`test_net.c:85`,
+  RC=134); `make test` + `make test-sanitize` stay green.
 - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
 - A framebuffer is available as `framebuffer.ppm`.
 - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.

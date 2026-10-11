@@ -133,6 +133,7 @@ struct machine {
      * publishes; the emulator still has exactly ONE vCPU, so entries > 1
      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
     int cfg_cpus;
+    int cfg_no_fb;        /* VIDEO V1: --no-fb -- publish no linear fb (VGA text box) */
 
     /* USB U5 (--no-usb-uhci): omit the UHCI companion entirely so the
      * EHCI-only machine shape of the guest's test_usb_ehci.sh QEMU lane

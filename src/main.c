@@ -29,11 +29,17 @@ static void write_ppm(machine_t *m, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return;
     fprintf(f, "P6\n%d %d\n255\n", m->fb_w, m->fb_h);
+    /* VIDEO V1: dump the DISPLAY, not raw VRAM -- the mode-3 console renders
+     * in text mode; graphics mode copies m->fb exactly (historical bytes). */
+    uint32_t *px = malloc((size_t)m->fb_w * (size_t)m->fb_h * 4);
+    if (!px) { fclose(f); return; }
+    vga_render_display(m, px, m->fb_w, m->fb_h);
     for (int i = 0; i < m->fb_w*m->fb_h; i++) {
-        uint32_t px = m->fb[i];
-        uint8_t rgb[3] = { (uint8_t)(px>>16), (uint8_t)(px>>8), (uint8_t)px };
+        uint32_t p = px[i];
+        uint8_t rgb[3] = { (uint8_t)(p>>16), (uint8_t)(p>>8), (uint8_t)p };
         fwrite(rgb, 1, 3, f);
     }
+    free(px);
     fclose(f);
 }
 
@@ -98,6 +104,10 @@ int main(int argc, char **argv) {
     const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
     int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
+    int cfg_no_fb = 0;              /* --no-fb: no linear fb published -- VGA text box (VIDEO V1) */
+    const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
+    const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
+    const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
                                      * land in the host image files too */
     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
@@ -116,6 +126,10 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--platform=", 11)) platform_name = argv[i]+11;
         else if (!strncmp(argv[i], "--max-instr=", 12)) max_instr = strtoull(argv[i]+12, NULL, 0);
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
+        else if (!strncmp(argv[i], "--dump-text=", 12)) text_out = argv[i]+12;
+        else if (!strcmp(argv[i], "--no-fb")) cfg_no_fb = 1;
+        else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
+        else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
         else if (!strncmp(argv[i], "--keys-at=", 10)) {
@@ -156,7 +170,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
-                   "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--log=out.txt]\n"
+                   "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--dump-text=out.txt] [--log=out.txt]\n"
+                   "          [--no-fb] no linear framebuffer: VGA text mode 3 box (VIDEO V1)\n"
+                  "          [--vbe=WxHxBPP|off] harness-side VBE mode-set through the dispi (VIDEO V3)\n"
+                  "          [--tap=host:port] e1000 + TAP socket (NET N0; ground rule 127.0.0.1:8080)\n"
                    "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n"
                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
@@ -183,6 +200,7 @@ int main(int argc, char **argv) {
     m->cpu.mach = m;
     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
     m->cfg_no_uhci = cfg_no_uhci; /* USB U5: EHCI-only machine shape */
+    m->cfg_no_fb = cfg_no_fb; /* VIDEO V1: VGA text box, no published fb */
     m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
     m->dbg_pit1 = smp_probe;  /* --smp-probe also arms the PIT ch2 trace */
     m->watch_phys = watch_phys;
@@ -193,6 +211,28 @@ int main(int argc, char **argv) {
     m->plat = (struct platform *)platform_by_name(platform_name);
     devices_init_common(m);
     devices_init_platform(m);
+    /* VIDEO V3: --vbe=WxHxBPP runs a harness-side VBE client's mode-set
+     * through the real dispi io path before the CPU starts; --vbe=off is the
+     * client's mode-3-forcing disable.  The display source follows the same
+     * documented mode state a guest client's writes produce. */
+    if (vbe_arg) {
+        int vw, vh, vb;
+        if (!strcmp(vbe_arg, "off")) {
+            vbe_mode_disable(m);
+        } else if (sscanf(vbe_arg, "%dx%dx%d", &vw, &vh, &vb) == 3 && vw > 0 && vh > 0) {
+            vbe_mode_set(m, vw, vh, vb);
+        } else {
+            mlog(&m->log, "[vbe] --vbe parse error (want WxHxBPP or off)");
+            return 1;
+        }
+    }
+    /* NET N0: --tap=host:port attaches the opt-in e1000 with its TAP socket
+     * (ground rule 127.0.0.1:8080).  Without the flag no PCI function is
+     * added and the historical no-NIC receipts stay byte-stable. */
+    if (tap_arg && e1000_attach(m, tap_arg) != 0) {
+        mlog(&m->log, "[e1000] --tap attach failed (want host:port, default port 8080)");
+        return 1;
+    }
     if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
         return 1;
@@ -252,6 +292,10 @@ int main(int argc, char **argv) {
             free(m);
             return EXIT_INPUT_ERROR;
         }
+        /* VIDEO V1: boot_info.fb published -> the LFB is the display source
+         * (vga_set_display_mode is a no-op under --no-fb, which locks the
+         * display to the VGA text console). */
+        vga_set_display_mode(m, 0);
     } else {
         cpu_reset(&m->cpu);
     }
@@ -396,6 +440,10 @@ int main(int argc, char **argv) {
     }
 
     if (fb_out) { write_ppm(m, fb_out); printf("\n[fb] framebuffer written to %s (%dx%d)\n", fb_out, m->fb_w, m->fb_h); }
+    if (text_out) {
+        vga_dump_text(m, text_out);
+        printf("\n[vga] text console written to %s (%dx%d)\n", text_out, 80, 25);
+    }
     if (log_out) {
         FILE *f = fopen(log_out, "w");
         if (f) {

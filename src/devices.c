@@ -5,6 +5,7 @@
 // behavioural EHCI controller that walks real qTD/QH chains to perform USB
 // Mass-Storage bulk transfers against a backing disk image, and small I/O
 // sinks for CMOS/Super I/O ports the firmware pokes but never reads back.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "machine.h"
@@ -14,6 +15,7 @@
 #include "cpu.h"    /* USB U3: cpu_devices_tick hook */
 #include "serial.h"
 #include "ahci.h"
+#include "vga_font.h"
 
 /* ============================ generic RAM window ========================== */
 typedef struct { uint8_t *buf; uint64_t base, size; uint32_t clear_bits_on_read; const char *name; } rw2_t;
@@ -561,6 +563,7 @@ void devices_tick(machine_t *m) {
         (g_st.usbcmd & (USBCMD_RS | USBCMD_ASE)) == (USBCMD_RS | USBCMD_ASE))
         ehci_walk(m, g_ehci.base);
     uhci_tick(m);
+    e1000_tick();            /* NET N0: TAP datagrams -> RX ring */
 }
 
 /* ================================ UHCI (USB 1.1) =========================== */
@@ -792,6 +795,314 @@ static void uhci_io_write32(void *ctx, uint16_t port, int size, uint32_t val) {
  * instead of the spec's 0x0B -- we mirror the class code at both offsets so
  * the firmware's (evidently hand-tested) logic actually finds the GPU. */
 
+/* ================================ VGA text ================================= */
+/* VIDEO V1: VGA text mode 3 -- the BIOS-box console the guest falls back to
+ * when there is no linear framebuffer (measured AuraLite-OS@0ed0d29): 80x25
+ * uint16 cells at 0xB8000 with the attribute in the high byte (fb.c VGA_ATTR
+ * 0x07) and the hardware cursor through the CRTC index/data pair (fb.c
+ * vga_move_cursor: outb(0x3D4, 0x0F/0x0E), outb(0x3D5, lo/hi)).  The cell
+ * buffer shadows flat RAM through its own RAM window (most-specific MMIO
+ * wins).  Display routing (VIDEO V1 measured contract; V2/V3 replace the two
+ * flip hooks with the real dispi mode state):
+ *   reset          -> text mode 3 ("SeaBIOS starts there");
+ *   GPU BAR0       -> the firmware's "enable:" recipe programs it -> the LFB
+ *                     becomes the display source (VBE-mode-set equivalent);
+ *   kload fb pub   -> same, the kernel's Limine mode-set equivalent;
+ *   --no-fb        -> cfg_no_fb locks the display to the text console. */
+#define VGA_TEXT_BASE  0xB8000u
+#define VGA_TEXT_SIZE  0x8000u
+#define VGA_COLS 80
+#define VGA_ROWS 25
+
+typedef struct {
+    machine_t *m;
+    uint8_t *text;            /* 80x25 cells: guest RAM at 0xB8000 (flat RAM) */
+    uint8_t crtc[256];        /* CRTC register file (cursor at 0x0E/0x0F) */
+    uint8_t crtc_idx;         /* 0x3D4 latched index */
+    uint8_t gr[16];           /* graphics controller file (VGA_GFX_MISC=6) */
+    uint8_t gr_idx;           /* 0x3CE latched index */
+    int text_mode;            /* 1 = mode 3 (reset); 0 = LFB graphics */
+} vga_t;
+static vga_t g_vga;
+
+/* Classic EGA palette the 4-bit VGA attribute indexes (0x00RRGGBB). */
+static const uint32_t vga_palette[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+    0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+    0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+};
+
+/* QEMU vga.c gr_mask[] -- the graphics controller's writable bits. */
+static const uint8_t vga_gr_mask[16] = {
+    0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f, 0x0f,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+#define VGA_GFX_MISC 6
+#define VGA_GR06_GRAPHICS_MODE 0x01
+
+static uint32_t vga_io_read(void *ctx, uint16_t port, int size) {
+    (void)ctx; (void)size;
+    if (port == 0x3D4) return g_vga.crtc_idx;
+    if (port == 0x3CE) return g_vga.gr_idx;
+    if (port == 0x3CF) return g_vga.gr[g_vga.gr_idx];
+    return g_vga.crtc[g_vga.crtc_idx];            /* 0x3D5 */
+}
+
+static void vga_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
+    (void)ctx; (void)size;
+    if (port == 0x3D4) { g_vga.crtc_idx = (uint8_t)val; return; }
+    if (port == 0x3CE) { g_vga.gr_idx = (uint8_t)val; return; }
+    if (port == 0x3CF) {
+        uint8_t i = g_vga.gr_idx;
+        g_vga.gr[i] = (uint8_t)((g_vga.gr[i] & ~vga_gr_mask[i]) |
+                                ((uint8_t)val & vga_gr_mask[i]));
+        if (i == VGA_GFX_MISC) {
+            /* VIDEO V3: the mode-3-forcing hardware path.  stage2's INT 0x10
+             * (AL=3) mode-set lands here -- the BIOS programs the graphics
+             * controller with VGA_GR06_GRAPHICS_MODE clear, and that is what
+             * puts the display back into text mode 3 (QEMU renders text iff
+             * this bit is clear).  Setting the bit is the graphics side. */
+            if (g_vga.gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE)
+                vga_set_display_mode(g_vga.m, 0);
+            else
+                vga_set_display_mode(g_vga.m, 1);
+        }
+        return;
+    }
+    g_vga.crtc[g_vga.crtc_idx] = (uint8_t)val;  /* 0x3D5 */
+}
+
+void vga_set_display_mode(machine_t *m, int text) {
+    if (g_vga.m != m) return;
+    if (m->cfg_no_fb) return;                     /* --no-fb locks text mode */
+    g_vga.text_mode = text;
+}
+
+int vga_display_is_text(machine_t *m) {
+    return g_vga.m == m && g_vga.text_mode;
+}
+
+/* Render the visible display into px (w*h pixels, 0x00RRGGBB): the mode-3
+ * console (glyphs + palette) or the LFB as-is.  Graphics mode copies m->fb
+ * exactly, so historical framebuffer.ppm bytes do not move. */
+void vga_render_display(machine_t *m, uint32_t *px, int w, int h) {
+    if (g_vga.m != m || !g_vga.text_mode) {
+        for (int i = 0; i < w*h; i++) px[i] = m->fb ? m->fb[i] : 0;
+        return;
+    }
+    memset(px, 0, (size_t)w * (size_t)h * 4);     /* panel around the console */
+    if (!g_vga.text) return;
+    const uint8_t *cells = g_vga.text;
+    for (int row = 0; row < VGA_ROWS; row++) {
+        for (int col = 0; col < VGA_COLS; col++) {
+            uint8_t ch = cells[2*(row*VGA_COLS + col)];
+            uint8_t attr = cells[2*(row*VGA_COLS + col) + 1];
+            uint32_t fg = vga_palette[attr & 0x0F];
+            uint32_t bg = vga_palette[(attr >> 4) & 0x07];
+            const unsigned char *glyph = vga_font8x16[ch];
+            for (int r = 0; r < 16; r++) {
+                unsigned bits = glyph[r];
+                for (int c = 0; c < 8; c++)
+                    px[(row*16 + r)*w + col*8 + c] = (bits & (0x80u >> c)) ? fg : bg;
+            }
+        }
+    }
+}
+
+/* Dump the mode-3 console as text (one line per row, trailing blanks cut). */
+void vga_dump_text(machine_t *m, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    if (g_vga.m == m && g_vga.text) {
+        const uint8_t *cells = g_vga.text;
+        for (int row = 0; row < VGA_ROWS; row++) {
+            char line[VGA_COLS + 1];
+            int n = VGA_COLS;
+            for (int col = 0; col < VGA_COLS; col++) {
+                uint8_t c = cells[2*(row*VGA_COLS + col)];
+                line[col] = (c >= 0x20 && c < 0x7F) ? (char)c : ' ';
+            }
+            while (n > 0 && line[n-1] == ' ') n--;   /* trailing blanks */
+            line[n] = 0;
+            fprintf(f, "%s\n", line);
+        }
+    }
+    fclose(f);
+}
+
+/* ============================ Bochs VBE dispi ============================== */
+/* VIDEO V2: the QEMU `-vga std` dispi interface (ports 0x1CE/0x1CF), the
+ * register-file contract of hw/display/bochs-vbe.h + vga.c
+ * vbe_ioport_write_data (measured from the QEMU sources; see
+ * VIDEO_PLAN.md §1.3).  The guest baseline never touches it (measured:
+ * no 0x1CE/0x1CF users in AuraLite-OS@0ed0d29) -- it exists for VBE
+ * clients and QEMU parity.  Display integration (V2): the ENABLED bit
+ * drives which surface the display shows -- enabling captures the
+ * machine's current display and switches to the LFB, disabling returns
+ * to the captured one; V3 adds the mode-set memory semantics
+ * (NOCLEARMEM clear-on-enable). */
+#define DISPI_ID            0x00
+#define DISPI_XRES          0x01
+#define DISPI_YRES          0x02
+#define DISPI_BPP           0x03
+#define DISPI_ENABLE        0x04
+#define DISPI_BANK          0x05
+#define DISPI_VIRT_WIDTH    0x06
+#define DISPI_VIRT_HEIGHT   0x07
+#define DISPI_X_OFFSET      0x08
+#define DISPI_Y_OFFSET      0x09
+#define DISPI_MEMORY_64K    0x0A   /* read-only, not a stored register */
+#define DISPI_ENABLED       0x01
+#define DISPI_GETCAPS       0x02
+#define DISPI_8BIT_DAC      0x20
+#define DISPI_LFB_ENABLED   0x40
+#define DISPI_NOCLEARMEM    0x80
+#define DISPI_MAX_XRES      16000
+#define DISPI_MAX_YRES      12000
+#define DISPI_MAX_BPP       32
+
+typedef struct {
+    machine_t *m;
+    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
+    uint16_t index;
+    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
+    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */ 
+    int prev_text;            /* display state captured at the enable edge */
+} dispi_t;
+static dispi_t g_dispi;
+
+static void dispi_fixup(void) {
+    /* QEMU vbe_fixup_regs (behavioural core): only meaningful while
+     * enabled; VIRT_WIDTH clamps up to XRES; VIRT_HEIGHT derives from the
+     * real VRAM size unless it already fits; the line offset derives. */
+    uint16_t *r = g_dispi.regs;
+    if (!(r[DISPI_ENABLE] & DISPI_ENABLED)) return;
+    if (r[DISPI_VIRT_WIDTH] < r[DISPI_XRES]) r[DISPI_VIRT_WIDTH] = r[DISPI_XRES];
+    unsigned bits = (r[DISPI_BPP] == 15) ? 16 : r[DISPI_BPP];
+    unsigned linelength = (unsigned)r[DISPI_VIRT_WIDTH] * ((bits + 7) / 8);
+    if (linelength == 0) return;
+    g_dispi.line_offset = linelength;
+    unsigned maxy = (unsigned)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
+    if (r[DISPI_VIRT_HEIGHT] == 0 || r[DISPI_VIRT_HEIGHT] > maxy)
+        r[DISPI_VIRT_HEIGHT] = (uint16_t)maxy;
+}
+
+static uint32_t dispi_index_read(void *ctx, uint16_t port, int size) {
+    (void)ctx; (void)port; (void)size;
+    return g_dispi.index;
+}
+
+static void dispi_index_write(void *ctx, uint16_t port, int size, uint32_t val) {
+    (void)ctx; (void)port; (void)size;
+    g_dispi.index = (uint16_t)(val & 0xFFFF);   /* QEMU stores verbatim */
+}
+
+static uint32_t dispi_data_read(void *ctx, uint16_t port, int size) {
+    (void)ctx; (void)port; (void)size;
+    uint16_t idx = g_dispi.index;
+    if (idx == DISPI_MEMORY_64K)
+        return (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / (64u * 1024u);
+    if (idx >= 0x0A) return 0;
+    if (g_dispi.regs[DISPI_ENABLE] & DISPI_GETCAPS) {
+        /* QEMU capability probe: XRES/YRES/BPP reads return the maxima */
+        if (idx == DISPI_XRES) return DISPI_MAX_XRES;
+        if (idx == DISPI_YRES) return DISPI_MAX_YRES;
+        if (idx == DISPI_BPP)  return DISPI_MAX_BPP;
+    }
+    return g_dispi.regs[idx];
+}
+
+static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
+    (void)ctx; (void)port; (void)size;
+    uint16_t idx = g_dispi.index;
+    uint16_t v = (uint16_t)(val & 0xFFFF);
+    if (idx >= 0x0A) return;                    /* MEMORY_64K is read-only */
+    switch (idx) {
+    case DISPI_ID:
+        /* accept ID0..ID5 verbatim; anything else keeps the old value */
+        if (v >= 0xB0C0 && v <= 0xB0C5) g_dispi.regs[idx] = v;
+        break;
+    case DISPI_XRES:
+        /* QEMU: reject unless <= MAX and 8-pixel aligned */
+        if (v <= DISPI_MAX_XRES && (v & 7) == 0) g_dispi.regs[idx] = v;
+        break;
+    case DISPI_YRES:
+        if (v <= DISPI_MAX_YRES) g_dispi.regs[idx] = v;
+        break;
+    case DISPI_BPP:
+        /* QEMU: 0 -> 8; accept 4/8/15/16/24/32 */
+        if (v == 0) v = 8;
+        if (v == 4 || v == 8 || v == 15 || v == 16 || v == 24 || v == 32)
+            g_dispi.regs[idx] = v;
+        break;
+    case DISPI_ENABLE: {
+        uint16_t old = g_dispi.regs[DISPI_ENABLE];
+        if ((v & DISPI_ENABLED) && !(old & DISPI_ENABLED)) {
+            /* QEMU 0->1 edge: VIRT_WIDTH/offsets reset, display -> LFB */
+            g_dispi.regs[DISPI_VIRT_WIDTH] = 0;
+            g_dispi.regs[DISPI_X_OFFSET] = 0;
+            g_dispi.regs[DISPI_Y_OFFSET] = 0;
+            g_dispi.prev_text = vga_display_is_text(g_dispi.m);
+        }
+        g_dispi.regs[DISPI_ENABLE] = v;
+        dispi_fixup();
+        if (v & DISPI_ENABLED) {
+            /* QEMU vbe_ioport_write_data: "clear the screen" on every
+             * ENABLED store unless DISPI_NOCLEARMEM -- memset(vram, 0,
+             * YRES * vbe_line_offset).  Our VRAM is the LFB buffer. */
+            if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb)
+                memset(g_dispi.m->fb, 0,
+                       (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset);
+            /* QEMU: "graphic mode + memory map 1" in VGA_GFX_MISC */
+            g_vga.gr[VGA_GFX_MISC] = (uint8_t)((g_vga.gr[VGA_GFX_MISC] & ~0x0cu) |
+                                               0x04u | VGA_GR06_GRAPHICS_MODE);
+            if (!(old & DISPI_ENABLED))
+                vga_set_display_mode(g_dispi.m, 0);
+        } else if (old & DISPI_ENABLED) {
+            /* QEMU 1->0 edge: bank window resets, display -> previous */
+            g_dispi.bank_offset = 0;
+            vga_set_display_mode(g_dispi.m, g_dispi.prev_text);
+        }
+        break;
+    }
+    case DISPI_BANK:
+        /* QEMU: val &= vbe_bank_mask ((vram >> 16) - 1) */
+        v = (uint16_t)(v & (uint16_t)(((g_dispi.m->fb_w * g_dispi.m->fb_h * 4u) >> 16) - 1));
+        g_dispi.regs[idx] = v;
+        g_dispi.bank_offset = (uint32_t)v << 16;
+        break;
+    default:
+        g_dispi.regs[idx] = v;                  /* VIRT_WIDTH/HEIGHT, offsets */
+        dispi_fixup();
+        break;
+    }
+}
+
+/* VIDEO V3: harness-side VBE client.  These program the dispi through the
+ * same 0x1CE/0x1CF io path a guest client uses -- the mode-switch lane goes
+ * through the real interface, not around it. */
+void vbe_mode_set(machine_t *m, int w, int h, int bpp) {
+    io_write(m, 0x1CE, 2, 0x01); io_write(m, 0x1CF, 2, (uint32_t)w);
+    io_write(m, 0x1CE, 2, 0x02); io_write(m, 0x1CF, 2, (uint32_t)h);
+    io_write(m, 0x1CE, 2, 0x03); io_write(m, 0x1CF, 2, (uint32_t)bpp);
+    io_write(m, 0x1CE, 2, 0x04);
+    io_write(m, 0x1CF, 2, DISPI_ENABLED | DISPI_LFB_ENABLED);
+}
+
+void vbe_mode_disable(machine_t *m) {
+    io_write(m, 0x1CE, 2, 0x04); io_write(m, 0x1CF, 2, 0);
+}
+
+/* GPU config hook: normal writable-mask store + "BAR0 programmed = the
+ * guest enabled the linear framebuffer" -> the LFB becomes the display
+ * source (the firmware's own enable: recipe writes 0xD0000000 there). */
+static void gpu_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
+    pci_default_cfg_write(d, reg, size, val);
+    if (reg == 0x10 && (uint32_t)val != 0)
+        vga_set_display_mode(g_vga.m, 0);
+}
+
 /* =========================== public init entry points ====================== */
 void devices_init_common(machine_t *m) {
     pci_init(m);
@@ -850,6 +1161,7 @@ void devices_init_common(machine_t *m) {
     /* GPU: dev2/func0 (real Intel iGPU convention) */
     pci_dev_t *gpu = pci_add_device(m, 0,2,0, "igpu", 0x8086, 0x0412, 0x03, 0x00, 0);
     gpu->cfg[0x0B] = 0x03; gpu->cfg[0x0C] = 0x03; /* class mirrored at the offset the firmware actually reads */
+    gpu->cfg_write = gpu_cfg_write;   /* VIDEO V1: BAR0 enable flips the display to the LFB */
 
     /* UHCI USB1.1 companion: 0:1.2 with the piix3-usb-uhci identity
      * (QEMU parity: run_qemu_usb_msc.sh / test_usb_msc.sh attach their
@@ -905,6 +1217,24 @@ void devices_init_common(machine_t *m) {
      * since it only uses it as early stack + scratch space. */
     make_ramwindow(m, 0xFEF00000ULL, 0x00400000ULL, 0, "CAR scratch window");
 
+    /* VIDEO V1: VGA text mode 3 (see the VGA section above).  The cells are
+     * plain guest RAM at 0xB8000 (the mem.c RAM path owns everything below
+     * RAM_SIZE, so no MMIO window is involved -- reads and writes are the
+     * guest's own). */
+    memset(&g_vga, 0, sizeof g_vga);
+    g_vga.m = m;
+    g_vga.text_mode = 1;
+    g_vga.text = m->ram + VGA_TEXT_BASE;
+    io_register(m, 0x3D4, 2, vga_io_read, vga_io_write, NULL, "vga-crtc");
+    io_register(m, 0x3CE, 2, vga_io_read, vga_io_write, NULL, "vga-gc");
+
+    /* VIDEO V2: Bochs VBE dispi (see the dispi section above).  Reset
+     * value of ID is ID0 (QEMU vga_reset); the rest zeroes. */
+    memset(&g_dispi, 0, sizeof g_dispi);
+    g_dispi.m = m;
+    g_dispi.regs[DISPI_ID] = 0xB0C0;
+    io_register(m, 0x1CE, 1, dispi_index_read, dispi_index_write, NULL, "vbe-dispi-index");
+    io_register(m, 0x1CF, 1, dispi_data_read, dispi_data_write, NULL, "vbe-dispi-data");
 }
 
 /* STORE S4: optional second AHCI controller (--ahci2).  QEMU's

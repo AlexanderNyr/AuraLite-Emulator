@@ -1,0 +1,474 @@
+From 5e180c269c358925624c91e32f6974da70a3ecba Mon Sep 17 00:00:00 2001
+From: Aura Agent <agent@aura.local>
+Date: Sat, 10 Oct 2026 17:56:07 +0000
+Subject: [PATCH] V2 update
+
+---
+ CHANGELOG.md             |  27 ++++++++
+ ROADMAP.md               |   3 +-
+ docs/plans/VIDEO_PLAN.md |  73 ++++++++++++++------
+ src/devices.c            | 142 +++++++++++++++++++++++++++++++++++++++
+ tests/test_video.c       | 122 ++++++++++++++++++++++++++++++++-
+ 5 files changed, 344 insertions(+), 23 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9764fa7..0a91bcb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,33 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0044 (VIDEO V2, Bochs VBE dispi)
++- Bochs VBE dispi register file on ports `0x1CE` (index select, stored
++  verbatim — QEMU has no auto-increment) / `0x1CF` (word data): the
++  QEMU `-vga std` contract of `hw/display/bochs-vbe.h` + `vga.c`
++  `vbe_ioport_write_data`.  ID `0xB0C0..0xB0C5` accept-list (reset =
++  `ID0`, QEMU `vga_reset`), XRES accept `<= 16000 && (val & 7) == 0`,
++  YRES `<= 12000`, BPP `0 -> 8` with `{4, 8, 15, 16, 24, 32}`,
++  GETCAPS (0x02) reads return the 16000/12000/32 maxima,
++  `VIDEO_MEMORY_64K` = vram/64K = 29 (read-only), BANK masked by
++  QEMU's `(vram >> 16) - 1` = 28 with `bank_offset = val << 16`,
++  `VIRT_WIDTH`/`VIRT_HEIGHT`/offsets with the behavioural
++  `vbe_fixup_regs` core (VIRT_WIDTH clamps to XRES; VIRT_HEIGHT
++  derives from vram/linesize).
++- ENABLE edge semantics: the 0->1 edge resets `VIRT_WIDTH`/offsets and
++  switches the display to the LFB; the 1->0 edge resets the bank window
++  and restores the machine's previous display (captured at the enable
++  edge).  The enable-edge VRAM clear (`NOCLEARMEM`) is V3's scope — V2
++  never mutates the LFB.  `tests/test_video.c` 4 -> 8 vectors.
++
++### Fixed / measured — patch 0044
++- The guest baseline never touches dispi (measured: no `0x1CE`/`0x1CF`
++  users in AuraLite-OS@`0ed0d29` — its GPU path is PCI BAR0 +
++  `boot_info.fb`); both U5-era guest lanes reproduce the historical
++  tapes byte-for-byte with the era recipe (`--max-instr=4500000000`).
++- NC: removing the ID accept-list turns `ok vga dispi id ladder` red
++  (abort RC=134 at `io_read(0x1CF)==0xB0C5`).
++
+ ### Added — patch 0043 (VIDEO V1, VGA text mode 3)
+ - VGA text mode 3 model (`src/devices.c` VGA section): the 80x25 cell
+   buffer is plain guest RAM at `0xB8000` (the mem.c RAM path owns
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 4b4a12a..acc0257 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -29,7 +29,7 @@ maps to exactly one plan below.
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+-| `docs/plans/VIDEO_PLAN.md` | 🔵 **IN PROGRESS** (V0–V1 done ✅, V2–V3 planned) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
++| `docs/plans/VIDEO_PLAN.md` | 🔵 **IN PROGRESS** (V0–V2 done ✅, V3 planned) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+@@ -88,3 +88,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0041` — USB U5: end-to-end + hardening close-out -- `--no-usb-uhci` (the `test_usb_ehci.sh` EHCI-only machine shape, `ok uhci omitted`), both sticks through the guest's MSC path (`/usb` info + `run /apps/filesize /usb/sector0.bin` typed over the KBC) with byte-identical x2 lane pairs (UHCI/AURALUSB + EHCI/AURALEHC), `MATRIX_DETERMINISM=1` matrix green with pairs byte-identical and AHCI/fs receipts byte-identical to the S5-era lanes, frozen-kernel reproducibility (`SOURCE_DATE_EPOCH` banner + 92160-byte trimmed initrd reconstruction), CHANGELOG U1–U5, 26 vectors~~ shipped — USB plan closed for both-stick MSC parity (U0–U5)
+ - ~~`0042` — VIDEO V0: measured baseline + `docs/plans/VIDEO_PLAN.md` (defect ledger: `0xB8000` is plain RAM with no display path, no CRTC `0x3D4/0x3D5` cursor pair, no Bochs VBE dispi `0x1CE/0x1CF`, no mode state; guest contract measured from `fb.c` VGA-text fallback + `stage2_start.asm` mode-3 force + QEMU `-vga std`)~~ shipped
+ - ~~`0043` — VIDEO V1: VGA text mode 3 (`0xB8000` cells as guest RAM + CRTC `0x3D4/0x3D5` cursor pair, 8x16 glyph rendering from the guest's own PSF2 font 256/256 byte-identical to `psf2_default_font.inc`, display routing text↔LFB with `--no-fb` lock), CLI `--no-fb`/`--dump-text`, `tests/test_video.c` 4 vectors (cells/layout, CRTC pair, glyph pixels, display routing); guest `--no-fb` lane hits the `fb.c:215` fallback receipt; normal guest lanes byte-identical to U5-era tapes; NC = CRTC-handler revert reddens the cursor-pair vector (RC=134)~~ shipped
++- ~~`0044` — VIDEO V2: Bochs VBE dispi (ports `0x1CE/0x1CF`) per the QEMU `vga.c` contract (ID `0xB0C0..0xB0C5` accept-list + ID0 reset, XRES `<=16000 && %8`, YRES `<=12000`, BPP `0->8` + `{4,8,15,16,24,32}`, GETCAPS maxima, `VIDEO_MEMORY_64K=29` read-only, BANK mask 28 + `bank_offset`, ENABLE edge: LFB display on enable / previous display on disable + `VIRT_*` fixup); `tests/test_video.c` 8 vectors; guest baseline never touches dispi (measured) and both U5-era guest lanes stay byte-identical; NC = ID accept-list removal reddens the id-ladder vector (RC=134)~~ shipped
+diff --git a/docs/plans/VIDEO_PLAN.md b/docs/plans/VIDEO_PLAN.md
+index a0dc076..58de717 100644
+--- a/docs/plans/VIDEO_PLAN.md
++++ b/docs/plans/VIDEO_PLAN.md
+@@ -23,8 +23,8 @@ honest so the BIOS/stage2 path and any VBE client have real hardware.
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | V0 | Measured baseline + this plan (defect ledger: no VGA text rendering, no CRTC, no Bochs VBE dispi, no mode state) | ✅ done | `patches/0042-VIDEO-V0-video-plan.patch` |
+-| V1 | VGA text mode 3: `0xB8000` text window + CRTC cursor pair (0x3D4/0x3D5), glyph rendering into the display output, `--no-fb` lane so the guest's `fb.c` fallback engages | 📋 | `patches/0043-VIDEO-V1-vga-text.patch` |
+-| V2 | Bochs VBE dispi (0x1CE/0x1CF): the `VBE_DISPI` register file, LFB window + video-memory sizing (the QEMU `-vga std` contract) | 📋 | `patches/0044-VIDEO-V2-vbe-dispi.patch` |
++| V1 | VGA text mode 3: `0xB8000` text window + CRTC cursor pair (0x3D4/0x3D5), glyph rendering into the display output, `--no-fb` lane so the guest's `fb.c` fallback engages | ✅ done | `patches/0043-VIDEO-V1-vga-text.patch` |
++| V2 | Bochs VBE dispi (0x1CE/0x1CF): the `VBE_DISPI` register file, LFB window + video-memory sizing (the QEMU `-vga std` contract) | ✅ done | `patches/0044-VIDEO-V2-vbe-dispi.patch` |
+ | V3 | Mode switching (text 3 ↔ VBE graphics), determinism ×2, sanitize, docs close-out | 📋 | `patches/0045-VIDEO-V3-video-mode-switch.patch` |
+ 
+ Note: the *guest* keeps its own roadmap (`AuraLite-OS/docs/BOOTLOADER_ROADMAP.md`
+@@ -88,15 +88,25 @@ and `stage2_start.asm` mode-3 contract are the acceptance surface.
+   against `boot_info.fb` and already work on the direct-load lane; they
+   are non-regression lanes for V1–V3.
+ 
+-### 1.3 The dispi contract to implement (QEMU hw/display/vbe.h)
++### 1.3 The dispi contract to implement (QEMU hw/display/vbe.h + vga.c)
+ 
+-Ports `0x1CE` (index, with auto-increment select) / `0x1CF` (data);
++Ports `0x1CE` (index select — QEMU stores the index verbatim, no
++auto-increment: `vbe_ioport_write_index`) / `0x1CF` (data, word-sized);
+ registers `VBE_DISPI_INDEX_ID=0x00` (accept `ID0..ID5` = `0xB0C0..0xB0C5`
+-and read back the newest supported), `XRES=0x01`, `YRES=0x02`, `BPP=0x03`
+-(4/8/15/16/24/32), `ENABLE=0x04` (`ENABLED=0x01`, `LFB_ENABLED=0x40`,
+-`NOCLEARMEM=0x80`), `BANK=0x05`, `VIRT_WIDTH=0x06`, `VIRT_HEIGHT=0x07`,
+-`X_OFFSET=0x08`, `Y_OFFSET=0x09`, `VIDEO_MEMORY_64K=0x0A`. The LFB is
+-the device's video memory — here the existing `0xD0000000` VRAM window.
++verbatim and read back the accepted value — the client-side ladder is
++write-then-read; anything else is rejected and the previous value
++survives), `XRES=0x01` (accept `<= 16000` and `val & 7 == 0`, QEMU
++`vbe_ioport_write_data`), `YRES=0x02` (`<= 12000`), `BPP=0x03`
++(`0 -> 8`, accept `4/8/15/16/24/32`), `ENABLE=0x04` (`ENABLED=0x01`,
++`GETCAPS=0x02`, `8BIT_DAC=0x20`, `LFB_ENABLED=0x40`, `NOCLEARMEM=0x80`),
++`BANK=0x05` (`val &= (vram_size >> 16) - 1`, `bank_offset = val << 16`),
++`VIRT_WIDTH=0x06`, `VIRT_HEIGHT=0x07`, `X_OFFSET=0x08`, `Y_OFFSET=0x09`,
++`VIDEO_MEMORY_64K=0x0A` (read-only, `vram_size / 64K`).  With `GETCAPS`
++set in ENABLE, reads of XRES/YRES/BPP return the maxima (16000/12000/32)
++— QEMU's capability probe.  Enabling resets `VIRT_WIDTH`/`X_OFFSET`/
++`Y_OFFSET` to 0 (QEMU's 0->1 transition); disabling restores the
++machine's previous display.  The LFB is the device's video memory —
++here the existing `0xD0000000` VRAM window.
+ 
+ ## 2. Defect ledger (drives V1–V3)
+ 
+@@ -183,18 +193,39 @@ prints the `fb none (VGA text)` variant only in `--no-fb` lanes.
+ **Gate:** `make test` (incl. `test-video`) + `make test-sanitize` green;
+ guest `--no-fb` lane receipts above; NC measured.
+ 
+-### V2 — Bochs VBE dispi (0x1CE/0x1CF)
+-
+-The `VBE_DISPI` register file per §1.3 over the existing VRAM window:
+-ID readback ladder, XRES/YRES/BPP get/set with the QEMU size/bpp
+-constraints, `VIDEO_MEMORY_64K` derived from the real VRAM size, BANK
+-windowing, ENABLE semantics (disabling returns the machine to the
+-previous mode's display).
+-
+-**DoD (measured):** unit vectors pin every register's behaviour
+-including the ID ladder and rejected out-of-range modes (QEMU-parity
+-clamping); the LFB stays byte-identical to the current VRAM window
+-(KERNEL-BOOT receipts do not move).
++### V2 — Bochs VBE dispi (0x1CE/0x1CF) ✅ shipped
++
++**Result (measured):** the QEMU `-vga std` dispi register file is
++implemented per §1.3 (the exact QEMU `vga.c` write-accept rules:
++XRES `<= 16000 && (val & 7) == 0`, YRES `<= 12000`, BPP `0 -> 8` with
++`4/8/15/16/24/32`, ID `0xB0C0..0xB0C5` verbatim, reset ID = `ID0`).
++`VIDEO_MEMORY_64K` derives from the real VRAM (1920000 / 64K = 29,
++read-only), BANK masks by QEMU's `(vram >> 16) - 1` = 28 and shifts
++`bank_offset = val << 16`, GETCAPS returns the 16000/12000/32 maxima on
++XRES/YRES/BPP reads.  The 0->1 ENABLE edge resets `VIRT_WIDTH`/offsets
++and switches the display to the LFB; the 1->0 edge resets the bank
++window and restores the machine's **previous** display (captured at the
++enable edge).  `vbe_fixup_regs` behavioural core: `VIRT_WIDTH` clamps up
++to XRES, `VIRT_HEIGHT` derives from `vram / linesize` (e.g. 800x600x32 →
++VIRT_WIDTH 800, VIRT_HEIGHT 600).  Model notes: the enable-edge VRAM
++clear (`NOCLEARMEM`) is V3's scope — V2 never mutates the LFB; the
++banked `0xA0000` aperture is out of scope (the flat RAM model serves it
++as plain RAM; `bank_offset` is real state).
++
++The guest baseline never touches the interface (measured: no
++`0x1CE`/`0x1CF` users in AuraLite-OS@`0ed0d29` — its GPU path is PCI
++BAR0 + `boot_info.fb`), so no new guest lane is required; the freeze is
++the historical lanes staying byte-identical.
++
++**DoD — all measured:** unit vectors `ok vga dispi id ladder (ID0 reset,
++ID0..ID5 accept, others rejected)`, `ok vga dispi mode regs (XRES x8,
++YRES/BPP rejects, GETCAPS maxima)`, `ok vga dispi mem/bank
++(MEMORY_64K=29 RO, bank mask 28, oob=0)`, `ok vga dispi enable/display
++(LFB on enable, previous on disable)` (8 vectors total in
++`tests/test_video.c`); the LFB stays byte-identical (KERNEL-BOOT
++receipts do not move; both U5-era guest lanes reproduce byte-for-byte);
++NC: removing the ID accept-list turns `ok vga dispi id ladder` red
++(measured: abort RC=134 at `io_read(0x1CF)==0xB0C5`).
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+diff --git a/src/devices.c b/src/devices.c
+index c3241ef..406da0d 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -900,6 +900,140 @@ void vga_dump_text(machine_t *m, const char *path) {
+     fclose(f);
+ }
+ 
++/* ============================ Bochs VBE dispi ============================== */
++/* VIDEO V2: the QEMU `-vga std` dispi interface (ports 0x1CE/0x1CF), the
++ * register-file contract of hw/display/bochs-vbe.h + vga.c
++ * vbe_ioport_write_data (measured from the QEMU sources; see
++ * VIDEO_PLAN.md §1.3).  The guest baseline never touches it (measured:
++ * no 0x1CE/0x1CF users in AuraLite-OS@0ed0d29) -- it exists for VBE
++ * clients and QEMU parity.  Display integration (V2): the ENABLED bit
++ * drives which surface the display shows -- enabling captures the
++ * machine's current display and switches to the LFB, disabling returns
++ * to the captured one; V3 adds the mode-set memory semantics
++ * (NOCLEARMEM clear-on-enable). */
++#define DISPI_ID            0x00
++#define DISPI_XRES          0x01
++#define DISPI_YRES          0x02
++#define DISPI_BPP           0x03
++#define DISPI_ENABLE        0x04
++#define DISPI_BANK          0x05
++#define DISPI_VIRT_WIDTH    0x06
++#define DISPI_VIRT_HEIGHT   0x07
++#define DISPI_X_OFFSET      0x08
++#define DISPI_Y_OFFSET      0x09
++#define DISPI_MEMORY_64K    0x0A   /* read-only, not a stored register */
++#define DISPI_ENABLED       0x01
++#define DISPI_GETCAPS       0x02
++#define DISPI_8BIT_DAC      0x20
++#define DISPI_LFB_ENABLED   0x40
++#define DISPI_NOCLEARMEM    0x80
++#define DISPI_MAX_XRES      16000
++#define DISPI_MAX_YRES      12000
++#define DISPI_MAX_BPP       32
++
++typedef struct {
++    machine_t *m;
++    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
++    uint16_t index;
++    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
++    int prev_text;            /* display state captured at the enable edge */
++} dispi_t;
++static dispi_t g_dispi;
++
++static void dispi_fixup(void) {
++    /* QEMU vbe_fixup_regs (behavioural core): only meaningful while
++     * enabled; VIRT_WIDTH clamps up to XRES; VIRT_HEIGHT derives from the
++     * real VRAM size unless it already fits. */
++    uint16_t *r = g_dispi.regs;
++    if (!(r[DISPI_ENABLE] & DISPI_ENABLED)) return;
++    if (r[DISPI_VIRT_WIDTH] < r[DISPI_XRES]) r[DISPI_VIRT_WIDTH] = r[DISPI_XRES];
++    unsigned bits = (r[DISPI_BPP] == 15) ? 16 : r[DISPI_BPP];
++    unsigned linelength = (unsigned)r[DISPI_VIRT_WIDTH] * ((bits + 7) / 8);
++    if (linelength == 0) return;
++    unsigned maxy = (unsigned)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
++    if (r[DISPI_VIRT_HEIGHT] == 0 || r[DISPI_VIRT_HEIGHT] > maxy)
++        r[DISPI_VIRT_HEIGHT] = (uint16_t)maxy;
++}
++
++static uint32_t dispi_index_read(void *ctx, uint16_t port, int size) {
++    (void)ctx; (void)port; (void)size;
++    return g_dispi.index;
++}
++
++static void dispi_index_write(void *ctx, uint16_t port, int size, uint32_t val) {
++    (void)ctx; (void)port; (void)size;
++    g_dispi.index = (uint16_t)(val & 0xFFFF);   /* QEMU stores verbatim */
++}
++
++static uint32_t dispi_data_read(void *ctx, uint16_t port, int size) {
++    (void)ctx; (void)port; (void)size;
++    uint16_t idx = g_dispi.index;
++    if (idx == DISPI_MEMORY_64K)
++        return (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / (64u * 1024u);
++    if (idx >= 0x0A) return 0;
++    if (g_dispi.regs[DISPI_ENABLE] & DISPI_GETCAPS) {
++        /* QEMU capability probe: XRES/YRES/BPP reads return the maxima */
++        if (idx == DISPI_XRES) return DISPI_MAX_XRES;
++        if (idx == DISPI_YRES) return DISPI_MAX_YRES;
++        if (idx == DISPI_BPP)  return DISPI_MAX_BPP;
++    }
++    return g_dispi.regs[idx];
++}
++
++static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
++    (void)ctx; (void)port; (void)size;
++    uint16_t idx = g_dispi.index;
++    uint16_t v = (uint16_t)(val & 0xFFFF);
++    if (idx >= 0x0A) return;                    /* MEMORY_64K is read-only */
++    switch (idx) {
++    case DISPI_ID:
++        /* accept ID0..ID5 verbatim; anything else keeps the old value */
++        if (v >= 0xB0C0 && v <= 0xB0C5) g_dispi.regs[idx] = v;
++        break;
++    case DISPI_XRES:
++        /* QEMU: reject unless <= MAX and 8-pixel aligned */
++        if (v <= DISPI_MAX_XRES && (v & 7) == 0) g_dispi.regs[idx] = v;
++        break;
++    case DISPI_YRES:
++        if (v <= DISPI_MAX_YRES) g_dispi.regs[idx] = v;
++        break;
++    case DISPI_BPP:
++        /* QEMU: 0 -> 8; accept 4/8/15/16/24/32 */
++        if (v == 0) v = 8;
++        if (v == 4 || v == 8 || v == 15 || v == 16 || v == 24 || v == 32)
++            g_dispi.regs[idx] = v;
++        break;
++    case DISPI_ENABLE: {
++        uint16_t old = g_dispi.regs[DISPI_ENABLE];
++        if ((v & DISPI_ENABLED) && !(old & DISPI_ENABLED)) {
++            /* QEMU 0->1 edge: VIRT_WIDTH/offsets reset, display -> LFB */
++            g_dispi.regs[DISPI_VIRT_WIDTH] = 0;
++            g_dispi.regs[DISPI_X_OFFSET] = 0;
++            g_dispi.regs[DISPI_Y_OFFSET] = 0;
++            g_dispi.prev_text = vga_display_is_text(g_dispi.m);
++            vga_set_display_mode(g_dispi.m, 0);
++        } else if (!(v & DISPI_ENABLED) && (old & DISPI_ENABLED)) {
++            /* QEMU 1->0 edge: bank window resets, display -> previous */
++            g_dispi.bank_offset = 0;
++            vga_set_display_mode(g_dispi.m, g_dispi.prev_text);
++        }
++        g_dispi.regs[DISPI_ENABLE] = v;
++        dispi_fixup();
++        break;
++    }
++    case DISPI_BANK:
++        /* QEMU: val &= vbe_bank_mask ((vram >> 16) - 1) */
++        v = (uint16_t)(v & (uint16_t)(((g_dispi.m->fb_w * g_dispi.m->fb_h * 4u) >> 16) - 1));
++        g_dispi.regs[idx] = v;
++        g_dispi.bank_offset = (uint32_t)v << 16;
++        break;
++    default:
++        g_dispi.regs[idx] = v;                  /* VIRT_WIDTH/HEIGHT, offsets */
++        dispi_fixup();
++        break;
++    }
++}
++
+ /* GPU config hook: normal writable-mask store + "BAR0 programmed = the
+  * guest enabled the linear framebuffer" -> the LFB becomes the display
+  * source (the firmware's own enable: recipe writes 0xD0000000 there). */
+@@ -1032,6 +1166,14 @@ void devices_init_common(machine_t *m) {
+     g_vga.text_mode = 1;
+     g_vga.text = m->ram + VGA_TEXT_BASE;
+     io_register(m, 0x3D4, 2, vga_io_read, vga_io_write, NULL, "vga-crtc");
++
++    /* VIDEO V2: Bochs VBE dispi (see the dispi section above).  Reset
++     * value of ID is ID0 (QEMU vga_reset); the rest zeroes. */
++    memset(&g_dispi, 0, sizeof g_dispi);
++    g_dispi.m = m;
++    g_dispi.regs[DISPI_ID] = 0xB0C0;
++    io_register(m, 0x1CE, 1, dispi_index_read, dispi_index_write, NULL, "vbe-dispi-index");
++    io_register(m, 0x1CF, 1, dispi_data_read, dispi_data_write, NULL, "vbe-dispi-data");
+ }
+ 
+ /* STORE S4: optional second AHCI controller (--ahci2).  QEMU's
+diff --git a/tests/test_video.c b/tests/test_video.c
+index f01cc49..b81f04f 100644
+--- a/tests/test_video.c
++++ b/tests/test_video.c
+@@ -1,4 +1,5 @@
+-/* tests/test_video.c -- VIDEO V1 vectors: VGA text mode 3 (the BIOS box).
++/* tests/test_video.c -- VIDEO V1+V2 vectors: VGA text mode 3 (the BIOS box)
++ * and the Bochs VBE dispi register file (ports 0x1CE/0x1CF, QEMU `-vga std`).
+  *
+  * The contract is measured from AuraLite-OS@0ed0d29 drivers/framebuffer/fb.c:
+  * 80x25 uint16 cells at 0xB8000 (attribute in the high byte, VGA_ATTR 0x07),
+@@ -130,11 +131,130 @@ static void test_display_routing(void) {
+     printf("ok vga display routing (reset text, BAR0/LFB, --no-fb lock)\n");
+ }
+ 
++static void test_dispi_id_ladder(void) {
++    fx_t f; fx_init(&f);
++    /* reset value is ID0 (QEMU vga_reset) -- the "interface present" probe */
++    io_write(&f.m, 0x1CE, 2, 0x00);
++    assert(io_read(&f.m, 0x1CF, 2) == 0xB0C0);
++    /* client ladder: write the wanted ID, read it back */
++    io_write(&f.m, 0x1CF, 2, 0xB0C5);            /* ID5 */
++    assert(io_read(&f.m, 0x1CF, 2) == 0xB0C5);
++    io_write(&f.m, 0x1CF, 2, 0xB0C6);            /* unsupported -> rejected */
++    assert(io_read(&f.m, 0x1CF, 2) == 0xB0C5);
++    io_write(&f.m, 0x1CF, 2, 0xB0C2);            /* ID2 accepted verbatim */
++    assert(io_read(&f.m, 0x1CF, 2) == 0xB0C2);
++    assert(io_read(&f.m, 0x1CE, 2) == 0x00);     /* index port reads back */
++    fx_done(&f);
++    printf("ok vga dispi id ladder (ID0 reset, ID0..ID5 accept, others rejected)\n");
++}
++
++static void test_dispi_mode_regs(void) {
++    fx_t f; fx_init(&f);
++    /* XRES: QEMU rejects > 16000 and values not 8-pixel aligned */
++    io_write(&f.m, 0x1CE, 2, 0x01);
++    io_write(&f.m, 0x1CF, 2, 800);
++    assert(io_read(&f.m, 0x1CF, 2) == 800);
++    io_write(&f.m, 0x1CF, 2, 801);               /* not divisible by 8 */
++    assert(io_read(&f.m, 0x1CF, 2) == 800);
++    io_write(&f.m, 0x1CF, 2, 16008);             /* over MAX, aligned */
++    assert(io_read(&f.m, 0x1CF, 2) == 800);
++    /* YRES: <= 12000 */
++    io_write(&f.m, 0x1CE, 2, 0x02);
++    io_write(&f.m, 0x1CF, 2, 600);
++    assert(io_read(&f.m, 0x1CF, 2) == 600);
++    io_write(&f.m, 0x1CF, 2, 12001);
++    assert(io_read(&f.m, 0x1CF, 2) == 600);
++    /* BPP: 0 -> 8; accept 4/8/15/16/24/32; reject others */
++    io_write(&f.m, 0x1CE, 2, 0x03);
++    io_write(&f.m, 0x1CF, 2, 0);
++    assert(io_read(&f.m, 0x1CF, 2) == 8);
++    io_write(&f.m, 0x1CF, 2, 15);
++    assert(io_read(&f.m, 0x1CF, 2) == 15);
++    io_write(&f.m, 0x1CF, 2, 7);
++    assert(io_read(&f.m, 0x1CF, 2) == 15);
++    /* GETCAPS: XRES/YRES/BPP reads return the maxima while armed */
++    io_write(&f.m, 0x1CE, 2, 0x04);
++    io_write(&f.m, 0x1CF, 2, 0x02);              /* GETCAPS only */
++    io_write(&f.m, 0x1CE, 2, 0x01);
++    assert(io_read(&f.m, 0x1CF, 2) == 16000);
++    io_write(&f.m, 0x1CE, 2, 0x02);
++    assert(io_read(&f.m, 0x1CF, 2) == 12000);
++    io_write(&f.m, 0x1CE, 2, 0x03);
++    assert(io_read(&f.m, 0x1CF, 2) == 32);
++    io_write(&f.m, 0x1CE, 2, 0x04);
++    io_write(&f.m, 0x1CF, 2, 0x00);              /* disarm */
++    io_write(&f.m, 0x1CE, 2, 0x03);
++    assert(io_read(&f.m, 0x1CF, 2) == 15);       /* back to the stored BPP */
++    fx_done(&f);
++    printf("ok vga dispi mode regs (XRES x8, YRES/BPP rejects, GETCAPS maxima)\n");
++}
++
++static void test_dispi_mem_bank(void) {
++    fx_t f; fx_init(&f);
++    /* VIDEO_MEMORY_64K = vram / 64K = 1920000/65536 = 29, read-only */
++    io_write(&f.m, 0x1CE, 2, 0x0A);
++    assert(io_read(&f.m, 0x1CF, 2) == 29);
++    io_write(&f.m, 0x1CF, 2, 0xFFFF);            /* ignored */
++    assert(io_read(&f.m, 0x1CF, 2) == 29);
++    /* BANK: QEMU mask = (vram >> 16) - 1 = 28 */
++    io_write(&f.m, 0x1CE, 2, 0x05);
++    io_write(&f.m, 0x1CF, 2, 0xFFFF);
++    assert(io_read(&f.m, 0x1CF, 2) == 28);
++    io_write(&f.m, 0x1CF, 2, 5);                 /* 5 & 28 = 4 */
++    assert(io_read(&f.m, 0x1CF, 2) == 4);
++    /* out-of-range index reads 0 */
++    io_write(&f.m, 0x1CE, 2, 0x0B);
++    assert(io_read(&f.m, 0x1CF, 2) == 0);
++    fx_done(&f);
++    printf("ok vga dispi mem/bank (MEMORY_64K=29 RO, bank mask 28, oob=0)\n");
++}
++
++static void test_dispi_enable_display(void) {
++    fx_t f; fx_init(&f);
++    assert(vga_display_is_text(&f.m));           /* reset = text mode 3 */
++    io_write(&f.m, 0x1CE, 2, 0x01); io_write(&f.m, 0x1CF, 2, 800);
++    io_write(&f.m, 0x1CE, 2, 0x02); io_write(&f.m, 0x1CF, 2, 600);
++    io_write(&f.m, 0x1CE, 2, 0x03); io_write(&f.m, 0x1CF, 2, 32);
++    /* enable: display -> LFB, QEMU 0->1 edge resets VIRT_WIDTH/offsets
++     * and vbe_fixup derives VIRT_WIDTH=XRES, VIRT_HEIGHT=vram/linesize */
++    io_write(&f.m, 0x1CE, 2, 0x04);
++    io_write(&f.m, 0x1CF, 2, 0x41);              /* ENABLED | LFB_ENABLED */
++    assert(!vga_display_is_text(&f.m));
++    io_write(&f.m, 0x1CE, 2, 0x06);
++    assert(io_read(&f.m, 0x1CF, 2) == 800);      /* VIRT_WIDTH clamped up */
++    io_write(&f.m, 0x1CE, 2, 0x07);
++    assert(io_read(&f.m, 0x1CF, 2) == 600);      /* 1920000 / (800*4) */
++    io_write(&f.m, 0x1CE, 2, 0x08);
++    assert(io_read(&f.m, 0x1CF, 2) == 0);        /* X_OFFSET reset */
++    /* disable: back to the previous display (text) */
++    io_write(&f.m, 0x1CE, 2, 0x04);
++    io_write(&f.m, 0x1CF, 2, 0x00);
++    assert(vga_display_is_text(&f.m));
++    fx_done(&f);
++
++    /* previous-display capture: from graphics, enable/disable returns to
++     * graphics (the machine's previous mode), not text */
++    fx_t g; fx_init(&g);
++    vga_set_display_mode(&g.m, 0);               /* BAR0-style flip */
++    io_write(&g.m, 0x1CE, 2, 0x04);
++    io_write(&g.m, 0x1CF, 2, 0x01);              /* ENABLED only */
++    assert(!vga_display_is_text(&g.m));
++    io_write(&g.m, 0x1CE, 2, 0x04);
++    io_write(&g.m, 0x1CF, 2, 0x00);
++    assert(!vga_display_is_text(&g.m));          /* restored to graphics */
++    fx_done(&g);
++    printf("ok vga dispi enable/display (LFB on enable, previous on disable)\n");
++}
++
+ int main(void) {
+     test_cells_layout();
+     test_crtc_cursor_pair();
+     test_glyph_pixels();
+     test_display_routing();
++    test_dispi_id_ladder();
++    test_dispi_mode_regs();
++    test_dispi_mem_bank();
++    test_dispi_enable_display();
+     printf("test-video: all tests passed\n");
+     return 0;
+ }
+-- 
+2.47.3
+

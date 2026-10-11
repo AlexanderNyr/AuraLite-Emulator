@@ -217,15 +217,19 @@ static uint32_t kfill_boot_info(machine_t *m, uint64_t kernel_end,
 
     /* Framebuffer: the GPU VRAM window from devices.c. Pixel format is
      * 8:8:8:8 with B in the low byte (little-endian BGRA), matching how
-     * write_ppm() decodes m->fb. */
-    bi.fb.phys_base  = 0xD0000000ULL;
-    bi.fb.width      = (uint32_t)m->fb_w;
-    bi.fb.height     = (uint32_t)m->fb_h;
-    bi.fb.pitch      = (uint32_t)m->fb_w * 4u;
-    bi.fb.bpp        = 32;
-    bi.fb.red_shift  = 16;
-    bi.fb.green_shift = 8;
-    bi.fb.blue_shift = 0;
+     * write_ppm() decodes m->fb.  VIDEO V1: --no-fb (cfg_no_fb) publishes no
+     * linear fb at all -- boot_info.fb stays zero and the display stays on
+     * the VGA text console (the guest's own fb.c fallback engages). */
+    if (!m->cfg_no_fb) {
+        bi.fb.phys_base  = 0xD0000000ULL;
+        bi.fb.width      = (uint32_t)m->fb_w;
+        bi.fb.height     = (uint32_t)m->fb_h;
+        bi.fb.pitch      = (uint32_t)m->fb_w * 4u;
+        bi.fb.bpp        = 32;
+        bi.fb.red_shift  = 16;
+        bi.fb.green_shift = 8;
+        bi.fb.blue_shift = 0;
+    }
 
     uint32_t n = 0;
     /* parameter names are prefixed: struct members .base/.length/.type must
@@ -256,8 +260,10 @@ static uint32_t kfill_boot_info(machine_t *m, uint64_t kernel_end,
     }
     if (usable_from < RAM_SIZE)
         MMAP(usable_from, (uint64_t)RAM_SIZE - usable_from, BOOT_MEM_USABLE);
-    /* fb window, matching the devices.c GPU VRAM MMIO region */
-    MMAP(0xD0000000ULL, (uint64_t)m->fb_w * (uint64_t)m->fb_h * 4u, BOOT_MEM_FRAMEBUF);
+    /* fb window, matching the devices.c GPU VRAM MMIO region (VIDEO V1:
+     * absent with --no-fb -- no framebuffer, no FRAMEBUF e820 entry) */
+    if (!m->cfg_no_fb)
+        MMAP(0xD0000000ULL, (uint64_t)m->fb_w * (uint64_t)m->fb_h * 4u, BOOT_MEM_FRAMEBUF);
     #undef MMAP
     bi.mmap_count = n;
 
@@ -460,13 +466,20 @@ int kload_boot(machine_t *m, const char *elf_path, const char *initrd_path) {
          "(identity 4G + HHDM 4G shared PDPT, kernel VMA %llu x 4KiB pages)",
          (unsigned long long)eh->e_entry, (unsigned long long)m->cpu.cr3,
          b.pages, (unsigned long long)npages);
-    mlog(&m->log, "[kload] boot_info @ phys 0x%llx: fb %dx%d @ 0xD0000000, "
-         "memmap=%u entries, usable to %u MiB, cpus=%d, rsdp=0x%llx, initrd=%s",
-         (unsigned long long)KLOAD_INFO_PHYS, m->fb_w, m->fb_h,
-         (unsigned)mmap_n, (unsigned)(RAM_SIZE / (1024u*1024u)),
-         (unsigned)(m->cfg_cpus < 1 ? 1 : m->cfg_cpus),
-         (unsigned long long)KLOAD_ACPI_BASE,
-         initrd_phys ? "phys+size" : "none");
+    {   /* VIDEO V1: --no-fb prints the VGA-text variant of the receipt */
+        char fbpart[64];
+        if (m->cfg_no_fb)
+            snprintf(fbpart, sizeof fbpart, "fb none (VGA text)");
+        else
+            snprintf(fbpart, sizeof fbpart, "fb %dx%d @ 0xD0000000", m->fb_w, m->fb_h);
+        mlog(&m->log, "[kload] boot_info @ phys 0x%llx: %s, "
+             "memmap=%u entries, usable to %u MiB, cpus=%d, rsdp=0x%llx, initrd=%s",
+             (unsigned long long)KLOAD_INFO_PHYS, fbpart,
+             (unsigned)mmap_n, (unsigned)(RAM_SIZE / (1024u*1024u)),
+             (unsigned)(m->cfg_cpus < 1 ? 1 : m->cfg_cpus),
+             (unsigned long long)KLOAD_ACPI_BASE,
+             initrd_phys ? "phys+size" : "none");
+    }
     if (kmain)
         mlog(&m->log, "[kload] symtab: kmain=0x%llx (reach marker armed)",
              (unsigned long long)kmain);

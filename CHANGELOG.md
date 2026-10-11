@@ -6,6 +6,143 @@ entry names its patch and the measured defect(s) it repaired.
 
 ## [Unreleased]
 
+### Added — patch 0046 (NET N0, e1000 RX-ready + TAP ingress)
+
+- **The RX-ready e1000 model** (`src/e1000.c`): PCI 0:4.0 `8086:100E`
+  (class `0x02/0x00`) with **BAR0 `0xFEBC0000`/128 KiB seeded into PCI
+  config** (the house pattern, cf. EHCI/UHCI/AHCI — the first N0 lane
+  measured the defect first: `BAR0 at phys 0x0`, `STATUS=0x00000000
+  (LU=0)`, `using default QEMU MAC`, `link is down`), the QEMU
+  `e1000_reset` behavioural core (RXCSUM 0, `RAL/RAH` preloaded with
+  the QEMU default MAC `52:54:00:12:34:56` + `RAH.AV`, `STATUS.LU`,
+  `CTRL.RST` self-clear), the RX ring ingress (frame DMA + `DD` +
+  `RDH++ mod RDLEN/16` + `ICR.RXT0`, gates `RCTL.EN` and
+  `RDH == RDT`), and opt-in TAP ingress: `--tap=host:port` (UDP
+  datagrams = Ethernet frames at the fixed endpoint `127.0.0.1:8080`,
+  the emulator connects; ≤8 datagrams/tick drained from
+  `devices_tick`).  Without `--tap=` no PCI function exists at all --
+  the historical firmware/K0–K8 and U5 receipts stay byte-stable and
+  the guest-visible firmware contract does not move.
+- **`tests/test_net.c` 2 vectors** (in `make test-unit`): `ok e1000
+  pci/reset contract` (RXCSUM 0, RAL/RAH preload, STATUS.LU, CTRL.RST
+  self-clear + preload survives, ICR read-to-clear, and the BAR0
+  readback regression vector over `0xCF8/0xCFC` == `0xFEBC0000`) and
+  `ok e1000 rx ingress` (RCTL.EN drop gate, DMA `0x6c6c6568`/"hell" LE,
+  desc.length + DD, RDH++/RXT0/ICR read-to-clear, ring-full drop with
+  `RDT = RDH = 1`).
+- **NC (once per phase)**: removing the RX-DMA `mem_write` loop reddens
+  the ingress vector -- `RC=134`, `tests/test_net.c:85: Assertion
+  'mem_read(&f.m, buf, 4) == 0x6c6c6568' failed`; restored from backup,
+  gates re-green.
+- **Measured**: `make test` + `make test-sanitize` RC=0; the guest
+  lane pair (`--tap=127.0.0.1:8080`, `--max-instr=4500000000`, the U5
+  freeze `kernel.elf` sha256 `395e5ec02bf39cc5…` + `initrd.tar`
+  sha256 `0581d3a5cb777af0…`) is byte-identical (both tapes sha256
+  `82614cd6f896aa9a…`, `cmp` clean) with the N0 gate `[net] using NIC:
+  e1000`, plus `BAR0 at phys 0xfebc0000`, `STATUS=0x00000002 (LU=1)`,
+  `MAC from RAL/RAH` (the preload contract exercised end-to-end); the
+  still-unmodelled TX path is the N1 ledger (`[e1000] TX timeout:
+  desc[N].status=0x00 TDH=0 TDT=N+1`, `[dhcp] FAIL: DISCOVER transmit
+  failed`, `[net] DHCP failed, using hardcoded IP 10.0.2.15`).
+- **Docs**: `docs/plans/NET_PLAN.md` (ground rules, guest/QEMU
+  contract, defect ledger D0–D3, N0–N3 phase table), ROADMAP +
+  `docs/STATUS.md` sync; doc-sync repair -- `docs/plans/VIDEO_PLAN.md`'s
+  status line was stale since 0042 ("in progress — V0 ✅, V1–V3
+  planned") and now reads "complete — V0–V3 (plan closed)" to match
+  its own phase table.
+
+### Added — patch 0045 (VIDEO V3, mode switching + close-out)
+
+- **Mode state as one machine**: text mode 3 ↔ VBE graphics driven by the
+  dispi ENABLE edge, the GPU BAR0 / kload fb publishes, and the VGA graphics
+  controller (`0x3CE/0x3CF`, QEMU `gr_mask`; `VGA_GFX_MISC` index 6).  Clearing
+  `VGA_GR06_GRAPHICS_MODE` is the guest's mode-3-forcing hardware path --
+  stage2's `INT 0x10` (AL=3) mode-set lands the display in text mode 3 there --
+  and a VBE client's mode-set lands it in graphics; `ok vga gc graphics/mode-3
+  path` pins both sides.
+- **Mode-set memory per `NOCLEARMEM`** (QEMU `vbe_ioport_write_data` literal):
+  every ENABLED store clears `YRES * vbe_line_offset` of VRAM unless
+  `DISPI_NOCLEARMEM`; `ok vga vbe mode-set clear/keep` measures the clear
+  boundary (320x200x32) and the keep case.
+- **`--vbe=WxHxBPP|off`**: a harness-side VBE client's mode-set through the
+  real `0x1CE/0x1CF` io path (the mode-switch lane's guest stand-in), plus
+  `tests/integration/test_video_modes.sh` (`make test-video-modes`): the
+  mode-switch lane and the V1 `--no-fb` guest lane, each twice -- all six
+  artifact pairs (ppm/txt/log) byte-identical, with display assertions per
+  mode (gfx: the Limine splash panel `0x10101c` + `0xdcdcdc` on the LFB
+  surface; txt: the mode-3 console render).
+
+### Fixed / measured — patch 0045
+
+- NC V3: removing the NOCLEARMEM clear reddens the clear vector (RC=134,
+  `test_video.c:258`).  `make test` + `make test-sanitize` green (video
+  10/10); the firmware lane and the K0–K8 kernel receipts do not move.
+
+### Added — patch 0044 (VIDEO V2, Bochs VBE dispi)
+- Bochs VBE dispi register file on ports `0x1CE` (index select, stored
+  verbatim — QEMU has no auto-increment) / `0x1CF` (word data): the
+  QEMU `-vga std` contract of `hw/display/bochs-vbe.h` + `vga.c`
+  `vbe_ioport_write_data`.  ID `0xB0C0..0xB0C5` accept-list (reset =
+  `ID0`, QEMU `vga_reset`), XRES accept `<= 16000 && (val & 7) == 0`,
+  YRES `<= 12000`, BPP `0 -> 8` with `{4, 8, 15, 16, 24, 32}`,
+  GETCAPS (0x02) reads return the 16000/12000/32 maxima,
+  `VIDEO_MEMORY_64K` = vram/64K = 29 (read-only), BANK masked by
+  QEMU's `(vram >> 16) - 1` = 28 with `bank_offset = val << 16`,
+  `VIRT_WIDTH`/`VIRT_HEIGHT`/offsets with the behavioural
+  `vbe_fixup_regs` core (VIRT_WIDTH clamps to XRES; VIRT_HEIGHT
+  derives from vram/linesize).
+- ENABLE edge semantics: the 0->1 edge resets `VIRT_WIDTH`/offsets and
+  switches the display to the LFB; the 1->0 edge resets the bank window
+  and restores the machine's previous display (captured at the enable
+  edge).  The enable-edge VRAM clear (`NOCLEARMEM`) is V3's scope — V2
+  never mutates the LFB.  `tests/test_video.c` 4 -> 8 vectors.
+
+### Fixed / measured — patch 0044
+- The guest baseline never touches dispi (measured: no `0x1CE`/`0x1CF`
+  users in AuraLite-OS@`0ed0d29` — its GPU path is PCI BAR0 +
+  `boot_info.fb`); both U5-era guest lanes reproduce the historical
+  tapes byte-for-byte with the era recipe (`--max-instr=4500000000`).
+- NC: removing the ID accept-list turns `ok vga dispi id ladder` red
+  (abort RC=134 at `io_read(0x1CF)==0xB0C5`).
+
+### Added — patch 0043 (VIDEO V1, VGA text mode 3)
+- VGA text mode 3 model (`src/devices.c` VGA section): the 80x25 cell
+  buffer is plain guest RAM at `0xB8000` (the mem.c RAM path owns
+  everything below `RAM_SIZE`), plus the CRTC index/data pair at
+  `0x3D4/0x3D5` (`crtc[256]`, `crtc_idx`) — the guest's own
+  `vga_move_cursor` recipe (idx 0x0E/0x0F) round-trips.
+- Glyph rendering from the guest's own font: `src/vga_font.h` is
+  byte-extracted from AuraLite-OS `psf2_default_font.inc` (256/256
+  glyphs identical, PD Linux console VGA 8x16), 8x16 1:1, 80x25 console
+  = 640x400 at the top-left of the 800x600 panel, VGA/EGA 16-colour
+  attribute palette.  Graphics mode copies `m->fb` exactly — historical
+  `framebuffer.ppm` bytes do not move.
+- Display routing: reset = text mode 3; GPU BAR0 programmed (the
+  firmware's `enable:` CFG write) or `boot_info.fb` published flips the
+  display to the LFB; `--no-fb` locks the text console.
+- CLI: `--no-fb` (no `boot_info.fb`, no FRAMEBUF e820 entry — the
+  guest's `fb.c:215` fallback engages and prints its
+  `VGA text 80x25 @ 0xB8000 (BIOS: no linear framebuffer)` receipt),
+  `--dump-text=path` (mode-3 console as text), `--dump-fb` renders the
+  display (console in text mode).  `tests/test_video.c` 4 vectors in the
+  `test-unit` gate.
+
+### Fixed / measured — patch 0043
+- Guest `--no-fb --dump-text` lane: the kload receipt `fb none (VGA
+  text)` (no FRAMEBUF e820 entry) and the guest's own fallback receipt
+  `[fb] VGA text 80x25 @ 0xB8000 (BIOS: no linear framebuffer)`
+  (fb.c:215); the dumped console shows the guest's cleared mode-3
+  screen (on this frozen baseline the guest's `vga_text_putc` is dead
+  code — fb.c:158, static, zero call sites — so console text stays
+  serial-only in the fallback; guest-side characteristic, measured).
+- Normal guest lanes byte-identical to the U5-era tapes — the full
+  stream (log + register dump + last-log reprint) on both shapes with
+  the era's recipe (`--max-instr=4500000000`): AURALUSB/normal
+  (`uhci1.out`, sha256 e615c39ec0c8…) and AURALEHC/`--no-usb-uhci`
+  (`ehci1.out`, sha256 eb778d65a001…) — byte-for-byte.
+- NC: reverting the CRTC write handler turns `ok vga crtc cursor pair`
+  red (abort RC=134 at `io_read(0x3D5)==0xF5`).
+
 ### Added — patch 0041 (USB U5, end-to-end + hardening close-out)
 - `--no-usb-uhci` CLI (`machine_t.cfg_no_uhci`): omits the UHCI companion
   (PCI 0:1.2 + I/O window) so the guest's `test_usb_ehci.sh` QEMU lane

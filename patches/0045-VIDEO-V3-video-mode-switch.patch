@@ -1,0 +1,675 @@
+From 6612c1f30919e395f9bde96f833aad10d8d27611 Mon Sep 17 00:00:00 2001
+From: Aura Agent <agent@aura.local>
+Date: Sat, 10 Oct 2026 19:30:25 +0000
+Subject: [PATCH] V3 update
+
+---
+ CHANGELOG.md                          | 27 +++++++++
+ Makefile                              |  6 +-
+ ROADMAP.md                            |  3 +-
+ docs/STATUS.md                        | 16 ++++++
+ docs/plans/VIDEO_PLAN.md              | 26 ++++++++-
+ src/devices.c                         | 74 ++++++++++++++++++++++---
+ src/devices.h                         |  5 ++
+ src/main.c                            | 18 ++++++
+ tests/integration/mode-gfx-1.txt      | 25 +++++++++
+ tests/integration/mode-gfx-2.txt      | 25 +++++++++
+ tests/integration/mode-txt-1.txt      | 25 +++++++++
+ tests/integration/mode-txt-2.txt      | 25 +++++++++
+ tests/integration/test_video_modes.sh | 80 +++++++++++++++++++++++++++
+ tests/test_video.c                    | 48 ++++++++++++++++
+ 14 files changed, 392 insertions(+), 11 deletions(-)
+ create mode 100644 tests/integration/mode-gfx-1.txt
+ create mode 100644 tests/integration/mode-gfx-2.txt
+ create mode 100644 tests/integration/mode-txt-1.txt
+ create mode 100644 tests/integration/mode-txt-2.txt
+ create mode 100755 tests/integration/test_video_modes.sh
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0a91bcb..4a5011f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,33 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0045 (VIDEO V3, mode switching + close-out)
++
++- **Mode state as one machine**: text mode 3 ↔ VBE graphics driven by the
++  dispi ENABLE edge, the GPU BAR0 / kload fb publishes, and the VGA graphics
++  controller (`0x3CE/0x3CF`, QEMU `gr_mask`; `VGA_GFX_MISC` index 6).  Clearing
++  `VGA_GR06_GRAPHICS_MODE` is the guest's mode-3-forcing hardware path --
++  stage2's `INT 0x10` (AL=3) mode-set lands the display in text mode 3 there --
++  and a VBE client's mode-set lands it in graphics; `ok vga gc graphics/mode-3
++  path` pins both sides.
++- **Mode-set memory per `NOCLEARMEM`** (QEMU `vbe_ioport_write_data` literal):
++  every ENABLED store clears `YRES * vbe_line_offset` of VRAM unless
++  `DISPI_NOCLEARMEM`; `ok vga vbe mode-set clear/keep` measures the clear
++  boundary (320x200x32) and the keep case.
++- **`--vbe=WxHxBPP|off`**: a harness-side VBE client's mode-set through the
++  real `0x1CE/0x1CF` io path (the mode-switch lane's guest stand-in), plus
++  `tests/integration/test_video_modes.sh` (`make test-video-modes`): the
++  mode-switch lane and the V1 `--no-fb` guest lane, each twice -- all six
++  artifact pairs (ppm/txt/log) byte-identical, with display assertions per
++  mode (gfx: the Limine splash panel `0x10101c` + `0xdcdcdc` on the LFB
++  surface; txt: the mode-3 console render).
++
++### Fixed / measured — patch 0045
++
++- NC V3: removing the NOCLEARMEM clear reddens the clear vector (RC=134,
++  `test_video.c:258`).  `make test` + `make test-sanitize` green (video
++  10/10); the firmware lane and the K0–K8 kernel receipts do not move.
++
+ ### Added — patch 0044 (VIDEO V2, Bochs VBE dispi)
+ - Bochs VBE dispi register file on ports `0x1CE` (index select, stored
+   verbatim — QEMU has no auto-increment) / `0x1CF` (word data): the
+diff --git a/Makefile b/Makefile
+index be3975e..420b3dc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes
+ all: x86emu
+ 
+ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
+@@ -88,6 +88,10 @@ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+ test: test-unit test-table test-kload test-ring3 test-boot
++
++# VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
++test-video-modes: x86emu
++	bash tests/integration/test_video_modes.sh
+ 	@set -e; for p in sandybridge ivybridge haswell broadwell baytrail; do echo "== $$p =="; ./x86emu --platform=$$p --max-instr=20000 >/tmp/x86emu-$$p.out 2>/tmp/x86emu-$$p.err; grep -E 'CPU state|STATE:|usb-msc|FAULT' /tmp/x86emu-$$p.out /tmp/x86emu-$$p.err || true; done
+ 
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index acc0257..8558f0f 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -29,7 +29,7 @@ maps to exactly one plan below.
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+-| `docs/plans/VIDEO_PLAN.md` | 🔵 **IN PROGRESS** (V0–V2 done ✅, V3 planned) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
++| `docs/plans/VIDEO_PLAN.md` | ✅ done (V0–V3) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
+ | `docs/plans/NET_PLAN.md` | 📋 planned | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+@@ -89,3 +89,4 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ - ~~`0042` — VIDEO V0: measured baseline + `docs/plans/VIDEO_PLAN.md` (defect ledger: `0xB8000` is plain RAM with no display path, no CRTC `0x3D4/0x3D5` cursor pair, no Bochs VBE dispi `0x1CE/0x1CF`, no mode state; guest contract measured from `fb.c` VGA-text fallback + `stage2_start.asm` mode-3 force + QEMU `-vga std`)~~ shipped
+ - ~~`0043` — VIDEO V1: VGA text mode 3 (`0xB8000` cells as guest RAM + CRTC `0x3D4/0x3D5` cursor pair, 8x16 glyph rendering from the guest's own PSF2 font 256/256 byte-identical to `psf2_default_font.inc`, display routing text↔LFB with `--no-fb` lock), CLI `--no-fb`/`--dump-text`, `tests/test_video.c` 4 vectors (cells/layout, CRTC pair, glyph pixels, display routing); guest `--no-fb` lane hits the `fb.c:215` fallback receipt; normal guest lanes byte-identical to U5-era tapes; NC = CRTC-handler revert reddens the cursor-pair vector (RC=134)~~ shipped
+ - ~~`0044` — VIDEO V2: Bochs VBE dispi (ports `0x1CE/0x1CF`) per the QEMU `vga.c` contract (ID `0xB0C0..0xB0C5` accept-list + ID0 reset, XRES `<=16000 && %8`, YRES `<=12000`, BPP `0->8` + `{4,8,15,16,24,32}`, GETCAPS maxima, `VIDEO_MEMORY_64K=29` read-only, BANK mask 28 + `bank_offset`, ENABLE edge: LFB display on enable / previous display on disable + `VIRT_*` fixup); `tests/test_video.c` 8 vectors; guest baseline never touches dispi (measured) and both U5-era guest lanes stay byte-identical; NC = ID accept-list removal reddens the id-ladder vector (RC=134)~~ shipped
++- ~~`0045` — VIDEO V3: mode switching + close-out -- the text-3 ↔ VBE-graphics machine state (dispi ENABLE edge, GPU BAR0/kload publish, GC `VGA_GR06_GRAPHICS_MODE` at `0x3CE/0x3CF` so stage2's INT 0x10 (AL=3) lands in mode 3 on the hardware side), QEMU-literal mode-set memory (`memset(YRES * vbe_line_offset)` unless `DISPI_NOCLEARMEM`), `--vbe=WxHxBPP|off` harness-side VBE client through the real dispi ports, `tests/integration/test_video_modes.sh` (mode-switch + V1 guest lanes x2: six byte-identical artifact pairs, display assertions per mode), `tests/test_video.c` 10 vectors; NC = NOCLEARMEM-clear removal reddens the clear vector (RC=134)~~ shipped
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3c7a610..d3fa7a9 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -28,6 +28,22 @@
+   matrix stays green with USB present (`MATRIX_DETERMINISM=1`, all pairs
+   byte-identical) and its AHCI/fs receipt lines are byte-identical to the S5-era
+   lane logs. The USB plan (U0–U5) is closed.
++- The VIDEO plan (V0–V3) is closed.  VGA text mode 3 is a real display now
++  (80x25 cells at `0xB8000`, the CRTC `0x3D4/0x3D5` cursor pair, 8x16 glyphs
++  from the guest's own PSF2 font -- 256/256 byte-identical to
++  `psf2_default_font.inc`, `--dump-text`/`--no-fb` measured on the guest's
++  `fb.c` fallback receipts), the Bochs VBE dispi (`0x1CE/0x1CF`) follows the
++  QEMU `vga.c` contract (ID `0xB0C0..0xB0C5` accept-list, XRES `%8`, BPP
++  set, GETCAPS, `VIDEO_MEMORY_64K=29`, BANK mask 28, ENABLE edge display
++  flip + `VIRT_*` fixup), and mode switching is one machine state (text 3 ↔
++  VBE graphics: the dispi ENABLE edge, the BAR0/kload publishes, and the GC
++  `VGA_GR06_GRAPHICS_MODE` bit at `0x3CE/0x3CF` -- stage2's INT 0x10 (AL=3)
++  lands in mode 3 on the hardware side; mode-set clears `YRES * vbe_line_offset`
++  unless `DISPI_NOCLEARMEM`).  `tests/test_video.c` runs 10 vectors; the
++  V3 mode-switch + V1 guest lanes (`tests/integration/test_video_modes.sh`,
++  `--vbe=WxHxBPP`) run twice each with six byte-identical artifact pairs and
++  display assertions per mode; historical firmware/K0–K8 receipts do not
++  move and `make test` + `make test-sanitize` stay green.
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/VIDEO_PLAN.md b/docs/plans/VIDEO_PLAN.md
+index 58de717..c6b65fa 100644
+--- a/docs/plans/VIDEO_PLAN.md
++++ b/docs/plans/VIDEO_PLAN.md
+@@ -25,7 +25,7 @@ honest so the BIOS/stage2 path and any VBE client have real hardware.
+ | V0 | Measured baseline + this plan (defect ledger: no VGA text rendering, no CRTC, no Bochs VBE dispi, no mode state) | ✅ done | `patches/0042-VIDEO-V0-video-plan.patch` |
+ | V1 | VGA text mode 3: `0xB8000` text window + CRTC cursor pair (0x3D4/0x3D5), glyph rendering into the display output, `--no-fb` lane so the guest's `fb.c` fallback engages | ✅ done | `patches/0043-VIDEO-V1-vga-text.patch` |
+ | V2 | Bochs VBE dispi (0x1CE/0x1CF): the `VBE_DISPI` register file, LFB window + video-memory sizing (the QEMU `-vga std` contract) | ✅ done | `patches/0044-VIDEO-V2-vbe-dispi.patch` |
+-| V3 | Mode switching (text 3 ↔ VBE graphics), determinism ×2, sanitize, docs close-out | 📋 | `patches/0045-VIDEO-V3-video-mode-switch.patch` |
++| V3 | Mode switching (text 3 ↔ VBE graphics), determinism ×2, sanitize, docs close-out | ✅ done | `patches/0045-VIDEO-V3-video-mode-switch.patch` |
+ 
+ Note: the *guest* keeps its own roadmap (`AuraLite-OS/docs/BOOTLOADER_ROADMAP.md`
+ BL1–BL8) and its display driver consumes `boot_info.fb` (Limine/GOP or
+@@ -229,7 +229,7 @@ NC: removing the ID accept-list turns `ok vga dispi id ladder` red
+ 
+ **Gate:** `make test` + `make test-sanitize` green.
+ 
+-### V3 — Mode switching + close-out
++### V3 — Mode switching + close-out ✅ shipped (0045)
+ 
+ Text mode 3 ↔ VBE graphics as machine state: ENABLE drives which
+ surface the display output shows; mode-set clears/keeps memory per
+@@ -246,6 +246,28 @@ kernel-lane receipts byte-stable).
+ 
+ **Gate:** all above + `make test` + `make test-sanitize` green.
+ 
++**Measured notes (V3):** the mode state is one machine now -- text mode
++3 ↔ VBE graphics driven by the dispi ENABLE edge, the GPU BAR0/kload
++publishes, and the graphics controller's `VGA_GR06_GRAPHICS_MODE` bit
++(ports `0x3CE/0x3CF`, QEMU `gr_mask`): stage2's INT 0x10 (AL=3) mode-set
++lands on the hardware side with that bit clear → text mode 3; a VBE
++client's mode-set lands in graphics; both transitions are pinned by
++`ok vga gc graphics/mode-3 path`. Mode-set memory follows QEMU's
++`vbe_ioport_write_data` literally: every ENABLED store clears
++`YRES * vbe_line_offset` of VRAM unless `DISPI_NOCLEARMEM`
++(`ok vga vbe mode-set clear/keep` measures the clear boundary and the
++keep case). The mode-switch lane is a harness-side VBE client's mode-set
++through the real `0x1CE/0x1CF` ports (`--vbe=WxHxBPP|off`, V3 CLI):
++`tests/integration/test_video_modes.sh` runs it and the V1 `--no-fb`
++guest lane twice each -- all six artifact pairs (ppm/txt/log) are
++byte-identical (shas `d471c24697fa`/`6a33fe9ef156`/`658e6fcd3ee3` gfx,
++`c3b3d73f6bbb`/`6a33fe9ef156`/`ccafdf3272c7` txt) with display
++assertions per mode (gfx = the Limine splash panel `0x10101c` +
++`0xdcdcdc` on the LFB surface; txt = the mode-3 console render). NC V3:
++removing the NOCLEARMEM clear reddens the clear vector (RC=134,
++`test_video.c:258`). `make test` + `make test-sanitize` green; the
++firmware lane and the K0–K8 kernel receipts do not move.
++
+ ## 4. Standing constraints
+ 
+ - The guest-visible firmware contract (`firmware/sample_firmware.nas`)
+diff --git a/src/devices.c b/src/devices.c
+index 406da0d..49bcd30 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -818,6 +818,8 @@ typedef struct {
+     uint8_t *text;            /* 80x25 cells: guest RAM at 0xB8000 (flat RAM) */
+     uint8_t crtc[256];        /* CRTC register file (cursor at 0x0E/0x0F) */
+     uint8_t crtc_idx;         /* 0x3D4 latched index */
++    uint8_t gr[16];           /* graphics controller file (VGA_GFX_MISC=6) */
++    uint8_t gr_idx;           /* 0x3CE latched index */
+     int text_mode;            /* 1 = mode 3 (reset); 0 = LFB graphics */
+ } vga_t;
+ static vga_t g_vga;
+@@ -830,16 +832,44 @@ static const uint32_t vga_palette[16] = {
+     0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+ };
+ 
++/* QEMU vga.c gr_mask[] -- the graphics controller's writable bits. */
++static const uint8_t vga_gr_mask[16] = {
++    0x0f, 0x0f, 0x0f, 0x1f, 0x03, 0x7b, 0x0f, 0x0f,
++    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++#define VGA_GFX_MISC 6
++#define VGA_GR06_GRAPHICS_MODE 0x01
++
+ static uint32_t vga_io_read(void *ctx, uint16_t port, int size) {
+     (void)ctx; (void)size;
+     if (port == 0x3D4) return g_vga.crtc_idx;
++    if (port == 0x3CE) return g_vga.gr_idx;
++    if (port == 0x3CF) return g_vga.gr[g_vga.gr_idx];
+     return g_vga.crtc[g_vga.crtc_idx];            /* 0x3D5 */
+ }
+ 
+ static void vga_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
+     (void)ctx; (void)size;
+-    if (port == 0x3D4) g_vga.crtc_idx = (uint8_t)val;
+-    else g_vga.crtc[g_vga.crtc_idx] = (uint8_t)val;  /* 0x3D5 */
++    if (port == 0x3D4) { g_vga.crtc_idx = (uint8_t)val; return; }
++    if (port == 0x3CE) { g_vga.gr_idx = (uint8_t)val; return; }
++    if (port == 0x3CF) {
++        uint8_t i = g_vga.gr_idx;
++        g_vga.gr[i] = (uint8_t)((g_vga.gr[i] & ~vga_gr_mask[i]) |
++                                ((uint8_t)val & vga_gr_mask[i]));
++        if (i == VGA_GFX_MISC) {
++            /* VIDEO V3: the mode-3-forcing hardware path.  stage2's INT 0x10
++             * (AL=3) mode-set lands here -- the BIOS programs the graphics
++             * controller with VGA_GR06_GRAPHICS_MODE clear, and that is what
++             * puts the display back into text mode 3 (QEMU renders text iff
++             * this bit is clear).  Setting the bit is the graphics side. */
++            if (g_vga.gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE)
++                vga_set_display_mode(g_vga.m, 0);
++            else
++                vga_set_display_mode(g_vga.m, 1);
++        }
++        return;
++    }
++    g_vga.crtc[g_vga.crtc_idx] = (uint8_t)val;  /* 0x3D5 */
+ }
+ 
+ void vga_set_display_mode(machine_t *m, int text) {
+@@ -936,6 +966,7 @@ typedef struct {
+     uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
+     uint16_t index;
+     uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
++    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */ 
+     int prev_text;            /* display state captured at the enable edge */
+ } dispi_t;
+ static dispi_t g_dispi;
+@@ -943,13 +974,14 @@ static dispi_t g_dispi;
+ static void dispi_fixup(void) {
+     /* QEMU vbe_fixup_regs (behavioural core): only meaningful while
+      * enabled; VIRT_WIDTH clamps up to XRES; VIRT_HEIGHT derives from the
+-     * real VRAM size unless it already fits. */
++     * real VRAM size unless it already fits; the line offset derives. */
+     uint16_t *r = g_dispi.regs;
+     if (!(r[DISPI_ENABLE] & DISPI_ENABLED)) return;
+     if (r[DISPI_VIRT_WIDTH] < r[DISPI_XRES]) r[DISPI_VIRT_WIDTH] = r[DISPI_XRES];
+     unsigned bits = (r[DISPI_BPP] == 15) ? 16 : r[DISPI_BPP];
+     unsigned linelength = (unsigned)r[DISPI_VIRT_WIDTH] * ((bits + 7) / 8);
+     if (linelength == 0) return;
++    g_dispi.line_offset = linelength;
+     unsigned maxy = (unsigned)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
+     if (r[DISPI_VIRT_HEIGHT] == 0 || r[DISPI_VIRT_HEIGHT] > maxy)
+         r[DISPI_VIRT_HEIGHT] = (uint16_t)maxy;
+@@ -1011,14 +1043,26 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
+             g_dispi.regs[DISPI_X_OFFSET] = 0;
+             g_dispi.regs[DISPI_Y_OFFSET] = 0;
+             g_dispi.prev_text = vga_display_is_text(g_dispi.m);
+-            vga_set_display_mode(g_dispi.m, 0);
+-        } else if (!(v & DISPI_ENABLED) && (old & DISPI_ENABLED)) {
++        }
++        g_dispi.regs[DISPI_ENABLE] = v;
++        dispi_fixup();
++        if (v & DISPI_ENABLED) {
++            /* QEMU vbe_ioport_write_data: "clear the screen" on every
++             * ENABLED store unless DISPI_NOCLEARMEM -- memset(vram, 0,
++             * YRES * vbe_line_offset).  Our VRAM is the LFB buffer. */
++            if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb)
++                memset(g_dispi.m->fb, 0,
++                       (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset);
++            /* QEMU: "graphic mode + memory map 1" in VGA_GFX_MISC */
++            g_vga.gr[VGA_GFX_MISC] = (uint8_t)((g_vga.gr[VGA_GFX_MISC] & ~0x0cu) |
++                                               0x04u | VGA_GR06_GRAPHICS_MODE);
++            if (!(old & DISPI_ENABLED))
++                vga_set_display_mode(g_dispi.m, 0);
++        } else if (old & DISPI_ENABLED) {
+             /* QEMU 1->0 edge: bank window resets, display -> previous */
+             g_dispi.bank_offset = 0;
+             vga_set_display_mode(g_dispi.m, g_dispi.prev_text);
+         }
+-        g_dispi.regs[DISPI_ENABLE] = v;
+-        dispi_fixup();
+         break;
+     }
+     case DISPI_BANK:
+@@ -1034,6 +1078,21 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
+     }
+ }
+ 
++/* VIDEO V3: harness-side VBE client.  These program the dispi through the
++ * same 0x1CE/0x1CF io path a guest client uses -- the mode-switch lane goes
++ * through the real interface, not around it. */
++void vbe_mode_set(machine_t *m, int w, int h, int bpp) {
++    io_write(m, 0x1CE, 2, 0x01); io_write(m, 0x1CF, 2, (uint32_t)w);
++    io_write(m, 0x1CE, 2, 0x02); io_write(m, 0x1CF, 2, (uint32_t)h);
++    io_write(m, 0x1CE, 2, 0x03); io_write(m, 0x1CF, 2, (uint32_t)bpp);
++    io_write(m, 0x1CE, 2, 0x04);
++    io_write(m, 0x1CF, 2, DISPI_ENABLED | DISPI_LFB_ENABLED);
++}
++
++void vbe_mode_disable(machine_t *m) {
++    io_write(m, 0x1CE, 2, 0x04); io_write(m, 0x1CF, 2, 0);
++}
++
+ /* GPU config hook: normal writable-mask store + "BAR0 programmed = the
+  * guest enabled the linear framebuffer" -> the LFB becomes the display
+  * source (the firmware's own enable: recipe writes 0xD0000000 there). */
+@@ -1166,6 +1225,7 @@ void devices_init_common(machine_t *m) {
+     g_vga.text_mode = 1;
+     g_vga.text = m->ram + VGA_TEXT_BASE;
+     io_register(m, 0x3D4, 2, vga_io_read, vga_io_write, NULL, "vga-crtc");
++    io_register(m, 0x3CE, 2, vga_io_read, vga_io_write, NULL, "vga-gc");
+ 
+     /* VIDEO V2: Bochs VBE dispi (see the dispi section above).  Reset
+      * value of ID is ID0 (QEMU vga_reset); the rest zeroes. */
+diff --git a/src/devices.h b/src/devices.h
+index 128af36..4772723 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -12,6 +12,11 @@ void vga_set_display_mode(machine_t *m, int text);      /* text=1: mode 3 */
+ int  vga_display_is_text(machine_t *m);
+ void vga_render_display(machine_t *m, uint32_t *px, int w, int h); /* display -> 0x00RRGGBB */
+ void vga_dump_text(machine_t *m, const char *path);     /* mode-3 console as text */
++
++/* VIDEO V3: harness-side VBE client -- programs the dispi through the same
++ * 0x1CE/0x1CF ports a guest client uses (mode-set / mode-set-off). */
++void vbe_mode_set(machine_t *m, int w, int h, int bpp);
++void vbe_mode_disable(machine_t *m);
+ void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at the instruction cadence */
+ 
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+diff --git a/src/main.c b/src/main.c
+index cfb449b..d07ca9d 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -106,6 +106,7 @@ int main(int argc, char **argv) {
+     int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
+     int cfg_no_fb = 0;              /* --no-fb: no linear fb published -- VGA text box (VIDEO V1) */
+     const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
++    const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
+     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
+                                      * land in the host image files too */
+     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+@@ -126,6 +127,7 @@ int main(int argc, char **argv) {
+         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
+         else if (!strncmp(argv[i], "--dump-text=", 12)) text_out = argv[i]+12;
+         else if (!strcmp(argv[i], "--no-fb")) cfg_no_fb = 1;
++        else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
+         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
+         else if (!strncmp(argv[i], "--keys-at=", 10)) {
+@@ -168,6 +170,7 @@ int main(int argc, char **argv) {
+             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
+                    "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--dump-text=out.txt] [--log=out.txt]\n"
+                    "          [--no-fb] no linear framebuffer: VGA text mode 3 box (VIDEO V1)\n"
++                  "          [--vbe=WxHxBPP|off] harness-side VBE mode-set through the dispi (VIDEO V3)\n"
+                    "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n"
+                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
+                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
+@@ -205,6 +208,21 @@ int main(int argc, char **argv) {
+     m->plat = (struct platform *)platform_by_name(platform_name);
+     devices_init_common(m);
+     devices_init_platform(m);
++    /* VIDEO V3: --vbe=WxHxBPP runs a harness-side VBE client's mode-set
++     * through the real dispi io path before the CPU starts; --vbe=off is the
++     * client's mode-3-forcing disable.  The display source follows the same
++     * documented mode state a guest client's writes produce. */
++    if (vbe_arg) {
++        int vw, vh, vb;
++        if (!strcmp(vbe_arg, "off")) {
++            vbe_mode_disable(m);
++        } else if (sscanf(vbe_arg, "%dx%dx%d", &vw, &vh, &vb) == 3 && vw > 0 && vh > 0) {
++            vbe_mode_set(m, vw, vh, vb);
++        } else {
++            mlog(&m->log, "[vbe] --vbe parse error (want WxHxBPP or off)");
++            return 1;
++        }
++    }
+     if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
+         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
+         return 1;
+diff --git a/tests/integration/mode-gfx-1.txt b/tests/integration/mode-gfx-1.txt
+new file mode 100644
+index 0000000..69a4569
+--- /dev/null
++++ b/tests/integration/mode-gfx-1.txt
+@@ -0,0 +1,25 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/tests/integration/mode-gfx-2.txt b/tests/integration/mode-gfx-2.txt
+new file mode 100644
+index 0000000..69a4569
+--- /dev/null
++++ b/tests/integration/mode-gfx-2.txt
+@@ -0,0 +1,25 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/tests/integration/mode-txt-1.txt b/tests/integration/mode-txt-1.txt
+new file mode 100644
+index 0000000..69a4569
+--- /dev/null
++++ b/tests/integration/mode-txt-1.txt
+@@ -0,0 +1,25 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/tests/integration/mode-txt-2.txt b/tests/integration/mode-txt-2.txt
+new file mode 100644
+index 0000000..69a4569
+--- /dev/null
++++ b/tests/integration/mode-txt-2.txt
+@@ -0,0 +1,25 @@
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/tests/integration/test_video_modes.sh b/tests/integration/test_video_modes.sh
+new file mode 100755
+index 0000000..8453566
+--- /dev/null
++++ b/tests/integration/test_video_modes.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++# VIDEO V3 mode-switch + V1 guest lanes, each twice: every pair byte-identical.
++#
++#   mode-gfx  -- a mode-switch lane through the dispi interface (--vbe=800x600x32
++#               runs a harness-side VBE client's mode-set via ports 0x1CE/0x1CF):
++#               the display shows the LFB surface -- the guest's Limine splash
++#               panel (measured: 0x10101c background + 0xdcdcdc foreground).
++#   mode-txt  -- the V1 guest lane (--no-fb): the display shows the mode-3
++#               console render (measured: uniform 0x000000 cls at this slice).
++#
++# Each lane runs twice; ppm/txt/log pairs must be byte-identical.  The recipe
++# is the frozen guest recipe (kernel/initrd measured in docs/plans/VIDEO_PLAN.md)
++# with --vbe/--no-fb and a deterministic instruction slice (no disk needed).  The x2 pairs land in tests/integration/
++# (the repo's *.ppm/*.log gitignore keeps the bulky artifacts local; the
++# measured pair shas are recorded in docs/plans/VIDEO_PLAN.md).
++set -u
++ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
++EMU="$ROOT/x86emu"
++K=/home/user/AuraLite-OS/build/kernel.elf
++I=/home/user/AuraLite-OS/build/initrd.tar
++INSTR=80000000
++
++command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 missing"; exit 0; }
++[ -x "$EMU" ] || { echo "ERROR: build x86emu first (make x86emu)"; exit 1; }
++[ -r "$K" ] && [ -r "$I" ] || { echo "SKIP: frozen guest kernel/initrd missing ($K)"; exit 0; }
++
++run() { # run <name> <extra-arg>
++    local n="$1" extra="$2"
++    "$EMU" --platform=haswell --kernel="$K" --initrd="$I" $extra \
++        --dump-fb="$ROOT/tests/integration/$n.ppm" \
++        --dump-text="$ROOT/tests/integration/$n.txt" \
++        --log="$ROOT/tests/integration/$n.log" \
++        --max-instr=$INSTR >/dev/null 2>&1
++}
++
++for n in 1 2; do
++    run "mode-gfx-$n" "--vbe=800x600x32" &
++    run "mode-txt-$n" "--no-fb" &
++done
++wait
++
++pass=1
++for d in mode-gfx mode-txt; do for e in ppm txt log; do
++    if cmp -s "$ROOT/tests/integration/$d-1.$e" "$ROOT/tests/integration/$d-2.$e"; then
++        echo "cmp $d.$e: byte-identical ($(sha256sum < "$ROOT/tests/integration/$d-1.$e" | cut -c1-12))"
++    else
++        echo "cmp $d.$e: MISMATCH"; pass=0
++    fi
++done; done
++
++# display output assertions per mode (measured expectations, above)
++(cd "$ROOT" && python3 - <<'EOF'
++import sys
++from collections import Counter
++def colors(path):
++    d = open(path, 'rb').read()
++    i = d.index(b'255\n') + 4
++    px = d[i:]
++    return Counter(px[j:j+3] for j in range(0, len(px), 3))
++gfx = colors('tests/integration/mode-gfx-1.ppm')
++txt = colors('tests/integration/mode-txt-1.ppm')
++ok = True
++if gfx.get(b'\x10\x10\x1c', 0) < 100000 or gfx.get(b'\xdc\xdc\xdc', 0) < 10000:
++    print('display gfx: FAIL (splash panel missing)', gfx.most_common(2)); ok = False
++else:
++    print('display gfx: ok (Limine splash panel on the LFB surface)')
++if list(txt) != [b'\x00\x00\x00']:
++    print('display txt: FAIL (mode-3 console not the cls render)', txt.most_common(2)); ok = False
++else:
++    print('display txt: ok (mode-3 console render)')
++sys.exit(0 if ok else 1)
++EOF
++)
++[ $? -eq 0 ] || pass=0
++
++if [ $pass -eq 1 ]; then
++    echo "test_video_modes: ALL PASS (mode-switch + V1 guest lanes, x2 byte-identical)"
++else
++    echo "test_video_modes: FAIL"; exit 1
++fi
+diff --git a/tests/test_video.c b/tests/test_video.c
+index b81f04f..a9790b0 100644
+--- a/tests/test_video.c
++++ b/tests/test_video.c
+@@ -246,6 +246,52 @@ static void test_dispi_enable_display(void) {
+     printf("ok vga dispi enable/display (LFB on enable, previous on disable)\n");
+ }
+ 
++static void test_vbe_mode_set_clear(void) {
++    fx_t f; fx_init(&f);
++    /* QEMU vbe_ioport_write_data ENABLED store: memset(vram, 0, YRES *
++     * vbe_line_offset) unless DISPI_NOCLEARMEM -- measured via the patch
++     * history ("clear the screen").  VRAM is our LFB buffer. */
++    for (unsigned i = 0; i < 320u*200u*4u + 16; i++)
++        mem_write(&f.m, GPU_BASE + i, 1, 0xA5);
++    /* harness-side client's mode-set: 320x200x32 -> clear 200*(320*4) */
++    vbe_mode_set(&f.m, 320, 200, 32);
++    assert(mem_read(&f.m, GPU_BASE, 4) == 0x00000000);
++    assert(mem_read(&f.m, GPU_BASE + 320u*200u*4u - 4, 4) == 0x00000000);
++    assert(mem_read(&f.m, GPU_BASE + 320u*200u*4u, 4) == 0xA5A5A5A5);   /* past the clear */
++    /* NOCLEARMEM keeps memory: reprogram a mode through the ports with the
++     * flag set -- the pattern must survive the enable store */
++    for (unsigned i = 0; i < 16; i++)
++        mem_write(&f.m, GPU_BASE + i, 1, 0x5A);
++    io_write(&f.m, 0x1CE, 2, 0x01); io_write(&f.m, 0x1CF, 2, 640);
++    io_write(&f.m, 0x1CE, 2, 0x02); io_write(&f.m, 0x1CF, 2, 480);
++    io_write(&f.m, 0x1CE, 2, 0x03); io_write(&f.m, 0x1CF, 2, 32);
++    io_write(&f.m, 0x1CE, 2, 0x04);
++    io_write(&f.m, 0x1CF, 2, 0xC1);              /* ENABLED | LFB | NOCLEARMEM */
++    assert(mem_read(&f.m, GPU_BASE, 4) == 0x5A5A5A5A);
++    fx_done(&f);
++    printf("ok vga vbe mode-set clear/keep (NOCLEARMEM)\n");
++}
++
++static void test_gc_mode3_path(void) {
++    fx_t f; fx_init(&f);
++    assert(vga_display_is_text(&f.m));           /* reset = text mode 3 */
++    /* GC VGA_GFX_MISC (index 6): setting VGA_GR06_GRAPHICS_MODE is the
++     * graphics side; clearing it is the guest's mode-3-forcing path --
++     * stage2's INT 0x10 (AL=3) mode-set lands here on the hardware side */
++    io_write(&f.m, 0x3CE, 2, 6);
++    io_write(&f.m, 0x3CF, 2, 0xFF);              /* gr_mask[6] = 0x0f */
++    assert(io_read(&f.m, 0x3CF, 2) == 0x0F);
++    assert(!vga_display_is_text(&f.m));          /* graphics side */
++    /* mode-3 forcing after a VBE mode-set: both land in text mode 3 */
++    vbe_mode_set(&f.m, 800, 600, 32);
++    assert(!vga_display_is_text(&f.m));
++    io_write(&f.m, 0x3CE, 2, 6);
++    io_write(&f.m, 0x3CF, 2, 0x0E);              /* bit0 clear = mode 3 */
++    assert(vga_display_is_text(&f.m));
++    fx_done(&f);
++    printf("ok vga gc graphics/mode-3 path (stage2 INT 0x10 contract)\n");
++}
++
+ int main(void) {
+     test_cells_layout();
+     test_crtc_cursor_pair();
+@@ -255,6 +301,8 @@ int main(void) {
+     test_dispi_mode_regs();
+     test_dispi_mem_bank();
+     test_dispi_enable_display();
++    test_vbe_mode_set_clear();
++    test_gc_mode3_path();
+     printf("test-video: all tests passed\n");
+     return 0;
+ }
+-- 
+2.47.3
+
