@@ -58,6 +58,53 @@ The focused CPU tests can be run independently:
 make test-unit
 ```
 
+`make test` also runs the NET wire lane (`make test-net-tx`): a small
+payload (`tests/nic_tx.asm`) boots through the real firmware transport
+off a throwaway `--disk=` image, transmits a frame through the e1000 TX
+ring and a host-side responder records what arrived on the TAP endpoint.
+It needs `nasm` and `python3`, and the fixed endpoint `UDP
+127.0.0.1:8080` free; it SKIPs (exit 0) when a dependency is missing.
+The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
+an AuraLite-OS build.
+
+`make test` also runs the NET RX lane, the responder's protocol vectors
+and the NET end-to-end lane (`make test-net-rx`,
+`make test-tap-responder`, `make test-net-e2e`).
+`tools/tap_responder.py` is the host side of the TAP socket: it answers
+DHCP, ARP, ICMP echo, **DNS** and **TCP** with slirp's user-mode
+addressing (guest `10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`) so a
+guest can get a lease, ping its gateway, resolve a name over UDP *and*
+over the RFC 1035 TCP carriage, and hold 16 TCP connections open at
+once. `tests/nic_net.c` is a freestanding x86_64 payload that reproduces
+the guest's own protocol code and rides the `--kernel=` load lane; twice,
+byte-identical, it puts **76 frames** on the wire and prints
+
+```
+[dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2
+[net] PASS: lease + ARP + echo reply (payload verified)
+[dns] PASS: 'example.com' -> 93.184.216.34
+[dns] PASS: 'example.com' -> 93.184.216.34 over TCP (45-byte message, prefix ok)
+[tcp-x5] PASS: 16 concurrent connections held and closed cleanly
+N3OK
+```
+
+Run the responder by hand with:
+
+```sh
+python3 tools/tap_responder.py --timeout 30          # DHCP/ARP/ICMP/DNS/TCP
+python3 tools/tap_responder.py --mode=capture --out frames.hex   # record only
+python3 tools/tap_responder.py --drop=arp,icmp,dhcp,dns          # withhold L2/L3 replies
+python3 tools/tap_responder.py --no-tcp                          # withhold TCP (the N3 control)
+```
+
+It needs `python3` and the endpoints `UDP 127.0.0.1:8080`/`:8081` free —
+both harnesses now *check* that before starting a lane, because
+`SO_REUSEADDR` lets two sockets bind the same port and a leftover
+responder will silently split the datagrams (ledger **D11**). `--gw-mac`
+overrides the gateway MAC, `--dns-ip` / `--dns-ttl` the A record
+(see ledger **D7** in `docs/plans/NET_PLAN.md`: the MAC follows slirp's
+published convention but could not be measured here).
+
 ## Architecture
 
 `src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.

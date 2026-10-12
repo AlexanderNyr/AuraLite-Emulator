@@ -20,11 +20,15 @@ void vbe_mode_disable(machine_t *m);
 
 /* NET N0: e1000 82540EM "RX-ready" model + TAP socket ingress (src/e1000.c).
  * The device is opt-in: e1000_test_add is the socketless unit entry, and
- * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080). */
+ * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080).
+ * NET N1 adds the TX half (TDT/TCTL doorbell -> TDH walk -> TAP datagram,
+ * descriptors completed with status.DD inside the doorbell store, because
+ * the guest's e1000_send() spins on DD with a bounded PAUSE budget). */
 void e1000_test_add(machine_t *m);
 int  e1000_attach(machine_t *m, const char *hostport);
 void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
 void e1000_tick(void);
+void e1000_tx_stats(uint64_t *sent, uint64_t *dropped);   /* N1 wire counters */
 void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at the instruction cadence */
 
 /* Decode the big-endian 16-bit fields used by SCSI READ(10). */

@@ -4,6 +4,7 @@
 /disk/*.bin
 /disk/*.img
 /tests/kload_fixture.elf
+/tests/nic_net.elf
 
 # Emulator output
 *.ppm
@@ -16,3 +17,6 @@
 .vscode/
 .idea/
 x86emu-asan
+
+# Python bytecode (tests/test_tap_responder.py imports tools/tap_responder.py)
+__pycache__/

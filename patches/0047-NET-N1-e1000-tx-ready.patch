@@ -1,0 +1,1495 @@
+From 2e505d5d5709dc45372dc19c5e9c5213587e8e81 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:12:24 +0000
+Subject: [PATCH] N1 update
+
+---
+ CHANGELOG.md                          | 102 +++++++++++
+ Makefile                              |  13 +-
+ README.md                             |   9 +
+ ROADMAP.md                            |   2 +-
+ docs/STATUS.md                        |  31 +++-
+ docs/plans/NET_PLAN.md                | 217 +++++++++++++++++++++--
+ src/devices.h                         |   6 +-
+ src/e1000.c                           | 245 +++++++++++++++++++++++++-
+ tests/integration/n1_tap_responder.py |  61 +++++++
+ tests/integration/n1_tx_tap.sh        | 147 ++++++++++++++++
+ tests/nic_tx.asm                      | 174 ++++++++++++++++++
+ tests/test_net.c                      | 244 ++++++++++++++++++++++++-
+ 12 files changed, 1226 insertions(+), 25 deletions(-)
+ create mode 100755 tests/integration/n1_tap_responder.py
+ create mode 100755 tests/integration/n1_tx_tap.sh
+ create mode 100644 tests/nic_tx.asm
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 61287eb..8225e23 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,108 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0047 (NET N1, e1000 TX-ready)
++
++- **The TX ring** (`src/e1000.c`): the doorbell walk `e1000_start_xmit`
++  (QEMU `set_tctl`, which `macreg_writeops[]` maps **both** `[TCTL]` and
++  `[TDT]` to — store, `TDT &= 0xffff`, walk), `e1000_tx_desc` (legacy
++  descriptor: `split_size = lower.data & 0xffff`, clamped to the room
++  left in `tx_data[0x10000]`, DMA-read at `buffer_addr`, frame out on
++  `CMD.EOP`, `CMD` left intact) and `e1000_send_frame` (one TAP
++  datagram per frame; `tap_fd < 0` or a failed `send` drops the frame
++  but still completes the descriptors — QEMU's null-backend shape, and
++  what lets the socketless unit lane assert DD instead of the wire).
++  `TCTL.EN` gates the walk, `tx_busy` is QEMU's re-entrancy guard, TDH
++  advances with `++TDH * 16 >= TDLEN -> 0`, and QEMU's two escapes for
++  a bogus TDT/TDLEN (TDH wraparound, `tdh_start >= TDLEN/16`) are kept
++  so a misprogrammed ring cannot spin. Causes end in ICR as
++  `TXQE | TXDW*` (`ICR = 0x81` for the guest's single-descriptor
++  send). **DD is written back inside the TDT store**, because
++  `e1000_send()` spins on `status & 0x01` with a 100000-PAUSE budget —
++  a `devices_tick`-deferred completion would still burn it. Closes
++  defect **D2** (`[e1000] TX timeout: desc[N].status=0x00 TDH=0
++  TDT=N+1`, `[dhcp] FAIL: DISCOVER transmit failed`).
++- **QEMU write-op parity** (ledger **D6**): N0 stored every non-CTRL/IMC
++  register verbatim, which measured wrong against `macreg_writeops[]` —
++  `IMS` is `set_ims` (`|= val`, not assign), `ICR` is `set_icr`
++  (`&= ~val`, not a no-op), `ICS` is `set_ics`, `TDH/RDH` are
++  `set_16bit`, `TDLEN/RDLEN` are `set_dlen` (`val & 0xfff80`), and
++  `TDT` shares TCTL's op. No N0 vector pinned the old behaviour.
++- **`e1000_tx_stats`** (`src/devices.h`): the wire counters
++  (`tx_frames`/`tx_dropped`). The device logs nothing on the RX/TX path
++  (parity with N0), so a harness proves "the frame reached the wire" by
++  reading these rather than grepping a log whose line count would
++  depend on how many frames a responder answered with — which would
++  cost the lane its byte-identical determinism pair. `e1000_reset_regs`
++  clears them plus `tx_size`/`tx_busy`, so a half-assembled frame
++  cannot survive `CTRL.RST` into the next ring.
++- **`tests/test_net.c` 5 new vectors** (2 N0 + 5 N1, in `make
++  test-unit`): `ok e1000 tx doorbell completion`, `ok e1000 tx TCTL.EN
++  gate + TCTL-write doorbell + TDT 16-bit mask`, `ok e1000 tx
++  multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask`, `ok
++  e1000 interrupt/register write-op parity`, `ok e1000 tx link gate +
++  CTRL.RST resets the TX ring`. They pin DD + `CMD` intact + TDH +
++  `ICR=0x81` + read-to-clear + drop counters; `TCTL.EN` clear ⇒ TDT
++  stores but consumes nothing *and raises no cause*, then a TCTL write
++  drains it; a no-EOP descriptor accumulates so two descriptors yield
++  **one** frame while both get DD (writeback runs for every descriptor
++  of the walk); `RS` clear ⇒ no DD but the slot is consumed; TDH 31→0;
++  `TDLEN & 0xfff80`; `STATUS.LU` and `CTRL.RST`.
++- **The wire lane** (`tests/nic_tx.asm`,
++  `tests/integration/n1_tap_responder.py`,
++  `tests/integration/n1_tx_tap.sh`, `make test-net-tx`, wired into
++  `make test`): a 489-byte payload rides the **real firmware-boot
++  transport** (throwaway `--disk=` image → `[usb-msc] READ(10) LBA=0
++  blocks=1` → `conventional entry reached at 0x00100000` → long mode),
++  programs the ring exactly like `e1000_init`/`e1000_send` and rings
++  TDT; the responder holds the ground-rule endpoint `UDP
++  127.0.0.1:8080`. Receipts, twice, byte-identical (`cmp` clean):
++  guest `[serial] N1TXOK  status=01 tdh=01 icr=81`, wire
++  `ffffffffffff52540012345608004e3154584f4b` (`ff:ff:ff:ff:ff:ff` /
++  `52:54:00:12:34:56` / `0x0800` / `N1TXOK` — 20 bytes in, 20 bytes
++  out, no FCS invention). Lane B re-runs the same payload **without**
++  `--tap=` and gets `N1TXFAIL  status=00 tdh=ff icr=ff` (no PCI
++  function ⇒ BAR0 reads the open bus) — the pin that keeps every
++  historical no-NIC lane byte-stable. Lane C (the frozen guest, `[e1000]
++  TX timeout` gone + `[dhcp]` on the wire) **SKIPs** here: the
++  AuraLite-OS toolchain (`clang --target=x86_64-elf`, `ld.lld`, `rustc`,
++  `mtools`) is not installable in this tree, so the harness prints the
++  exact reproduction line instead of failing.
++- **NC (once per phase)**: removing the descriptor writeback from
++  `e1000_tx_desc` reddens the doorbell vector — `RC=134`,
++  `tests/test_net.c:167: test_tx_doorbell_completion: Assertion
++  'tx_desc_status(&f, ring, 0) == 0x01' failed` — and flips the wire
++  receipt to `N1TXFAIL status=00 tdh=01 icr=80`, i.e. exactly the
++  `status=0x00` half of the D2 guest receipt (head still advances,
++  frame still leaves, only the completion is missing — which is why the
++  guest's *spin* is what times out). Restored from backup, gates
++  re-green.
++- **Measured**: `make test` RC=0 (boot integration receipts untouched:
++  `[usb-msc] READ(10) LBA=0 blocks=1`, `GUEST_OK`, `framebuffer marker
++  OK: pixel[0]=0x00200000`); `make test-sanitize` RC=0 — and since that
++  target does not rebuild `test-net`, the net vectors *and* the wire
++  lane were additionally run by hand under
++  `-fsanitize=address,undefined -fno-sanitize-recover=all`
++  (`X86EMU=<asan build> tests/integration/n1_tx_tap.sh`), both clean,
++  so the real `send()` path is covered too; `make fuzz
++  FUZZ_PROGRAMS=64` — `64 programs, 1536 instructions compared -- all
++  states match`, `0 host-level crashes`. Lane A artifact shas are in
++  `docs/plans/NET_PLAN.md` N1.
++- **Deliberately not in N1** (measured, recorded as ledger **D4** and
++  in the plan's "Not in N1"): the INTx line — `e1000_add` seeds no PCI
++  cfg `0x3C` and nothing emulates INTA#/ack, so the guest reads
++  `IRQ line 0` and polls; raising a line with no ack path would leave
++  the 8259A ISR bit set and never re-service the guest, which is worse
++  than not raising it. Also deferred: TX statistics counters
++  (`TPT`/`TOTL`/`GPTC`/`PTC*`), context/TSO descriptors, VLAN
++  insertion, FCS insertion for `CMD.IFCS`.
++- **Docs**: `docs/plans/NET_PLAN.md` (N1 ✅ with the measured TX
++  contract from both sources, D2 closed, D4/D5/D6 added — D5 records
++  the deliberate divergence from QEMU's `TXD_STAT_DD = 0x01000000`,
++  which lands in descriptor byte 15 while the SDM and the frozen guest
++  driver both read DD as bit 0 of the status byte at offset 12),
++  ROADMAP + `docs/STATUS.md` + README sync.
++
+ ### Added — patch 0046 (NET N0, e1000 RX-ready + TAP ingress)
+ 
+ - **The RX-ready e1000 model** (`src/e1000.c`): PCI 0:4.0 `8086:100E`
+diff --git a/Makefile b/Makefile
+index 694338b..4e1b020 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx
+ all: x86emu
+ 
+ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
+@@ -89,7 +89,16 @@ test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/
+ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+-test: test-unit test-table test-kload test-ring3 test-boot
++# NET N1: the TX wire lane.  The payload (tests/nic_tx.asm) rides the real
++# firmware-boot transport off a throwaway --disk= image, so this needs nasm +
++# python3 (it SKIPs, exit 0, when either is missing) and the ground-rule TAP
++# endpoint UDP 127.0.0.1:8080 free on the host.  The frozen-guest lane inside
++# it SKIPs unless KERNEL/INITRD point at the frozen AuraLite-OS build.
++test-net-tx: x86emu firmware/firmware.bin tests/nic_tx.asm \
++             tests/integration/n1_tx_tap.sh tests/integration/n1_tap_responder.py
++	sh tests/integration/n1_tx_tap.sh
++
++test: test-unit test-table test-kload test-ring3 test-boot test-net-tx
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+diff --git a/README.md b/README.md
+index 408e7bb..9d8e3d5 100644
+--- a/README.md
++++ b/README.md
+@@ -58,6 +58,15 @@ The focused CPU tests can be run independently:
+ make test-unit
+ ```
+ 
++`make test` also runs the NET wire lane (`make test-net-tx`): a small
++payload (`tests/nic_tx.asm`) boots through the real firmware transport
++off a throwaway `--disk=` image, transmits a frame through the e1000 TX
++ring and a host-side responder records what arrived on the TAP endpoint.
++It needs `nasm` and `python3`, and the fixed endpoint `UDP
++127.0.0.1:8080` free; it SKIPs (exit 0) when a dependency is missing.
++The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
++an AuraLite-OS build.
++
+ ## Architecture
+ 
+ `src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index ce76c3b..9bc43be 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@ maps to exactly one plan below.
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ done (V0–V3) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
+-| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0 done ✅ — RX-ready e1000 + TAP ingress measured; N1–N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
++| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0–N1 done ✅ — RX-ready e1000 + TAP ingress, TX ring measured end-to-end on the wire; N2–N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 559cc5d..4d233ea 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -60,10 +60,35 @@
+   (`--max-instr=4500000000`) is byte-identical (both tapes sha256
+   `82614cd6f896aa9a…`) with the `[net] using NIC: e1000` gate,
+   `BAR0 at phys 0xfebc0000`, `STATUS=0x00000002 (LU=1)` and
+-  `MAC from RAL/RAH`.  TX stays N1 (measured `[e1000] TX timeout`
+-  receipts; `[dhcp] FAIL: DISCOVER transmit failed` → `[net] fallback
+-  IP active`).  NC reddens the ingress vector (`test_net.c:85`,
++  `MAC from RAL/RAH`.  NC reddens the ingress vector (`test_net.c:85`,
+   RC=134); `make test` + `make test-sanitize` stay green.
++- The NET plan's N1 (TX-ready) is measured.  The TDT/TCTL doorbell walks
++  TDH over the legacy TX ring, the frame leaves as one TAP datagram
++  (`TCTL.EN` gated) and the descriptors are completed **inside the
++  doorbell store** — because the guest's `e1000_send()` spins on
++  `status & 0x01` with a 100000-PAUSE budget, a tick-deferred completion
++  would still burn it.  Causes land in ICR as `TXQE|TXDW` (`0x81` for a
++  single-descriptor send); the register-write fallback gained QEMU
++  `macreg_writeops[]` parity (`IMS |=`, `ICR &= ~val`, `ICS`, 16-bit
++  heads, `TDLEN/RDLEN & 0xfff80`).  `tests/test_net.c` runs 7 vectors
++  (2 N0 + 5 N1).  The wire lane (`make test-net-tx` →
++  `tests/integration/n1_tx_tap.sh`) puts a 489-byte payload
++  (`tests/nic_tx.asm`) on the **real firmware-boot transport** off a
++  throwaway `--disk=` image and holds the ground-rule endpoint with
++  `n1_tap_responder.py`: twice, byte-identical, the guest prints
++  `N1TXOK  status=01 tdh=01 icr=81` and the wire carries
++  `ffffffffffff52540012345608004e3154584f4b` (20 bytes in, 20 bytes
++  out).  The same payload without `--tap=` reports
++  `N1TXFAIL  status=00 tdh=ff icr=ff` (open-bus BAR0) — the opt-in pin.
++  The frozen-guest lane SKIPs here (the AuraLite-OS toolchain is not
++  installable in this tree) and prints its reproduction line instead.
++  NC removes the descriptor writeback: `test_net.c:167`, RC=134, and the
++  wire receipt flips to `N1TXFAIL status=00 tdh=01 icr=80`.  `make test`
++  (now incl. `test-net-tx`), `make test-sanitize` and the hand-run
++  sanitized wire lane stay green.  Deliberately not modelled yet: the
++  INTx line (no PCI cfg `0x3C`, no ack path — a raised line would strand
++  the 8259A ISR bit under a polling guest), TX statistics counters,
++  context/TSO descriptors, VLAN and `CMD.IFCS` FCS insertion.
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/NET_PLAN.md b/docs/plans/NET_PLAN.md
+index cc3d98b..b0f3954 100644
+--- a/docs/plans/NET_PLAN.md
++++ b/docs/plans/NET_PLAN.md
+@@ -32,12 +32,12 @@ kernel (`kernel.elf` sha256 `395e5ec02bf39cc5…`, 3051512 B).
+    `RXCSUM` reads 0, `CTRL.RST` (bit 26) self-clears (the guest polls
+    on it).
+ 
+-**Status: in progress — N0 ✅, N1–N3 planned 📋**
++**Status: in progress — N0–N1 ✅, N2–N3 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | N0 | Measured baseline + this plan; the RX-ready e1000 (PCI `8086:100E` at 0:4:0 + BAR0 `0xFEBC0000`/128 KiB + reset contract + RX ring DMA) + TAP ingress (`--tap=`) | ✅ done | `patches/0046-NET-N0-e1000-rx-ready.patch` |
+-| N1 | TX-ready: the TDT doorbell → TDH walk → TAP datagrams (`TCTL.EN`), TX descriptor completion (the guest's `[e1000] TX timeout` receipts gone) | 📋 | `patches/0047-NET-N1-e1000-tx-ready.patch` |
++| N1 | TX-ready: the TDT doorbell → TDH walk → TAP datagrams (`TCTL.EN`), TX descriptor completion (the guest's `[e1000] TX timeout` receipts gone) | ✅ done | `patches/0047-NET-N1-e1000-tx-ready.patch` |
+ | N2 | Host responder on the TAP endpoint (DHCP + ARP + ICMP, the QEMU `-netdev user` receipt shape) so the guest's online self-tests pass | 📋 | `patches/0048-NET-N2-tap-responder.patch` |
+ | N3 | End-to-end close-out: determinism ×2, sanitize, docs close-out (plan closed) | 📋 | `patches/0049-NET-N3-net-e2e.patch` |
+ 
+@@ -130,15 +130,50 @@ buffer.
+   `ok e1000 pci/reset contract` (BAR0 readback over `0xCF8/0xCFC`).
+   Post-fix receipts: `BAR0 at phys 0xfebc0000`,
+   `STATUS=0x00000002 (LU=1)`, `MAC from RAL/RAH`.
+-- **D2 — TX not modelled** (measured, deferred to N1): the TDT
+-  doorbell stores but TDH never advances — receipts
++- **D2 — TX not modelled** (fixed by N1): the TDT doorbell stored but
++  TDH never advanced and no descriptor was ever completed — receipts
+   `[e1000] TX timeout: desc[N].status=0x00 TDH=0 TDT=N+1`,
+   `[net6] RS TX failed`, `[dhcp] FAIL: DISCOVER transmit failed (link
+   down or TX timeout)`, then `[net] DHCP failed, using hardcoded IP
+   10.0.2.15` / `[net] our IP: 10.0.2.15, gateway: 10.0.2.2` /
+-  `[net] fallback IP active; …`.
++  `[net] fallback IP active; …`. N1 re-measured the same shape from the
++  machine side with the wire payload (lane B of `n1_tx_tap.sh` still
++  shows it whenever the device is absent:
++  `N1TXFAIL status=00 tdh=ff icr=ff`), and the post-fix receipt is
++  `N1TXOK status=01 tdh=01 icr=81` plus the frame on the socket.
+ - **D3 — no host responder** (deferred to N2): DHCP/ARP/ICMP go
+   unanswered, so the online self-tests cannot pass.
++- **D4 — the INTx line is not wired** (measured in N1, deliberately
++  *not* fixed there): `e1000_add` does not seed PCI config `0x3C`
++  (interrupt line) and nothing emulates INTA#/ack, so the guest reads
++  `IRQ line 0` and stays on its polled path (N0 receipt
++  `[e1000] IRQ line 0 enabled (IMS=0x000000d5)`). N1 therefore does
++  ICR/ICS **bookkeeping only** — `set_ics` semantics without asserting
++  a line. Raising one now would be *worse* than not raising it: with no
++  ack path the 8259A ISR bit would stay set and the polling guest would
++  never be re-serviced. Full INTx (cfg `0x3C`, `pci_set_irq`, the
++  `(ICR & IMS) != 0` condition, EOI) is N3/N4 scope.
++- **D5 — QEMU's `TXD_STAT_*` bits sit in the wrong descriptor byte**
++  (measured in N1, diverged from QEMU on purpose): QEMU's
++  `hw/net/e1000.c` defines `E1000_TXD_STAT_DD` as `0x01000000`, i.e.
++  bit 24 of the dword read at descriptor offset 12 — which lands in
++  descriptor **byte 15** (the VLAN ID byte), not the status byte. The
++  Intel 8254x SDM puts `DD/EC/LC/TU` in bits 0..3 of the **status byte
++  at offset 12**, and the frozen guest driver tests
++  `tx_ring[old_tail].status & 0x01` where `status` is the `u8` at
++  struct offset 12 (`drivers/e1000/e1000.c:93,571`). This file's own RX
++  half already writes DD that way (`RXD_STAT_DD 0x01` at offset 12),
++  which is what the N0 guest receipt showed. N1 follows the
++  datasheet + guest, byte-granular.
++- **D6 — the N0 register-write fallback was too permissive** (fixed
++  inside N1): N0 stored every non-CTRL/IMC register verbatim.
++  Measured against QEMU `macreg_writeops[]` that is wrong for
++  `IMS` (`set_ims` is `IMS |= val`, not an assign), `ICR` (`set_icr` is
++  `ICR &= ~val`, not a no-op), `ICS` (`set_ics`), `TDH/RDH`
++  (`set_16bit`), `TDLEN/RDLEN` (`set_dlen`, `val & 0xfff80`) and
++  `TDT` (shares TCTL's op: store, mask TDT to 16 bits, `start_xmit`).
++  No N0 vector pinned the old behaviour, so the change is safe;
++  `ok e1000 interrupt/register write-op parity` now pins the new one.
+ 
+ ## 2. Phases
+ 
+@@ -227,14 +262,172 @@ initrd + paths.)
+ integration, firmware contract `pixel[0]=0x00200000` intact);
+ `make test-sanitize` RC=0 (ASan+UBSan).
+ 
+-### N1 — TX-ready — 📋 planned
++### N1 — TX-ready — ✅ done (`patches/0047-NET-N1-e1000-tx-ready.patch`)
++
++**TX contract measured first, from two sources.** QEMU
++`hw/net/e1000.c`: `macreg_writeops[]` maps **both** `[TCTL]` and
++`[TDT]` to `set_tctl` (store, `TDT &= 0xffff`, `start_xmit`), so the
++doorbell is a TDT *or* a TCTL write; `start_xmit` returns unless
++`TCTL.EN`, guards re-entrancy with `tx.busy`, walks `while (TDH !=
++TDT)` over `tx_desc_base + 16*TDH` (`TDBAH<<32 | TDBAL & ~0xf`),
++advances with `if (++TDH * 16 >= TDLEN) TDH = 0`, breaks on the TDH
++wraparound and on `tdh_start >= TDLEN/16` (its two escapes for a bogus
++TDT/TDLEN), and ends with `set_ics(s, 0, cause)` where `cause` starts
++at `E1000_ICS_TXQE` and ORs in `E1000_ICR_TXDW` per RS writeback.
++`process_tx_desc` takes `split_size = lower.data & 0xffff`, clamps it
++to the room left in `tx.data[0x10000]`, DMA-reads at `buffer_addr`,
++and only on `CMD.EOP` calls `xmit_seg` (the send) and resets the
++assembly. `txdesc_writeback` returns 0 unless `CMD.RS|RPS`, else
++`upper = (upper | DD) & ~(EC|LC|TU)` and returns `ICR_TXDW`. The guest
++side (`AuraLite-OS@0ed0d29 drivers/e1000/e1000.c`, identical at HEAD):
++`e1000_init` programs `TDLEN = 32*16`, `TDH = TDT = 0`,
++`TCTL = EN | (0x10<<4) | (0x40<<12)`, `IMS = 0xD5`; `e1000_send`
++refuses without `STATUS.LU`, clamps to 2048, fills
++`length/cso=0/cmd=0x0B (EOP|IFCS|RS)/status=0`, bumps
++`tail = (tail+1) % 32`, **rings `TDT = tail`**, then spins
++`while ((tx_ring[old_tail].status & 0x01) == 0 && timeout-- > 0) pause`
++with `timeout = 100000` and prints `[e1000] TX timeout:
++desc[%u].status=0x%02x TDH=%u TDT=%u` on exhaustion. **Consequence for
++the model: DD must be written back *inside* the TDT store, not on a
++later tick** — a `devices_tick`-deferred completion would still burn
++the guest's PAUSE budget and, worse, make the receipt depend on the
++256-instruction cadence.
++
++**Implementation** (`src/e1000.c`, `src/devices.h`, `Makefile`):
++`e1000_send_frame` (TAP datagram out, `tap_fd < 0` or a failed `send`
++drops the frame but still completes the descriptors — QEMU's
++null-backend shape, and what makes the socketless unit lane assert DD
++rather than the wire), `e1000_tx_desc` (one descriptor of the walk),
++`e1000_start_xmit` (the `set_tctl` walk), `e1000_tx_stats` (the wire
++counters — the device logs nothing on the RX/TX path, parity with N0,
++so a harness proves "the frame reached the wire" by reading these
++instead of grepping a log whose line count would otherwise depend on
++how many frames a responder answered with), and TX state in `e1000_t`
++(`tx_data[0x10000]`, `tx_size`, `tx_busy`, `tx_frames`, `tx_dropped`)
++which `e1000_reset_regs` clears — a half-assembled frame must not
++survive a `CTRL.RST` into the next ring. `e1000_mmio_write` gained the
++QEMU write-op parity of ledger **D6**.
++
++**Unit vectors** (`tests/test_net.c`, in `make test-unit`) — 2 N0 + 5 N1:
+ 
+-The TX ring: TDT doorbell walks TDH, descriptors are consumed
+-(`status.DD`), frames leave through the TAP socket (`TCTL.EN` gate),
+-`IMS.TXD` interrupt when requested. DoD: unit vectors per the QEMU TX
+-contract (doorbell, completion, gate) + the guest's `[e1000] TX
+-timeout` receipts disappear and `[dhcp]` reaches the wire; the N0 lane
+-pair re-run byte-stable modulo the TX receipts; NC + sanitize.
++```
++ok e1000 pci/reset contract (RXCSUM 0, RAL/RAH preload, RST self-clear)
++ok e1000 rx ingress (DMA + DD + RDH, EN/full gating)
++ok e1000 tx doorbell completion (DD + CMD intact + TDH + TXDW/TXQE)
++ok e1000 tx TCTL.EN gate + TCTL-write doorbell + TDT 16-bit mask
++ok e1000 tx multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask
++ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)
++ok e1000 tx link gate + CTRL.RST resets the TX ring
++test-net: all tests passed
++```
++
++(What they pin: DD + `CMD` left intact + TDH advance + `ICR = 0x81`
++(TXDW|TXQE) + read-to-clear + the socketless drop counters; `TCTL.EN`
++clear ⇒ TDT stores but consumes nothing *and raises no cause*, then a
++TCTL write drains the pending descriptor, `TDT` masked to 16 bits;
++a no-EOP descriptor accumulates so two descriptors yield **one** frame
++while both get DD (writeback runs for every descriptor of the walk,
++EOP or not), `RS` clear ⇒ no DD but the slot is still consumed, TDH
++31 → 0 wrap, `TDLEN & 0xfff80`; `IMS |=`, `IMC &= ~`, `ICR &= ~val`,
++`ICS` ORs causes in, 16-bit heads; `STATUS.LU` readable, and
++`CTRL.RST` clearing TDLEN/TDH while the MAC preload comes back.)
++
++**NC (once per phase)**: removing the descriptor writeback from
++`e1000_tx_desc` (DD + `ICR_TXDW`) reddens the doorbell vector —
++`RC=134`, `tests/test_net.c:167: test_tx_doorbell_completion:
++Assertion 'tx_desc_status(&f, ring, 0) == 0x01' failed` — and the wire
++payload's receipt flips to `N1TXFAIL status=00 tdh=01 icr=80`, i.e.
++exactly the `status=0x00` half of the D2 guest receipt (the head still
++advances, the frame still leaves, only the completion is missing —
++which is why the guest's *spin* is what times out). Restored from
++backup, gates re-green.
++
++**Lanes** (`make test-net-tx` → `tests/integration/n1_tx_tap.sh`;
++needs `nasm` + `python3` and the endpoint `UDP 127.0.0.1:8080` free —
++it SKIPs, exit 0, when a dependency is missing):
++
++- **Lane A (wire, ×2 determinism pair).** `tests/nic_tx.asm` (489 code
++  bytes of the 512 the loader reads) rides the **real firmware-boot
++  transport**: a throwaway `--disk=` image, `[usb-msc] READ(10) LBA=0
++  blocks=1` → `bulk-IN 512 bytes -> guest 0x00100000` → `conventional
++  entry reached`, long mode, then the payload programs the ring exactly
++  like `e1000_init`/`e1000_send` and rings TDT.
++  `tests/integration/n1_tap_responder.py` holds the ground-rule
++  endpoint and records what arrived:
++
++  ```
++  [serial] N1TXOK  status=01 tdh=01 icr=81
++  ffffffffffff52540012345608004e3154584f4b
++  ```
++
++  The frame is `ff:ff:ff:ff:ff:ff` / `52:54:00:12:34:56` / `0x0800` /
++  `N1TXOK` — the buffer the guest DMA'd, byte for byte, 20 bytes in and
++  20 bytes out (no FCS invention). `status=01` is DD in the status
++  *byte*, `tdh=01` the head advance, `icr=81` TXDW|TXQE.
++
++  *Measured constraint worth keeping:* the firmware's long-mode map is
++  **not** all of RAM. `PML4[0] → PDPT[0] (0x12003, a table) → PD`, and
++  `PD[0] = 0x19B` is a **2 MiB** page (PS in a PDE), so a payload may
++  only touch conventional RAM at `0x100000..0x1FFFFF`; a write to
++  `0x200000` raises `#PF v=0x200000 err=0x2` (`PD[1] = 0`). MMIO
++  reaches it via `PDPT[3]` (`0xC0000000..0xFFFFFFFF`) — which is how
++  the framebuffer at `0xD0000000` and BAR0 at `0xFEBC0000` work. The
++  ring and the DMA buffer therefore live at `0x100800`/`0x100C00`.
++
++- **Lane B (opt-in ground rule).** The same payload **without**
++  `--tap=`: no PCI function exists, BAR0 reads hit the open bus and
++  return all-ones, so the receipt is
++  `N1TXFAIL  status=00 tdh=ff icr=ff` and no frame can exist. This is
++  the pin that keeps every historical no-NIC lane byte-stable.
++
++- **Lane C (frozen-guest receipts) — SKIP in this tree.** The N0 lane
++  re-run; asserts `[net] using NIC: e1000`, `[dhcp] starting DHCP
++  discovery`, the **absence** of `[e1000] TX timeout`, and ≥1 frame on
++  the wire. The AuraLite-OS toolchain (`clang --target=x86_64-elf`,
++  `ld.lld`, `rustc`, `mtools`) is not installable here, so the frozen
++  `kernel.elf`/`initrd.tar` cannot be produced; the harness prints the
++  exact reproduction line instead of failing:
++
++  ```
++  KERNEL=/home/user/AuraLite-OS/build/kernel.elf \
++  INITRD=/home/user/AuraLite-OS/build/initrd.tar \
++      tests/integration/n1_tx_tap.sh
++  ```
++
++  (Note for whoever runs it: `AuraLite-OS/SHA256SUMS` pins
++  `kernel.elf` `be3258d7…`, not the U5-freeze `395e5ec0…` this plan
++  cites, so a fresh build is a *different* binary — record its sha
++  alongside the receipts.)
++
++Determinism: lane A run twice, both tapes and both frame logs
++byte-identical (`cmp` clean; the harness defaults to the fixed workdir
++`/tmp/n1-tx-tap` because the tape embeds the `--disk=` path, which is
++what makes these shas reproducible):
++
++| Artifact | sha256 |
++|---|---|
++| `a1.out` = `a2.out` (lane A tape) | `f080146e99daf0086bf7a9c6f0c724586543e4e54204a7b904c1f1dfbd14e3be` |
++| `a1-frames.hex` = `a2-frames.hex` (wire) | `407c20de647cfb1459ebcd72d24e62167db60f7ec4cdee300a85c6cbb904c8bf` |
++| `b1.out` (lane B tape) | `270c237cfd4ff5ffbed1ec6c484ce323fe2f199dfd793a1d3bcbbdcadd652fc8` |
++| `nic_tx.bin` (payload, 512 B) | `29a20dd600b1944800a3e0fea79b8e4651b0e97d5a1bf83f4d1bddcee13f40f3` |
++
++**Gates**: `make test` RC=0 (now including `test-net-tx`; the boot
++integration receipts are untouched — `[usb-msc] READ(10) LBA=0
++blocks=1`, `GUEST_OK`, `framebuffer marker OK: pixel[0]=0x00200000`);
++`make test-sanitize` RC=0 (ASan+UBSan), and because that target does
++not rebuild `test-net`, the net vectors *and* the wire lane were also
++run by hand under `-fsanitize=address,undefined
++-fno-sanitize-recover=all` (`X86EMU=<asan build> tests/integration/
++n1_tx_tap.sh`) — both clean, so the real `send()` path is covered too;
++`make fuzz FUZZ_PROGRAMS=64` — `64 programs, 1536 instructions
++compared -- all states match`, `0 host-level crashes`.
++
++**Not in N1** (measured, deferred): the INTx line (**D4**), TX
++statistics counters (`TPT`/`TOTL`/`GPTC`/`PTC*`, QEMU's `xmit_seg` +
++`e1000x_increase_size_stats`), context/TSO descriptors, VLAN insertion
++(`VLE`), and FCS insertion for `CMD.IFCS` — the guest asks for IFCS
++but the wire frame is what the buffer held, which is also what QEMU's
++`e1000_send_packet` hands its backend.
+ 
+ ### N2 — Host responder (DHCP + ARP + ICMP) — 📋 planned
+ 
+diff --git a/src/devices.h b/src/devices.h
+index c14ed6d..96754e1 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -20,11 +20,15 @@ void vbe_mode_disable(machine_t *m);
+ 
+ /* NET N0: e1000 82540EM "RX-ready" model + TAP socket ingress (src/e1000.c).
+  * The device is opt-in: e1000_test_add is the socketless unit entry, and
+- * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080). */
++ * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080).
++ * NET N1 adds the TX half (TDT/TCTL doorbell -> TDH walk -> TAP datagram,
++ * descriptors completed with status.DD inside the doorbell store, because
++ * the guest's e1000_send() spins on DD with a bounded PAUSE budget). */
+ void e1000_test_add(machine_t *m);
+ int  e1000_attach(machine_t *m, const char *hostport);
+ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
+ void e1000_tick(void);
++void e1000_tx_stats(uint64_t *sent, uint64_t *dropped);   /* N1 wire counters */
+ void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at the instruction cadence */
+ 
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+diff --git a/src/e1000.c b/src/e1000.c
+index 0f82eac..20889af 100644
+--- a/src/e1000.c
++++ b/src/e1000.c
+@@ -10,8 +10,17 @@
+  *   - QEMU compat: the reset state follows QEMU's e1000_reset (RXCSUM reads
+  *     0 after CTRL.RST, RAL/RAH preloaded, STATUS.LU on link).
+  *
+- * N0 covers the PCI function + BAR0 register file + reset + RX ring DMA
+- * (socket -> guest).  TX (TDT doorbell -> socket) is N1. */
++ * N0 covered the PCI function + BAR0 register file + reset + RX ring DMA
++ * (socket -> guest).  N1 adds the TX half: the TDT/TCTL doorbell walks TDH
++ * over the legacy TX ring, the frame leaves through the TAP socket
++ * (TCTL.EN gated) and the descriptors are completed (status.DD), so the
++ * guest's e1000_send() DD spin-wait retires instead of printing
++ * "[e1000] TX timeout: desc[N].status=0x00 TDH=0 TDT=N+1" (defect D2).
++ * TX semantics are measured from QEMU hw/net/e1000.c start_xmit /
++ * process_tx_desc / txdesc_writeback, and the guest side from
++ * AuraLite-OS@0ed0d29 drivers/e1000/e1000.c e1000_send() (cmd 0x0B =
++ * EOP|IFCS|RS, TDT tail doorbell, spin on status.DD, TDH read back for
++ * the timeout receipt). */
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -34,6 +43,7 @@
+ #define E1000_STATUS      0x00008
+ #define E1000_EERD        0x00014
+ #define E1000_ICR         0x000C0
++#define E1000_ICS         0x000C8
+ #define E1000_IMS         0x000D0
+ #define E1000_IMC         0x000D8
+ #define E1000_RCTL        0x00100
+@@ -64,14 +74,61 @@
+ #define TCTL_EN           (1u << 1)
+ #define TCTL_PSP          (1u << 3)
+ #define RAH_AV            (1u << 31)
++#define ICR_TXDW          (1u << 0)   /* TX descriptor written back */
++#define ICR_LSC           (1u << 2)   /* link status change         */
++#define ICR_RXDMT0        (1u << 4)
++#define ICR_RXO           (1u << 6)
+ #define ICR_RXT0          (1u << 7)
++#define ICR_TXQE          (1u << 7)   /* TX queue empty (QEMU: same bit slot,
++                                       * distinct cause -- start_xmit always
++                                       * raises it, the guest unmasks it)    */
+ #define RXD_STAT_DD       0x01
+ 
++/* N1: legacy TX descriptor (Intel 8254x SDM, 16 bytes).  lower.data =
++ * length | cso<<16 | cmd<<24; upper.data = status | css<<8 | popts<<16 |
++ * special<<24, i.e. status is the BYTE at descriptor offset 12 and cmd the
++ * byte at offset 11.  The guest driver's struct tx_desc
++ * (drivers/e1000/e1000.c:93) agrees byte for byte:
++ * addr[0:8) length[8:10) cso[10] cmd[11] status[12] css[13] special[14:16). */
++#define TXD_CMD_EOP       (1u << 24)  /* CMD bit0: end of packet             */
++#define TXD_CMD_RS        (1u << 27)  /* CMD bit3: report status (writeback) */
++#define TXD_CMD_DEXT      (1u << 29)  /* CMD bit5: 0 = legacy descriptor     */
++/* STATUS byte (descriptor offset 12).  QEMU's e1000 model instead defines
++ * E1000_TXD_STAT_DD as 0x01000000, i.e. bit 24 of the dword read at offset
++ * 12 -- which lands in descriptor byte 15 (the VLAN ID byte), not the status
++ * byte.  Measured against the two things this project is pinned to, the
++ * byte-granular form is the contract: the Intel 8254x SDM puts DD/EC/LC/TU
++ * in bits 0..3 of the status byte, and the frozen guest driver tests
++ * `tx_ring[old_tail].status & 0x01` where `status` is the u8 at struct
++ * offset 12 (drivers/e1000/e1000.c:93,571).  The RX half of this very file
++ * already writes its DD that way (RXD_STAT_DD 0x01 at the same offset) and
++ * that is what the N0 guest receipt showed. */
++#define TXD_STAT_DD       0x01u       /* STATUS bit0: descriptor done        */
++#define TXD_STAT_EC       0x02u       /* STATUS bit1: excess collisions      */
++#define TXD_STAT_LC       0x04u       /* STATUS bit2: late collision         */
++#define TXD_STAT_TU       0x08u       /* STATUS bit3: TX underrun            */
++
++#define E1000_TX_DATA_MAX 0x10000u    /* QEMU s->tx.data[] size               */
++#define E1000_TX_DESC_SZ   16u
++#define E1000_DLEN_MASK    0xfff80u   /* QEMU set_dlen: TDLEN/RDLEN are 128B
++                                       * multiples (both rings)                */
++
++
+ typedef struct {
+     machine_t *m;
+     uint32_t regs[E1000_REG_BYTES / 4];
+     int tap_fd;            /* -1 = no TAP socket */
+     int attached;
++    /* N1: TX assembly state (QEMU struct e1000_tx).  A frame may span
++     * several descriptors, so bytes accumulate here until CMD.EOP; `busy`
++     * is QEMU's re-entrancy guard (a doorbell inside the walk is a no-op). */
++    uint8_t  tx_data[E1000_TX_DATA_MAX];
++    uint32_t tx_size;
++    int      tx_busy;
++    /* Counters, so the walk stays deterministic and the log stays quiet:
++     * every frame that reached the TAP socket, and every frame dropped
++     * because no socket is attached (the socketless unit lane). */
++    uint64_t tx_frames, tx_dropped;
+ } e1000_t;
+ static e1000_t g_e1000;
+ 
+@@ -79,12 +136,145 @@ static e1000_t g_e1000;
+  * pre-initialized RAL/RAH (AddrValid + the QEMU default MAC), RXCSUM 0. */
+ static void e1000_reset_regs(void) {
+     memset(g_e1000.regs, 0, sizeof g_e1000.regs);
++    /* N1: the TX assembly state and the wire counters are device state, so a
++     * reset (device add, or CTRL.RST) starts them clean -- a half-assembled
++     * frame must not survive into the next ring. */
++    g_e1000.tx_size = 0;
++    g_e1000.tx_busy = 0;
++    g_e1000.tx_frames = 0;
++    g_e1000.tx_dropped = 0;
+     g_e1000.regs[E1000_STATUS / 4] = STATUS_LU;    /* link up on attach */
+     /* 52:54:00:12:34:56 -> RAL = 0x12005452, RAH = AV | 0x5634 */
+     g_e1000.regs[E1000_RA / 4] = 0x12005452u;
+     g_e1000.regs[(E1000_RA + 4) / 4] = RAH_AV | 0x5634u;
+ }
+ 
++/* ============================ TX ring egress ============================== */
++/* N1.  Measured from QEMU hw/net/e1000.c:
++ *
++ *   set_tctl()   -- BOTH [TCTL] and [TDT] map to it: it stores the value,
++ *                   masks TDT to 16 bits, then calls start_xmit().  So the
++ *                   doorbell is a TDT *or* a TCTL write (the guest writes
++ *                   TCTL once at init with TDH==TDT, which is a no-op walk).
++ *   start_xmit() -- returns immediately unless TCTL.EN; guards re-entrancy
++ *                   with tx.busy; walks TDH != TDT; per descriptor calls
++ *                   process_tx_desc() then txdesc_writeback(); advances TDH
++ *                   with "++TDH * 16 >= TDLEN -> TDH = 0"; breaks on the
++ *                   TDH wraparound and on a bogus TDLEN ("nothing too
++ *                   intelligent we could do about this"); finally raises
++ *                   ICS_TXQE unconditionally ORed with the TXDW causes the
++ *                   writebacks returned.
++ *   process_tx_desc() -- legacy path: split_size = lower.data & 0xffff
++ *                   (the length field), clamped to the remaining tx.data
++ *                   room, DMA-read at buffer_addr into tx.data+tx.size.
++ *                   CMD.EOP absent -> accumulate only, the frame is not on
++ *                   the wire yet; CMD.EOP -> xmit_seg() (send) and reset the
++ *                   assembly state.  Context (CMD.DEXT) and TSO descriptors
++ *                   are out of scope: the guest only ever submits legacy
++ *                   cmd 0x0B.
++ *   txdesc_writeback() -- called by start_xmit for EVERY descriptor of the
++ *                   walk, EOP or not (it is a separate call, not part of
++ *                   process_tx_desc), so a mid-frame RS descriptor is
++ *                   completed too.  Returns 0 unless CMD.RS; otherwise
++ *                   upper.data = (upper.data | DD) & ~(EC|LC|TU), written
++ *                   back to the descriptor, and returns ICS_TXDW.  Note QEMU
++ *                   does NOT clear CMD here.
++ *
++ * The guest contract this satisfies (drivers/e1000/e1000.c e1000_send):
++ * memcpy into tx_buffers[tail], length=len, cmd=0x0B (EOP|IFCS|RS),
++ * status=0, TDT=tail+1, then spin <=100000 PAUSEs on status&0x01 -- so DD
++ * must be written back *inside* the TDT store, not on a later tick.
++ */
++static void e1000_send_frame(e1000_t *e) {
++    if (e->tx_size == 0) return;
++    if (e->tap_fd < 0) {
++        /* No host endpoint: the frame is dropped but the descriptors still
++         * complete, exactly like QEMU's NIC with a null backend (and like
++         * the socketless unit lane, which asserts DD/TDH, not the wire). */
++        e->tx_dropped++;
++        return;
++    }
++    ssize_t n = send(e->tap_fd, e->tx_data, e->tx_size, 0);
++    if (n < 0) {
++        /* UDP to a connected endpoint: ECONNREFUSED arrives when nothing is
++         * bound at 127.0.0.1:8080.  Drop, do not fail the descriptor -- the
++         * guest's TX path must not depend on the host responder being up
++         * (that is N2's lane, and QEMU behaves the same way). */
++        e->tx_dropped++;
++        return;
++    }
++    e->tx_frames++;
++}
++
++/* One descriptor of the walk.  Returns the ICR cause bits its writeback
++ * produced (QEMU: `cause |= txdesc_writeback(...)`). */
++static uint32_t e1000_tx_desc(machine_t *m, uint64_t desc) {
++    e1000_t *e = &g_e1000;
++    uint64_t addr = (uint64_t)mem_read(m, desc, 4)
++                  | ((uint64_t)mem_read(m, desc + 4, 4) << 32);
++    uint32_t lower = (uint32_t)mem_read(m, desc + 8, 4);
++    uint32_t upper = (uint32_t)mem_read(m, desc + 12, 4);
++    uint32_t split = lower & 0xFFFFu;               /* legacy: length field */
++
++    if (!(lower & TXD_CMD_DEXT)) {                  /* legacy descriptor */
++        uint32_t room = E1000_TX_DATA_MAX - e->tx_size;
++        if (split > room) split = room;             /* QEMU: MIN(sizeof data
++                                                     * - size, split_size)  */
++        for (uint32_t i = 0; i < split; i++)
++            e->tx_data[e->tx_size + i] = (uint8_t)mem_read(m, addr + i, 1);
++        e->tx_size += split;
++    }
++
++    if (lower & TXD_CMD_EOP) {
++        e1000_send_frame(e);
++        e->tx_size = 0;
++    }
++
++    /* QEMU calls txdesc_writeback() for EVERY descriptor of the walk, EOP or
++     * not: a mid-frame descriptor with CMD.RS is completed just the same, so
++     * the guest can reuse it as soon as the frame it belongs to goes out. */
++    if (!(lower & TXD_CMD_RS))
++        return 0;                                   /* QEMU: no writeback */
++    upper = (upper | TXD_STAT_DD) & ~(TXD_STAT_EC | TXD_STAT_LC | TXD_STAT_TU);
++    mem_write(m, desc + 12, 4, upper);
++    return ICR_TXDW;
++}
++
++static void e1000_start_xmit(machine_t *m) {
++    e1000_t *e = &g_e1000;
++    if (!(e->regs[E1000_TCTL / 4] & TCTL_EN))
++        return;                                     /* "tx disabled" */
++    if (e->tx_busy) return;                         /* QEMU re-entrancy guard */
++    e->tx_busy = 1;
++
++    uint32_t cause = ICR_TXQE;                      /* always raised */
++    uint32_t tdh_start = e->regs[E1000_TDH / 4];
++    uint64_t base = (uint64_t)e->regs[E1000_TDBAL / 4]
++                  | ((uint64_t)e->regs[E1000_TDBAH / 4] << 32);
++
++    while (e->regs[E1000_TDH / 4] != e->regs[E1000_TDT / 4]) {
++        uint32_t tdh = e->regs[E1000_TDH / 4];
++        cause |= e1000_tx_desc(m, base + (uint64_t)tdh * E1000_TX_DESC_SZ);
++        if (++e->regs[E1000_TDH / 4] * E1000_TX_DESC_SZ >= e->regs[E1000_TDLEN / 4])
++            e->regs[E1000_TDH / 4] = 0;
++        /* QEMU's two escape hatches for a guest that programs bogus
++         * TDT/TDLEN: the head came back round to where it started, or the
++         * start was already past the ring.  Without them a TDH==0/TDT==32
++         * ring with TDLEN==0 would spin forever. */
++        if (e->regs[E1000_TDH / 4] == tdh_start ||
++            tdh_start >= e->regs[E1000_TDLEN / 4] / E1000_TX_DESC_SZ)
++            break;
++    }
++
++    e->tx_busy = 0;
++    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line would
++     * follow when (ICR & IMS) != 0.  This device has no board line wired
++     * (the guest reads PCI cfg 0x3C as 0 and drives a polled fallback), so
++     * ICR/ICS bookkeeping is the whole honest surface here -- see the N1
++     * ledger entry D4 in docs/plans/NET_PLAN.md. */
++    e->regs[E1000_ICR / 4] |= cause;
++}
++
+ /* =============================== MMIO ===================================== */
+ uint64_t e1000_mmio_read(void *ctx, uint64_t addr, int size) {
+     e1000_t *e = ctx;
+@@ -112,10 +302,44 @@ void e1000_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+         e->regs[E1000_CTRL / 4] = (uint32_t)val;
+         return;
+     }
+-    if (off == E1000_ICR || off == E1000_IMC) {
+-        /* ICR is read-to-clear (W1C-nothing); IMC clears the mask */
+-        if (off == E1000_IMC) e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
++    /* N1: QEMU write-op parity for the interrupt and ring registers.  The
++     * N0 fallback stored every one of these verbatim, which measured wrong
++     * against hw/net/e1000.c macreg_writeops[]: IMS is set_ims (OR, not
++     * assign), ICR is set_icr (clear the written bits, not a no-op), ICS is
++     * set_ics (OR into the cause), TDH/RDH are set_16bit, TDLEN/RDLEN are
++     * set_dlen (val & 0xfff80), and TDT shares TCTL's op -- store, mask TDT
++     * to 16 bits, then walk.  No N0 vector pinned the old behaviour. */
++    switch (off) {
++    case E1000_ICS:
++        /* QEMU set_ics -> set_interrupt_cause: the written causes join ICR
++         * (and ICS).  ICS is write-only on this part, so only ICR matters
++         * to the guest; both are updated to keep the register file honest. */
++        e->regs[E1000_ICR / 4] |= (uint32_t)val;
++        e->regs[E1000_ICS / 4] |= (uint32_t)val;
+         return;
++    case E1000_ICR:
++        e->regs[E1000_ICR / 4] &= ~(uint32_t)val;
++        return;
++    case E1000_IMS:
++        e->regs[E1000_IMS / 4] |= (uint32_t)val;
++        return;
++    case E1000_IMC:
++        e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
++        return;
++    case E1000_TDLEN: case E1000_RDLEN:
++        e->regs[off / 4] = (uint32_t)val & E1000_DLEN_MASK;
++        return;
++    case E1000_TDH: case E1000_RDH: case E1000_TDT:
++        e->regs[off / 4] = (uint32_t)val & 0xFFFFu;
++        if (off == E1000_TDT) e1000_start_xmit(e->m);   /* the doorbell */
++        return;
++    case E1000_TCTL:
++        e->regs[E1000_TCTL / 4] = (uint32_t)val;
++        e->regs[E1000_TDT / 4] &= 0xFFFFu;              /* QEMU set_tctl */
++        e1000_start_xmit(e->m);
++        return;
++    default:
++        break;
+     }
+     e->regs[off / 4] = (uint32_t)val;       /* RAL/RAH, rings, RCTL, ... */
+ }
+@@ -203,6 +427,17 @@ int e1000_attach(machine_t *m, const char *hostport) {
+     return 0;
+ }
+ 
++/* N1 observability for the integration lane: the wire counters.  The device
++ * logs nothing on the RX or TX path (parity with N0), so a harness that has
++ * to prove "the frame reached the wire" reads these instead of grepping a
++ * log whose line count would otherwise depend on how many frames the host
++ * responder happened to answer with -- which would cost the lane its
++ * byte-identical determinism pair. */
++void e1000_tx_stats(uint64_t *sent, uint64_t *dropped) {
++    if (sent)    *sent    = g_e1000.tx_frames;
++    if (dropped) *dropped = g_e1000.tx_dropped;
++}
++
+ void e1000_tick(void) {
+     /* pull TAP datagrams into the RX ring at the device cadence */
+     if (g_e1000.tap_fd < 0 || !g_e1000.attached) return;
+diff --git a/tests/integration/n1_tap_responder.py b/tests/integration/n1_tap_responder.py
+new file mode 100755
+index 0000000..1eba96c
+--- /dev/null
++++ b/tests/integration/n1_tap_responder.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""tests/integration/n1_tap_responder.py -- NET N1 host-side TAP endpoint.
++
++The N0 ground rule fixes the transport: TAP datagrams ARE Ethernet frames and
++the endpoint is UDP 127.0.0.1:8080, with the emulator as the connecting side.
++N1 is the first phase where a frame leaves the guest, so something has to be
++bound at that endpoint to prove it -- this is the smallest honest thing that
++can be: it records every datagram, one hex frame per line, and exits after
++`--count` frames or `--timeout` seconds.
++
++It deliberately does NOT answer (N2 is the host-responder phase), and it
++deliberately writes nothing that could leak back into the emulator's own log:
++the frames land in a separate file so the determinism pair in n1_tx_tap.sh
++compares emulator output only.
++
++Usage:
++    n1_tap_responder.py --out frames.hex [--port 8080] [--count 1]
++                        [--timeout 30]
++"""
++import argparse
++import binascii
++import socket
++import sys
++import time
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", required=True, help="hex frame log to write")
++    ap.add_argument("--port", type=int, default=8080)
++    ap.add_argument("--host", default="127.0.0.1")
++    ap.add_argument("--count", type=int, default=1, help="frames to capture")
++    ap.add_argument("--timeout", type=float, default=30.0, help="seconds")
++    a = ap.parse_args()
++
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    s.bind((a.host, a.port))
++    s.settimeout(a.timeout)
++
++    got = 0
++    deadline = time.monotonic() + a.timeout
++    with open(a.out, "w", encoding="ascii") as f:
++        while got < a.count:
++            s.settimeout(max(0.05, deadline - time.monotonic()))
++            try:
++                data, _peer = s.recvfrom(65536)
++            except socket.timeout:
++                break
++            if not data:
++                continue
++            f.write(binascii.hexlify(data).decode("ascii") + "\n")
++            f.flush()
++            got += 1
++    s.close()
++    print("responder: captured %d frame(s) -> %s" % (got, a.out))
++    return 0 if got >= a.count else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/integration/n1_tx_tap.sh b/tests/integration/n1_tx_tap.sh
+new file mode 100755
+index 0000000..f1e413e
+--- /dev/null
++++ b/tests/integration/n1_tx_tap.sh
+@@ -0,0 +1,147 @@
++#!/bin/sh
++# tests/integration/n1_tx_tap.sh -- NET N1 wire + guest receipt harness.
++#
++# N1's claim is that a frame the guest submits to the TX ring actually reaches
++# the wire, and that the descriptor is completed inside the doorbell store so
++# the guest's e1000_send() DD spin-wait retires.  Three lanes measure that:
++#
++#   Lane A (wire, always runs): the real firmware-boot transport loads
++#     tests/nic_tx.asm off LBA 0 of a throwaway --disk= image and jumps to it
++#     in long mode; the payload programs the TX ring exactly the way the
++#     frozen guest driver does, rings the TDT doorbell and reports on COM1.
++#     n1_tap_responder.py holds the ground-rule endpoint (UDP 127.0.0.1:8080)
++#     and records what arrived.  Receipts required:
++#       guest   [serial] N1TXOK  status=01 tdh=01 icr=81
++#       wire    ffffffffffff52540012345608004e3154584f4b   (one frame, exact)
++#     status=01 is DD in the status BYTE (descriptor offset 12), tdh=01 is the
++#     head advance, icr=81 is TXDW|TXQE.  Run twice: both .out tapes and both
++#     frame logs must be byte-identical (determinism pair).
++#
++#   Lane B (opt-in, always runs): the same payload WITHOUT --tap=.  The e1000
++#     PCI function does not exist then (ground rule 3), so BAR0 reads hit the
++#     open bus and return all-ones (measured: status=00 tdh=ff icr=ff), and the
++#     payload must report failure.  This is the pin that keeps every historical
++#     no-NIC lane byte-stable.
++#
++#   Lane C (guest receipts, SKIPs without the frozen guest): the N0 lane
++#     re-run.  N1's DoD is that `[e1000] TX timeout` disappears and `[dhcp]`
++#     reaches the wire, with the rest of the tape unchanged modulo those TX
++#     receipts.  Requires the frozen AuraLite-OS kernel/initrd (the recipe is
++#     recorded in docs/plans/NET_PLAN.md N0/N1).
++#
++# Usage:
++#   tests/integration/n1_tx_tap.sh [workdir]
++# Optional env: X86EMU (default ./x86emu), KERNEL, INITRD (lane C),
++#   RESP_TIMEOUT (default 20).
++
++set -eu
++
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++X86EMU=${X86EMU:-$ROOT/x86emu}
++WORK=${1:-/tmp/n1-tx-tap}   # fixed default: the tape embeds the --disk= path, so a
++                             # stable workdir is what makes the recorded shas reproducible
++KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
++INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
++RESP_TIMEOUT=${RESP_TIMEOUT:-20}
++TAP=127.0.0.1:8080
++FRAME_HEX=ffffffffffff52540012345608004e3154584f4b
++
++mkdir -p "$WORK"
++fail=0
++need()    { grep -q "$1" "$2"    || { echo "  MISSING: $3"; fail=1; }; }
++need_no() { grep -q "$1" "$2" && { echo "  PRESENT: $3"; fail=1; } || :; }
++
++command -v nasm    >/dev/null 2>&1 || { echo "SKIP: nasm missing"; exit 0; }
++command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 missing"; exit 0; }
++[ -x "$X86EMU" ] || { echo "ERROR: build x86emu first (make x86emu)"; exit 1; }
++
++# ---- the payload and its throwaway disk image -----------------------------
++nasm -f bin "$ROOT/tests/nic_tx.asm" -o "$WORK/nic_tx.bin"
++python3 - "$WORK/nic_tx.bin" "$WORK/disk.img" <<'EOF' || exit 1
++import sys
++p = open(sys.argv[1], 'rb').read()
++assert len(p) <= 512, 'payload must fit the firmware loader single block (%d)' % len(p)
++open(sys.argv[2], 'wb').write(p + b'\0' * (1024 * 1024 - len(p)))
++EOF
++
++# ---- one lane: responder up first (UDP connect() is a no-op, so an unbound
++# ---- endpoint would silently cost us the frame), then the emulator.
++run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
++    tag=$1; shift
++    python3 "$ROOT/tests/integration/n1_tap_responder.py" \
++        --out "$WORK/$tag-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
++        > "$WORK/$tag-resp.out" 2>&1 &
++    resp=$!
++    # wait until the endpoint is actually bound
++    i=0
++    while [ $i -lt 100 ]; do
++        if python3 -c "
++import socket,sys
++s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
++try:
++    s.bind(('127.0.0.1',8080))
++except OSError:
++    sys.exit(0)
++s.close(); sys.exit(1)" 2>/dev/null; then break; fi
++        i=$((i+1)); sleep 0.05
++    done
++    "$X86EMU" --platform=haswell --disk="$WORK/disk.img" "$@" \
++        --max-instr=600000 > "$WORK/$tag.out" 2>&1
++    wait "$resp" || true
++}
++
++echo "== lane A: TX through the real firmware-boot transport (x2 determinism)"
++run_tx_lane a1 --tap="$TAP"
++run_tx_lane a2 --tap="$TAP"
++for t in a1 a2; do
++    need "N1TXOK  status=01 tdh=01 icr=81" "$WORK/$t.out" \
++        "lane $t: DD + TDH + TXDW/TXQE receipt"
++    need "\[guest\] conventional entry reached at 0x00100000" "$WORK/$t.out" \
++        "lane $t: firmware transport reached the payload"
++    if [ "$(cat "$WORK/$t-frames.hex" 2>/dev/null)" != "$FRAME_HEX" ]; then
++        echo "  WIRE: lane $t frame mismatch:"
++        echo "    want $FRAME_HEX"
++        echo "    got  $(cat "$WORK/$t-frames.hex" 2>/dev/null)"
++        fail=1
++    fi
++done
++cmp -s "$WORK/a1.out" "$WORK/a2.out" \
++    || { echo "  NONDETERMINISTIC: lane A tapes differ"; fail=1; }
++cmp -s "$WORK/a1-frames.hex" "$WORK/a2-frames.hex" \
++    || { echo "  NONDETERMINISTIC: lane A wire frames differ"; fail=1; }
++
++echo "== lane B: no --tap= means no e1000 at all (opt-in ground rule)"
++"$X86EMU" --platform=haswell --disk="$WORK/disk.img" \
++    --max-instr=600000 > "$WORK/b1.out" 2>&1
++need "N1TXFAIL  status=00 tdh=ff icr=ff" "$WORK/b1.out" \
++    "lane B: BAR0 reads open-bus 0xFF without the device"
++need "\[guest\] conventional entry reached at 0x00100000" "$WORK/b1.out" \
++    "lane B: the same transport still boots"
++need_no "\[e1000\]" "$WORK/b1.out" "lane B: no e1000 device lines"
++
++echo "== lane C: frozen-guest receipts (the N0 lane re-run)"
++if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
++    python3 "$ROOT/tests/integration/n1_tap_responder.py" \
++        --out "$WORK/c1-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
++        > "$WORK/c1-resp.out" 2>&1 &
++    "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
++        --tap="$TAP" --log="$WORK/c1.log" \
++        --max-instr=4500000000 > "$WORK/c1.out" 2>&1 || true
++    wait || true
++    need "\[net\] using NIC: e1000"                "$WORK/c1.log" "lane C: NIC bound"
++    need "\[dhcp\] starting DHCP discovery"        "$WORK/c1.log" "lane C: DHCP ran"
++    need_no "\[e1000\] TX timeout"                 "$WORK/c1.log" "lane C: D2 receipt gone"
++    [ -s "$WORK/c1-frames.hex" ] \
++        || { echo "  MISSING: lane C put nothing on the wire"; fail=1; }
++else
++    echo "SKIP: frozen guest kernel/initrd missing ($KERNEL / $INITRD)"
++    echo "      reproduce with:"
++    echo "        KERNEL=$KERNEL INITRD=$INITRD $0 $WORK"
++fi
++
++if [ "$fail" -eq 0 ]; then
++    echo "N1 TX wire receipts: ALL PASS"
++else
++    echo "N1 TX wire receipts: FAIL (see $WORK)"
++    exit 1
++fi
+diff --git a/tests/nic_tx.asm b/tests/nic_tx.asm
+new file mode 100644
+index 0000000..f4be2a0
+--- /dev/null
++++ b/tests/nic_tx.asm
+@@ -0,0 +1,174 @@
++; tests/nic_tx.asm -- NET N1 wire payload: the TX half of the e1000, measured
++; through the real firmware-boot transport (not a unit fixture).
++;
++; The firmware's USB mass-storage loader reads exactly ONE 512-byte block off
++; LBA 0 of --disk= into physical 0x00100000 and jumps there in 64-bit long
++; mode, identity paging, interrupts off (firmware/sample_firmware.nas:689) --
++; the contract disk/test_kernel.asm runs under.  So this payload must stay
++; <= 512 bytes; it is that contract's NIC twin.  It programs the TX ring the
++; way the frozen guest driver does (AuraLite-OS@0ed0d29 drivers/e1000/e1000.c:
++; e1000_init + e1000_send), rings the TDT doorbell and reports on COM1:
++;
++;   N1TXOK status=01 tdh=01 icr=81   <- DD written back inside the doorbell
++;                                        store, TDH advanced, TXDW|TXQE up
++;   N1TXFAIL status=.. tdh=.. icr=.. <- any of those missing; defect D2's
++;                                        receipt was status=00 tdh=00
++;
++; The frame itself leaves through the TAP socket (ground rule: UDP datagrams =
++; Ethernet frames, 127.0.0.1:8080), so "the bytes reached the wire" is proven
++; host-side by tests/integration/n1_tx_tap.sh, not here.  Keeping this output
++; independent of the socket is deliberate: the same binary must print the same
++; thing whether or not a responder is bound, or the determinism pair would
++; depend on host scheduling.
++;
++; Build: nasm -f bin tests/nic_tx.asm -o <out>.bin   (Makefile: test-net-tx)
++[bits 64]
++[org 0x100000]
++
++BAR    equ 0xFEBC0000       ; e1000 82540EM BAR0 (0:4.0, opt-in via --tap=)
++CTRL   equ 0x0000
++ICR    equ 0x00C0
++IMS    equ 0x00D0
++TCTL   equ 0x0400
++TDBAL  equ 0x3800
++TDLEN  equ 0x3808
++TDH    equ 0x3810
++TDT    equ 0x3818
++COM1   equ 0x03F8
++; The firmware's long-mode map is NOT all of RAM: PML4[0] -> PDPT[0] -> PD,
++; and PD[0] = 0x19B is a 2 MiB page (PS in a PDE), so the only conventional
++; RAM a payload may touch is 0x100000..0x1FFFFF -- measured: a write to
++; 0x200000 raises #PF err=0x2 (PD[1] = 0).  MMIO reaches the payload through
++; PDPT[3] (0xC0000000..0xFFFFFFFF, which is how the framebuffer at
++; 0xD0000000 and BAR0 at 0xFEBC0000 work).  So the ring and the DMA buffer
++; live just above this payload's own 512 bytes.
++RING   equ 0x100800         ; 32 legacy TX descriptors (guest NUM_TX_DESC)
++FRAME  equ 0x100C00         ; the frame's DMA buffer (guest tx_buffers[0])
++FLEN   equ 20
++
++%macro MW 2                 ; MMIO write
++    mov r11d, BAR + %1
++    mov eax, %2
++    mov [r11], eax
++%endmacro
++%macro MR 1                 ; MMIO read -> eax
++    mov r11d, BAR + %1
++    mov eax, [r11]
++%endmacro
++
++start:
++    cli
++    ; ---- the frame: broadcast dst, the QEMU-default src 52:54:00:12:34:56,
++    ; ---- ethertype 0x0800, payload "N1TXOK" -- three stores, not twenty
++    ; ---- byte-writes, because the loader only gives us one block.
++    mov rax, 0x5452FFFFFFFFFFFF       ; ff*6 | 52 54
++    mov [FRAME], rax
++    mov rax, 0x314E000856341200       ; 00 12 34 56 | 08 00 | 'N' '1'
++    mov [FRAME+8], rax
++    mov eax, 0x4B4F5854               ; 'T' 'X' 'O' 'K'
++    mov [FRAME+16], eax
++
++    ; ---- descriptor 0, exactly as e1000_send() fills it: addr=FRAME,
++    ; ---- length=20, cso=0, cmd=0x0B (EOP|IFCS|RS), status=0.
++    mov dword [RING+0], FRAME
++    mov dword [RING+4], 0
++    mov dword [RING+8], FLEN | (0x0B << 24)
++    mov dword [RING+12], 0
++
++    ; ---- TX init as e1000_init() does it.  The TCTL write is itself a
++    ; ---- doorbell (QEMU maps [TCTL] and [TDT] to the same op), so the cause
++    ; ---- register is drained afterwards to keep the receipt honest.
++    MW CTRL,  (1 << 0) | (1 << 6)     ; FD | SLU
++    MW IMS,   0xD5                    ; the guest's mask
++    MW TDBAL, RING
++    MW TDLEN, 32 * 16
++    MW TDH,   0
++    MW TDT,   0
++    MW TCTL,  (1 << 1) | (0x10 << 4) | (0x40 << 12)   ; EN | CT | COLD
++    MR ICR                            ; drain the empty init walk's TXQE
++
++    ; ---- the doorbell.  e1000_send() then spins on status&0x01 with a
++    ; ---- bounded PAUSE budget; here the very next read is the check, so a
++    ; ---- DD that lands later than the TDT store is a failure.
++    MW TDT, 1
++    mov r12d, [RING+12]               ; status byte = bits 0..7 of the dword
++    and r12d, 0xFF
++    MR TDH
++    mov r13d, eax
++    MR ICR
++    mov r14d, eax
++
++    ; ---- verdict, then one receipt line
++    mov rsi, .sok
++    cmp r12d, 0x01                    ; DD?
++    jne .fail
++    cmp r13d, 1                       ; TDH advanced?
++    jne .fail
++    test r14d, (1 << 0) | (1 << 7)    ; TXDW and TXQE?
++    jz .fail
++    jmp .say
++.fail:
++    mov rsi, .sbad
++.say:
++    call .str
++    mov rsi, .sst
++    call .str
++    mov r9d, r12d
++    call .hex2
++    mov rsi, .stdh
++    call .str
++    mov r9d, r13d
++    call .hex2
++    mov rsi, .sicr
++    call .str
++    mov r9d, r14d
++    call .hex2
++    mov ecx, 10
++    call .put
++.halt:
++    hlt
++    jmp .halt
++
++.str:                                 ; NUL-terminated string at rsi -> COM1
++    mov al, [rsi]
++    test al, al
++    jz .ret
++    inc rsi
++    mov cl, al                        ; .put takes the character in cl
++    call .put
++    jmp .str
++.hex2:                                ; r9d low byte -> two hex digits
++    mov rcx, r9
++    shr rcx, 4
++    call .nib
++    mov rcx, r9
++.nib:
++    and ecx, 0xF
++    cmp ecx, 10
++    jb .dig
++    add ecx, 39                       ; 'a'-10-'0'
++.dig:
++    add ecx, '0'
++.put:                                 ; cl = character -> COM1, polled THR-empty
++    push rax
++    push rcx
++    mov dx, COM1 + 5
++.spin:
++    in al, dx
++    test al, 0x20
++    jz .spin
++    mov dx, COM1
++    mov al, cl
++    out dx, al
++    pop rcx
++    pop rax
++.ret:
++    ret
++
++.sok:    db 'N1TXOK ', 0
++.sbad:   db 'N1TXFAIL ', 0
++.sst:    db ' status=', 0
++.stdh:   db ' tdh=', 0
++.sicr:   db ' icr=', 0
++
++times 512-($-$$) db 0
+diff --git a/tests/test_net.c b/tests/test_net.c
+index 9d5ea0c..cf12b8e 100644
+--- a/tests/test_net.c
++++ b/tests/test_net.c
+@@ -1,4 +1,4 @@
+-/* tests/test_net.c -- NET N0 vectors: the e1000 82540EM "RX-ready" model.
++/* tests/test_net.c -- NET N0+N1 vectors: the e1000 82540EM model.
+  *
+  * Contract measured from AuraLite-OS@0ed0d29 (drivers/e1000/e1000.c,
+  * kernel/arch/i386/net32.c) and QEMU's hw/net/e1000.c e1000_reset:
+@@ -9,6 +9,19 @@
+  *   - RXCSUM reads 0 after reset (QEMU compat);
+  *   - RX ring ingress: frame DMA into the head buffer, DD status, RDH
+  *     advance, ICR.RXT0; RCTL.EN gates the receiver, RDH==RDT drops.
++ *
++ * N1 adds the TX ring (QEMU start_xmit / process_tx_desc / txdesc_writeback,
++ * guest side e1000_send()):
++ *   - the doorbell is a TDT write AND a TCTL write -- both map to QEMU's
++ *     set_tctl, which stores, masks TDT to 16 bits and calls start_xmit();
++ *   - TCTL.EN gates the walk ("tx disabled" -> return);
++ *   - the walk runs while TDH != TDT, DD is written back inside the doorbell
++ *     store (the guest spins on status&0x01 with a bounded PAUSE budget),
++ *     CMD stays intact (QEMU's txdesc_writeback does not clear it), and
++ *     TDH wraps with "++TDH * 16 >= TDLEN -> TDH = 0";
++ *   - ICR gets TXDW (bit 0) for RS descriptors and TXQE (bit 7) for every
++ *     completed walk;
++ *   - a frame without CMD.EOP accumulates: no wire, no DD, no TXDW.
+  */
+ #include <assert.h>
+ #include <stdint.h>
+@@ -98,9 +111,238 @@ static void test_rx_ingress(void) {
+     printf("ok e1000 rx ingress (DMA + DD + RDH, EN/full gating)\n");
+ }
+ 
++/* ---- N1 helpers: one legacy TX descriptor, exactly as e1000_send() builds it
++ * (length, cso=0, cmd=0x0B = EOP|IFCS|RS, status=0). ---- */
++static void tx_desc_put(fx_t *f, uint64_t ring, unsigned idx, uint64_t buf,
++                        uint16_t len, uint8_t cmd) {
++    uint64_t d = ring + idx * 16;
++    mem_write(&f->m, d + 0, 4, (uint32_t)buf);          /* addr lo */
++    mem_write(&f->m, d + 4, 4, 0);                      /* addr hi */
++    mem_write(&f->m, d + 8, 4, (uint32_t)len | ((uint32_t)cmd << 24));
++    mem_write(&f->m, d + 12, 4, 0);                     /* status/css/popts */
++}
++static uint8_t tx_desc_status(fx_t *f, uint64_t ring, unsigned idx) {
++    return (uint8_t)mem_read(&f->m, ring + idx * 16 + 12, 1);
++}
++static uint8_t tx_desc_cmd(fx_t *f, uint64_t ring, unsigned idx) {
++    return (uint8_t)mem_read(&f->m, ring + idx * 16 + 11, 1);
++}
++
++/* Program the TX ring the way the guest's e1000_init() does: TDLEN =
++ * NUM_TX_DESC*16, TDH = TDT = 0, TCTL = EN | (0x10<<4) | (0x40<<12).
++ * The wire counters are device state, so a CTRL.RST first gives every
++ * vector its own baseline instead of inheriting the previous one's. */
++static void tx_ring_setup(fx_t *f, uint64_t ring, uint32_t ndesc) {
++    wr(f, 0x0000, (1u << 26));                          /* CTRL.RST */
++    wr(f, 0x3800, (uint32_t)ring);                      /* TDBAL */
++    wr(f, 0x3804, 0);                                   /* TDBAH */
++    wr(f, 0x3808, ndesc * 16);                          /* TDLEN */
++    wr(f, 0x3810, 0);                                   /* TDH */
++    wr(f, 0x3818, 0);                                   /* TDT */
++    wr(f, 0x0400, (1u << 1) | (0x10u << 4) | (0x40u << 12));
++}
++
++static void test_tx_doorbell_completion(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t ring = 0x100000;                     /* 32 descriptors */
++    const uint64_t buf  = 0x200000;
++    tx_ring_setup(&f, ring, 32);
++    assert(rd(&f, 0x3808) == 32 * 16);                  /* TDLEN stored */
++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
++
++    /* The guest's frame: broadcast dst, our MAC src, a tagged payload. */
++    static const uint8_t frame[20] = {
++        0xff,0xff,0xff,0xff,0xff,0xff, 0x52,0x54,0x00,0x12,0x34,0x56,
++        0x08,0x00, 'N','1','T','X','O','K'
++    };
++    for (unsigned i = 0; i < sizeof frame; i++)
++        mem_write(&f.m, buf + i, 1, frame[i]);
++    tx_desc_put(&f, ring, 0, buf, sizeof frame, 0x0B);  /* EOP|IFCS|RS */
++    assert(tx_desc_status(&f, ring, 0) == 0);
++
++    /* The doorbell: one TDT store.  DD must be back before it returns --
++     * e1000_send() spins on status&0x01 with a 100000-PAUSE budget and
++     * prints "[e1000] TX timeout" when it never lands (defect D2). */
++    wr(&f, 0x3818, 1);
++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* DD */
++    assert(tx_desc_cmd(&f, ring, 0) == 0x0B);           /* CMD intact (QEMU) */
++    assert(rd(&f, 0x3810) == 1);                        /* TDH advanced */
++    assert(rd(&f, 0x3818) == 1);                        /* TDT as written */
++
++    /* ICR: TXDW (RS writeback) + TXQE (QEMU raises it on every walk). */
++    uint32_t icr = rd(&f, 0x00C0);
++    assert(icr & (1u << 0));                            /* TXDW  */
++    assert(icr & (1u << 7));                            /* TXQE  */
++    assert(rd(&f, 0x00C0) == 0);                        /* read-to-clear */
++
++    /* Second descriptor in the same ring: the walk is repeatable. */
++    tx_desc_put(&f, ring, 1, buf, sizeof frame, 0x0B);
++    wr(&f, 0x3818, 2);
++    assert(tx_desc_status(&f, ring, 1) == 0x01);
++    assert(rd(&f, 0x3810) == 2);
++
++    /* The socketless lane drops the frames but still completes them (QEMU
++     * with a null backend); the counters are the observable proof. */
++    uint64_t sent = 1, dropped = 0;
++    e1000_tx_stats(&sent, &dropped);
++    assert(sent == 0 && dropped == 2);
++    fx_done(&f);
++    printf("ok e1000 tx doorbell completion (DD + CMD intact + TDH + TXDW/TXQE)\n");
++}
++
++static void test_tx_tctl_gate_and_doorbell(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t ring = 0x100000, buf = 0x200000;
++    tx_ring_setup(&f, ring, 32);
++    tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
++    /* tx_ring_setup's own TCTL write is a doorbell (QEMU maps [TCTL] to
++     * set_tctl): with TDH==TDT the walk is empty but start_xmit still ends
++     * with set_ics(..., TXQE), so drain the cause register before asserting
++     * on the gated one.  Measured: ICR reads 0x80 right after the setup. */
++    assert(rd(&f, 0x00C0) == (1u << 7));                 /* TXQE only */
++    (void)rd(&f, 0x00C0);                                /* read-to-clear */
++
++    /* Transmitter disabled: QEMU start_xmit() returns before the walk, so
++     * the doorbell stores TDT but consumes nothing -- not even TXQE. */
++    wr(&f, 0x0400, 0);                                   /* TCTL without EN */
++    wr(&f, 0x3818, 1);
++    assert(rd(&f, 0x3818) == 1);                        /* TDT stored */
++    assert(rd(&f, 0x3810) == 0);                        /* TDH unmoved */
++    assert(tx_desc_status(&f, ring, 0) == 0);           /* no DD */
++    assert(rd(&f, 0x00C0) == 0);                        /* no cause */
++
++    /* A TCTL write is the second doorbell: QEMU maps [TCTL] and [TDT] to the
++     * same op, so enabling the transmitter drains the pending descriptor. */
++    wr(&f, 0x0400, (1u << 1) | (0x10u << 4) | (0x40u << 12));
++    assert(rd(&f, 0x3810) == 1);                        /* TDH advanced */
++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* DD */
++    assert(rd(&f, 0x00C0) & (1u << 0));                 /* TXDW */
++
++    /* TDT is masked to 16 bits by that same op (QEMU set_tctl). */
++    wr(&f, 0x3818, 0x00030001u);
++    assert(rd(&f, 0x3818) == 1);
++    fx_done(&f);
++    printf("ok e1000 tx TCTL.EN gate + TCTL-write doorbell + TDT 16-bit mask\n");
++}
++
++static void test_tx_multidescriptor_and_wrap(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t ring = 0x100000;
++    tx_ring_setup(&f, ring, 32);
++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
++
++    /* A frame split over two descriptors: the first carries no EOP, so it
++     * only accumulates -- ONE frame reaches the wire, not two.  Both
++     * descriptors still get DD, because QEMU calls txdesc_writeback() for
++     * every descriptor of the walk (EOP or not) and both have CMD.RS. */
++    tx_desc_put(&f, ring, 0, 0x200000, 8, 0x0A);        /* IFCS|RS, no EOP */
++    tx_desc_put(&f, ring, 1, 0x200008, 6, 0x0B);        /* EOP|IFCS|RS     */
++    wr(&f, 0x3818, 2);
++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* RS -> DD */
++    assert(tx_desc_status(&f, ring, 1) == 0x01);
++    assert(rd(&f, 0x3810) == 2);
++    uint64_t sent = 1, dropped = 0;
++    e1000_tx_stats(&sent, &dropped);
++    assert(sent == 0 && dropped == 1);                  /* ONE frame, not two */
++    (void)rd(&f, 0x00C0);                               /* drain TXDW|TXQE */
++
++    /* No RS: QEMU's txdesc_writeback returns 0 without touching upper.data,
++     * so DD never lands -- the pin that keeps the writeback conditional.
++     * TXQE is still raised (every walk ends with set_ics(..., TXQE)). */
++    tx_desc_put(&f, ring, 2, 0x200000, 14, 0x01);       /* EOP only */
++    wr(&f, 0x3818, 3);
++    assert(tx_desc_status(&f, ring, 2) == 0);           /* no DD without RS */
++    assert(rd(&f, 0x3810) == 3);                        /* consumed anyway */
++    assert(!(rd(&f, 0x00C0) & (1u << 0)));              /* no TXDW */
++
++    /* Ring wrap: TDH 31 -> 0 via "++TDH * 16 >= TDLEN".  The head is parked
++     * with the pending descriptor already in slot 31, so the single TDT
++     * store that opens the slot both transmits it and wraps the head. */
++    tx_desc_put(&f, ring, 31, 0x200000, 14, 0x0B);
++    wr(&f, 0x3810, 31);                                 /* TDH = last slot */
++    assert(rd(&f, 0x3810) == 31);
++    wr(&f, 0x3818, 0);                                  /* TDT = wrap point */
++    assert(tx_desc_status(&f, ring, 31) == 0x01);       /* slot 31 consumed */
++    assert(rd(&f, 0x3810) == 0);                        /* head wrapped */
++    assert(rd(&f, 0x3818) == 0);
++
++    /* TDLEN is a set_dlen register: val & 0xfff80 (128-byte multiples). */
++    wr(&f, 0x3808, 0xFFFFFFFFu);
++    assert(rd(&f, 0x3808) == 0xFFF80u);
++    wr(&f, 0x3808, 32 * 16);
++    fx_done(&f);
++    printf("ok e1000 tx multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask\n");
++}
++
++static void test_interrupt_register_semantics(void) {
++    fx_t f; fx_init(&f);
++
++    /* IMS is QEMU's set_ims: `IMS |= val`, not an assign.  The guest writes
++     * it once at init (RXT0|RXDMT0|RXO|TXDW|LSC) and never re-masks. */
++    wr(&f, 0x00D0, 0x01);
++    wr(&f, 0x00D0, 0x80);
++    assert(rd(&f, 0x00D0) == 0x81);
++    /* IMC clears the written bits out of IMS. */
++    wr(&f, 0x00D8, 0x80);
++    assert(rd(&f, 0x00D0) == 0x01);
++
++    /* ICR is QEMU's set_icr: `ICR &= ~val` (the N0 model stored nothing).
++     * ICR is also read-to-clear, so a read cannot be used to observe a
++     * partial clear -- the sequence below proves &= ~val with one read: if
++     * the write had been a no-op (N0) the read would return 0x81. */
++    wr(&f, 0x00C8, (1u << 0) | (1u << 7));              /* ICS: raise causes */
++    wr(&f, 0x00C0, (1u << 0));                          /* clear TXDW only */
++    assert(rd(&f, 0x00C0) == 0x80);                     /* TXQE survives */
++    assert(rd(&f, 0x00C0) == 0);                        /* read-to-clear */
++
++    /* ICS is QEMU's set_ics: causes OR into ICR (write-only register). */
++    wr(&f, 0x00C8, (1u << 4));                          /* RXDMT0 */
++    wr(&f, 0x00C8, (1u << 2));                          /* LSC */
++    assert(rd(&f, 0x00C0) == 0x14);
++
++    /* TDH/RDH are set_16bit registers. */
++    wr(&f, 0x3810, 0x00020003u);
++    assert(rd(&f, 0x3810) == 3);
++    wr(&f, 0x2810, 0x00020004u);
++    assert(rd(&f, 0x2810) == 4);
++    fx_done(&f);
++    printf("ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)\n");
++}
++
++static void test_tx_link_gate(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t ring = 0x100000, buf = 0x200000;
++    tx_ring_setup(&f, ring, 32);
++    tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
++
++    /* e1000_send() refuses before touching the ring when STATUS.LU is clear
++     * ("link down or TX timeout"), so the machine must keep LU readable and
++     * must still complete a descriptor the guest submitted anyway -- the
++     * device does not gate TX on the link (QEMU does not either). */
++    assert(rd(&f, 0x0008) & (1u << 1));                 /* LU on attach */
++    wr(&f, 0x0000, (1u << 0) | (1u << 6));              /* CTRL FD|SLU */
++    assert(rd(&f, 0x0008) & (1u << 1));
++    wr(&f, 0x3818, 1);
++    assert(tx_desc_status(&f, ring, 0) == 0x01);
++
++    /* CTRL.RST resets the ring registers and the assembly state. */
++    wr(&f, 0x0000, (1u << 26));
++    assert(rd(&f, 0x3808) == 0);                        /* TDLEN cleared */
++    assert(rd(&f, 0x3810) == 0);                        /* TDH cleared */
++    assert(rd(&f, 0x5400) == 0x12005452u);              /* MAC preload back */
++    fx_done(&f);
++    printf("ok e1000 tx link gate + CTRL.RST resets the TX ring\n");
++}
++
+ int main(void) {
+     test_pci_reset_contract();
+     test_rx_ingress();
++    test_tx_doorbell_completion();
++    test_tx_tctl_gate_and_doorbell();
++    test_tx_multidescriptor_and_wrap();
++    test_interrupt_register_semantics();
++    test_tx_link_gate();
+     printf("test-net: all tests passed\n");
+     return 0;
+ }
+-- 
+2.47.3
+

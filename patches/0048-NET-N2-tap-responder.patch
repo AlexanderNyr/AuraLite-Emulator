@@ -1,0 +1,3983 @@
+From 6c2ee3d3164555038be17dcc67ba1d7d21433e14 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:37:36 +0000
+Subject: [PATCH] N2 update
+
+---
+ .gitignore                               |    4 +
+ CHANGELOG.md                             |  133 ++
+ Makefile                                 |   28 +-
+ README.md                                |   22 +
+ ROADMAP.md                               |    2 +-
+ docs/STATUS.md                           |   49 +
+ docs/plans/NET_PLAN.md                   |  291 ++++-
+ patches/0047-NET-N1-e1000-tx-ready.patch | 1495 ++++++++++++++++++++++
+ tests/integration/n2_responder.sh        |  222 ++++
+ tests/nic_net.c                          |  552 ++++++++
+ tests/nic_net.ld                         |   33 +
+ tests/test_tap_responder.py              |  481 +++++++
+ tools/tap_responder.py                   |  485 +++++++
+ 13 files changed, 3781 insertions(+), 16 deletions(-)
+ create mode 100644 patches/0047-NET-N1-e1000-tx-ready.patch
+ create mode 100755 tests/integration/n2_responder.sh
+ create mode 100644 tests/nic_net.c
+ create mode 100644 tests/nic_net.ld
+ create mode 100755 tests/test_tap_responder.py
+ create mode 100755 tools/tap_responder.py
+
+diff --git a/.gitignore b/.gitignore
+index 3d7c22c..c27a585 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,6 +4,7 @@
+ /disk/*.bin
+ /disk/*.img
+ /tests/kload_fixture.elf
++/tests/nic_net.elf
+ 
+ # Emulator output
+ *.ppm
+@@ -16,3 +17,6 @@
+ .vscode/
+ .idea/
+ x86emu-asan
++
++# Python bytecode (tests/test_tap_responder.py imports tools/tap_responder.py)
++__pycache__/
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8225e23..df23088 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,139 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0048 (NET N2, host responder: DHCP + ARP + ICMP)
++
++- **`tools/tap_responder.py`** (new, 485 lines, stdlib only): the host
++  side of the `--tap=` socket. It binds the ground-rule endpoint
++  `UDP 127.0.0.1:8080` and answers the three protocols the frozen guest
++  speaks — DHCP DISCOVER→OFFER and REQUEST→ACK, ARP who-has for the
++  gateway, ICMP echo → echo reply — with slirp's user-mode addressing
++  taken from the guest's own source (`kernel/net/net.c:39-47`): guest
++  `10.0.2.15`, gateway/DHCP server `10.0.2.2`, DNS `10.0.2.3`, lease
++  3600 s. It is **stateless** (no lease table, no ARP cache, no
++  sequence numbers), so two instances and a replayed frame answer
++  identically — both pinned by vectors. Option order is slirp's
++  (`53, 54, 51, 1, 3, 6, END`), the DHCP replies are broadcast at L2
++  *and* L3, the ARP reply is broadcast, the echo reply is unicast and
++  returns all 32 payload bytes unchanged. Flags: `--mode=slirp|capture`
++  (`capture` = N1's record-only lane), `--gw-mac`, `--udp-checksum`
++  (off by default — the guest sends 0 and validates nothing),
++  `--drop=arp,icmp,dhcp` (the NC lever), `--out`, `--count`,
++  `--timeout`, `--quiet`. Closes defect **D3**.
++- **`tests/test_tap_responder.py`** (new, 481 lines, `make
++  test-tap-responder`, RC=0): 9 vectors. The test builds its requests
++  with a *second, independent* transcription of `net.c`'s builders and
++  feeds the replies back through a transcription of `net.c`'s own
++  accept filters, so a reply passes only if the guest would accept it —
++  including the details that are easy to get right-looking and wrong:
++  DISCOVER is **287** bytes (`14+20+8+236+3+5+1`), UDP checksum **0**,
++  ports `68→67`, ARP padded to 60, ICMP 74 bytes with payload
++  `0x41..0x60`, the ACK path checks `xid` while the ARP path checks
++  only `opcode == 2` and copies `sender_mac` verbatim.
++- **`tests/nic_net.c` + `tests/nic_net.ld`** (new, 552 + 33 lines): the
++  wire payload, a freestanding x86_64 guest stand-in that rides the
++  **K1 kernel-load transport** (`--kernel=`) instead of N1's
++  firmware-boot one. The reason is measured: the firmware loader
++  delivers a single 512-byte block from LBA 0 and its long-mode map
++  covers only `0x100000..0x1FFFFF` (`PD[0] = 0x19B`, 2 MiB page), while
++  DHCP + ARP + ICMP plus a 64-deep RX ring need more code and more
++  address space; `--kernel=` gives identity 0..4 GiB + HHDM and entry
++  in long mode with paging on. It reproduces the frozen guest's driver
++  where it matters — rings programmed as `e1000_init` steps 6/7 do
++  (`RCTL = 0x0400801a`, `MTA` all-ones, `RDT = N-1`, `RAL/RAH` + AV),
++  `nic_send` = `e1000_send` (`cmd 0x0B`, TDT doorbell, the **100000**
++  pause-spin budget from `drivers/e1000/e1000.c:565`), `nic_poll` =
++  `e1000_hw_rx_drain` — and its frames are byte-identical to `net.c`'s
++  (`xid 0x12345678`, ident `0x1234`/`0x1235`, `flags 0x8000`, ICMP
++  ident `0x1234` seq `1`, `ip.ident 1`, `ttl 64`, 60-byte pad).
++- **The wire lane** (`tests/integration/n2_responder.sh`, new, 222
++  lines, `make test-net-rx`, wired into `make test`). Lane A (×2
++  determinism pair) receipts, all four frames on the wire and nothing
++  else:
++
++  ```
++  [serial] [dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2
++  [serial] [net] ARP reply: gateway is 52:55:0a:00:02:02
++  [serial] [net] ICMP payload verified (ident+seq+32 bytes)
++  [serial] [net] PASS: lease + ARP + echo reply (payload verified)
++  [serial] N2OK
++  responder: 4 frame(s) in, replies arp=1 dhcp=2 icmp=1 ignored=0
++  ```
++
++  Lane B re-runs the same payload **without** `--tap=`: no PCI function
++  ⇒ BAR0 reads the open bus ⇒ all-ones ⇒ `STATUS.LU` *reads set*, so
++  the payload proceeds into a TX ring nobody services and reports the
++  guest's own timeout instead of hanging —
++  `[e1000] TX timeout: desc[0].status=0x00 TDH=4294967295
++  TDT=4294967295`, `[dhcp] FAIL: DISCOVER transmit failed`, `N2FAIL`.
++  Lane C (frozen guest, the DoD as the guest prints it) **SKIPs** here
++  for the same reason as in N0/N1 — the AuraLite-OS toolchain
++  (`clang --target=x86_64-elf`, `ld.lld`, `rustc`, `mtools`) is not
++  installable in this tree — and prints the exact reproduction line.
++- **NC (once per phase)** — measured on both sides:
++  1. *host-side, lane D, runs every time*: `--drop=arp,icmp,dhcp` ⇒
++     `[drop] DHCP message type 1 (negative control)`,
++     `replies arp=0 dhcp=0 icmp=0 ignored=0`, guest
++     `[dhcp] FAIL: no OFFER received` / `[net] FAIL: no DHCP lease` /
++     `N2FAIL`, exactly **1** frame on the wire (the DISCOVER). The
++     harness asserts every line and exits 1 if any is missing.
++  2. *emulator-side, by hand* (needs a rebuilt emulator, so it is a
++     documented step rather than a lane that quietly rebuilds the tree):
++     removing `mem_write(m, desc + 8, 2, len);` — the RX descriptor
++     **length** writeback, `src/e1000.c:372` — flips lane A to
++     `[dhcp] FAIL: no OFFER received` / `[net] FAIL: no DHCP lease` /
++     `N2FAIL` while the responder still logs a complete
++     DISCOVER/OFFER/REQUEST/ACK/ARP/ICMP exchange. Restored from
++     backup, gates re-green. **Not** a valid control, and this is the
++     phase's most useful measurement: removing the *DD* writeback at
++     `src/e1000.c:373` leaves the run **green** (`N2OK`), because
++     `e1000_hw_rx_drain` gates on `pkt_len > 0` and never looks at DD.
++     `tests/nic_net.c` now additionally requires DD (a strictly tighter
++     gate than the guest's, so it cannot pass on an emulator that
++     publishes a stale length with no completion), and the comment in
++     `nic_poll` records why the control had to move.
++- **A bug the wire found that no protocol vector could**: the responder
++  first replied with `sendto(reply, (host, port))` — to the endpoint it
++  had *bound*, which is the endpoint the emulator `connect()`ed **to**,
++  so every reply went to the responder's own socket. Its log looked
++  perfect (`DISCOVER → OFFER 10.0.2.15`) next to a guest printing
++  `[dhcp] FAIL: no OFFER received`. Fixed to reply to the peer address
++  `recvfrom` reports, and locked by
++  `test_reply_goes_to_the_peer_not_to_the_endpoint`, which drives the
++  real tool over a real connected socket; reintroducing the bug fails 3
++  of its 4 checks (measured).
++- **Measured**: `make test` RC=0 (now including `test-tap-responder` +
++  `test-net-rx`; `test-net-tx` re-run green in the same invocation, and
++  the boot integration receipts untouched — `[usb-msc] READ(10) LBA=0
++  blocks=1`, `GUEST_OK`, `framebuffer marker OK:
++  pixel[0]=0x00200000`); `make test-sanitize` RC=0 (ASan+UBSan);
++  `make fuzz FUZZ_PROGRAMS=256` — `256 programs, 6144 instructions
++  compared -- all states match`, `crash invariant: 64 garbage streams,
++  33 clean faults, 2 halts, 0 host-level crashes`. **No emulator source
++  changed in N2** — `git status --porcelain src/` is empty, so every
++  historical lane is byte-stable by construction. Lane A/B/D artifact
++  shas are in `docs/plans/NET_PLAN.md` N2.
++- **New ledger entry D7** — the gateway's MAC is *not measurable* here:
++  slirp's convention is `52:55:` + the gateway's four IP bytes
++  (`52:55:0a:00:02:02` for `10.0.2.2`), but libslirp's `bootp.c` was
++  unreachable from this sandbox (four mirrors tried — qemu master,
++  v5.2.0, v4.2.0, gitlab.freedesktop.org — all 404 or access-blocked)
++  and no QEMU binary is installed to trace. It gates nothing (the
++  guest's ARP accept path checks only length, ethertype and
++  `opcode == 2`), so the value is quarantined behind `--gw-mac`.
++- **Docs**: `docs/plans/NET_PLAN.md` (N2 ✅ with the measured protocol
++  contract from `kernel/net/net.c`, D3 closed, **D7** added, and a
++  correction — the DoD receipt this plan used to quote,
++  `[net] PASS: lease + ARP + echo reply (payload verified)`, is from
++  `kernel/arch/i386/net32.c:319`, the **i386** port; the x86_64 guest
++  never prints it. N2's real receipts are the two the guest's own
++  integration cases assert: `[dhcp] PASS: IP 10.0.2.15, gateway
++  10.0.2.2` (`test_e1000e.sh:48`, `test_vmxnet3.sh:49`) and `[net]
++  PASS: ping 10.0.2.2 successful` (`net.c:1190`, `test_e1000e.sh:50`,
++  `test_vmxnet3.sh:51`, `scripts/ci_test.sh:72`). The payload prints
++  the i386 line too, as an *extra* receipt on top of the real ones),
++  ROADMAP + `docs/STATUS.md` + README sync.
++
+ ### Added — patch 0047 (NET N1, e1000 TX-ready)
+ 
+ - **The TX ring** (`src/e1000.c`): the doorbell walk `e1000_start_xmit`
+diff --git a/Makefile b/Makefile
+index 4e1b020..b58f7d1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-tap-responder
+ all: x86emu
+ 
+ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
+@@ -98,7 +98,31 @@ test-net-tx: x86emu firmware/firmware.bin tests/nic_tx.asm \
+              tests/integration/n1_tx_tap.sh tests/integration/n1_tap_responder.py
+ 	sh tests/integration/n1_tx_tap.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-boot test-net-tx
++# NET N2: the RX wire lane + the host responder.  tools/tap_responder.py is the
++# host side of the --tap= socket: it holds slirp's user-mode addressing (guest
++# 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3) and answers exactly the three
++# protocols the frozen guest speaks.  Its protocol vectors are pure Python -- no
++# sockets, no emulator -- so test-tap-responder runs everywhere python3 does.
++# The wire payload rides the K1 kernel-load transport (--kernel=), not N1's
++# firmware-boot single 512-byte block: DHCP + ARP + ICMP together are far more
++# than 512 bytes of code, and the firmware memory map (RAM 0x100000-0x1FFFFF
++# only) leaves no room for a 64-deep RX ring.  tests/nic_net.c reproduces the
++# frozen guest's own protocol code, byte for byte on the wire, from
++# AuraLite-OS@0ed0d29 kernel/net/net.c and drivers/e1000/e1000.c.
++tests/nic_net.elf: tests/nic_net.c tests/nic_net.ld
++	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
++	    -mcmodel=kernel -mno-sse -mno-sse2 -mno-mmx -mno-red-zone -nostdlib -no-pie \
++	    -Wl,-z,max-page-size=0x1000 -T tests/nic_net.ld \
++	    tests/nic_net.c -o $@
++
++test-tap-responder: tools/tap_responder.py tests/test_tap_responder.py
++	python3 tests/test_tap_responder.py
++
++test-net-rx: x86emu tests/nic_net.elf tools/tap_responder.py \
++             tests/test_tap_responder.py tests/integration/n2_responder.sh
++	sh tests/integration/n2_responder.sh
++
++test: test-unit test-table test-kload test-ring3 test-boot test-net-tx test-tap-responder test-net-rx
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+diff --git a/README.md b/README.md
+index 9d8e3d5..933be81 100644
+--- a/README.md
++++ b/README.md
+@@ -67,6 +67,28 @@ It needs `nasm` and `python3`, and the fixed endpoint `UDP
+ The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
+ an AuraLite-OS build.
+ 
++`make test` also runs the NET RX lane and the responder's protocol
++vectors (`make test-net-rx`, `make test-tap-responder`).
++`tools/tap_responder.py` is the host side of the TAP socket: it answers
++DHCP, ARP and ICMP echo with slirp's user-mode addressing (guest
++`10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`) so a guest can actually
++get a lease and ping its gateway. `tests/nic_net.c` is a freestanding
++x86_64 payload that reproduces the guest's own protocol code and rides
++the `--kernel=` load lane; twice, byte-identical, it prints
++`[dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2` and `[net] PASS: lease +
++ARP + echo reply (payload verified)`. Run the responder by hand with:
++
++```sh
++python3 tools/tap_responder.py --timeout 30          # answers DHCP/ARP/ICMP
++python3 tools/tap_responder.py --mode=capture --out frames.hex   # record only
++python3 tools/tap_responder.py --drop=arp,icmp,dhcp  # the negative control
++```
++
++It needs `python3` and the endpoints `UDP 127.0.0.1:8080`/`:8081` free;
++`--gw-mac` overrides the gateway MAC (see ledger **D7** in
++`docs/plans/NET_PLAN.md`: that value follows slirp's published
++convention but could not be measured here).
++
+ ## Architecture
+ 
+ `src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 9bc43be..da4d8e0 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -30,7 +30,7 @@ maps to exactly one plan below.
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ done (V0–V3) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
+-| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0–N1 done ✅ — RX-ready e1000 + TAP ingress, TX ring measured end-to-end on the wire; N2–N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
++| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0–N2 done ✅ — RX-ready e1000 + TAP ingress, TX ring measured end-to-end on the wire, host responder answering DHCP+ARP+ICMP so the lease/ping receipts are reachable with no emulator source change; N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 4d233ea..96605e2 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -89,6 +89,55 @@
+   INTx line (no PCI cfg `0x3C`, no ack path — a raised line would strand
+   the 8259A ISR bit under a polling guest), TX statistics counters,
+   context/TSO descriptors, VLAN and `CMD.IFCS` FCS insertion.
++- The NET plan's N2 (host responder) is measured — and it needed **no
++  emulator source change at all** (`git status --porcelain src/` empty),
++  so every historical lane is byte-stable by construction.
++  `tools/tap_responder.py` holds the ground-rule endpoint
++  `UDP 127.0.0.1:8080` and answers DHCP (DISCOVER→OFFER,
++  REQUEST→ACK), ARP who-has for the gateway and ICMP echo, with slirp's
++  user-mode addressing read out of the guest's own source
++  (`kernel/net/net.c:39-47`: guest `10.0.2.15`, gateway `10.0.2.2`, DNS
++  `10.0.2.3`).  It is stateless — no lease table, no ARP cache, no
++  sequence numbers — so two instances and a replayed frame answer
++  identically.  `tests/test_tap_responder.py` runs 9 vectors
++  (`make test-tap-responder`) that build requests with a second,
++  independent transcription of `net.c`'s builders and feed the replies
++  back through `net.c`'s own accept filters.  The wire lane
++  (`make test-net-rx` → `tests/integration/n2_responder.sh`) runs
++  `tests/nic_net.c` — a freestanding x86_64 guest stand-in on the **K1
++  kernel-load transport**, chosen over N1's firmware-boot one because
++  that delivers a single 512-byte block and maps only
++  `0x100000..0x1FFFFF` (`PD[0] = 0x19B`), too little for DHCP+ARP+ICMP
++  plus a 64-deep RX ring.  Twice, byte-identical (serial tape
++  `d5ac2cb1ccdb76af…`, the four wire frames `3b6de9b8de3ab3c4…`,
++  responder log `2c0075bf2856b66d…`): `[dhcp] PASS: IP 10.0.2.15,
++  gateway 10.0.2.2`, `[net] ARP reply: gateway is 52:55:0a:00:02:02`,
++  `[net] ICMP payload verified (ident+seq+32 bytes)`, `[net] PASS:
++  lease + ARP + echo reply (payload verified)`, `N2OK`, and
++  `responder: 4 frame(s) in, replies arp=1 dhcp=2 icmp=1 ignored=0`.
++  The same payload without `--tap=` reports the guest's own timeout
++  rather than hanging (`[e1000] TX timeout: desc[0].status=0x00
++  TDH=4294967295 TDT=4294967295` → `N2FAIL`), because an open-bus BAR0
++  reads all-ones and `STATUS.LU` therefore *reads set*.  NC is measured
++  on both sides: `--drop=arp,icmp,dhcp` (lane D, runs every time) gives
++  `replies arp=0 dhcp=0 icmp=0`, exactly one wire frame and
++  `[dhcp] FAIL: no OFFER received` / `N2FAIL`; removing the RX
++  descriptor **length** writeback (`src/e1000.c:372`) by hand gives the
++  same failure while the responder still logs a full exchange.  The
++  phase's most useful measurement is what is *not* a control: removing
++  the **DD** writeback (`src/e1000.c:373`) leaves the run green, because
++  `e1000_hw_rx_drain` gates on `pkt_len > 0` and never inspects DD — the
++  payload now requires DD anyway (strictly tighter than the guest) and
++  says so in a comment.  New ledger entry **D7**: the gateway MAC
++  follows slirp's `52:55:` + IP-bytes convention but could not be
++  measured (libslirp unreachable from this sandbox, four mirrors tried),
++  gates nothing, and is pinned behind `--gw-mac`.  `make test` (now
++  incl. `test-tap-responder` + `test-net-rx`, with `test-net-tx`
++  re-green), `make test-sanitize` and `make fuzz FUZZ_PROGRAMS=256`
++  (`6144 instructions compared -- all states match`, `0 host-level
++  crashes`) stay green.  Still not modelled: the INTx line (**D4**),
++  DNS/TCP receipts (N3), DHCP lease state and renewal, ICMP other than
++  echo, IPv6.
+ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
+ - A framebuffer is available as `framebuffer.ppm`.
+ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
+diff --git a/docs/plans/NET_PLAN.md b/docs/plans/NET_PLAN.md
+index b0f3954..5bd228a 100644
+--- a/docs/plans/NET_PLAN.md
++++ b/docs/plans/NET_PLAN.md
+@@ -32,20 +32,34 @@ kernel (`kernel.elf` sha256 `395e5ec02bf39cc5…`, 3051512 B).
+    `RXCSUM` reads 0, `CTRL.RST` (bit 26) self-clears (the guest polls
+    on it).
+ 
+-**Status: in progress — N0–N1 ✅, N2–N3 planned 📋**
++**Status: in progress — N0–N2 ✅, N3 planned 📋**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | N0 | Measured baseline + this plan; the RX-ready e1000 (PCI `8086:100E` at 0:4:0 + BAR0 `0xFEBC0000`/128 KiB + reset contract + RX ring DMA) + TAP ingress (`--tap=`) | ✅ done | `patches/0046-NET-N0-e1000-rx-ready.patch` |
+ | N1 | TX-ready: the TDT doorbell → TDH walk → TAP datagrams (`TCTL.EN`), TX descriptor completion (the guest's `[e1000] TX timeout` receipts gone) | ✅ done | `patches/0047-NET-N1-e1000-tx-ready.patch` |
+-| N2 | Host responder on the TAP endpoint (DHCP + ARP + ICMP, the QEMU `-netdev user` receipt shape) so the guest's online self-tests pass | 📋 | `patches/0048-NET-N2-tap-responder.patch` |
++| N2 | Host responder on the TAP endpoint (DHCP + ARP + ICMP, the QEMU `-netdev user` receipt shape) so the guest's online self-tests pass | ✅ done | `patches/0048-NET-N2-tap-responder.patch` |
+ | N3 | End-to-end close-out: determinism ×2, sanitize, docs close-out (plan closed) | 📋 | `patches/0049-NET-N3-net-e2e.patch` |
+ 
+ Note: the *guest* runs its own online self-tests (`net_self_test`:
+ DHCP → ARP → ICMP echo; then DNS/TCP checks when the lease path is
+ live). This plan closes the **emulator's NIC + TAP** gaps those tests
+-assume; `[net] PASS: lease + ARP + echo reply (payload verified)` is the
+-N2 acceptance receipt.
++assume. N2's acceptance receipts are the two the frozen guest's own
++integration cases assert — `[dhcp] PASS: IP 10.0.2.15, gateway
++10.0.2.2` (`AuraLite-OS/tests/integration/cases/test_e1000e.sh:48`,
++`test_vmxnet3.sh:49`) and `[net] PASS: ping 10.0.2.2 successful (ICMP
++echo reply received)` (printed at `kernel/net/net.c:1190`, asserted at
++`test_e1000e.sh:50`, `test_vmxnet3.sh:51`, and `scripts/ci_test.sh:72`).
++
++*Correction, measured in N2:* earlier revisions of this note quoted
++`[net] PASS: lease + ARP + echo reply (payload verified)` as the N2
++receipt. That line exists, but in `kernel/arch/i386/net32.c:319` — the
++**i386** port, not the x86_64 kernel this emulator boots. The x86_64
++guest never prints it, so a harness that grepped for it would have
++passed against nothing. `tests/nic_net.c` prints it anyway, because that
++payload reproduces the i386 port's *stronger* check (the reply's ident,
++seq and all 32 payload bytes) as an extra receipt on top of the two the
++x86_64 guest actually emits.
+ 
+ ## 1. Measured baseline (N0 entry state)
+ 
+@@ -141,8 +155,11 @@ buffer.
+   shows it whenever the device is absent:
+   `N1TXFAIL status=00 tdh=ff icr=ff`), and the post-fix receipt is
+   `N1TXOK status=01 tdh=01 icr=81` plus the frame on the socket.
+-- **D3 — no host responder** (deferred to N2): DHCP/ARP/ICMP go
+-  unanswered, so the online self-tests cannot pass.
++- **D3 — no host responder** (fixed by N2): DHCP/ARP/ICMP went
++  unanswered, so the online self-tests could not pass. N2 adds
++  `tools/tap_responder.py` on the ground-rule endpoint and measures the
++  receipts in §N2 below; `--drop=arp,icmp,dhcp` reproduces the old
++  behaviour on demand (that is lane D, the phase's NC).
+ - **D4 — the INTx line is not wired** (measured in N1, deliberately
+   *not* fixed there): `e1000_add` does not seed PCI config `0x3C`
+   (interrupt line) and nothing emulates INTA#/ack, so the guest reads
+@@ -174,6 +191,23 @@ buffer.
+   `TDT` (shares TCTL's op: store, mask TDT to 16 bits, `start_xmit`).
+   No N0 vector pinned the old behaviour, so the change is safe;
+   `ok e1000 interrupt/register write-op parity` now pins the new one.
++- **D7 — the gateway's MAC address is not measurable** (found in N2,
++  *not* fixed, pinned behind a flag): the responder has to put some
++  source MAC on the DHCP OFFER/ACK and on the ARP reply, and slirp's
++  convention is `52:55:` followed by the gateway's four IP bytes —
++  `52:55:0a:00:02:02` for `10.0.2.2`. That is what QEMU/libslirp are
++  widely documented to emit, but it could not be **measured** here:
++  libslirp's `bootp.c` was unreachable from this sandbox (four mirrors
++  tried — `raw.githubusercontent.com/qemu/qemu` at master, v5.2.0 and
++  v4.2.0, and `gitlab.freedesktop.org/slirp/libslirp` — all 404 or
++  access-blocked), and no QEMU binary is installed to trace. It does not
++  gate anything: the guest's ARP accept path (`net.c:441-465`) checks
++  only `len >= 42`, ethertype `0x0806` and `opcode == 2`, then copies
++  `sender_mac` verbatim — it never compares the target IP either. So the
++  value is a wire-detail guess, quarantined behind `--gw-mac` (default
++  `52:55:0a:00:02:02`) so that whoever can measure it against a real
++  `qemu -netdev user` fixes one flag and no code. Recorded here rather
++  than asserted in prose.
+ 
+ ## 2. Phases
+ 
+@@ -429,14 +463,245 @@ statistics counters (`TPT`/`TOTL`/`GPTC`/`PTC*`, QEMU's `xmit_seg` +
+ but the wire frame is what the buffer held, which is also what QEMU's
+ `e1000_send_packet` hands its backend.
+ 
+-### N2 — Host responder (DHCP + ARP + ICMP) — 📋 planned
++### N2 — Host responder (DHCP + ARP + ICMP) — ✅ done (`patches/0048-NET-N2-tap-responder.patch`)
+ 
+-A host-side responder bound to `127.0.0.1:8080` answering the guest's
+-DHCP discovery with a lease, ARP for the gateway, and ICMP echo (the
+-QEMU `-netdev user` receipt shape the guest already names). DoD: the
+-guest's online self-tests print `[net] PASS: lease + ARP + echo reply
+-(payload verified)` end-to-end through the TAP socket; determinism ×2;
+-NC + sanitize.
++**Implementation** (`tools/tap_responder.py`, 485 lines): a
++single-file, stdlib-only host responder bound to the ground-rule
++endpoint `UDP 127.0.0.1:8080`. It is deliberately **stateless** — it
++keeps no lease table, no ARP cache and no sequence numbers, so two
++instances answer identically and replaying a frame answers identically
++(both are pinned below). It answers exactly the three protocols the
++frozen guest speaks and nothing else:
++
++| protocol | accepted when | answered with |
++|---|---|---|
++| DHCP | `udp.sport == 68 and dport == 67`, option 53 ∈ {1, 3}, `xid` echoed | OFFER (53=2) / ACK (53=5), `yiaddr 10.0.2.15`, options `53, 54, 51, 1, 3, 6, END` in slirp's order, broadcast at L2 **and** L3 |
++| ARP | ethertype `0x0806`, `opcode == 1`, `target_ip == 10.0.2.2` | reply `opcode 2`, `sender_mac = --gw-mac`, broadcast (slirp's shape) |
++| ICMP | ethertype `0x0800`, `ip.protocol == 1`, `icmp.type == 8` | `type 0` echo reply, ident/seq/`ip.ident` preserved, 32 payload bytes returned unchanged, unicast |
++
++Addressing is slirp's user-mode scheme, taken from the guest's own
++source rather than assumed (`kernel/net/net.c:39-47`): guest
++`10.0.2.15`, gateway/DHCP server `10.0.2.2`, DNS `10.0.2.3`, lease
++3600 s. Flags: `--mode=slirp|capture` (`capture` is N1's record-only
++lane), `--gw-mac` (ledger **D7**), `--udp-checksum` (off by default —
++the guest sends 0 and validates nothing), `--drop=arp,icmp,dhcp` (the
++NC lever), `--out`, `--count`, `--timeout`, `--quiet`.
++
++*One bug the wire found that no protocol vector could:* the first
++version replied with `sendto(reply, (host, port))` — i.e. to the
++endpoint it had **bound**, which is the endpoint the emulator
++`connect()`ed *to*. The reply went to the responder's own socket. The
++host log looked perfect (`DISCOVER → OFFER 10.0.2.15`) while the guest
++printed `[dhcp] FAIL: no OFFER received`. Fixed to reply to the peer
++address `recvfrom` reports, and locked by
++`test_reply_goes_to_the_peer_not_to_the_endpoint`, which drives the real
++tool over a real connected socket and fails 3 of its 4 checks when the
++bug is reintroduced (measured).
++
++**Protocol vectors** (`tests/test_tap_responder.py`, 481 lines,
++`make test-tap-responder`, RC=0): the test builds its requests with a
++*second, independent* implementation of `net.c`'s builders, then feeds
++the replies back through a transcription of `net.c`'s own accept
++filters — so a reply only passes if the guest would accept it. 9
++vectors:
++
++```
++test_frames_match_the_guest_builder      DISCOVER is 287 B, IP checksum 0,
++                                         UDP checksum 0, 68→67; ARP padded to
++                                         60; ICMP 74 B with 0x41..0x60
++test_arp_reply                           guest filter passes; sender_mac is
++                                         the gw MAC; an ARP *reply* from the
++                                         guest is not answered (no loop)
++test_dhcp_discover_offer                 op=2, chaddr/xid echoed, yiaddr
++                                         10.0.2.15, options 53/54/1/3/6/51 +
++                                         END, broadcast, ip.total_length 298
++                                         == bytes behind the eth header
++test_dhcp_request_ack                    ACK 53=5, option 3 → gateway_ip; a
++                                         different xid is rejected
++test_icmp_echo_reply                     type 0, ident 0x1234 + seq 1 + all
++                                         32 bytes unchanged, checksums 0,
++                                         src/dst swapped
++test_reply_goes_to_the_peer_not_to_the_endpoint
++                                         (see above; socket-level)
++test_determinism_and_the_drop_lever      two instances identical, replay
++                                         identical, --drop per-protocol
++test_junk_does_not_answer                runt / wrong-ethertype / wrong-port
++                                         / non-echo frames get no reply
++test-tap-responder: all tests passed
++```
++
++**The wire payload** (`tests/nic_net.c`, 552 lines +
++`tests/nic_net.ld`): a freestanding x86_64 guest stand-in that rides the
++**K1 kernel-load transport** (`--kernel=`, `src/kloader.c`) rather than
++N1's firmware-boot one. The reason is measured, not stylistic: the
++firmware loader delivers a single 512-byte block from LBA 0 and its
++long-mode map covers only `0x100000..0x1FFFFF` (`PD[0] = 0x19B`, a 2 MiB
++page), while DHCP + ARP + ICMP plus a 64-deep RX ring need both more
++code and more address space. `--kernel=` gives identity-mapped 0..4 GiB
++plus HHDM, entry in long mode with paging on.
++
++The payload reproduces the frozen guest's protocol code line for line
++where it matters — `nic_init` programs the rings exactly as
++`e1000_init` steps 6/7 do (`RDLEN = N*16`, `RDH = 0`, `RDT = N-1`,
++`MTA[0..127] = 0xFFFFFFFF`, `RCTL = EN|SECRC|BAM|MPE|UPE = 0x0400801a`,
++`RAL/RAH` with AV), `nic_send` is `e1000_send` including `cmd 0x0B`
++(EOP|IFCS|RS), the TDT doorbell and the **100000** pause-spin budget
++(`drivers/e1000/e1000.c:565`), and `nic_poll` is `e1000_hw_rx_drain`
++(RDH delta, `length` from the descriptor, `status = 0`, `RDT` re-armed).
++Rings and buffers sit at fixed physical addresses (`0x300000`/
++`0x310000`/`0x340000`/`0x350000`). The DHCP, ARP and ICMP frames it
++emits are byte-identical to what `net.c` builds, including `xid
++0x12345678`, ident `0x1234`/`0x1235`, `flags 0x8000`, ICMP ident
++`0x1234` seq `1`, `ip.ident 1`, `ttl 64` and the 60-byte pad.
++
++*One fidelity gap this closed, and it changes what the NC can be:* the
++first `nic_poll` consumed a descriptor on the RDH delta alone, exactly
++like the guest does. That made N2's planned emulator-side negative
++control — removing `e1000_rx_frame`'s DD writeback
++(`src/e1000.c:373`) — **inert**: the run still printed `N2OK`. Reading
++`e1000_hw_rx_drain` again shows why — the guest gates on `pkt_len > 0`,
++not on DD, so a missing DD genuinely does not break it. Two consequences,
++both now in the tree: the stand-in additionally requires DD (a strictly
++tighter gate than the guest's, so it cannot pass on an emulator that
++publishes a stale length with no completion), and the phase's
++emulator-side control removes the **length** writeback
++(`src/e1000.c:372`) instead, which does fail.
++
++**NC (once per phase)** — two measurements, one host-side (a lane) and
++one emulator-side (documented, because it needs a rebuilt emulator):
++
++1. *Host-side, lane D of the harness.* `--drop=arp,icmp,dhcp`: the
++   responder logs `[drop] DHCP message type 1 (negative control)` and
++   `replies arp=0 dhcp=0 icmp=0 ignored=0`, the guest degrades to its
++   first timeout and stops — `[dhcp] FAIL: no OFFER received`,
++   `[net] FAIL: no DHCP lease`, `N2FAIL`, exactly one frame on the wire
++   (the DISCOVER). The harness asserts all of it and exits 1 if any of
++   it is missing.
++2. *Emulator-side, by hand.* Removing
++   `mem_write(m, desc + 8, 2, len);` from `e1000_rx_frame`
++   (`src/e1000.c:372`) — the RX descriptor length writeback, which is
++   the field the guest actually reads — flips lane A to
++   `[dhcp] FAIL: no OFFER received` / `[net] FAIL: no DHCP lease` /
++   `N2FAIL`, while the responder still logs a complete DISCOVER/OFFER,
++   REQUEST/ACK, ARP and ICMP exchange (the frames leave the guest fine;
++   only the completion is lost). Restored from backup, gates re-green.
++   *Not* a valid control: removing the DD writeback at `:373` — see
++   above, measured `N2OK` either way.
++
++**Lanes** (`make test-net-rx` → `tests/integration/n2_responder.sh`,
++222 lines; needs `python3` + a C compiler and the endpoints
++`UDP 127.0.0.1:8080`/`:8081` free — SKIPs, exit 0, when python3 is
++missing):
++
++- **Lane A (wire, ×2 determinism pair).**
++  `tests/nic_net.elf` + `tools/tap_responder.py`:
++
++  ```
++  [serial] [dhcp] starting DHCP discovery...
++  [serial] [dhcp] DISCOVER sent (xid=0x12345678)
++  [serial] [dhcp] OFFER: IP 10.0.2.15, server 10.0.2.2
++  [serial] [dhcp] REQUEST sent (requesting 10.0.2.15)
++  [serial] [dhcp] subnet mask: 255.255.255.0
++  [serial] [dhcp] DNS server: 10.0.2.3 (1 total)
++  [serial] [dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2
++  [serial] [net] ARP request sent for 10.0.2.2
++  [serial] [net] ARP reply: gateway is 52:55:0a:00:02:02
++  [serial] [net] ICMP echo request sent to 10.0.2.2
++  [serial] [net] ICMP echo reply received from 10.0.2.2 (seq 1)
++  [serial] [net] ICMP payload verified (ident+seq+32 bytes)
++  [serial] [net] PASS: lease + ARP + echo reply (payload verified)
++  [serial] N2OK
++  ```
++
++  and the responder's own log:
++
++  ```
++  responder: mode=slirp bound 127.0.0.1:8080 gw-ip=10.0.2.2 gw-mac=52:55:0a:00:02:02
++    DHCP DISCOVER xid=0x12345678 chaddr=52:54:00:12:34:56 -> OFFER 10.0.2.15
++    DHCP REQUEST xid=0x12345678 for 10.0.2.15 -> ACK 10.0.2.15
++    ARP  who-has 10.0.2.2 tell 10.0.2.15 -> reply 10.0.2.2 is at 52:55:0a:00:02:02
++    ICMP echo request from 10.0.2.15 (id 0x1234 seq 1, 32 payload bytes) -> echo reply
++  responder: 4 frame(s) in, replies arp=1 dhcp=2 icmp=1 ignored=0
++  ```
++
++  Exactly **four** frames reach the wire, and they are the guest's,
++  byte for byte — the harness asserts the count and the two-run `cmp`:
++
++  | # | frame (hex) | what it is |
++  |---|---|---|
++  | 1 | `ffffffffffff5254001234560800450001111234…638253633501013703010306ff` (287 B) | DISCOVER: `ip.ident 0x1234`, `udp 68→67 len 0x00fd csum 0`, `xid 12345678`, `flags 0x8000`, `chaddr 52:54:00:12:34:56`, cookie + `53=1`, `55=[1,3,6]`, END |
++  | 2 | `ffffffffffff5254001234560800450001181235…6382536335010332040a00020f36040a000202ff` (294 B) | REQUEST: `ip.ident 0x1235`, `udp len 0x0104`, `53=3`, `50=10.0.2.15`, `54=10.0.2.2`, END |
++  | 3 | `ffffffffffff525400123456080600010800060400015254001234560a00020f00ff000000000a000202…` (60 B) | ARP who-has `10.0.2.2` tell `10.0.2.15`, padded |
++  | 4 | `52550a00020252540012345608004500003c00010000400162b00a00020f0a0002020800e0b512340001 4142…5f60` (74 B) | ICMP echo request, ident `0x1234` seq `1`, payload `0x41..0x60` |
++
++- **Lane B (opt-in ground rule).** The same payload **without**
++  `--tap=`: no PCI function exists, BAR0 reads hit the open bus and
++  return all-ones — which means `STATUS.LU` *reads set*, so the payload
++  proceeds into a TX ring nobody services and reports the guest's own
++  timeout rather than hanging:
++
++  ```
++  [serial] [e1000] TX timeout: desc[0].status=0x00 TDH=4294967295 TDT=4294967295
++  [serial] [dhcp] FAIL: DISCOVER transmit failed (link down or TX timeout)
++  [serial] [net] FAIL: no DHCP lease
++  [serial] N2FAIL
++  ```
++
++  (`4294967295` is `0xFFFFFFFF`, the open-bus read, printed with the
++  guest's own `%u` formatting.) This is the pin that keeps every
++  historical no-NIC lane byte-stable.
++
++- **Lane C (frozen-guest receipts) — SKIP in this tree.** The DoD as the
++  real guest prints it: `[net] using NIC: e1000`, `[dhcp] PASS: IP
++  10.0.2.15, gateway 10.0.2.2`, `[net] PASS: ping 10.0.2.2 successful
++  (ICMP echo reply received)`, and the absence of `[e1000] TX timeout`.
++  As in N0/N1, the AuraLite-OS toolchain (`clang --target=x86_64-elf`,
++  `ld.lld`, `rustc`, `mtools`) is not installable here, so the harness
++  prints the reproduction line instead of failing:
++
++  ```
++  KERNEL=/home/user/AuraLite-OS/build/kernel.elf \
++  INITRD=/home/user/AuraLite-OS/build/initrd.tar \
++      tests/integration/n2_responder.sh
++  ```
++
++- **Lane D (negative control).** See NC 1 above; it runs every time.
++
++Determinism: lane A run twice, serial tape + wire frames + responder log
++all byte-identical (`cmp` clean; harness workdir `/tmp/n2-responder`).
++The serial tape embeds the `--kernel=` path, so the shas below are for
++the harness-built payload:
++
++| Artifact | sha256 |
++|---|---|
++| `a1.log` = `a2.log` (lane A serial tape) | `d5ac2cb1ccdb76afa317675cdd45f94dbe2ae894349d7d5366af8a73a4e6e0fd` |
++| `a1-frames.hex` = `a2-frames.hex` (the 4 wire frames) | `3b6de9b8de3ab3c424e337c722bf7450946594ff4b4fe98363b854c08255ed73` |
++| `a1-resp.out` = `a2-resp.out` (responder log) | `2c0075bf2856b66dfa094eb5e44cb51a80b31524fe030e52c0fc30c355737a28` |
++| `b1.log` (lane B serial tape) | `6f85467f92d284897acc93859a34fcd9a359577758d3bc9b7b18b602af4f2ca3` |
++| `d1.log` (lane D / NC serial tape) | `d952b38fa0446abfb789231a1be432f49cc5bd4754453dbaabdcbe432a5ee09b` |
++| `tests/nic_net.elf` (payload, 15968 B) | `f96d60069b94771fa7047f9001892f82ed20db3e60dae3dd796afd33bb47b01d` |
++
++The wire-frame sha is stable across payload rebuilds and was already
++`3b6de9b8…` before the `nic_poll` DD gate went in — the frames on the
++wire did not change, only what the payload is willing to accept.
++
++**Gates**: `make test` RC=0 (now including `test-tap-responder` and
++`test-net-rx`; `test-net-tx` re-run green in the same invocation, and
++the boot integration receipts untouched — `[usb-msc] READ(10) LBA=0
++blocks=1`, `GUEST_OK`, `framebuffer marker OK: pixel[0]=0x00200000`);
++`make test-sanitize` RC=0 (ASan+UBSan); `make fuzz FUZZ_PROGRAMS=256` —
++`256 programs, 6144 instructions compared -- all states match`,
++`crash invariant: 64 garbage streams, 33 clean faults, 2 halts, 0
++host-level crashes`. No emulator source changed in N2, so the
++`src/` tree is byte-identical to N1's (`git status --porcelain src/`
++empty).
++
++**Not in N2** (measured, deferred): the INTx line (**D4**), DNS and TCP
++receipts (N3 — the responder answers no UDP/53 and no SYN), DHCP lease
++state / renewal / `DECLINE` handling (the responder is stateless by
++design), the gateway MAC measurement (**D7**), UDP checksums on DHCP
++replies (off by default; `--udp-checksum` exists), ICMP other than echo
++(no destination-unreachable, no TTL-exceeded), and any IPv6.
+ 
+ ### N3 — End-to-end close-out — 📋 planned
+ 
+diff --git a/patches/0047-NET-N1-e1000-tx-ready.patch b/patches/0047-NET-N1-e1000-tx-ready.patch
+new file mode 100644
+index 0000000..470105d
+--- /dev/null
++++ b/patches/0047-NET-N1-e1000-tx-ready.patch
+@@ -0,0 +1,1495 @@
++From 2e505d5d5709dc45372dc19c5e9c5213587e8e81 Mon Sep 17 00:00:00 2001
++From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
++Date: Sun, 11 Oct 2026 16:12:24 +0000
++Subject: [PATCH] N1 update
++
++---
++ CHANGELOG.md                          | 102 +++++++++++
++ Makefile                              |  13 +-
++ README.md                             |   9 +
++ ROADMAP.md                            |   2 +-
++ docs/STATUS.md                        |  31 +++-
++ docs/plans/NET_PLAN.md                | 217 +++++++++++++++++++++--
++ src/devices.h                         |   6 +-
++ src/e1000.c                           | 245 +++++++++++++++++++++++++-
++ tests/integration/n1_tap_responder.py |  61 +++++++
++ tests/integration/n1_tx_tap.sh        | 147 ++++++++++++++++
++ tests/nic_tx.asm                      | 174 ++++++++++++++++++
++ tests/test_net.c                      | 244 ++++++++++++++++++++++++-
++ 12 files changed, 1226 insertions(+), 25 deletions(-)
++ create mode 100755 tests/integration/n1_tap_responder.py
++ create mode 100755 tests/integration/n1_tx_tap.sh
++ create mode 100644 tests/nic_tx.asm
++
++diff --git a/CHANGELOG.md b/CHANGELOG.md
++index 61287eb..8225e23 100644
++--- a/CHANGELOG.md
+++++ b/CHANGELOG.md
++@@ -6,6 +6,108 @@ entry names its patch and the measured defect(s) it repaired.
++ 
++ ## [Unreleased]
++ 
+++### Added — patch 0047 (NET N1, e1000 TX-ready)
+++
+++- **The TX ring** (`src/e1000.c`): the doorbell walk `e1000_start_xmit`
+++  (QEMU `set_tctl`, which `macreg_writeops[]` maps **both** `[TCTL]` and
+++  `[TDT]` to — store, `TDT &= 0xffff`, walk), `e1000_tx_desc` (legacy
+++  descriptor: `split_size = lower.data & 0xffff`, clamped to the room
+++  left in `tx_data[0x10000]`, DMA-read at `buffer_addr`, frame out on
+++  `CMD.EOP`, `CMD` left intact) and `e1000_send_frame` (one TAP
+++  datagram per frame; `tap_fd < 0` or a failed `send` drops the frame
+++  but still completes the descriptors — QEMU's null-backend shape, and
+++  what lets the socketless unit lane assert DD instead of the wire).
+++  `TCTL.EN` gates the walk, `tx_busy` is QEMU's re-entrancy guard, TDH
+++  advances with `++TDH * 16 >= TDLEN -> 0`, and QEMU's two escapes for
+++  a bogus TDT/TDLEN (TDH wraparound, `tdh_start >= TDLEN/16`) are kept
+++  so a misprogrammed ring cannot spin. Causes end in ICR as
+++  `TXQE | TXDW*` (`ICR = 0x81` for the guest's single-descriptor
+++  send). **DD is written back inside the TDT store**, because
+++  `e1000_send()` spins on `status & 0x01` with a 100000-PAUSE budget —
+++  a `devices_tick`-deferred completion would still burn it. Closes
+++  defect **D2** (`[e1000] TX timeout: desc[N].status=0x00 TDH=0
+++  TDT=N+1`, `[dhcp] FAIL: DISCOVER transmit failed`).
+++- **QEMU write-op parity** (ledger **D6**): N0 stored every non-CTRL/IMC
+++  register verbatim, which measured wrong against `macreg_writeops[]` —
+++  `IMS` is `set_ims` (`|= val`, not assign), `ICR` is `set_icr`
+++  (`&= ~val`, not a no-op), `ICS` is `set_ics`, `TDH/RDH` are
+++  `set_16bit`, `TDLEN/RDLEN` are `set_dlen` (`val & 0xfff80`), and
+++  `TDT` shares TCTL's op. No N0 vector pinned the old behaviour.
+++- **`e1000_tx_stats`** (`src/devices.h`): the wire counters
+++  (`tx_frames`/`tx_dropped`). The device logs nothing on the RX/TX path
+++  (parity with N0), so a harness proves "the frame reached the wire" by
+++  reading these rather than grepping a log whose line count would
+++  depend on how many frames a responder answered with — which would
+++  cost the lane its byte-identical determinism pair. `e1000_reset_regs`
+++  clears them plus `tx_size`/`tx_busy`, so a half-assembled frame
+++  cannot survive `CTRL.RST` into the next ring.
+++- **`tests/test_net.c` 5 new vectors** (2 N0 + 5 N1, in `make
+++  test-unit`): `ok e1000 tx doorbell completion`, `ok e1000 tx TCTL.EN
+++  gate + TCTL-write doorbell + TDT 16-bit mask`, `ok e1000 tx
+++  multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask`, `ok
+++  e1000 interrupt/register write-op parity`, `ok e1000 tx link gate +
+++  CTRL.RST resets the TX ring`. They pin DD + `CMD` intact + TDH +
+++  `ICR=0x81` + read-to-clear + drop counters; `TCTL.EN` clear ⇒ TDT
+++  stores but consumes nothing *and raises no cause*, then a TCTL write
+++  drains it; a no-EOP descriptor accumulates so two descriptors yield
+++  **one** frame while both get DD (writeback runs for every descriptor
+++  of the walk); `RS` clear ⇒ no DD but the slot is consumed; TDH 31→0;
+++  `TDLEN & 0xfff80`; `STATUS.LU` and `CTRL.RST`.
+++- **The wire lane** (`tests/nic_tx.asm`,
+++  `tests/integration/n1_tap_responder.py`,
+++  `tests/integration/n1_tx_tap.sh`, `make test-net-tx`, wired into
+++  `make test`): a 489-byte payload rides the **real firmware-boot
+++  transport** (throwaway `--disk=` image → `[usb-msc] READ(10) LBA=0
+++  blocks=1` → `conventional entry reached at 0x00100000` → long mode),
+++  programs the ring exactly like `e1000_init`/`e1000_send` and rings
+++  TDT; the responder holds the ground-rule endpoint `UDP
+++  127.0.0.1:8080`. Receipts, twice, byte-identical (`cmp` clean):
+++  guest `[serial] N1TXOK  status=01 tdh=01 icr=81`, wire
+++  `ffffffffffff52540012345608004e3154584f4b` (`ff:ff:ff:ff:ff:ff` /
+++  `52:54:00:12:34:56` / `0x0800` / `N1TXOK` — 20 bytes in, 20 bytes
+++  out, no FCS invention). Lane B re-runs the same payload **without**
+++  `--tap=` and gets `N1TXFAIL  status=00 tdh=ff icr=ff` (no PCI
+++  function ⇒ BAR0 reads the open bus) — the pin that keeps every
+++  historical no-NIC lane byte-stable. Lane C (the frozen guest, `[e1000]
+++  TX timeout` gone + `[dhcp]` on the wire) **SKIPs** here: the
+++  AuraLite-OS toolchain (`clang --target=x86_64-elf`, `ld.lld`, `rustc`,
+++  `mtools`) is not installable in this tree, so the harness prints the
+++  exact reproduction line instead of failing.
+++- **NC (once per phase)**: removing the descriptor writeback from
+++  `e1000_tx_desc` reddens the doorbell vector — `RC=134`,
+++  `tests/test_net.c:167: test_tx_doorbell_completion: Assertion
+++  'tx_desc_status(&f, ring, 0) == 0x01' failed` — and flips the wire
+++  receipt to `N1TXFAIL status=00 tdh=01 icr=80`, i.e. exactly the
+++  `status=0x00` half of the D2 guest receipt (head still advances,
+++  frame still leaves, only the completion is missing — which is why the
+++  guest's *spin* is what times out). Restored from backup, gates
+++  re-green.
+++- **Measured**: `make test` RC=0 (boot integration receipts untouched:
+++  `[usb-msc] READ(10) LBA=0 blocks=1`, `GUEST_OK`, `framebuffer marker
+++  OK: pixel[0]=0x00200000`); `make test-sanitize` RC=0 — and since that
+++  target does not rebuild `test-net`, the net vectors *and* the wire
+++  lane were additionally run by hand under
+++  `-fsanitize=address,undefined -fno-sanitize-recover=all`
+++  (`X86EMU=<asan build> tests/integration/n1_tx_tap.sh`), both clean,
+++  so the real `send()` path is covered too; `make fuzz
+++  FUZZ_PROGRAMS=64` — `64 programs, 1536 instructions compared -- all
+++  states match`, `0 host-level crashes`. Lane A artifact shas are in
+++  `docs/plans/NET_PLAN.md` N1.
+++- **Deliberately not in N1** (measured, recorded as ledger **D4** and
+++  in the plan's "Not in N1"): the INTx line — `e1000_add` seeds no PCI
+++  cfg `0x3C` and nothing emulates INTA#/ack, so the guest reads
+++  `IRQ line 0` and polls; raising a line with no ack path would leave
+++  the 8259A ISR bit set and never re-service the guest, which is worse
+++  than not raising it. Also deferred: TX statistics counters
+++  (`TPT`/`TOTL`/`GPTC`/`PTC*`), context/TSO descriptors, VLAN
+++  insertion, FCS insertion for `CMD.IFCS`.
+++- **Docs**: `docs/plans/NET_PLAN.md` (N1 ✅ with the measured TX
+++  contract from both sources, D2 closed, D4/D5/D6 added — D5 records
+++  the deliberate divergence from QEMU's `TXD_STAT_DD = 0x01000000`,
+++  which lands in descriptor byte 15 while the SDM and the frozen guest
+++  driver both read DD as bit 0 of the status byte at offset 12),
+++  ROADMAP + `docs/STATUS.md` + README sync.
+++
++ ### Added — patch 0046 (NET N0, e1000 RX-ready + TAP ingress)
++ 
++ - **The RX-ready e1000 model** (`src/e1000.c`): PCI 0:4.0 `8086:100E`
++diff --git a/Makefile b/Makefile
++index 694338b..4e1b020 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
++ SRC := $(wildcard src/*.c)
++ 
++ .DELETE_ON_ERROR:
++-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes
+++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx
++ all: x86emu
++ 
++ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
++@@ -89,7 +89,16 @@ test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/
++ test-boot: x86emu firmware/firmware.bin disk/disk.img
++ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
++ 
++-test: test-unit test-table test-kload test-ring3 test-boot
+++# NET N1: the TX wire lane.  The payload (tests/nic_tx.asm) rides the real
+++# firmware-boot transport off a throwaway --disk= image, so this needs nasm +
+++# python3 (it SKIPs, exit 0, when either is missing) and the ground-rule TAP
+++# endpoint UDP 127.0.0.1:8080 free on the host.  The frozen-guest lane inside
+++# it SKIPs unless KERNEL/INITRD point at the frozen AuraLite-OS build.
+++test-net-tx: x86emu firmware/firmware.bin tests/nic_tx.asm \
+++             tests/integration/n1_tx_tap.sh tests/integration/n1_tap_responder.py
+++	sh tests/integration/n1_tx_tap.sh
+++
+++test: test-unit test-table test-kload test-ring3 test-boot test-net-tx
++ 
++ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
++ test-video-modes: x86emu
++diff --git a/README.md b/README.md
++index 408e7bb..9d8e3d5 100644
++--- a/README.md
+++++ b/README.md
++@@ -58,6 +58,15 @@ The focused CPU tests can be run independently:
++ make test-unit
++ ```
++ 
+++`make test` also runs the NET wire lane (`make test-net-tx`): a small
+++payload (`tests/nic_tx.asm`) boots through the real firmware transport
+++off a throwaway `--disk=` image, transmits a frame through the e1000 TX
+++ring and a host-side responder records what arrived on the TAP endpoint.
+++It needs `nasm` and `python3`, and the fixed endpoint `UDP
+++127.0.0.1:8080` free; it SKIPs (exit 0) when a dependency is missing.
+++The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
+++an AuraLite-OS build.
+++
++ ## Architecture
++ 
++ `src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.
++diff --git a/ROADMAP.md b/ROADMAP.md
++index ce76c3b..9bc43be 100644
++--- a/ROADMAP.md
+++++ b/ROADMAP.md
++@@ -30,7 +30,7 @@ maps to exactly one plan below.
++ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
++ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
++ | `docs/plans/VIDEO_PLAN.md` | ✅ done (V0–V3) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V3 |
++-| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0 done ✅ — RX-ready e1000 + TAP ingress measured; N1–N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
+++| `docs/plans/NET_PLAN.md` | 🔵 **IN PROGRESS** (N0–N1 done ✅ — RX-ready e1000 + TAP ingress, TX ring measured end-to-end on the wire; N2–N3 planned) | e1000 model (the OS's primary NIC) + host TAP backend | N0–N3 |
++ | `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
++ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
++ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
++diff --git a/docs/STATUS.md b/docs/STATUS.md
++index 559cc5d..4d233ea 100644
++--- a/docs/STATUS.md
+++++ b/docs/STATUS.md
++@@ -60,10 +60,35 @@
++   (`--max-instr=4500000000`) is byte-identical (both tapes sha256
++   `82614cd6f896aa9a…`) with the `[net] using NIC: e1000` gate,
++   `BAR0 at phys 0xfebc0000`, `STATUS=0x00000002 (LU=1)` and
++-  `MAC from RAL/RAH`.  TX stays N1 (measured `[e1000] TX timeout`
++-  receipts; `[dhcp] FAIL: DISCOVER transmit failed` → `[net] fallback
++-  IP active`).  NC reddens the ingress vector (`test_net.c:85`,
+++  `MAC from RAL/RAH`.  NC reddens the ingress vector (`test_net.c:85`,
++   RC=134); `make test` + `make test-sanitize` stay green.
+++- The NET plan's N1 (TX-ready) is measured.  The TDT/TCTL doorbell walks
+++  TDH over the legacy TX ring, the frame leaves as one TAP datagram
+++  (`TCTL.EN` gated) and the descriptors are completed **inside the
+++  doorbell store** — because the guest's `e1000_send()` spins on
+++  `status & 0x01` with a 100000-PAUSE budget, a tick-deferred completion
+++  would still burn it.  Causes land in ICR as `TXQE|TXDW` (`0x81` for a
+++  single-descriptor send); the register-write fallback gained QEMU
+++  `macreg_writeops[]` parity (`IMS |=`, `ICR &= ~val`, `ICS`, 16-bit
+++  heads, `TDLEN/RDLEN & 0xfff80`).  `tests/test_net.c` runs 7 vectors
+++  (2 N0 + 5 N1).  The wire lane (`make test-net-tx` →
+++  `tests/integration/n1_tx_tap.sh`) puts a 489-byte payload
+++  (`tests/nic_tx.asm`) on the **real firmware-boot transport** off a
+++  throwaway `--disk=` image and holds the ground-rule endpoint with
+++  `n1_tap_responder.py`: twice, byte-identical, the guest prints
+++  `N1TXOK  status=01 tdh=01 icr=81` and the wire carries
+++  `ffffffffffff52540012345608004e3154584f4b` (20 bytes in, 20 bytes
+++  out).  The same payload without `--tap=` reports
+++  `N1TXFAIL  status=00 tdh=ff icr=ff` (open-bus BAR0) — the opt-in pin.
+++  The frozen-guest lane SKIPs here (the AuraLite-OS toolchain is not
+++  installable in this tree) and prints its reproduction line instead.
+++  NC removes the descriptor writeback: `test_net.c:167`, RC=134, and the
+++  wire receipt flips to `N1TXFAIL status=00 tdh=01 icr=80`.  `make test`
+++  (now incl. `test-net-tx`), `make test-sanitize` and the hand-run
+++  sanitized wire lane stay green.  Deliberately not modelled yet: the
+++  INTx line (no PCI cfg `0x3C`, no ack path — a raised line would strand
+++  the 8259A ISR bit under a polling guest), TX statistics counters,
+++  context/TSO descriptors, VLAN and `CMD.IFCS` FCS insertion.
++ - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
++ - A framebuffer is available as `framebuffer.ppm`.
++ - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.
++diff --git a/docs/plans/NET_PLAN.md b/docs/plans/NET_PLAN.md
++index cc3d98b..b0f3954 100644
++--- a/docs/plans/NET_PLAN.md
+++++ b/docs/plans/NET_PLAN.md
++@@ -32,12 +32,12 @@ kernel (`kernel.elf` sha256 `395e5ec02bf39cc5…`, 3051512 B).
++    `RXCSUM` reads 0, `CTRL.RST` (bit 26) self-clears (the guest polls
++    on it).
++ 
++-**Status: in progress — N0 ✅, N1–N3 planned 📋**
+++**Status: in progress — N0–N1 ✅, N2–N3 planned 📋**
++ 
++ | Phase | Scope | Status | Deliverable |
++ |---|---|---|---|
++ | N0 | Measured baseline + this plan; the RX-ready e1000 (PCI `8086:100E` at 0:4:0 + BAR0 `0xFEBC0000`/128 KiB + reset contract + RX ring DMA) + TAP ingress (`--tap=`) | ✅ done | `patches/0046-NET-N0-e1000-rx-ready.patch` |
++-| N1 | TX-ready: the TDT doorbell → TDH walk → TAP datagrams (`TCTL.EN`), TX descriptor completion (the guest's `[e1000] TX timeout` receipts gone) | 📋 | `patches/0047-NET-N1-e1000-tx-ready.patch` |
+++| N1 | TX-ready: the TDT doorbell → TDH walk → TAP datagrams (`TCTL.EN`), TX descriptor completion (the guest's `[e1000] TX timeout` receipts gone) | ✅ done | `patches/0047-NET-N1-e1000-tx-ready.patch` |
++ | N2 | Host responder on the TAP endpoint (DHCP + ARP + ICMP, the QEMU `-netdev user` receipt shape) so the guest's online self-tests pass | 📋 | `patches/0048-NET-N2-tap-responder.patch` |
++ | N3 | End-to-end close-out: determinism ×2, sanitize, docs close-out (plan closed) | 📋 | `patches/0049-NET-N3-net-e2e.patch` |
++ 
++@@ -130,15 +130,50 @@ buffer.
++   `ok e1000 pci/reset contract` (BAR0 readback over `0xCF8/0xCFC`).
++   Post-fix receipts: `BAR0 at phys 0xfebc0000`,
++   `STATUS=0x00000002 (LU=1)`, `MAC from RAL/RAH`.
++-- **D2 — TX not modelled** (measured, deferred to N1): the TDT
++-  doorbell stores but TDH never advances — receipts
+++- **D2 — TX not modelled** (fixed by N1): the TDT doorbell stored but
+++  TDH never advanced and no descriptor was ever completed — receipts
++   `[e1000] TX timeout: desc[N].status=0x00 TDH=0 TDT=N+1`,
++   `[net6] RS TX failed`, `[dhcp] FAIL: DISCOVER transmit failed (link
++   down or TX timeout)`, then `[net] DHCP failed, using hardcoded IP
++   10.0.2.15` / `[net] our IP: 10.0.2.15, gateway: 10.0.2.2` /
++-  `[net] fallback IP active; …`.
+++  `[net] fallback IP active; …`. N1 re-measured the same shape from the
+++  machine side with the wire payload (lane B of `n1_tx_tap.sh` still
+++  shows it whenever the device is absent:
+++  `N1TXFAIL status=00 tdh=ff icr=ff`), and the post-fix receipt is
+++  `N1TXOK status=01 tdh=01 icr=81` plus the frame on the socket.
++ - **D3 — no host responder** (deferred to N2): DHCP/ARP/ICMP go
++   unanswered, so the online self-tests cannot pass.
+++- **D4 — the INTx line is not wired** (measured in N1, deliberately
+++  *not* fixed there): `e1000_add` does not seed PCI config `0x3C`
+++  (interrupt line) and nothing emulates INTA#/ack, so the guest reads
+++  `IRQ line 0` and stays on its polled path (N0 receipt
+++  `[e1000] IRQ line 0 enabled (IMS=0x000000d5)`). N1 therefore does
+++  ICR/ICS **bookkeeping only** — `set_ics` semantics without asserting
+++  a line. Raising one now would be *worse* than not raising it: with no
+++  ack path the 8259A ISR bit would stay set and the polling guest would
+++  never be re-serviced. Full INTx (cfg `0x3C`, `pci_set_irq`, the
+++  `(ICR & IMS) != 0` condition, EOI) is N3/N4 scope.
+++- **D5 — QEMU's `TXD_STAT_*` bits sit in the wrong descriptor byte**
+++  (measured in N1, diverged from QEMU on purpose): QEMU's
+++  `hw/net/e1000.c` defines `E1000_TXD_STAT_DD` as `0x01000000`, i.e.
+++  bit 24 of the dword read at descriptor offset 12 — which lands in
+++  descriptor **byte 15** (the VLAN ID byte), not the status byte. The
+++  Intel 8254x SDM puts `DD/EC/LC/TU` in bits 0..3 of the **status byte
+++  at offset 12**, and the frozen guest driver tests
+++  `tx_ring[old_tail].status & 0x01` where `status` is the `u8` at
+++  struct offset 12 (`drivers/e1000/e1000.c:93,571`). This file's own RX
+++  half already writes DD that way (`RXD_STAT_DD 0x01` at offset 12),
+++  which is what the N0 guest receipt showed. N1 follows the
+++  datasheet + guest, byte-granular.
+++- **D6 — the N0 register-write fallback was too permissive** (fixed
+++  inside N1): N0 stored every non-CTRL/IMC register verbatim.
+++  Measured against QEMU `macreg_writeops[]` that is wrong for
+++  `IMS` (`set_ims` is `IMS |= val`, not an assign), `ICR` (`set_icr` is
+++  `ICR &= ~val`, not a no-op), `ICS` (`set_ics`), `TDH/RDH`
+++  (`set_16bit`), `TDLEN/RDLEN` (`set_dlen`, `val & 0xfff80`) and
+++  `TDT` (shares TCTL's op: store, mask TDT to 16 bits, `start_xmit`).
+++  No N0 vector pinned the old behaviour, so the change is safe;
+++  `ok e1000 interrupt/register write-op parity` now pins the new one.
++ 
++ ## 2. Phases
++ 
++@@ -227,14 +262,172 @@ initrd + paths.)
++ integration, firmware contract `pixel[0]=0x00200000` intact);
++ `make test-sanitize` RC=0 (ASan+UBSan).
++ 
++-### N1 — TX-ready — 📋 planned
+++### N1 — TX-ready — ✅ done (`patches/0047-NET-N1-e1000-tx-ready.patch`)
+++
+++**TX contract measured first, from two sources.** QEMU
+++`hw/net/e1000.c`: `macreg_writeops[]` maps **both** `[TCTL]` and
+++`[TDT]` to `set_tctl` (store, `TDT &= 0xffff`, `start_xmit`), so the
+++doorbell is a TDT *or* a TCTL write; `start_xmit` returns unless
+++`TCTL.EN`, guards re-entrancy with `tx.busy`, walks `while (TDH !=
+++TDT)` over `tx_desc_base + 16*TDH` (`TDBAH<<32 | TDBAL & ~0xf`),
+++advances with `if (++TDH * 16 >= TDLEN) TDH = 0`, breaks on the TDH
+++wraparound and on `tdh_start >= TDLEN/16` (its two escapes for a bogus
+++TDT/TDLEN), and ends with `set_ics(s, 0, cause)` where `cause` starts
+++at `E1000_ICS_TXQE` and ORs in `E1000_ICR_TXDW` per RS writeback.
+++`process_tx_desc` takes `split_size = lower.data & 0xffff`, clamps it
+++to the room left in `tx.data[0x10000]`, DMA-reads at `buffer_addr`,
+++and only on `CMD.EOP` calls `xmit_seg` (the send) and resets the
+++assembly. `txdesc_writeback` returns 0 unless `CMD.RS|RPS`, else
+++`upper = (upper | DD) & ~(EC|LC|TU)` and returns `ICR_TXDW`. The guest
+++side (`AuraLite-OS@0ed0d29 drivers/e1000/e1000.c`, identical at HEAD):
+++`e1000_init` programs `TDLEN = 32*16`, `TDH = TDT = 0`,
+++`TCTL = EN | (0x10<<4) | (0x40<<12)`, `IMS = 0xD5`; `e1000_send`
+++refuses without `STATUS.LU`, clamps to 2048, fills
+++`length/cso=0/cmd=0x0B (EOP|IFCS|RS)/status=0`, bumps
+++`tail = (tail+1) % 32`, **rings `TDT = tail`**, then spins
+++`while ((tx_ring[old_tail].status & 0x01) == 0 && timeout-- > 0) pause`
+++with `timeout = 100000` and prints `[e1000] TX timeout:
+++desc[%u].status=0x%02x TDH=%u TDT=%u` on exhaustion. **Consequence for
+++the model: DD must be written back *inside* the TDT store, not on a
+++later tick** — a `devices_tick`-deferred completion would still burn
+++the guest's PAUSE budget and, worse, make the receipt depend on the
+++256-instruction cadence.
+++
+++**Implementation** (`src/e1000.c`, `src/devices.h`, `Makefile`):
+++`e1000_send_frame` (TAP datagram out, `tap_fd < 0` or a failed `send`
+++drops the frame but still completes the descriptors — QEMU's
+++null-backend shape, and what makes the socketless unit lane assert DD
+++rather than the wire), `e1000_tx_desc` (one descriptor of the walk),
+++`e1000_start_xmit` (the `set_tctl` walk), `e1000_tx_stats` (the wire
+++counters — the device logs nothing on the RX/TX path, parity with N0,
+++so a harness proves "the frame reached the wire" by reading these
+++instead of grepping a log whose line count would otherwise depend on
+++how many frames a responder answered with), and TX state in `e1000_t`
+++(`tx_data[0x10000]`, `tx_size`, `tx_busy`, `tx_frames`, `tx_dropped`)
+++which `e1000_reset_regs` clears — a half-assembled frame must not
+++survive a `CTRL.RST` into the next ring. `e1000_mmio_write` gained the
+++QEMU write-op parity of ledger **D6**.
+++
+++**Unit vectors** (`tests/test_net.c`, in `make test-unit`) — 2 N0 + 5 N1:
++ 
++-The TX ring: TDT doorbell walks TDH, descriptors are consumed
++-(`status.DD`), frames leave through the TAP socket (`TCTL.EN` gate),
++-`IMS.TXD` interrupt when requested. DoD: unit vectors per the QEMU TX
++-contract (doorbell, completion, gate) + the guest's `[e1000] TX
++-timeout` receipts disappear and `[dhcp]` reaches the wire; the N0 lane
++-pair re-run byte-stable modulo the TX receipts; NC + sanitize.
+++```
+++ok e1000 pci/reset contract (RXCSUM 0, RAL/RAH preload, RST self-clear)
+++ok e1000 rx ingress (DMA + DD + RDH, EN/full gating)
+++ok e1000 tx doorbell completion (DD + CMD intact + TDH + TXDW/TXQE)
+++ok e1000 tx TCTL.EN gate + TCTL-write doorbell + TDT 16-bit mask
+++ok e1000 tx multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask
+++ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)
+++ok e1000 tx link gate + CTRL.RST resets the TX ring
+++test-net: all tests passed
+++```
+++
+++(What they pin: DD + `CMD` left intact + TDH advance + `ICR = 0x81`
+++(TXDW|TXQE) + read-to-clear + the socketless drop counters; `TCTL.EN`
+++clear ⇒ TDT stores but consumes nothing *and raises no cause*, then a
+++TCTL write drains the pending descriptor, `TDT` masked to 16 bits;
+++a no-EOP descriptor accumulates so two descriptors yield **one** frame
+++while both get DD (writeback runs for every descriptor of the walk,
+++EOP or not), `RS` clear ⇒ no DD but the slot is still consumed, TDH
+++31 → 0 wrap, `TDLEN & 0xfff80`; `IMS |=`, `IMC &= ~`, `ICR &= ~val`,
+++`ICS` ORs causes in, 16-bit heads; `STATUS.LU` readable, and
+++`CTRL.RST` clearing TDLEN/TDH while the MAC preload comes back.)
+++
+++**NC (once per phase)**: removing the descriptor writeback from
+++`e1000_tx_desc` (DD + `ICR_TXDW`) reddens the doorbell vector —
+++`RC=134`, `tests/test_net.c:167: test_tx_doorbell_completion:
+++Assertion 'tx_desc_status(&f, ring, 0) == 0x01' failed` — and the wire
+++payload's receipt flips to `N1TXFAIL status=00 tdh=01 icr=80`, i.e.
+++exactly the `status=0x00` half of the D2 guest receipt (the head still
+++advances, the frame still leaves, only the completion is missing —
+++which is why the guest's *spin* is what times out). Restored from
+++backup, gates re-green.
+++
+++**Lanes** (`make test-net-tx` → `tests/integration/n1_tx_tap.sh`;
+++needs `nasm` + `python3` and the endpoint `UDP 127.0.0.1:8080` free —
+++it SKIPs, exit 0, when a dependency is missing):
+++
+++- **Lane A (wire, ×2 determinism pair).** `tests/nic_tx.asm` (489 code
+++  bytes of the 512 the loader reads) rides the **real firmware-boot
+++  transport**: a throwaway `--disk=` image, `[usb-msc] READ(10) LBA=0
+++  blocks=1` → `bulk-IN 512 bytes -> guest 0x00100000` → `conventional
+++  entry reached`, long mode, then the payload programs the ring exactly
+++  like `e1000_init`/`e1000_send` and rings TDT.
+++  `tests/integration/n1_tap_responder.py` holds the ground-rule
+++  endpoint and records what arrived:
+++
+++  ```
+++  [serial] N1TXOK  status=01 tdh=01 icr=81
+++  ffffffffffff52540012345608004e3154584f4b
+++  ```
+++
+++  The frame is `ff:ff:ff:ff:ff:ff` / `52:54:00:12:34:56` / `0x0800` /
+++  `N1TXOK` — the buffer the guest DMA'd, byte for byte, 20 bytes in and
+++  20 bytes out (no FCS invention). `status=01` is DD in the status
+++  *byte*, `tdh=01` the head advance, `icr=81` TXDW|TXQE.
+++
+++  *Measured constraint worth keeping:* the firmware's long-mode map is
+++  **not** all of RAM. `PML4[0] → PDPT[0] (0x12003, a table) → PD`, and
+++  `PD[0] = 0x19B` is a **2 MiB** page (PS in a PDE), so a payload may
+++  only touch conventional RAM at `0x100000..0x1FFFFF`; a write to
+++  `0x200000` raises `#PF v=0x200000 err=0x2` (`PD[1] = 0`). MMIO
+++  reaches it via `PDPT[3]` (`0xC0000000..0xFFFFFFFF`) — which is how
+++  the framebuffer at `0xD0000000` and BAR0 at `0xFEBC0000` work. The
+++  ring and the DMA buffer therefore live at `0x100800`/`0x100C00`.
+++
+++- **Lane B (opt-in ground rule).** The same payload **without**
+++  `--tap=`: no PCI function exists, BAR0 reads hit the open bus and
+++  return all-ones, so the receipt is
+++  `N1TXFAIL  status=00 tdh=ff icr=ff` and no frame can exist. This is
+++  the pin that keeps every historical no-NIC lane byte-stable.
+++
+++- **Lane C (frozen-guest receipts) — SKIP in this tree.** The N0 lane
+++  re-run; asserts `[net] using NIC: e1000`, `[dhcp] starting DHCP
+++  discovery`, the **absence** of `[e1000] TX timeout`, and ≥1 frame on
+++  the wire. The AuraLite-OS toolchain (`clang --target=x86_64-elf`,
+++  `ld.lld`, `rustc`, `mtools`) is not installable here, so the frozen
+++  `kernel.elf`/`initrd.tar` cannot be produced; the harness prints the
+++  exact reproduction line instead of failing:
+++
+++  ```
+++  KERNEL=/home/user/AuraLite-OS/build/kernel.elf \
+++  INITRD=/home/user/AuraLite-OS/build/initrd.tar \
+++      tests/integration/n1_tx_tap.sh
+++  ```
+++
+++  (Note for whoever runs it: `AuraLite-OS/SHA256SUMS` pins
+++  `kernel.elf` `be3258d7…`, not the U5-freeze `395e5ec0…` this plan
+++  cites, so a fresh build is a *different* binary — record its sha
+++  alongside the receipts.)
+++
+++Determinism: lane A run twice, both tapes and both frame logs
+++byte-identical (`cmp` clean; the harness defaults to the fixed workdir
+++`/tmp/n1-tx-tap` because the tape embeds the `--disk=` path, which is
+++what makes these shas reproducible):
+++
+++| Artifact | sha256 |
+++|---|---|
+++| `a1.out` = `a2.out` (lane A tape) | `f080146e99daf0086bf7a9c6f0c724586543e4e54204a7b904c1f1dfbd14e3be` |
+++| `a1-frames.hex` = `a2-frames.hex` (wire) | `407c20de647cfb1459ebcd72d24e62167db60f7ec4cdee300a85c6cbb904c8bf` |
+++| `b1.out` (lane B tape) | `270c237cfd4ff5ffbed1ec6c484ce323fe2f199dfd793a1d3bcbbdcadd652fc8` |
+++| `nic_tx.bin` (payload, 512 B) | `29a20dd600b1944800a3e0fea79b8e4651b0e97d5a1bf83f4d1bddcee13f40f3` |
+++
+++**Gates**: `make test` RC=0 (now including `test-net-tx`; the boot
+++integration receipts are untouched — `[usb-msc] READ(10) LBA=0
+++blocks=1`, `GUEST_OK`, `framebuffer marker OK: pixel[0]=0x00200000`);
+++`make test-sanitize` RC=0 (ASan+UBSan), and because that target does
+++not rebuild `test-net`, the net vectors *and* the wire lane were also
+++run by hand under `-fsanitize=address,undefined
+++-fno-sanitize-recover=all` (`X86EMU=<asan build> tests/integration/
+++n1_tx_tap.sh`) — both clean, so the real `send()` path is covered too;
+++`make fuzz FUZZ_PROGRAMS=64` — `64 programs, 1536 instructions
+++compared -- all states match`, `0 host-level crashes`.
+++
+++**Not in N1** (measured, deferred): the INTx line (**D4**), TX
+++statistics counters (`TPT`/`TOTL`/`GPTC`/`PTC*`, QEMU's `xmit_seg` +
+++`e1000x_increase_size_stats`), context/TSO descriptors, VLAN insertion
+++(`VLE`), and FCS insertion for `CMD.IFCS` — the guest asks for IFCS
+++but the wire frame is what the buffer held, which is also what QEMU's
+++`e1000_send_packet` hands its backend.
++ 
++ ### N2 — Host responder (DHCP + ARP + ICMP) — 📋 planned
++ 
++diff --git a/src/devices.h b/src/devices.h
++index c14ed6d..96754e1 100644
++--- a/src/devices.h
+++++ b/src/devices.h
++@@ -20,11 +20,15 @@ void vbe_mode_disable(machine_t *m);
++ 
++ /* NET N0: e1000 82540EM "RX-ready" model + TAP socket ingress (src/e1000.c).
++  * The device is opt-in: e1000_test_add is the socketless unit entry, and
++- * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080). */
+++ * e1000_attach binds the fixed TAP endpoint (ground rule 127.0.0.1:8080).
+++ * NET N1 adds the TX half (TDT/TCTL doorbell -> TDH walk -> TAP datagram,
+++ * descriptors completed with status.DD inside the doorbell store, because
+++ * the guest's e1000_send() spins on DD with a bounded PAUSE budget). */
++ void e1000_test_add(machine_t *m);
++ int  e1000_attach(machine_t *m, const char *hostport);
++ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
++ void e1000_tick(void);
+++void e1000_tx_stats(uint64_t *sent, uint64_t *dropped);   /* N1 wire counters */
++ void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at the instruction cadence */
++ 
++ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
++diff --git a/src/e1000.c b/src/e1000.c
++index 0f82eac..20889af 100644
++--- a/src/e1000.c
+++++ b/src/e1000.c
++@@ -10,8 +10,17 @@
++  *   - QEMU compat: the reset state follows QEMU's e1000_reset (RXCSUM reads
++  *     0 after CTRL.RST, RAL/RAH preloaded, STATUS.LU on link).
++  *
++- * N0 covers the PCI function + BAR0 register file + reset + RX ring DMA
++- * (socket -> guest).  TX (TDT doorbell -> socket) is N1. */
+++ * N0 covered the PCI function + BAR0 register file + reset + RX ring DMA
+++ * (socket -> guest).  N1 adds the TX half: the TDT/TCTL doorbell walks TDH
+++ * over the legacy TX ring, the frame leaves through the TAP socket
+++ * (TCTL.EN gated) and the descriptors are completed (status.DD), so the
+++ * guest's e1000_send() DD spin-wait retires instead of printing
+++ * "[e1000] TX timeout: desc[N].status=0x00 TDH=0 TDT=N+1" (defect D2).
+++ * TX semantics are measured from QEMU hw/net/e1000.c start_xmit /
+++ * process_tx_desc / txdesc_writeback, and the guest side from
+++ * AuraLite-OS@0ed0d29 drivers/e1000/e1000.c e1000_send() (cmd 0x0B =
+++ * EOP|IFCS|RS, TDT tail doorbell, spin on status.DD, TDH read back for
+++ * the timeout receipt). */
++ #include <arpa/inet.h>
++ #include <errno.h>
++ #include <fcntl.h>
++@@ -34,6 +43,7 @@
++ #define E1000_STATUS      0x00008
++ #define E1000_EERD        0x00014
++ #define E1000_ICR         0x000C0
+++#define E1000_ICS         0x000C8
++ #define E1000_IMS         0x000D0
++ #define E1000_IMC         0x000D8
++ #define E1000_RCTL        0x00100
++@@ -64,14 +74,61 @@
++ #define TCTL_EN           (1u << 1)
++ #define TCTL_PSP          (1u << 3)
++ #define RAH_AV            (1u << 31)
+++#define ICR_TXDW          (1u << 0)   /* TX descriptor written back */
+++#define ICR_LSC           (1u << 2)   /* link status change         */
+++#define ICR_RXDMT0        (1u << 4)
+++#define ICR_RXO           (1u << 6)
++ #define ICR_RXT0          (1u << 7)
+++#define ICR_TXQE          (1u << 7)   /* TX queue empty (QEMU: same bit slot,
+++                                       * distinct cause -- start_xmit always
+++                                       * raises it, the guest unmasks it)    */
++ #define RXD_STAT_DD       0x01
++ 
+++/* N1: legacy TX descriptor (Intel 8254x SDM, 16 bytes).  lower.data =
+++ * length | cso<<16 | cmd<<24; upper.data = status | css<<8 | popts<<16 |
+++ * special<<24, i.e. status is the BYTE at descriptor offset 12 and cmd the
+++ * byte at offset 11.  The guest driver's struct tx_desc
+++ * (drivers/e1000/e1000.c:93) agrees byte for byte:
+++ * addr[0:8) length[8:10) cso[10] cmd[11] status[12] css[13] special[14:16). */
+++#define TXD_CMD_EOP       (1u << 24)  /* CMD bit0: end of packet             */
+++#define TXD_CMD_RS        (1u << 27)  /* CMD bit3: report status (writeback) */
+++#define TXD_CMD_DEXT      (1u << 29)  /* CMD bit5: 0 = legacy descriptor     */
+++/* STATUS byte (descriptor offset 12).  QEMU's e1000 model instead defines
+++ * E1000_TXD_STAT_DD as 0x01000000, i.e. bit 24 of the dword read at offset
+++ * 12 -- which lands in descriptor byte 15 (the VLAN ID byte), not the status
+++ * byte.  Measured against the two things this project is pinned to, the
+++ * byte-granular form is the contract: the Intel 8254x SDM puts DD/EC/LC/TU
+++ * in bits 0..3 of the status byte, and the frozen guest driver tests
+++ * `tx_ring[old_tail].status & 0x01` where `status` is the u8 at struct
+++ * offset 12 (drivers/e1000/e1000.c:93,571).  The RX half of this very file
+++ * already writes its DD that way (RXD_STAT_DD 0x01 at the same offset) and
+++ * that is what the N0 guest receipt showed. */
+++#define TXD_STAT_DD       0x01u       /* STATUS bit0: descriptor done        */
+++#define TXD_STAT_EC       0x02u       /* STATUS bit1: excess collisions      */
+++#define TXD_STAT_LC       0x04u       /* STATUS bit2: late collision         */
+++#define TXD_STAT_TU       0x08u       /* STATUS bit3: TX underrun            */
+++
+++#define E1000_TX_DATA_MAX 0x10000u    /* QEMU s->tx.data[] size               */
+++#define E1000_TX_DESC_SZ   16u
+++#define E1000_DLEN_MASK    0xfff80u   /* QEMU set_dlen: TDLEN/RDLEN are 128B
+++                                       * multiples (both rings)                */
+++
+++
++ typedef struct {
++     machine_t *m;
++     uint32_t regs[E1000_REG_BYTES / 4];
++     int tap_fd;            /* -1 = no TAP socket */
++     int attached;
+++    /* N1: TX assembly state (QEMU struct e1000_tx).  A frame may span
+++     * several descriptors, so bytes accumulate here until CMD.EOP; `busy`
+++     * is QEMU's re-entrancy guard (a doorbell inside the walk is a no-op). */
+++    uint8_t  tx_data[E1000_TX_DATA_MAX];
+++    uint32_t tx_size;
+++    int      tx_busy;
+++    /* Counters, so the walk stays deterministic and the log stays quiet:
+++     * every frame that reached the TAP socket, and every frame dropped
+++     * because no socket is attached (the socketless unit lane). */
+++    uint64_t tx_frames, tx_dropped;
++ } e1000_t;
++ static e1000_t g_e1000;
++ 
++@@ -79,12 +136,145 @@ static e1000_t g_e1000;
++  * pre-initialized RAL/RAH (AddrValid + the QEMU default MAC), RXCSUM 0. */
++ static void e1000_reset_regs(void) {
++     memset(g_e1000.regs, 0, sizeof g_e1000.regs);
+++    /* N1: the TX assembly state and the wire counters are device state, so a
+++     * reset (device add, or CTRL.RST) starts them clean -- a half-assembled
+++     * frame must not survive into the next ring. */
+++    g_e1000.tx_size = 0;
+++    g_e1000.tx_busy = 0;
+++    g_e1000.tx_frames = 0;
+++    g_e1000.tx_dropped = 0;
++     g_e1000.regs[E1000_STATUS / 4] = STATUS_LU;    /* link up on attach */
++     /* 52:54:00:12:34:56 -> RAL = 0x12005452, RAH = AV | 0x5634 */
++     g_e1000.regs[E1000_RA / 4] = 0x12005452u;
++     g_e1000.regs[(E1000_RA + 4) / 4] = RAH_AV | 0x5634u;
++ }
++ 
+++/* ============================ TX ring egress ============================== */
+++/* N1.  Measured from QEMU hw/net/e1000.c:
+++ *
+++ *   set_tctl()   -- BOTH [TCTL] and [TDT] map to it: it stores the value,
+++ *                   masks TDT to 16 bits, then calls start_xmit().  So the
+++ *                   doorbell is a TDT *or* a TCTL write (the guest writes
+++ *                   TCTL once at init with TDH==TDT, which is a no-op walk).
+++ *   start_xmit() -- returns immediately unless TCTL.EN; guards re-entrancy
+++ *                   with tx.busy; walks TDH != TDT; per descriptor calls
+++ *                   process_tx_desc() then txdesc_writeback(); advances TDH
+++ *                   with "++TDH * 16 >= TDLEN -> TDH = 0"; breaks on the
+++ *                   TDH wraparound and on a bogus TDLEN ("nothing too
+++ *                   intelligent we could do about this"); finally raises
+++ *                   ICS_TXQE unconditionally ORed with the TXDW causes the
+++ *                   writebacks returned.
+++ *   process_tx_desc() -- legacy path: split_size = lower.data & 0xffff
+++ *                   (the length field), clamped to the remaining tx.data
+++ *                   room, DMA-read at buffer_addr into tx.data+tx.size.
+++ *                   CMD.EOP absent -> accumulate only, the frame is not on
+++ *                   the wire yet; CMD.EOP -> xmit_seg() (send) and reset the
+++ *                   assembly state.  Context (CMD.DEXT) and TSO descriptors
+++ *                   are out of scope: the guest only ever submits legacy
+++ *                   cmd 0x0B.
+++ *   txdesc_writeback() -- called by start_xmit for EVERY descriptor of the
+++ *                   walk, EOP or not (it is a separate call, not part of
+++ *                   process_tx_desc), so a mid-frame RS descriptor is
+++ *                   completed too.  Returns 0 unless CMD.RS; otherwise
+++ *                   upper.data = (upper.data | DD) & ~(EC|LC|TU), written
+++ *                   back to the descriptor, and returns ICS_TXDW.  Note QEMU
+++ *                   does NOT clear CMD here.
+++ *
+++ * The guest contract this satisfies (drivers/e1000/e1000.c e1000_send):
+++ * memcpy into tx_buffers[tail], length=len, cmd=0x0B (EOP|IFCS|RS),
+++ * status=0, TDT=tail+1, then spin <=100000 PAUSEs on status&0x01 -- so DD
+++ * must be written back *inside* the TDT store, not on a later tick.
+++ */
+++static void e1000_send_frame(e1000_t *e) {
+++    if (e->tx_size == 0) return;
+++    if (e->tap_fd < 0) {
+++        /* No host endpoint: the frame is dropped but the descriptors still
+++         * complete, exactly like QEMU's NIC with a null backend (and like
+++         * the socketless unit lane, which asserts DD/TDH, not the wire). */
+++        e->tx_dropped++;
+++        return;
+++    }
+++    ssize_t n = send(e->tap_fd, e->tx_data, e->tx_size, 0);
+++    if (n < 0) {
+++        /* UDP to a connected endpoint: ECONNREFUSED arrives when nothing is
+++         * bound at 127.0.0.1:8080.  Drop, do not fail the descriptor -- the
+++         * guest's TX path must not depend on the host responder being up
+++         * (that is N2's lane, and QEMU behaves the same way). */
+++        e->tx_dropped++;
+++        return;
+++    }
+++    e->tx_frames++;
+++}
+++
+++/* One descriptor of the walk.  Returns the ICR cause bits its writeback
+++ * produced (QEMU: `cause |= txdesc_writeback(...)`). */
+++static uint32_t e1000_tx_desc(machine_t *m, uint64_t desc) {
+++    e1000_t *e = &g_e1000;
+++    uint64_t addr = (uint64_t)mem_read(m, desc, 4)
+++                  | ((uint64_t)mem_read(m, desc + 4, 4) << 32);
+++    uint32_t lower = (uint32_t)mem_read(m, desc + 8, 4);
+++    uint32_t upper = (uint32_t)mem_read(m, desc + 12, 4);
+++    uint32_t split = lower & 0xFFFFu;               /* legacy: length field */
+++
+++    if (!(lower & TXD_CMD_DEXT)) {                  /* legacy descriptor */
+++        uint32_t room = E1000_TX_DATA_MAX - e->tx_size;
+++        if (split > room) split = room;             /* QEMU: MIN(sizeof data
+++                                                     * - size, split_size)  */
+++        for (uint32_t i = 0; i < split; i++)
+++            e->tx_data[e->tx_size + i] = (uint8_t)mem_read(m, addr + i, 1);
+++        e->tx_size += split;
+++    }
+++
+++    if (lower & TXD_CMD_EOP) {
+++        e1000_send_frame(e);
+++        e->tx_size = 0;
+++    }
+++
+++    /* QEMU calls txdesc_writeback() for EVERY descriptor of the walk, EOP or
+++     * not: a mid-frame descriptor with CMD.RS is completed just the same, so
+++     * the guest can reuse it as soon as the frame it belongs to goes out. */
+++    if (!(lower & TXD_CMD_RS))
+++        return 0;                                   /* QEMU: no writeback */
+++    upper = (upper | TXD_STAT_DD) & ~(TXD_STAT_EC | TXD_STAT_LC | TXD_STAT_TU);
+++    mem_write(m, desc + 12, 4, upper);
+++    return ICR_TXDW;
+++}
+++
+++static void e1000_start_xmit(machine_t *m) {
+++    e1000_t *e = &g_e1000;
+++    if (!(e->regs[E1000_TCTL / 4] & TCTL_EN))
+++        return;                                     /* "tx disabled" */
+++    if (e->tx_busy) return;                         /* QEMU re-entrancy guard */
+++    e->tx_busy = 1;
+++
+++    uint32_t cause = ICR_TXQE;                      /* always raised */
+++    uint32_t tdh_start = e->regs[E1000_TDH / 4];
+++    uint64_t base = (uint64_t)e->regs[E1000_TDBAL / 4]
+++                  | ((uint64_t)e->regs[E1000_TDBAH / 4] << 32);
+++
+++    while (e->regs[E1000_TDH / 4] != e->regs[E1000_TDT / 4]) {
+++        uint32_t tdh = e->regs[E1000_TDH / 4];
+++        cause |= e1000_tx_desc(m, base + (uint64_t)tdh * E1000_TX_DESC_SZ);
+++        if (++e->regs[E1000_TDH / 4] * E1000_TX_DESC_SZ >= e->regs[E1000_TDLEN / 4])
+++            e->regs[E1000_TDH / 4] = 0;
+++        /* QEMU's two escape hatches for a guest that programs bogus
+++         * TDT/TDLEN: the head came back round to where it started, or the
+++         * start was already past the ring.  Without them a TDH==0/TDT==32
+++         * ring with TDLEN==0 would spin forever. */
+++        if (e->regs[E1000_TDH / 4] == tdh_start ||
+++            tdh_start >= e->regs[E1000_TDLEN / 4] / E1000_TX_DESC_SZ)
+++            break;
+++    }
+++
+++    e->tx_busy = 0;
+++    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line would
+++     * follow when (ICR & IMS) != 0.  This device has no board line wired
+++     * (the guest reads PCI cfg 0x3C as 0 and drives a polled fallback), so
+++     * ICR/ICS bookkeeping is the whole honest surface here -- see the N1
+++     * ledger entry D4 in docs/plans/NET_PLAN.md. */
+++    e->regs[E1000_ICR / 4] |= cause;
+++}
+++
++ /* =============================== MMIO ===================================== */
++ uint64_t e1000_mmio_read(void *ctx, uint64_t addr, int size) {
++     e1000_t *e = ctx;
++@@ -112,10 +302,44 @@ void e1000_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
++         e->regs[E1000_CTRL / 4] = (uint32_t)val;
++         return;
++     }
++-    if (off == E1000_ICR || off == E1000_IMC) {
++-        /* ICR is read-to-clear (W1C-nothing); IMC clears the mask */
++-        if (off == E1000_IMC) e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
+++    /* N1: QEMU write-op parity for the interrupt and ring registers.  The
+++     * N0 fallback stored every one of these verbatim, which measured wrong
+++     * against hw/net/e1000.c macreg_writeops[]: IMS is set_ims (OR, not
+++     * assign), ICR is set_icr (clear the written bits, not a no-op), ICS is
+++     * set_ics (OR into the cause), TDH/RDH are set_16bit, TDLEN/RDLEN are
+++     * set_dlen (val & 0xfff80), and TDT shares TCTL's op -- store, mask TDT
+++     * to 16 bits, then walk.  No N0 vector pinned the old behaviour. */
+++    switch (off) {
+++    case E1000_ICS:
+++        /* QEMU set_ics -> set_interrupt_cause: the written causes join ICR
+++         * (and ICS).  ICS is write-only on this part, so only ICR matters
+++         * to the guest; both are updated to keep the register file honest. */
+++        e->regs[E1000_ICR / 4] |= (uint32_t)val;
+++        e->regs[E1000_ICS / 4] |= (uint32_t)val;
++         return;
+++    case E1000_ICR:
+++        e->regs[E1000_ICR / 4] &= ~(uint32_t)val;
+++        return;
+++    case E1000_IMS:
+++        e->regs[E1000_IMS / 4] |= (uint32_t)val;
+++        return;
+++    case E1000_IMC:
+++        e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
+++        return;
+++    case E1000_TDLEN: case E1000_RDLEN:
+++        e->regs[off / 4] = (uint32_t)val & E1000_DLEN_MASK;
+++        return;
+++    case E1000_TDH: case E1000_RDH: case E1000_TDT:
+++        e->regs[off / 4] = (uint32_t)val & 0xFFFFu;
+++        if (off == E1000_TDT) e1000_start_xmit(e->m);   /* the doorbell */
+++        return;
+++    case E1000_TCTL:
+++        e->regs[E1000_TCTL / 4] = (uint32_t)val;
+++        e->regs[E1000_TDT / 4] &= 0xFFFFu;              /* QEMU set_tctl */
+++        e1000_start_xmit(e->m);
+++        return;
+++    default:
+++        break;
++     }
++     e->regs[off / 4] = (uint32_t)val;       /* RAL/RAH, rings, RCTL, ... */
++ }
++@@ -203,6 +427,17 @@ int e1000_attach(machine_t *m, const char *hostport) {
++     return 0;
++ }
++ 
+++/* N1 observability for the integration lane: the wire counters.  The device
+++ * logs nothing on the RX or TX path (parity with N0), so a harness that has
+++ * to prove "the frame reached the wire" reads these instead of grepping a
+++ * log whose line count would otherwise depend on how many frames the host
+++ * responder happened to answer with -- which would cost the lane its
+++ * byte-identical determinism pair. */
+++void e1000_tx_stats(uint64_t *sent, uint64_t *dropped) {
+++    if (sent)    *sent    = g_e1000.tx_frames;
+++    if (dropped) *dropped = g_e1000.tx_dropped;
+++}
+++
++ void e1000_tick(void) {
++     /* pull TAP datagrams into the RX ring at the device cadence */
++     if (g_e1000.tap_fd < 0 || !g_e1000.attached) return;
++diff --git a/tests/integration/n1_tap_responder.py b/tests/integration/n1_tap_responder.py
++new file mode 100755
++index 0000000..1eba96c
++--- /dev/null
+++++ b/tests/integration/n1_tap_responder.py
++@@ -0,0 +1,61 @@
+++#!/usr/bin/env python3
+++"""tests/integration/n1_tap_responder.py -- NET N1 host-side TAP endpoint.
+++
+++The N0 ground rule fixes the transport: TAP datagrams ARE Ethernet frames and
+++the endpoint is UDP 127.0.0.1:8080, with the emulator as the connecting side.
+++N1 is the first phase where a frame leaves the guest, so something has to be
+++bound at that endpoint to prove it -- this is the smallest honest thing that
+++can be: it records every datagram, one hex frame per line, and exits after
+++`--count` frames or `--timeout` seconds.
+++
+++It deliberately does NOT answer (N2 is the host-responder phase), and it
+++deliberately writes nothing that could leak back into the emulator's own log:
+++the frames land in a separate file so the determinism pair in n1_tx_tap.sh
+++compares emulator output only.
+++
+++Usage:
+++    n1_tap_responder.py --out frames.hex [--port 8080] [--count 1]
+++                        [--timeout 30]
+++"""
+++import argparse
+++import binascii
+++import socket
+++import sys
+++import time
+++
+++
+++def main() -> int:
+++    ap = argparse.ArgumentParser()
+++    ap.add_argument("--out", required=True, help="hex frame log to write")
+++    ap.add_argument("--port", type=int, default=8080)
+++    ap.add_argument("--host", default="127.0.0.1")
+++    ap.add_argument("--count", type=int, default=1, help="frames to capture")
+++    ap.add_argument("--timeout", type=float, default=30.0, help="seconds")
+++    a = ap.parse_args()
+++
+++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+++    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+++    s.bind((a.host, a.port))
+++    s.settimeout(a.timeout)
+++
+++    got = 0
+++    deadline = time.monotonic() + a.timeout
+++    with open(a.out, "w", encoding="ascii") as f:
+++        while got < a.count:
+++            s.settimeout(max(0.05, deadline - time.monotonic()))
+++            try:
+++                data, _peer = s.recvfrom(65536)
+++            except socket.timeout:
+++                break
+++            if not data:
+++                continue
+++            f.write(binascii.hexlify(data).decode("ascii") + "\n")
+++            f.flush()
+++            got += 1
+++    s.close()
+++    print("responder: captured %d frame(s) -> %s" % (got, a.out))
+++    return 0 if got >= a.count else 2
+++
+++
+++if __name__ == "__main__":
+++    sys.exit(main())
++diff --git a/tests/integration/n1_tx_tap.sh b/tests/integration/n1_tx_tap.sh
++new file mode 100755
++index 0000000..f1e413e
++--- /dev/null
+++++ b/tests/integration/n1_tx_tap.sh
++@@ -0,0 +1,147 @@
+++#!/bin/sh
+++# tests/integration/n1_tx_tap.sh -- NET N1 wire + guest receipt harness.
+++#
+++# N1's claim is that a frame the guest submits to the TX ring actually reaches
+++# the wire, and that the descriptor is completed inside the doorbell store so
+++# the guest's e1000_send() DD spin-wait retires.  Three lanes measure that:
+++#
+++#   Lane A (wire, always runs): the real firmware-boot transport loads
+++#     tests/nic_tx.asm off LBA 0 of a throwaway --disk= image and jumps to it
+++#     in long mode; the payload programs the TX ring exactly the way the
+++#     frozen guest driver does, rings the TDT doorbell and reports on COM1.
+++#     n1_tap_responder.py holds the ground-rule endpoint (UDP 127.0.0.1:8080)
+++#     and records what arrived.  Receipts required:
+++#       guest   [serial] N1TXOK  status=01 tdh=01 icr=81
+++#       wire    ffffffffffff52540012345608004e3154584f4b   (one frame, exact)
+++#     status=01 is DD in the status BYTE (descriptor offset 12), tdh=01 is the
+++#     head advance, icr=81 is TXDW|TXQE.  Run twice: both .out tapes and both
+++#     frame logs must be byte-identical (determinism pair).
+++#
+++#   Lane B (opt-in, always runs): the same payload WITHOUT --tap=.  The e1000
+++#     PCI function does not exist then (ground rule 3), so BAR0 reads hit the
+++#     open bus and return all-ones (measured: status=00 tdh=ff icr=ff), and the
+++#     payload must report failure.  This is the pin that keeps every historical
+++#     no-NIC lane byte-stable.
+++#
+++#   Lane C (guest receipts, SKIPs without the frozen guest): the N0 lane
+++#     re-run.  N1's DoD is that `[e1000] TX timeout` disappears and `[dhcp]`
+++#     reaches the wire, with the rest of the tape unchanged modulo those TX
+++#     receipts.  Requires the frozen AuraLite-OS kernel/initrd (the recipe is
+++#     recorded in docs/plans/NET_PLAN.md N0/N1).
+++#
+++# Usage:
+++#   tests/integration/n1_tx_tap.sh [workdir]
+++# Optional env: X86EMU (default ./x86emu), KERNEL, INITRD (lane C),
+++#   RESP_TIMEOUT (default 20).
+++
+++set -eu
+++
+++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+++X86EMU=${X86EMU:-$ROOT/x86emu}
+++WORK=${1:-/tmp/n1-tx-tap}   # fixed default: the tape embeds the --disk= path, so a
+++                             # stable workdir is what makes the recorded shas reproducible
+++KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
+++INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
+++RESP_TIMEOUT=${RESP_TIMEOUT:-20}
+++TAP=127.0.0.1:8080
+++FRAME_HEX=ffffffffffff52540012345608004e3154584f4b
+++
+++mkdir -p "$WORK"
+++fail=0
+++need()    { grep -q "$1" "$2"    || { echo "  MISSING: $3"; fail=1; }; }
+++need_no() { grep -q "$1" "$2" && { echo "  PRESENT: $3"; fail=1; } || :; }
+++
+++command -v nasm    >/dev/null 2>&1 || { echo "SKIP: nasm missing"; exit 0; }
+++command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 missing"; exit 0; }
+++[ -x "$X86EMU" ] || { echo "ERROR: build x86emu first (make x86emu)"; exit 1; }
+++
+++# ---- the payload and its throwaway disk image -----------------------------
+++nasm -f bin "$ROOT/tests/nic_tx.asm" -o "$WORK/nic_tx.bin"
+++python3 - "$WORK/nic_tx.bin" "$WORK/disk.img" <<'EOF' || exit 1
+++import sys
+++p = open(sys.argv[1], 'rb').read()
+++assert len(p) <= 512, 'payload must fit the firmware loader single block (%d)' % len(p)
+++open(sys.argv[2], 'wb').write(p + b'\0' * (1024 * 1024 - len(p)))
+++EOF
+++
+++# ---- one lane: responder up first (UDP connect() is a no-op, so an unbound
+++# ---- endpoint would silently cost us the frame), then the emulator.
+++run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
+++    tag=$1; shift
+++    python3 "$ROOT/tests/integration/n1_tap_responder.py" \
+++        --out "$WORK/$tag-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
+++        > "$WORK/$tag-resp.out" 2>&1 &
+++    resp=$!
+++    # wait until the endpoint is actually bound
+++    i=0
+++    while [ $i -lt 100 ]; do
+++        if python3 -c "
+++import socket,sys
+++s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+++try:
+++    s.bind(('127.0.0.1',8080))
+++except OSError:
+++    sys.exit(0)
+++s.close(); sys.exit(1)" 2>/dev/null; then break; fi
+++        i=$((i+1)); sleep 0.05
+++    done
+++    "$X86EMU" --platform=haswell --disk="$WORK/disk.img" "$@" \
+++        --max-instr=600000 > "$WORK/$tag.out" 2>&1
+++    wait "$resp" || true
+++}
+++
+++echo "== lane A: TX through the real firmware-boot transport (x2 determinism)"
+++run_tx_lane a1 --tap="$TAP"
+++run_tx_lane a2 --tap="$TAP"
+++for t in a1 a2; do
+++    need "N1TXOK  status=01 tdh=01 icr=81" "$WORK/$t.out" \
+++        "lane $t: DD + TDH + TXDW/TXQE receipt"
+++    need "\[guest\] conventional entry reached at 0x00100000" "$WORK/$t.out" \
+++        "lane $t: firmware transport reached the payload"
+++    if [ "$(cat "$WORK/$t-frames.hex" 2>/dev/null)" != "$FRAME_HEX" ]; then
+++        echo "  WIRE: lane $t frame mismatch:"
+++        echo "    want $FRAME_HEX"
+++        echo "    got  $(cat "$WORK/$t-frames.hex" 2>/dev/null)"
+++        fail=1
+++    fi
+++done
+++cmp -s "$WORK/a1.out" "$WORK/a2.out" \
+++    || { echo "  NONDETERMINISTIC: lane A tapes differ"; fail=1; }
+++cmp -s "$WORK/a1-frames.hex" "$WORK/a2-frames.hex" \
+++    || { echo "  NONDETERMINISTIC: lane A wire frames differ"; fail=1; }
+++
+++echo "== lane B: no --tap= means no e1000 at all (opt-in ground rule)"
+++"$X86EMU" --platform=haswell --disk="$WORK/disk.img" \
+++    --max-instr=600000 > "$WORK/b1.out" 2>&1
+++need "N1TXFAIL  status=00 tdh=ff icr=ff" "$WORK/b1.out" \
+++    "lane B: BAR0 reads open-bus 0xFF without the device"
+++need "\[guest\] conventional entry reached at 0x00100000" "$WORK/b1.out" \
+++    "lane B: the same transport still boots"
+++need_no "\[e1000\]" "$WORK/b1.out" "lane B: no e1000 device lines"
+++
+++echo "== lane C: frozen-guest receipts (the N0 lane re-run)"
+++if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
+++    python3 "$ROOT/tests/integration/n1_tap_responder.py" \
+++        --out "$WORK/c1-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
+++        > "$WORK/c1-resp.out" 2>&1 &
+++    "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
+++        --tap="$TAP" --log="$WORK/c1.log" \
+++        --max-instr=4500000000 > "$WORK/c1.out" 2>&1 || true
+++    wait || true
+++    need "\[net\] using NIC: e1000"                "$WORK/c1.log" "lane C: NIC bound"
+++    need "\[dhcp\] starting DHCP discovery"        "$WORK/c1.log" "lane C: DHCP ran"
+++    need_no "\[e1000\] TX timeout"                 "$WORK/c1.log" "lane C: D2 receipt gone"
+++    [ -s "$WORK/c1-frames.hex" ] \
+++        || { echo "  MISSING: lane C put nothing on the wire"; fail=1; }
+++else
+++    echo "SKIP: frozen guest kernel/initrd missing ($KERNEL / $INITRD)"
+++    echo "      reproduce with:"
+++    echo "        KERNEL=$KERNEL INITRD=$INITRD $0 $WORK"
+++fi
+++
+++if [ "$fail" -eq 0 ]; then
+++    echo "N1 TX wire receipts: ALL PASS"
+++else
+++    echo "N1 TX wire receipts: FAIL (see $WORK)"
+++    exit 1
+++fi
++diff --git a/tests/nic_tx.asm b/tests/nic_tx.asm
++new file mode 100644
++index 0000000..f4be2a0
++--- /dev/null
+++++ b/tests/nic_tx.asm
++@@ -0,0 +1,174 @@
+++; tests/nic_tx.asm -- NET N1 wire payload: the TX half of the e1000, measured
+++; through the real firmware-boot transport (not a unit fixture).
+++;
+++; The firmware's USB mass-storage loader reads exactly ONE 512-byte block off
+++; LBA 0 of --disk= into physical 0x00100000 and jumps there in 64-bit long
+++; mode, identity paging, interrupts off (firmware/sample_firmware.nas:689) --
+++; the contract disk/test_kernel.asm runs under.  So this payload must stay
+++; <= 512 bytes; it is that contract's NIC twin.  It programs the TX ring the
+++; way the frozen guest driver does (AuraLite-OS@0ed0d29 drivers/e1000/e1000.c:
+++; e1000_init + e1000_send), rings the TDT doorbell and reports on COM1:
+++;
+++;   N1TXOK status=01 tdh=01 icr=81   <- DD written back inside the doorbell
+++;                                        store, TDH advanced, TXDW|TXQE up
+++;   N1TXFAIL status=.. tdh=.. icr=.. <- any of those missing; defect D2's
+++;                                        receipt was status=00 tdh=00
+++;
+++; The frame itself leaves through the TAP socket (ground rule: UDP datagrams =
+++; Ethernet frames, 127.0.0.1:8080), so "the bytes reached the wire" is proven
+++; host-side by tests/integration/n1_tx_tap.sh, not here.  Keeping this output
+++; independent of the socket is deliberate: the same binary must print the same
+++; thing whether or not a responder is bound, or the determinism pair would
+++; depend on host scheduling.
+++;
+++; Build: nasm -f bin tests/nic_tx.asm -o <out>.bin   (Makefile: test-net-tx)
+++[bits 64]
+++[org 0x100000]
+++
+++BAR    equ 0xFEBC0000       ; e1000 82540EM BAR0 (0:4.0, opt-in via --tap=)
+++CTRL   equ 0x0000
+++ICR    equ 0x00C0
+++IMS    equ 0x00D0
+++TCTL   equ 0x0400
+++TDBAL  equ 0x3800
+++TDLEN  equ 0x3808
+++TDH    equ 0x3810
+++TDT    equ 0x3818
+++COM1   equ 0x03F8
+++; The firmware's long-mode map is NOT all of RAM: PML4[0] -> PDPT[0] -> PD,
+++; and PD[0] = 0x19B is a 2 MiB page (PS in a PDE), so the only conventional
+++; RAM a payload may touch is 0x100000..0x1FFFFF -- measured: a write to
+++; 0x200000 raises #PF err=0x2 (PD[1] = 0).  MMIO reaches the payload through
+++; PDPT[3] (0xC0000000..0xFFFFFFFF, which is how the framebuffer at
+++; 0xD0000000 and BAR0 at 0xFEBC0000 work).  So the ring and the DMA buffer
+++; live just above this payload's own 512 bytes.
+++RING   equ 0x100800         ; 32 legacy TX descriptors (guest NUM_TX_DESC)
+++FRAME  equ 0x100C00         ; the frame's DMA buffer (guest tx_buffers[0])
+++FLEN   equ 20
+++
+++%macro MW 2                 ; MMIO write
+++    mov r11d, BAR + %1
+++    mov eax, %2
+++    mov [r11], eax
+++%endmacro
+++%macro MR 1                 ; MMIO read -> eax
+++    mov r11d, BAR + %1
+++    mov eax, [r11]
+++%endmacro
+++
+++start:
+++    cli
+++    ; ---- the frame: broadcast dst, the QEMU-default src 52:54:00:12:34:56,
+++    ; ---- ethertype 0x0800, payload "N1TXOK" -- three stores, not twenty
+++    ; ---- byte-writes, because the loader only gives us one block.
+++    mov rax, 0x5452FFFFFFFFFFFF       ; ff*6 | 52 54
+++    mov [FRAME], rax
+++    mov rax, 0x314E000856341200       ; 00 12 34 56 | 08 00 | 'N' '1'
+++    mov [FRAME+8], rax
+++    mov eax, 0x4B4F5854               ; 'T' 'X' 'O' 'K'
+++    mov [FRAME+16], eax
+++
+++    ; ---- descriptor 0, exactly as e1000_send() fills it: addr=FRAME,
+++    ; ---- length=20, cso=0, cmd=0x0B (EOP|IFCS|RS), status=0.
+++    mov dword [RING+0], FRAME
+++    mov dword [RING+4], 0
+++    mov dword [RING+8], FLEN | (0x0B << 24)
+++    mov dword [RING+12], 0
+++
+++    ; ---- TX init as e1000_init() does it.  The TCTL write is itself a
+++    ; ---- doorbell (QEMU maps [TCTL] and [TDT] to the same op), so the cause
+++    ; ---- register is drained afterwards to keep the receipt honest.
+++    MW CTRL,  (1 << 0) | (1 << 6)     ; FD | SLU
+++    MW IMS,   0xD5                    ; the guest's mask
+++    MW TDBAL, RING
+++    MW TDLEN, 32 * 16
+++    MW TDH,   0
+++    MW TDT,   0
+++    MW TCTL,  (1 << 1) | (0x10 << 4) | (0x40 << 12)   ; EN | CT | COLD
+++    MR ICR                            ; drain the empty init walk's TXQE
+++
+++    ; ---- the doorbell.  e1000_send() then spins on status&0x01 with a
+++    ; ---- bounded PAUSE budget; here the very next read is the check, so a
+++    ; ---- DD that lands later than the TDT store is a failure.
+++    MW TDT, 1
+++    mov r12d, [RING+12]               ; status byte = bits 0..7 of the dword
+++    and r12d, 0xFF
+++    MR TDH
+++    mov r13d, eax
+++    MR ICR
+++    mov r14d, eax
+++
+++    ; ---- verdict, then one receipt line
+++    mov rsi, .sok
+++    cmp r12d, 0x01                    ; DD?
+++    jne .fail
+++    cmp r13d, 1                       ; TDH advanced?
+++    jne .fail
+++    test r14d, (1 << 0) | (1 << 7)    ; TXDW and TXQE?
+++    jz .fail
+++    jmp .say
+++.fail:
+++    mov rsi, .sbad
+++.say:
+++    call .str
+++    mov rsi, .sst
+++    call .str
+++    mov r9d, r12d
+++    call .hex2
+++    mov rsi, .stdh
+++    call .str
+++    mov r9d, r13d
+++    call .hex2
+++    mov rsi, .sicr
+++    call .str
+++    mov r9d, r14d
+++    call .hex2
+++    mov ecx, 10
+++    call .put
+++.halt:
+++    hlt
+++    jmp .halt
+++
+++.str:                                 ; NUL-terminated string at rsi -> COM1
+++    mov al, [rsi]
+++    test al, al
+++    jz .ret
+++    inc rsi
+++    mov cl, al                        ; .put takes the character in cl
+++    call .put
+++    jmp .str
+++.hex2:                                ; r9d low byte -> two hex digits
+++    mov rcx, r9
+++    shr rcx, 4
+++    call .nib
+++    mov rcx, r9
+++.nib:
+++    and ecx, 0xF
+++    cmp ecx, 10
+++    jb .dig
+++    add ecx, 39                       ; 'a'-10-'0'
+++.dig:
+++    add ecx, '0'
+++.put:                                 ; cl = character -> COM1, polled THR-empty
+++    push rax
+++    push rcx
+++    mov dx, COM1 + 5
+++.spin:
+++    in al, dx
+++    test al, 0x20
+++    jz .spin
+++    mov dx, COM1
+++    mov al, cl
+++    out dx, al
+++    pop rcx
+++    pop rax
+++.ret:
+++    ret
+++
+++.sok:    db 'N1TXOK ', 0
+++.sbad:   db 'N1TXFAIL ', 0
+++.sst:    db ' status=', 0
+++.stdh:   db ' tdh=', 0
+++.sicr:   db ' icr=', 0
+++
+++times 512-($-$$) db 0
++diff --git a/tests/test_net.c b/tests/test_net.c
++index 9d5ea0c..cf12b8e 100644
++--- a/tests/test_net.c
+++++ b/tests/test_net.c
++@@ -1,4 +1,4 @@
++-/* tests/test_net.c -- NET N0 vectors: the e1000 82540EM "RX-ready" model.
+++/* tests/test_net.c -- NET N0+N1 vectors: the e1000 82540EM model.
++  *
++  * Contract measured from AuraLite-OS@0ed0d29 (drivers/e1000/e1000.c,
++  * kernel/arch/i386/net32.c) and QEMU's hw/net/e1000.c e1000_reset:
++@@ -9,6 +9,19 @@
++  *   - RXCSUM reads 0 after reset (QEMU compat);
++  *   - RX ring ingress: frame DMA into the head buffer, DD status, RDH
++  *     advance, ICR.RXT0; RCTL.EN gates the receiver, RDH==RDT drops.
+++ *
+++ * N1 adds the TX ring (QEMU start_xmit / process_tx_desc / txdesc_writeback,
+++ * guest side e1000_send()):
+++ *   - the doorbell is a TDT write AND a TCTL write -- both map to QEMU's
+++ *     set_tctl, which stores, masks TDT to 16 bits and calls start_xmit();
+++ *   - TCTL.EN gates the walk ("tx disabled" -> return);
+++ *   - the walk runs while TDH != TDT, DD is written back inside the doorbell
+++ *     store (the guest spins on status&0x01 with a bounded PAUSE budget),
+++ *     CMD stays intact (QEMU's txdesc_writeback does not clear it), and
+++ *     TDH wraps with "++TDH * 16 >= TDLEN -> TDH = 0";
+++ *   - ICR gets TXDW (bit 0) for RS descriptors and TXQE (bit 7) for every
+++ *     completed walk;
+++ *   - a frame without CMD.EOP accumulates: no wire, no DD, no TXDW.
++  */
++ #include <assert.h>
++ #include <stdint.h>
++@@ -98,9 +111,238 @@ static void test_rx_ingress(void) {
++     printf("ok e1000 rx ingress (DMA + DD + RDH, EN/full gating)\n");
++ }
++ 
+++/* ---- N1 helpers: one legacy TX descriptor, exactly as e1000_send() builds it
+++ * (length, cso=0, cmd=0x0B = EOP|IFCS|RS, status=0). ---- */
+++static void tx_desc_put(fx_t *f, uint64_t ring, unsigned idx, uint64_t buf,
+++                        uint16_t len, uint8_t cmd) {
+++    uint64_t d = ring + idx * 16;
+++    mem_write(&f->m, d + 0, 4, (uint32_t)buf);          /* addr lo */
+++    mem_write(&f->m, d + 4, 4, 0);                      /* addr hi */
+++    mem_write(&f->m, d + 8, 4, (uint32_t)len | ((uint32_t)cmd << 24));
+++    mem_write(&f->m, d + 12, 4, 0);                     /* status/css/popts */
+++}
+++static uint8_t tx_desc_status(fx_t *f, uint64_t ring, unsigned idx) {
+++    return (uint8_t)mem_read(&f->m, ring + idx * 16 + 12, 1);
+++}
+++static uint8_t tx_desc_cmd(fx_t *f, uint64_t ring, unsigned idx) {
+++    return (uint8_t)mem_read(&f->m, ring + idx * 16 + 11, 1);
+++}
+++
+++/* Program the TX ring the way the guest's e1000_init() does: TDLEN =
+++ * NUM_TX_DESC*16, TDH = TDT = 0, TCTL = EN | (0x10<<4) | (0x40<<12).
+++ * The wire counters are device state, so a CTRL.RST first gives every
+++ * vector its own baseline instead of inheriting the previous one's. */
+++static void tx_ring_setup(fx_t *f, uint64_t ring, uint32_t ndesc) {
+++    wr(f, 0x0000, (1u << 26));                          /* CTRL.RST */
+++    wr(f, 0x3800, (uint32_t)ring);                      /* TDBAL */
+++    wr(f, 0x3804, 0);                                   /* TDBAH */
+++    wr(f, 0x3808, ndesc * 16);                          /* TDLEN */
+++    wr(f, 0x3810, 0);                                   /* TDH */
+++    wr(f, 0x3818, 0);                                   /* TDT */
+++    wr(f, 0x0400, (1u << 1) | (0x10u << 4) | (0x40u << 12));
+++}
+++
+++static void test_tx_doorbell_completion(void) {
+++    fx_t f; fx_init(&f);
+++    const uint64_t ring = 0x100000;                     /* 32 descriptors */
+++    const uint64_t buf  = 0x200000;
+++    tx_ring_setup(&f, ring, 32);
+++    assert(rd(&f, 0x3808) == 32 * 16);                  /* TDLEN stored */
+++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
+++
+++    /* The guest's frame: broadcast dst, our MAC src, a tagged payload. */
+++    static const uint8_t frame[20] = {
+++        0xff,0xff,0xff,0xff,0xff,0xff, 0x52,0x54,0x00,0x12,0x34,0x56,
+++        0x08,0x00, 'N','1','T','X','O','K'
+++    };
+++    for (unsigned i = 0; i < sizeof frame; i++)
+++        mem_write(&f.m, buf + i, 1, frame[i]);
+++    tx_desc_put(&f, ring, 0, buf, sizeof frame, 0x0B);  /* EOP|IFCS|RS */
+++    assert(tx_desc_status(&f, ring, 0) == 0);
+++
+++    /* The doorbell: one TDT store.  DD must be back before it returns --
+++     * e1000_send() spins on status&0x01 with a 100000-PAUSE budget and
+++     * prints "[e1000] TX timeout" when it never lands (defect D2). */
+++    wr(&f, 0x3818, 1);
+++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* DD */
+++    assert(tx_desc_cmd(&f, ring, 0) == 0x0B);           /* CMD intact (QEMU) */
+++    assert(rd(&f, 0x3810) == 1);                        /* TDH advanced */
+++    assert(rd(&f, 0x3818) == 1);                        /* TDT as written */
+++
+++    /* ICR: TXDW (RS writeback) + TXQE (QEMU raises it on every walk). */
+++    uint32_t icr = rd(&f, 0x00C0);
+++    assert(icr & (1u << 0));                            /* TXDW  */
+++    assert(icr & (1u << 7));                            /* TXQE  */
+++    assert(rd(&f, 0x00C0) == 0);                        /* read-to-clear */
+++
+++    /* Second descriptor in the same ring: the walk is repeatable. */
+++    tx_desc_put(&f, ring, 1, buf, sizeof frame, 0x0B);
+++    wr(&f, 0x3818, 2);
+++    assert(tx_desc_status(&f, ring, 1) == 0x01);
+++    assert(rd(&f, 0x3810) == 2);
+++
+++    /* The socketless lane drops the frames but still completes them (QEMU
+++     * with a null backend); the counters are the observable proof. */
+++    uint64_t sent = 1, dropped = 0;
+++    e1000_tx_stats(&sent, &dropped);
+++    assert(sent == 0 && dropped == 2);
+++    fx_done(&f);
+++    printf("ok e1000 tx doorbell completion (DD + CMD intact + TDH + TXDW/TXQE)\n");
+++}
+++
+++static void test_tx_tctl_gate_and_doorbell(void) {
+++    fx_t f; fx_init(&f);
+++    const uint64_t ring = 0x100000, buf = 0x200000;
+++    tx_ring_setup(&f, ring, 32);
+++    tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
+++    /* tx_ring_setup's own TCTL write is a doorbell (QEMU maps [TCTL] to
+++     * set_tctl): with TDH==TDT the walk is empty but start_xmit still ends
+++     * with set_ics(..., TXQE), so drain the cause register before asserting
+++     * on the gated one.  Measured: ICR reads 0x80 right after the setup. */
+++    assert(rd(&f, 0x00C0) == (1u << 7));                 /* TXQE only */
+++    (void)rd(&f, 0x00C0);                                /* read-to-clear */
+++
+++    /* Transmitter disabled: QEMU start_xmit() returns before the walk, so
+++     * the doorbell stores TDT but consumes nothing -- not even TXQE. */
+++    wr(&f, 0x0400, 0);                                   /* TCTL without EN */
+++    wr(&f, 0x3818, 1);
+++    assert(rd(&f, 0x3818) == 1);                        /* TDT stored */
+++    assert(rd(&f, 0x3810) == 0);                        /* TDH unmoved */
+++    assert(tx_desc_status(&f, ring, 0) == 0);           /* no DD */
+++    assert(rd(&f, 0x00C0) == 0);                        /* no cause */
+++
+++    /* A TCTL write is the second doorbell: QEMU maps [TCTL] and [TDT] to the
+++     * same op, so enabling the transmitter drains the pending descriptor. */
+++    wr(&f, 0x0400, (1u << 1) | (0x10u << 4) | (0x40u << 12));
+++    assert(rd(&f, 0x3810) == 1);                        /* TDH advanced */
+++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* DD */
+++    assert(rd(&f, 0x00C0) & (1u << 0));                 /* TXDW */
+++
+++    /* TDT is masked to 16 bits by that same op (QEMU set_tctl). */
+++    wr(&f, 0x3818, 0x00030001u);
+++    assert(rd(&f, 0x3818) == 1);
+++    fx_done(&f);
+++    printf("ok e1000 tx TCTL.EN gate + TCTL-write doorbell + TDT 16-bit mask\n");
+++}
+++
+++static void test_tx_multidescriptor_and_wrap(void) {
+++    fx_t f; fx_init(&f);
+++    const uint64_t ring = 0x100000;
+++    tx_ring_setup(&f, ring, 32);
+++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
+++
+++    /* A frame split over two descriptors: the first carries no EOP, so it
+++     * only accumulates -- ONE frame reaches the wire, not two.  Both
+++     * descriptors still get DD, because QEMU calls txdesc_writeback() for
+++     * every descriptor of the walk (EOP or not) and both have CMD.RS. */
+++    tx_desc_put(&f, ring, 0, 0x200000, 8, 0x0A);        /* IFCS|RS, no EOP */
+++    tx_desc_put(&f, ring, 1, 0x200008, 6, 0x0B);        /* EOP|IFCS|RS     */
+++    wr(&f, 0x3818, 2);
+++    assert(tx_desc_status(&f, ring, 0) == 0x01);        /* RS -> DD */
+++    assert(tx_desc_status(&f, ring, 1) == 0x01);
+++    assert(rd(&f, 0x3810) == 2);
+++    uint64_t sent = 1, dropped = 0;
+++    e1000_tx_stats(&sent, &dropped);
+++    assert(sent == 0 && dropped == 1);                  /* ONE frame, not two */
+++    (void)rd(&f, 0x00C0);                               /* drain TXDW|TXQE */
+++
+++    /* No RS: QEMU's txdesc_writeback returns 0 without touching upper.data,
+++     * so DD never lands -- the pin that keeps the writeback conditional.
+++     * TXQE is still raised (every walk ends with set_ics(..., TXQE)). */
+++    tx_desc_put(&f, ring, 2, 0x200000, 14, 0x01);       /* EOP only */
+++    wr(&f, 0x3818, 3);
+++    assert(tx_desc_status(&f, ring, 2) == 0);           /* no DD without RS */
+++    assert(rd(&f, 0x3810) == 3);                        /* consumed anyway */
+++    assert(!(rd(&f, 0x00C0) & (1u << 0)));              /* no TXDW */
+++
+++    /* Ring wrap: TDH 31 -> 0 via "++TDH * 16 >= TDLEN".  The head is parked
+++     * with the pending descriptor already in slot 31, so the single TDT
+++     * store that opens the slot both transmits it and wraps the head. */
+++    tx_desc_put(&f, ring, 31, 0x200000, 14, 0x0B);
+++    wr(&f, 0x3810, 31);                                 /* TDH = last slot */
+++    assert(rd(&f, 0x3810) == 31);
+++    wr(&f, 0x3818, 0);                                  /* TDT = wrap point */
+++    assert(tx_desc_status(&f, ring, 31) == 0x01);       /* slot 31 consumed */
+++    assert(rd(&f, 0x3810) == 0);                        /* head wrapped */
+++    assert(rd(&f, 0x3818) == 0);
+++
+++    /* TDLEN is a set_dlen register: val & 0xfff80 (128-byte multiples). */
+++    wr(&f, 0x3808, 0xFFFFFFFFu);
+++    assert(rd(&f, 0x3808) == 0xFFF80u);
+++    wr(&f, 0x3808, 32 * 16);
+++    fx_done(&f);
+++    printf("ok e1000 tx multi-descriptor EOP, RS-gated writeback, TDH wrap, TDLEN mask\n");
+++}
+++
+++static void test_interrupt_register_semantics(void) {
+++    fx_t f; fx_init(&f);
+++
+++    /* IMS is QEMU's set_ims: `IMS |= val`, not an assign.  The guest writes
+++     * it once at init (RXT0|RXDMT0|RXO|TXDW|LSC) and never re-masks. */
+++    wr(&f, 0x00D0, 0x01);
+++    wr(&f, 0x00D0, 0x80);
+++    assert(rd(&f, 0x00D0) == 0x81);
+++    /* IMC clears the written bits out of IMS. */
+++    wr(&f, 0x00D8, 0x80);
+++    assert(rd(&f, 0x00D0) == 0x01);
+++
+++    /* ICR is QEMU's set_icr: `ICR &= ~val` (the N0 model stored nothing).
+++     * ICR is also read-to-clear, so a read cannot be used to observe a
+++     * partial clear -- the sequence below proves &= ~val with one read: if
+++     * the write had been a no-op (N0) the read would return 0x81. */
+++    wr(&f, 0x00C8, (1u << 0) | (1u << 7));              /* ICS: raise causes */
+++    wr(&f, 0x00C0, (1u << 0));                          /* clear TXDW only */
+++    assert(rd(&f, 0x00C0) == 0x80);                     /* TXQE survives */
+++    assert(rd(&f, 0x00C0) == 0);                        /* read-to-clear */
+++
+++    /* ICS is QEMU's set_ics: causes OR into ICR (write-only register). */
+++    wr(&f, 0x00C8, (1u << 4));                          /* RXDMT0 */
+++    wr(&f, 0x00C8, (1u << 2));                          /* LSC */
+++    assert(rd(&f, 0x00C0) == 0x14);
+++
+++    /* TDH/RDH are set_16bit registers. */
+++    wr(&f, 0x3810, 0x00020003u);
+++    assert(rd(&f, 0x3810) == 3);
+++    wr(&f, 0x2810, 0x00020004u);
+++    assert(rd(&f, 0x2810) == 4);
+++    fx_done(&f);
+++    printf("ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)\n");
+++}
+++
+++static void test_tx_link_gate(void) {
+++    fx_t f; fx_init(&f);
+++    const uint64_t ring = 0x100000, buf = 0x200000;
+++    tx_ring_setup(&f, ring, 32);
+++    tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
+++    (void)rd(&f, 0x00C0);                               /* drain setup TXQE */
+++
+++    /* e1000_send() refuses before touching the ring when STATUS.LU is clear
+++     * ("link down or TX timeout"), so the machine must keep LU readable and
+++     * must still complete a descriptor the guest submitted anyway -- the
+++     * device does not gate TX on the link (QEMU does not either). */
+++    assert(rd(&f, 0x0008) & (1u << 1));                 /* LU on attach */
+++    wr(&f, 0x0000, (1u << 0) | (1u << 6));              /* CTRL FD|SLU */
+++    assert(rd(&f, 0x0008) & (1u << 1));
+++    wr(&f, 0x3818, 1);
+++    assert(tx_desc_status(&f, ring, 0) == 0x01);
+++
+++    /* CTRL.RST resets the ring registers and the assembly state. */
+++    wr(&f, 0x0000, (1u << 26));
+++    assert(rd(&f, 0x3808) == 0);                        /* TDLEN cleared */
+++    assert(rd(&f, 0x3810) == 0);                        /* TDH cleared */
+++    assert(rd(&f, 0x5400) == 0x12005452u);              /* MAC preload back */
+++    fx_done(&f);
+++    printf("ok e1000 tx link gate + CTRL.RST resets the TX ring\n");
+++}
+++
++ int main(void) {
++     test_pci_reset_contract();
++     test_rx_ingress();
+++    test_tx_doorbell_completion();
+++    test_tx_tctl_gate_and_doorbell();
+++    test_tx_multidescriptor_and_wrap();
+++    test_interrupt_register_semantics();
+++    test_tx_link_gate();
++     printf("test-net: all tests passed\n");
++     return 0;
++ }
++-- 
++2.47.3
++
+diff --git a/tests/integration/n2_responder.sh b/tests/integration/n2_responder.sh
+new file mode 100755
+index 0000000..4a1b751
+--- /dev/null
++++ b/tests/integration/n2_responder.sh
+@@ -0,0 +1,222 @@
++#!/bin/sh
++# tests/integration/n2_responder.sh -- NET N2 host-responder wire harness.
++#
++# N2's claim is that a frame the guest puts on the wire gets a protocol-correct
++# answer back, and that the guest's own filters accept it.  That is a two-sided
++# claim, so it is measured on both sides:
++#
++#   Lane A (wire, always runs, x2): tools/tap_responder.py holds the ground-rule
++#     TAP endpoint (UDP 127.0.0.1:8080) and answers as slirp's user-mode stack
++#     does; tests/nic_net.c rides the K1 kernel-load transport (--kernel=, the
++#     4 GiB identity + HHDM map) and runs the frozen guest's own protocol code:
++#     DHCP DISCOVER/OFFER/REQUEST/ACK, then ARP who-has for the gateway, then an
++#     ICMP echo request with the guest's 32-byte 0x41..0x60 payload.  Receipts
++#     required, in the guest's own wording where the guest has wording:
++#       [dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2
++#       [net]  ICMP payload verified (ident+seq+32 bytes)
++#       [net]  PASS: lease + ARP + echo reply (payload verified)
++#       N2OK
++#     and the wire tape must be exactly four frames -- DISCOVER, REQUEST, ARP,
++#     ICMP echo -- byte-identical between the two runs.
++#
++#   Lane B (no device, always runs): the same payload WITHOUT --tap=.  The e1000
++#     function does not exist then (ground rule 3), so STATUS reads all-ones off
++#     the open bus -- LU is set, the link looks up -- and the payload proceeds
++#     into a TX ring nobody services.  It must report the guest's own timeout
++#     receipt rather than hang:
++#       [e1000] TX timeout: desc[0].status=0x00 TDH=4294967295 TDT=4294967295
++#       [dhcp] FAIL: DISCOVER transmit failed (link down or TX timeout)
++#       N2FAIL
++#     This is the pin that keeps every historical no-NIC lane byte-stable.
++#
++#   Lane C (frozen guest, SKIPs without it): the real AuraLite-OS kernel + initrd
++#     against the same responder.  N2's DoD receipts are the two lines the
++#     guest's own integration cases assert (tests/integration/cases/test_e1000e.sh
++#     :48 and test_vmxnet3.sh:49 in AuraLite-OS):
++#       [dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2
++#       [net] PASS: ping 10.0.2.2 successful (ICMP echo reply received)
++#     Requires the frozen build; the recipe is in docs/plans/NET_PLAN.md N2.
++#
++#   Lane D (negative control, always runs): the responder up with
++#     --drop=arp,icmp,dhcp.  Nothing is answered, so the run must degrade to the
++#     first timeout and nothing further:
++#       [dhcp] FAIL: no OFFER received
++#       [net] FAIL: no DHCP lease
++#       N2FAIL
++#     and this lane exits non-zero.  The emulator-side control for the same phase
++#     (removing src/e1000.c's RX descriptor *length* writeback -- not the DD bit,
++#     which the guest never checks) is documented in CHANGELOG.md and NET_PLAN.md
++#     with its measured receipts; it needs a rebuilt emulator, so it stays a
++#     documented manual step instead of a lane that quietly rebuilds the tree.
++#
++# Usage:
++#   tests/integration/n2_responder.sh [workdir]
++# Optional env: X86EMU (default ./x86emu), KERNEL, INITRD (lane C),
++#   RESP_TIMEOUT (default 25), MAX_INSTR (default 60000000).
++
++set -eu
++
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++X86EMU=${X86EMU:-$ROOT/x86emu}
++WORK=${1:-/tmp/n2-responder}
++KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
++INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
++RESP_TIMEOUT=${RESP_TIMEOUT:-25}
++MAX_INSTR=${MAX_INSTR:-60000000}
++TAP=127.0.0.1:8080
++NC_TAP=127.0.0.1:8081          # lane D binds its own port so it cannot race A
++GW_MAC=52:55:0a:00:02:02
++
++mkdir -p "$WORK"
++fail=0
++need()    { grep -q "$1" "$2"    || { echo "  MISSING: $3"; fail=1; }; }
++need_no() { grep -q "$1" "$2" && { echo "  PRESENT: $3"; fail=1; } || :; }
++
++command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 missing"; exit 0; }
++[ -x "$X86EMU" ] || { echo "ERROR: build x86emu first (make x86emu)"; exit 1; }
++
++# ---- the payload ----------------------------------------------------------
++# Built here rather than by the Makefile so `sh tests/integration/n2_responder.sh`
++# works on a fresh clone.  Flags are the frozen K1 guest-image flags: no
++# sanitizers, no PIE, kernel code model, no SSE/red zone.
++CC=${CC:-cc}
++"$CC" -std=c11 -O1 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
++    -mcmodel=kernel -mno-sse -mno-sse2 -mno-mmx -mno-red-zone -nostdlib -no-pie \
++    -Wl,-z,max-page-size=0x1000 -T "$ROOT/tests/nic_net.ld" \
++    "$ROOT/tests/nic_net.c" -o "$WORK/nic_net.elf"
++
++# wait until a port is actually bound, so the emulator's UDP connect() (a no-op
++# against an unbound endpoint) cannot silently cost us the first frame.
++wait_bound() { # wait_bound <port>
++    i=0
++    while [ "$i" -lt 100 ]; do
++        if python3 -c "
++import socket,sys
++s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
++try:
++    s.bind(('127.0.0.1',$1))
++except OSError:
++    sys.exit(0)
++s.close(); sys.exit(1)" 2>/dev/null; then return 0; fi
++        i=$((i+1)); sleep 0.05
++    done
++    echo "  ERROR: nothing bound UDP $1"
++    return 1
++}
++
++run_lane() { # run_lane <tag> <tap|none> <responder args...>
++    tag=$1; mode=$2; shift 2
++    if [ "$mode" != "none" ]; then
++        python3 "$ROOT/tools/tap_responder.py" \
++            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" "$@" \
++            > "$WORK/$tag-resp.out" 2>&1 &
++        resp=$!
++        wait_bound "${mode##*:}" || { fail=1; return 1; }
++    fi
++    if [ "$mode" = "none" ]; then
++        "$X86EMU" --platform=haswell --kernel="$WORK/nic_net.elf" \
++            --max-instr="$MAX_INSTR" --log="$WORK/$tag.log" \
++            > "$WORK/$tag.out" 2>&1 || true
++    else
++        "$X86EMU" --platform=haswell --kernel="$WORK/nic_net.elf" \
++            --tap="$mode" --max-instr="$MAX_INSTR" --log="$WORK/$tag.log" \
++            > "$WORK/$tag.out" 2>&1 || true
++        wait "$resp" || true
++    fi
++}
++
++echo "== protocol vectors: tools/tap_responder.py against the guest's own filters"
++python3 "$ROOT/tests/test_tap_responder.py" > "$WORK/unit.out" 2>&1 \
++    || { echo "  FAIL: responder protocol vectors (see $WORK/unit.out)"; fail=1; }
++need "test-tap-responder: all tests passed" "$WORK/unit.out" \
++    "responder protocol vectors"
++
++echo "== lane A: DHCP + ARP + ICMP over the real wire (x2 determinism)"
++run_lane a1 "$TAP"
++run_lane a2 "$TAP"
++for t in a1 a2; do
++    need "\[kload\] entry=0xffffffff80100000"          "$WORK/$t.log" \
++        "lane $t: K1 transport reached the payload in long mode"
++    need "\[dhcp\] OFFER: IP 10.0.2.15, server 10.0.2.2" "$WORK/$t.log" \
++        "lane $t: OFFER accepted by net.c's filter"
++    need "\[dhcp\] PASS: IP 10.0.2.15, gateway 10.0.2.2" "$WORK/$t.log" \
++        "lane $t: lease receipt (the guest's own integration assert)"
++    need "\[net\] ARP reply: gateway is $GW_MAC"       "$WORK/$t.log" \
++        "lane $t: ARP reply accepted, gateway MAC learned"
++    need "\[net\] ICMP payload verified (ident+seq+32 bytes)" "$WORK/$t.log" \
++        "lane $t: echo reply payload is the request's 0x41..0x60"
++    need "\[net\] PASS: lease + ARP + echo reply (payload verified)" "$WORK/$t.log" \
++        "lane $t: N2 composite receipt"
++    need "N2OK"                                        "$WORK/$t.log" \
++        "lane $t: payload summary"
++    need_no "N2FAIL"                                   "$WORK/$t.log" \
++        "lane $t: payload reported failure"
++    need "DHCP DISCOVER"                               "$WORK/$t-resp.out" \
++        "lane $t: responder saw the DISCOVER"
++    need "DHCP REQUEST"                                "$WORK/$t-resp.out" \
++        "lane $t: responder saw the REQUEST"
++    need "who-has 10.0.2.2 tell 10.0.2.15"             "$WORK/$t-resp.out" \
++        "lane $t: responder saw the ARP request"
++    need "ICMP echo request from 10.0.2.15 (id 0x1234 seq 1, 32 payload bytes)" \
++        "$WORK/$t-resp.out" "lane $t: responder saw the echo request"
++    n=$(wc -l < "$WORK/$t-frames.hex")
++    [ "$n" -eq 4 ] || { echo "  WIRE: lane $t put $n frames on the wire, want 4"; fail=1; }
++done
++cmp -s "$WORK/a1.log" "$WORK/a2.log" \
++    || { echo "  NONDETERMINISTIC: lane A serial tapes differ"; fail=1; }
++cmp -s "$WORK/a1-frames.hex" "$WORK/a2-frames.hex" \
++    || { echo "  NONDETERMINISTIC: lane A wire frames differ"; fail=1; }
++cmp -s "$WORK/a1-resp.out" "$WORK/a2-resp.out" \
++    || { echo "  NONDETERMINISTIC: lane A responder logs differ"; fail=1; }
++
++echo "== lane B: no --tap= means no e1000 at all (opt-in ground rule)"
++run_lane b1 none
++need "\[e1000\] TX timeout: desc\[0\].status=0x00 TDH=4294967295 TDT=4294967295" \
++    "$WORK/b1.log" "lane B: open-bus STATUS still reports LU, TX ring unserviced"
++need "\[dhcp\] FAIL: DISCOVER transmit failed" "$WORK/b1.log" \
++    "lane B: the payload reports instead of hanging"
++need "N2FAIL"    "$WORK/b1.log" "lane B: payload summary"
++need_no "N2OK"   "$WORK/b1.log" "lane B: payload claimed success without a NIC"
++need_no "\[dhcp\] PASS" "$WORK/b1.log" "lane B: no lease without a device"
++
++echo "== lane C: frozen-guest receipts (the DoD as the guest prints it)"
++if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
++    python3 "$ROOT/tools/tap_responder.py" \
++        --out "$WORK/c1-frames.hex" --timeout "$RESP_TIMEOUT" \
++        > "$WORK/c1-resp.out" 2>&1 &
++    "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
++        --tap="$TAP" --log="$WORK/c1.log" \
++        --max-instr=4500000000 > "$WORK/c1.out" 2>&1 || true
++    wait || true
++    need "\[net\] using NIC: e1000"                "$WORK/c1.log" "lane C: NIC bound"
++    need "\[dhcp\] PASS: IP 10.0.2.15, gateway 10.0.2.2" "$WORK/c1.log" \
++        "lane C: lease receipt"
++    need "\[net\] PASS: ping 10.0.2.2 successful (ICMP echo reply received)" \
++        "$WORK/c1.log" "lane C: self-test ping receipt"
++    need_no "\[e1000\] TX timeout"                 "$WORK/c1.log" "lane C: D2 receipt gone"
++else
++    echo "SKIP: frozen guest kernel/initrd missing ($KERNEL / $INITRD)"
++    echo "      reproduce with:"
++    echo "        KERNEL=$KERNEL INITRD=$INITRD $0 $WORK"
++fi
++
++echo "== lane D: negative control -- responder answers nothing (--drop)"
++run_lane d1 "$NC_TAP" --port 8081 --drop=arp,icmp,dhcp
++need "\[dhcp\] DISCOVER sent"        "$WORK/d1.log" "lane D: the request still went out"
++need "\[dhcp\] FAIL: no OFFER received" "$WORK/d1.log" "lane D: first timeout receipt"
++need "\[net\] FAIL: no DHCP lease"   "$WORK/d1.log" "lane D: no lease"
++need "N2FAIL"                        "$WORK/d1.log" "lane D: payload summary"
++need_no "N2OK"                       "$WORK/d1.log" "lane D: payload claimed success"
++need_no "\[dhcp\] PASS"              "$WORK/d1.log" "lane D: no lease receipt"
++need_no "ARP reply: gateway is"      "$WORK/d1.log" "lane D: never reached ARP"
++n=$(wc -l < "$WORK/d1-frames.hex")
++[ "$n" -eq 1 ] || { echo "  WIRE: lane D saw $n frames, want exactly 1 DISCOVER"; fail=1; }
++need "replies arp=0 dhcp=0 icmp=0" "$WORK/d1-resp.out" \
++    "lane D: responder withheld every reply"
++
++if [ "$fail" -eq 0 ]; then
++    echo "N2 responder receipts: ALL PASS"
++else
++    echo "N2 responder receipts: FAIL (see $WORK)"
++    exit 1
++fi
+diff --git a/tests/nic_net.c b/tests/nic_net.c
+new file mode 100644
+index 0000000..2ed7206
+--- /dev/null
++++ b/tests/nic_net.c
+@@ -0,0 +1,552 @@
++/* tests/nic_net.c -- NET N2 wire payload: a guest stand-in that runs the
++ * frozen guest's own online self-test (DHCP -> ARP -> ICMP echo) against the
++ * host responder, through the real e1000 rings and the real TAP socket.
++ *
++ * Why this exists.  N2's DoD receipt (`[dhcp] PASS: IP 10.0.2.15, gateway
++ * 10.0.2.2` + `[net] PASS: ping 10.0.2.2 successful`) belongs to the frozen
++ * AuraLite-OS kernel, and that kernel cannot be built in every tree (it needs
++ * clang --target=x86_64-elf, ld.lld, rustc and mtools).  Leaving the phase
++ * unmeasured is not the house style, so this payload reproduces the guest's
++ * wire behaviour line by line and the harness SKIPs the real guest on top of
++ * it.  It is a *stand-in*, and it is written to be one honestly:
++ *
++ *   - the packets are built by the same code shape as AuraLite-OS@0ed0d29
++ *     kernel/net/net.c (net_eth_send's 60-byte pad, the DISCOVER/REQUEST
++ *     builders, net_ping's ident 0x1234 / seq 1 / 0x41..0x60 payload), and
++ *     the replies are accepted by the same filters, in the same order;
++ *   - the rings are programmed the way drivers/e1000/e1000.c e1000_init does
++ *     it (TX: TDLEN 32*16, TCTL EN|CT|COLD; RX: RDLEN 64*16, RDT = N-1,
++ *     MTA[0..127] = ~0, RCTL 0x0400801a) and drained the way
++ *     e1000_hw_rx_drain does (RDH delta, length from the descriptor, status
++ *     cleared, RDT re-armed to last_rdh + N - 1);
++ *   - the receipt lines are the guest's strings, so a tape from this payload
++ *     and a tape from the real kernel are directly comparable.
++ *
++ * It is NOT a second implementation of the stack: no sockets, no timers, no
++ * allocator.  Timeouts are bounded spin counts, which keeps the run
++ * deterministic (see the N2 determinism pair in docs/plans/NET_PLAN.md).
++ *
++ * Build: see the Makefile's `tests/nic_net.elf` rule (freestanding, the K1
++ * fixture's flags).  Entry is _start in long mode with paging on; the identity
++ * map kload_boot installs covers 0..4 GiB, so physical addresses are used
++ * directly.
++ */
++#include <stdint.h>
++
++/* ---- e1000 register file (BAR0 0xFEBC0000, seeded by e1000_add) ---------- */
++#define BAR        0xFEBC0000u
++#define REG(r)     (*(volatile uint32_t *)(uintptr_t)(BAR + (r)))
++#define E_CTRL     0x0000
++#define E_STATUS   0x0008
++#define E_ICR      0x00C0
++#define E_IMS      0x00D0
++#define E_RCTL     0x0100
++#define E_TCTL     0x0400
++#define E_RDBAL    0x2800
++#define E_RDBAH    0x2804
++#define E_RDLEN    0x2808
++#define E_RDH      0x2810
++#define E_RDT      0x2818
++#define E_TDBAL    0x3800
++#define E_TDBAH    0x3804
++#define E_TDLEN    0x3808
++#define E_TDH      0x3810
++#define E_TDT      0x3818
++#define E_MTA      0x5200
++#define E_RAL      0x5400
++#define E_RAH      0x5404
++
++#define CTRL_FD    (1u << 0)
++#define CTRL_SLU   (1u << 6)
++/* RX descriptor status byte (descriptor offset 12), bit 0 = DD.  Same value
++ * and same byte offset as the emulator's src/e1000.c RXD_STAT_DD. */
++#define RXD_STAT_DD  0x01
++#define STATUS_LU  (1u << 1)
++#define TCTL_EN    (1u << 1)
++#define RCTL_EN    (1u << 1)
++
++/* ---- guest constants (drivers/e1000/e1000.c) ----------------------------- */
++#define NUM_TX_DESC   32
++#define NUM_RX_DESC   64
++#define PKT_BUF_SIZE  2048
++
++/* ---- slirp addressing, as the guest hardcodes it (kernel/net/net.c:39-47) - */
++#define OUR_IP   0x0A00020Fu      /* 10.0.2.15, host order like the guest's */
++#define GW_IP    0x0A000202u      /* 10.0.2.2  */
++
++/* ---- fixed physical layout.  kload_boot puts this image at 0x100000 and the
++ * ---- boot_info at 0x20000, so the rings live above both; RAM_SIZE is 128
++ * ---- MiB, and everything here is a few hundred KiB. */
++#define TX_RING_PHYS   0x00300000u
++#define TX_BUF_PHYS    0x00310000u
++#define RX_RING_PHYS   0x00340000u
++#define RX_BUF_PHYS    0x00350000u
++
++struct tx_desc {                    /* e1000.c:93, 16 bytes */
++    uint64_t addr;
++    uint16_t length;
++    uint8_t  cso;
++    uint8_t  cmd;
++    uint8_t  status;
++    uint8_t  css;
++    uint16_t special;
++} __attribute__((packed));
++
++struct rx_desc {
++    uint64_t addr;
++    uint16_t length;
++    uint16_t csum;
++    uint8_t  status;
++    uint8_t  errors;
++    uint16_t special;
++} __attribute__((packed));
++
++static volatile struct tx_desc *const tx_ring =
++    (volatile struct tx_desc *)(uintptr_t)TX_RING_PHYS;
++static volatile struct rx_desc *const rx_ring =
++    (volatile struct rx_desc *)(uintptr_t)RX_RING_PHYS;
++static uint8_t *const tx_buf = (uint8_t *)(uintptr_t)TX_BUF_PHYS;
++static uint8_t *const rx_buf = (uint8_t *)(uintptr_t)RX_BUF_PHYS;
++
++static uint8_t our_mac[6];
++static uint8_t gw_mac[6];
++static uint32_t our_ip, gw_ip;
++static uint32_t tx_tail, rx_last;
++
++/* ---- COM1 ---------------------------------------------------------------- */
++static void outb(uint16_t port, uint8_t v) {
++    __asm__ volatile("outb %0, %1" : : "a"(v), "dN"(port));
++}
++static uint8_t inb(uint16_t port) {
++    uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "dN"(port)); return v;
++}
++static void putc_(char c) {
++    while (!(inb(0x3FD) & 0x20)) { }
++    outb(0x3F8, (uint8_t)c);
++}
++static void puts_(const char *s) { for (; *s; s++) putc_(*s); }
++static void hex(uint32_t v, int digits) {
++    static const char d[] = "0123456789abcdef";
++    for (int i = digits - 1; i >= 0; i--) putc_(d[(v >> (i * 4)) & 0xF]);
++}
++static void dec(uint32_t v) {
++    char b[10]; int n = 0;
++    if (!v) { putc_('0'); return; }
++    while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
++    while (n) putc_(b[--n]);
++}
++static void ipdots(uint32_t ip) {          /* the guest prints host order */
++    dec((ip >> 24) & 0xFF); putc_('.');
++    dec((ip >> 16) & 0xFF); putc_('.');
++    dec((ip >> 8) & 0xFF);  putc_('.');
++    dec(ip & 0xFF);
++}
++static void macdots(const uint8_t *m) {
++    for (int i = 0; i < 6; i++) { if (i) putc_(':'); hex(m[i], 2); }
++}
++
++/* ---- byte order + checksum, as net.c:156-198 -----------------------------
++ * The guest's own htons_/htonl_ are not reproduced here: this payload builds
++ * every header byte-wise (put_be32) and reads them back with be32, which is
++ * the same wire order with one less place to get a swap wrong.  `checksum()`
++ * IS reproduced bit for bit, because a wrong header checksum is exactly the
++ * class of bug a lenient peer would hide. */
++static uint16_t checksum(const void *data, uint32_t len) {
++    const uint8_t *p = data;
++    uint32_t sum = 0;
++    for (uint32_t i = 0; i + 1 < len; i += 2)
++        sum += (uint32_t)((p[i] << 8) | p[i + 1]);
++    if (len & 1) sum += p[len - 1];
++    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
++    return (uint16_t)(~sum & 0xFFFF);
++}
++static uint32_t be32(const uint8_t *p) {
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
++}
++static void put_be32(uint8_t *p, uint32_t v) {
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
++    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
++}
++
++/* ---- the rings ----------------------------------------------------------- */
++static void nic_init(void) {
++    for (uint32_t i = 0; i < NUM_TX_DESC * sizeof(struct tx_desc); i++)
++        ((uint8_t *)(uintptr_t)TX_RING_PHYS)[i] = 0;
++    for (uint32_t i = 0; i < NUM_RX_DESC * sizeof(struct rx_desc); i++)
++        ((uint8_t *)(uintptr_t)RX_RING_PHYS)[i] = 0;
++
++    our_mac[0] = 0x52; our_mac[1] = 0x54; our_mac[2] = 0x00;
++    our_mac[3] = 0x12; our_mac[4] = 0x34; our_mac[5] = 0x56;
++
++    REG(E_CTRL) = CTRL_FD | CTRL_SLU;
++    REG(E_IMS)  = 0xD5;                       /* the guest's mask */
++
++    /* TX, exactly as e1000_init's step 6 */
++    REG(E_TDBAL) = TX_RING_PHYS;
++    REG(E_TDBAH) = 0;
++    REG(E_TDLEN) = NUM_TX_DESC * 16;
++    REG(E_TDH)   = 0;
++    REG(E_TDT)   = 0;
++    REG(E_TCTL)  = TCTL_EN | (0x10u << 4) | (0x40u << 12);
++
++    /* RX, exactly as e1000_init's step 7: one buffer per descriptor, tail
++     * armed to N-1 so the ring is never "full" (RDH == RDT drops). */
++    for (uint32_t i = 0; i < NUM_RX_DESC; i++)
++        rx_ring[i].addr = RX_BUF_PHYS + (uint64_t)i * PKT_BUF_SIZE;
++    REG(E_RDBAL) = RX_RING_PHYS;
++    REG(E_RDBAH) = 0;
++    REG(E_RDLEN) = NUM_RX_DESC * 16;
++    REG(E_RDH)   = 0;
++    REG(E_RDT)   = NUM_RX_DESC - 1;
++    REG(E_RAL)   = (uint32_t)our_mac[0] | ((uint32_t)our_mac[1] << 8) |
++                   ((uint32_t)our_mac[2] << 16) | ((uint32_t)our_mac[3] << 24);
++    REG(E_RAH)   = (uint32_t)our_mac[4] | ((uint32_t)our_mac[5] << 8) |
++                   (1u << 31);
++    for (int i = 0; i < 128; i++) REG(E_MTA + i * 4) = 0xFFFFFFFFu;
++    REG(E_RCTL)  = RCTL_EN | (1u << 26) | (1u << 15) | (1u << 4) | (1u << 3);
++
++    tx_tail = 0;
++    rx_last = 0;
++}
++
++/* e1000_send(): one descriptor, cmd 0x0B, TDT doorbell, then spin on DD. */
++static int nic_send(const uint8_t *frame, uint32_t len) {
++    if (!(REG(E_STATUS) & STATUS_LU)) { puts_("[e1000] link down\n"); return -1; }
++    if (len > PKT_BUF_SIZE) len = PKT_BUF_SIZE;
++    uint32_t slot = tx_tail;
++    for (uint32_t i = 0; i < len; i++) tx_buf[i] = frame[i];
++    tx_ring[slot].addr   = TX_BUF_PHYS;
++    tx_ring[slot].length = (uint16_t)len;
++    tx_ring[slot].cso    = 0;
++    tx_ring[slot].cmd    = 0x0B;              /* EOP | IFCS | RS */
++    tx_ring[slot].status = 0;
++    tx_tail = (tx_tail + 1) % NUM_TX_DESC;
++    REG(E_TDT) = tx_tail;                     /* the doorbell */
++    /* The guest's own budget is 100000 pause-spins (drivers/e1000/e1000.c:565),
++     * and the number matters: it is what makes the no-device lane report
++     * instead of hanging.  Copied, not invented. */
++    for (int32_t timeout = 100000; timeout-- > 0;) {
++        if (tx_ring[slot].status & 0x01) return 0;
++        __asm__ volatile("pause");
++    }
++    puts_("[e1000] TX timeout: desc["); dec(slot);
++    puts_("].status=0x"); hex(tx_ring[slot].status, 2);
++    puts_(" TDH="); dec(REG(E_TDH));
++    puts_(" TDT="); dec(REG(E_TDT)); putc_('\n');
++    return -1;
++}
++
++/* e1000_hw_rx_drain() (drivers/e1000/e1000.c:504): RDH delta, `length` from
++ * the descriptor, `pkt_len > 0` as the gate, status cleared, RDT re-armed.
++ * Returns one frame per call, 0 when the ring holds nothing usable.
++ *
++ * Two fidelity notes, both measured rather than assumed:
++ *  - The guest gates on `length`, NOT on DD.  So removing the emulator's DD
++ *    writeback (src/e1000.c:373) does not make the frozen guest fail; the
++ *    length writeback at src/e1000.c:372 is the one that does.  That is why
++ *    N2's emulator-side negative control removes the length, not the DD.
++ *  - This stand-in additionally requires DD, because that is what the SDM and
++ *    QEMU say a completed RX descriptor carries, and N2 must not pass on an
++ *    emulator that publishes a stale length with no completion.  It is a
++ *    strictly tighter gate than the guest's: everything the guest accepts,
++ *    this accepts too.
++ * A zero-length or DD-less slot is consumed exactly as the guest consumes it
++ * (status cleared, head advanced, RDT re-armed) but reports nothing. */
++static uint32_t nic_poll(uint8_t *out, uint32_t cap) {
++    uint32_t rdh = REG(E_RDH);
++    if (rdh == rx_last) return 0;
++    uint32_t idx = rx_last % NUM_RX_DESC;
++    uint32_t len = rx_ring[idx].length;
++    uint8_t  st  = rx_ring[idx].status;
++    if (len > PKT_BUF_SIZE) len = PKT_BUF_SIZE;
++    if (len > cap) len = cap;
++    if (len && (st & RXD_STAT_DD)) {
++        const uint8_t *src = rx_buf + (uint64_t)idx * PKT_BUF_SIZE;
++        for (uint32_t i = 0; i < len; i++) out[i] = src[i];
++    } else {
++        len = 0;
++    }
++    rx_ring[idx].status = 0;
++    rx_last = (rx_last + 1) % NUM_RX_DESC;
++    REG(E_RDT) = (rx_last + NUM_RX_DESC - 1) % NUM_RX_DESC;
++    return len;
++}
++
++/* Bounded receive: the emulator drains the TAP socket from devices_tick every
++ * 256 instructions, so the reply lands on a tick -- which only happens while
++ * the guest executes.  A spin budget, not a clock, keeps that deterministic. */
++#define RECV_SPINS 3000000u
++static uint32_t nic_recv(uint8_t *out, uint32_t cap) {
++    for (uint32_t t = 0; t < RECV_SPINS; t++) {
++        uint32_t n = nic_poll(out, cap);
++        if (n) return n;
++        __asm__ volatile("pause");
++    }
++    return 0;
++}
++
++/* ---- Ethernet / IP / UDP framing, as net.c:293 --------------------------- */
++static uint32_t eth_build(uint8_t *frame, const uint8_t dst[6],
++                          uint16_t ethertype, const uint8_t *payload,
++                          uint32_t plen) {
++    for (int i = 0; i < 6; i++) { frame[i] = dst[i]; frame[6 + i] = our_mac[i]; }
++    frame[12] = (uint8_t)(ethertype >> 8);
++    frame[13] = (uint8_t)ethertype;
++    for (uint32_t i = 0; i < plen; i++) frame[14 + i] = payload[i];
++    uint32_t total = 14 + plen;
++    while (total < 60) frame[total++] = 0;    /* the 60-byte minimum */
++    return total;
++}
++
++static void ip_build(uint8_t *p, uint8_t proto, uint32_t src, uint32_t dst,
++                     const uint8_t *body, uint32_t blen, uint16_t ident) {
++    p[0] = 0x45; p[1] = 0;
++    p[2] = (uint8_t)((20 + blen) >> 8); p[3] = (uint8_t)(20 + blen);
++    p[4] = (uint8_t)(ident >> 8);       p[5] = (uint8_t)ident;
++    p[6] = 0; p[7] = 0;
++    p[8] = 64; p[9] = proto; p[10] = 0; p[11] = 0;
++    put_be32(p + 12, src);
++    put_be32(p + 16, dst);
++    uint16_t cs = checksum(p, 20);
++    p[10] = (uint8_t)(cs >> 8); p[11] = (uint8_t)cs;
++    for (uint32_t i = 0; i < blen; i++) p[20 + i] = body[i];
++}
++
++/* ---- DHCP, as net.c:801 -------------------------------------------------- */
++#define DHCP_FIXED 236
++static uint32_t dhcp_build(uint8_t *buf, uint8_t msgtype, uint32_t xid,
++                           int with_request_opts, uint32_t req_ip,
++                           uint32_t srv_ip) {
++    for (uint32_t i = 0; i < DHCP_FIXED; i++) buf[i] = 0;
++    buf[0] = 1; buf[1] = 1; buf[2] = 6; buf[3] = 0;
++    put_be32(buf + 4, xid);
++    buf[10] = 0x80; buf[11] = 0;                 /* broadcast flag */
++    for (int i = 0; i < 6; i++) buf[28 + i] = our_mac[i];
++    put_be32(buf + 232, 0x63825363u);            /* magic cookie */
++
++    uint32_t o = DHCP_FIXED;
++    buf[o++] = 53; buf[o++] = 1; buf[o++] = msgtype;
++    if (!with_request_opts) {                    /* DISCOVER: parameter list */
++        buf[o++] = 55; buf[o++] = 3;
++        buf[o++] = 1; buf[o++] = 3; buf[o++] = 6;
++    } else {                                     /* REQUEST: 50 then 54 */
++        buf[o++] = 50; buf[o++] = 4; put_be32(buf + o, req_ip); o += 4;
++        buf[o++] = 54; buf[o++] = 4; put_be32(buf + o, srv_ip); o += 4;
++    }
++    buf[o++] = 255;
++    return o;
++}
++
++static const uint8_t *dhcp_find_option(const uint8_t *opts, int len, uint8_t code,
++                                       int *out_len) {
++    int i = 0;                                   /* net.c:777 verbatim */
++    while (i < len) {
++        uint8_t c = opts[i];
++        if (c == 255) break;
++        if (c == 0) { i++; continue; }
++        if (i + 1 >= len) break;
++        uint8_t l = opts[i + 1];
++        if (c == code) { if (out_len) *out_len = l; return opts + i + 2; }
++        i += 2 + l;
++    }
++    return 0;
++}
++
++static uint32_t dhcp_xid = 0x12345678u;          /* net.c:808 */
++
++static int dhcp_send(uint8_t msgtype, uint32_t req_ip, uint32_t srv_ip) {
++    uint8_t pkt[576], frame[700];
++    uint32_t dlen = dhcp_build(pkt, msgtype, dhcp_xid, msgtype == 3,
++                               req_ip, srv_ip);
++    uint32_t udp_len = 8 + dlen;
++    uint8_t *udp = frame + 14 + 20;
++    udp[0] = (uint8_t)(68 >> 8); udp[1] = (uint8_t)68;   /* src port 68 */
++    udp[2] = (uint8_t)(67 >> 8); udp[3] = (uint8_t)67;   /* dst port 67 */
++    udp[4] = (uint8_t)(udp_len >> 8); udp[5] = (uint8_t)udp_len;
++    udp[6] = 0; udp[7] = 0;                      /* no UDP checksum, as the guest */
++    for (uint32_t i = 0; i < dlen; i++) udp[8 + i] = pkt[i];
++    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
++    ip_build(frame + 14, 17, 0x00000000u, 0xFFFFFFFFu, udp, udp_len,
++             msgtype == 1 ? 0x1234 : 0x1235);
++    uint32_t total = 14 + 20 + udp_len;
++    while (total < 60) frame[total++] = 0;
++    for (int i = 0; i < 6; i++) { frame[i] = bcast[i]; frame[6 + i] = our_mac[i]; }
++    frame[12] = 0x08; frame[13] = 0x00;
++    return nic_send(frame, total);
++}
++
++/* Returns the message type accepted (2/5), or 0 on timeout. */
++static int dhcp_recv(uint32_t *yiaddr, uint32_t *server_id, uint32_t *mask,
++                     uint32_t *dns, uint32_t *router) {
++    uint8_t rbuf[2048];
++    uint32_t n = nic_recv(rbuf, sizeof rbuf);
++    if (!n) return 0;
++    if (n < 14 + 20 + 8 + DHCP_FIXED) return 0;
++    if (rbuf[12] != 0x08 || rbuf[13] != 0x00) return 0;
++    if (rbuf[14 + 9] != 17) return 0;
++    if (rbuf[34] != 0 || rbuf[35] != 67) return 0;      /* udp.src == 67 */
++    if (rbuf[36] != 0 || rbuf[37] != 68) return 0;      /* udp.dst == 68 */
++    const uint8_t *dhcp = rbuf + 42;
++    int opts_len = (int)n - (14 + 20 + 8 + DHCP_FIXED);
++    if (opts_len < 4) return 0;
++    if (dhcp[0] != 2) return 0;                          /* BOOTREPLY */
++    /* net.c:1058 -- the ACK path compares ntohl_(ack->xid) with the xid it
++     * sent; the OFFER path does not, but a responder that cannot echo an xid
++     * is not worth talking to, so this stand-in checks it in both. */
++    if (be32(dhcp + 4) != dhcp_xid) return 0;
++    const uint8_t *opts = dhcp + DHCP_FIXED;
++    int l;
++    const uint8_t *mt = dhcp_find_option(opts, opts_len, 53, &l);
++    if (!mt || l != 1) return 0;
++    *yiaddr = be32(dhcp + 16);                   /* net.c:927 ntohl_(yiaddr) */
++    const uint8_t *sid = dhcp_find_option(opts, opts_len, 54, &l);
++    if (sid && l == 4) *server_id = be32(sid);
++    const uint8_t *sm = dhcp_find_option(opts, opts_len, 1, &l);
++    if (sm && l == 4) *mask = be32(sm);
++    const uint8_t *dn = dhcp_find_option(opts, opts_len, 6, &l);
++    if (dn && l >= 4) *dns = be32(dn);
++    const uint8_t *rt = dhcp_find_option(opts, opts_len, 3, &l);
++    if (rt && l >= 4) *router = be32(rt);
++    return mt[0];
++}
++
++static int run_dhcp(void) {
++    puts_("[dhcp] starting DHCP discovery...\n");
++    uint32_t yiaddr = 0, sid = 0, mask = 0, dns = 0, router = 0;
++
++    if (dhcp_send(1, 0, 0) < 0) {
++        puts_("[dhcp] FAIL: DISCOVER transmit failed (link down or TX timeout)\n");
++        return -1;
++    }
++    puts_("[dhcp] DISCOVER sent (xid=0x"); hex(dhcp_xid, 8); puts_(")\n");
++
++    int mt = dhcp_recv(&yiaddr, &sid, &mask, &dns, &router);
++    if (mt != 2) { puts_("[dhcp] FAIL: no OFFER received\n"); return -1; }
++    puts_("[dhcp] OFFER: IP "); ipdots(yiaddr);
++    puts_(", server "); ipdots(sid); putc_('\n');
++
++    if (dhcp_send(3, yiaddr, sid) < 0) {
++        puts_("[dhcp] FAIL: REQUEST transmit failed (link down or TX timeout)\n");
++        return -1;
++    }
++    puts_("[dhcp] REQUEST sent (requesting "); ipdots(yiaddr); puts_(")\n");
++
++    uint32_t ayi = 0, asid = 0, amask = mask, adns = dns, arouter = 0;
++    mt = dhcp_recv(&ayi, &asid, &amask, &adns, &arouter);
++    if (mt != 5) { puts_("[dhcp] FAIL: no ACK received\n"); return -1; }
++    if (ayi) yiaddr = ayi;
++    if (arouter) router = arouter;
++    our_ip = yiaddr;
++    if (router) gw_ip = router;
++    if (mask) {
++        puts_("[dhcp] subnet mask: "); ipdots(mask); putc_('\n');
++    }
++    if (dns) {
++        puts_("[dhcp] DNS server: "); ipdots(dns); puts_(" (1 total)\n");
++    }
++    puts_("[dhcp] PASS: IP "); ipdots(our_ip);
++    puts_(", gateway "); ipdots(gw_ip); putc_('\n');
++    return 0;
++}
++
++/* ---- ARP, as net.c:356 --------------------------------------------------- */
++static int run_arp(void) {
++    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
++    uint8_t payload[28], frame[60];
++    payload[0] = 0; payload[1] = 1;               /* hw type 1 */
++    payload[2] = 0x08; payload[3] = 0x00;         /* proto 0x0800 */
++    payload[4] = 6; payload[5] = 4;
++    payload[6] = 0; payload[7] = 1;               /* opcode: request */
++    for (int i = 0; i < 6; i++) payload[8 + i] = our_mac[i];
++    put_be32(payload + 14, our_ip);
++    for (int i = 0; i < 6; i++) payload[14 + 6 + i] = 0;
++    put_be32(payload + 24, gw_ip);
++    uint32_t len = eth_build(frame, bcast, 0x0806, payload, 28);
++    if (nic_send(frame, len) < 0) {
++        puts_("[net] ARP request TX failed\n"); return -1;
++    }
++    puts_("[net] ARP request sent for "); ipdots(gw_ip); putc_('\n');
++
++    uint8_t rbuf[2048];
++    uint32_t n = nic_recv(rbuf, sizeof rbuf);
++    if (!n) { puts_("[net] ARP timeout\n"); return -1; }
++    if (n < 14 + 28) { puts_("[net] ARP reply too short\n"); return -1; }
++    if (rbuf[12] != 0x08 || rbuf[13] != 0x06) {
++        puts_("[net] ARP: unexpected ethertype\n"); return -1;
++    }
++    if (rbuf[20] != 0 || rbuf[21] != 2) {
++        puts_("[net] ARP: opcode is not a reply\n"); return -1;
++    }
++    for (int i = 0; i < 6; i++) gw_mac[i] = rbuf[22 + i];
++    puts_("[net] ARP reply: gateway is "); macdots(gw_mac); putc_('\n');
++    return 0;
++}
++
++/* ---- ICMP echo, as net.c:476 -------------------------------------------- */
++static int run_ping(void) {
++    uint8_t pkt[14 + 20 + 8 + 32];
++    uint8_t *icmp = pkt + 34;
++    for (int i = 0; i < 32; i++) icmp[8 + i] = (uint8_t)(i + 0x41);
++    icmp[0] = 8; icmp[1] = 0; icmp[2] = 0; icmp[3] = 0;
++    icmp[4] = 0x12; icmp[5] = 0x34;               /* ident 0x1234 */
++    icmp[6] = 0; icmp[7] = 1;                     /* seq 1 */
++    uint16_t cs = checksum(icmp, 40);
++    icmp[2] = (uint8_t)(cs >> 8); icmp[3] = (uint8_t)cs;
++    ip_build(pkt + 14, 1, our_ip, gw_ip, icmp, 40, 1);
++    for (int i = 0; i < 6; i++) { pkt[i] = gw_mac[i]; pkt[6 + i] = our_mac[i]; }
++    pkt[12] = 0x08; pkt[13] = 0x00;
++    if (nic_send(pkt, sizeof pkt) < 0) {
++        puts_("[net] ICMP echo request TX failed\n"); return -1;
++    }
++    puts_("[net] ICMP echo request sent to "); ipdots(gw_ip); putc_('\n');
++
++    uint8_t rbuf[2048];
++    uint32_t n = nic_recv(rbuf, sizeof rbuf);
++    if (!n) { puts_("[net] ICMP echo reply timeout\n"); return -1; }
++    if (n < 14 + 20 + 8) { puts_("[net] ICMP reply too short\n"); return -1; }
++    if (rbuf[12] != 0x08 || rbuf[13] != 0x00) {
++        puts_("[net] ICMP: unexpected ethertype\n"); return -1;
++    }
++    if (rbuf[14 + 9] != 1) { puts_("[net] ICMP: protocol is not 1\n"); return -1; }
++    if (rbuf[34] != 0) { puts_("[net] ICMP: type is not echo reply\n"); return -1; }
++    uint16_t seq = (uint16_t)((rbuf[40] << 8) | rbuf[41]);
++    puts_("[net] ICMP echo reply received from "); ipdots(gw_ip);
++    puts_(" (seq "); dec(seq); puts_(")\n");
++    /* The guest stops at `type == 0`; this payload goes the extra step the
++     * plan's "payload verified" wording asks for, and reports it separately. */
++    int same = 1;
++    for (int i = 0; i < 32; i++)
++        if (rbuf[42 + i] != (uint8_t)(i + 0x41)) same = 0;
++    uint16_t rid = (uint16_t)((rbuf[38] << 8) | rbuf[39]);
++    puts_("[net] ICMP payload ");
++    puts_(same && rid == 0x1234 && seq == 1 ? "verified (ident+seq+32 bytes)\n"
++                                            : "MISMATCH\n");
++    return same ? 0 : -1;
++}
++
++/* ---- entry --------------------------------------------------------------- */
++__attribute__((section(".text._start")))
++void _start(void) {
++    __asm__ volatile("cli");
++    nic_init();
++
++    int fail = 0;
++    if (run_dhcp() != 0) {
++        puts_("[net] FAIL: no DHCP lease\n");
++        fail = 1;
++    }
++    if (!fail && run_arp() != 0) {
++        puts_("[net] FAIL: gateway ARP unanswered\n");
++        fail = 1;
++    }
++    if (!fail && run_ping() != 0) {
++        puts_("[net] FAIL: no ICMP echo reply\n");
++        fail = 1;
++    }
++    if (!fail) {
++        puts_("[net] PASS: lease + ARP + echo reply (payload verified)\n");
++    }
++    puts_(fail ? "N2FAIL\n" : "N2OK\n");
++    for (;;) { __asm__ volatile("hlt"); }
++}
+diff --git a/tests/nic_net.ld b/tests/nic_net.ld
+new file mode 100644
+index 0000000..0fc7277
+--- /dev/null
++++ b/tests/nic_net.ld
+@@ -0,0 +1,33 @@
++/* tests/nic_net.ld -- NET N2 wire payload link script.
++ *
++ * Same contract as tests/kload_fixture.ld, which is the K1 artifact: link at
++ * the real AuraLite VMA (KLOAD_KERNEL_VMA + 1 MiB) so kload_boot()'s
++ * segment-math path is exercised faithfully rather than around a friendlier
++ * address, and keep p_paddr == p_vaddr (the GNU ld ET_EXEC default) because
++ * kload_boot() validates exactly that.
++ *
++ * Why this transport and not the firmware one N1 used: the firmware's USB
++ * mass-storage loader reads ONE 512-byte block off LBA 0, and its long-mode
++ * map only covers 0x100000..0x1FFFFF of RAM (PD[0] = 0x19B is a 2 MiB page --
++ * measured in N1).  A DHCP + ARP + ICMP client with two descriptor rings does
++ * not fit in either budget.  kload_boot() gives a freestanding C payload a
++ * 4 GiB identity map plus the HHDM, entered in long mode with paging on.
++ */
++OUTPUT_FORMAT("elf64-x86-64")
++OUTPUT_ARCH(i386:x86-64)
++ENTRY(_start)
++
++SECTIONS
++{
++    . = 0xFFFFFFFF80100000;
++
++    .text : {
++        *(.text._start)   /* _start must lead: do not rely on traversal order */
++        *(.text*)
++    }
++    . = ALIGN(0x1000);
++    .rodata : { *(.rodata*) }
++    . = ALIGN(0x1000);
++    .data : { *(.data*) *(.got*) }
++    .bss : { *(.bss*) *(COMMON) }
++}
+diff --git a/tests/test_tap_responder.py b/tests/test_tap_responder.py
+new file mode 100755
+index 0000000..884a4f3
+--- /dev/null
++++ b/tests/test_tap_responder.py
+@@ -0,0 +1,481 @@
++#!/usr/bin/env python3
++"""tests/test_tap_responder.py -- NET N2 protocol vectors for the responder.
++
++The wire lane (`tests/integration/n2_responder.sh`) proves the responder works
++against a real guest through the real socket, but it cannot say *why* a reply
++was accepted.  These vectors close that gap: they rebuild the guest's own
++request frames byte for byte from AuraLite-OS@0ed0d29 `kernel/net/net.c`, feed
++them to `tools/tap_responder.Responder`, and then accept or reject the reply
++using **the guest's filters ported verbatim** -- same comparisons, same order,
++same minimum lengths.  So a reply that passes here is a reply the frozen guest
++would consume, and the constants that matter (ports 67/68, options 1/3/6/53/54,
++`yiaddr`, `xid` echo, `opcode == 2`, `icmp.type == 0`) are each pinned by an
++assertion rather than implied by a working run.
++
++Also pinned: the RFC 1071 checksums (the guest computes them with
++`checksum()` at net.c:171 and a wrong one is exactly the class of bug that
++would pass a lenient peer), the 60-byte minimum frame pad the guest itself
++applies in `net_eth_send`, and the `--drop` lever the negative control uses.
++
++Run: python3 tests/test_tap_responder.py   (RC=0 = all passed)
++"""
++import os
++import struct
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                                "..", "tools"))
++import tap_responder as R  # noqa: E402
++
++FAILED = []
++
++
++def check(cond, label):
++    if cond:
++        print("ok   %s" % label)
++    else:
++        print("FAIL %s" % label)
++        FAILED.append(label)
++
++
++# ---------------------------------------------------------------------------
++# The guest's side, rebuilt from kernel/net/net.c (0ed0d29).
++# ---------------------------------------------------------------------------
++OUR_MAC = bytes([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])   # RAL/RAH preload (N0)
++BCAST_MAC = b"\xff" * 6
++BCAST_IP = b"\xff\xff\xff\xff"
++
++
++def g_checksum(data: bytes) -> int:
++    """net.c:171 `checksum()`: 16-bit BE words, carries folded, complemented."""
++    total = 0
++    i = 0
++    n = len(data)
++    while i + 1 < n:
++        total += (data[i] << 8) | data[i + 1]
++        i += 2
++    if i < n:                       # odd tail: the guest's loop adds the byte
++        total += data[i]
++    while total >> 16:
++        total = (total & 0xFFFF) + (total >> 16)
++    return (~total) & 0xFFFF
++
++
++def g_eth(payload: bytes, ethertype: int, dst: bytes = BCAST_MAC) -> bytes:
++    """net.c:293 `net_eth_send`: src = our MAC, ethertype BE, pad to 60."""
++    frame = dst + OUR_MAC + struct.pack("!H", ethertype) + payload
++    if len(frame) < 60:
++        frame += b"\x00" * (60 - len(frame))
++    return frame
++
++
++def g_ipv4(proto: int, src: bytes, dst: bytes, body: bytes, ident: int) -> bytes:
++    """net.c's ipv4_hdr builder: v4/ihl5, tos 0, flags_frag 0, ttl 64."""
++    hdr = struct.pack("!BBHHHBBH", 0x45, 0, 20 + len(body), ident, 0, 64,
++                      proto, 0) + src + dst
++    return hdr[:10] + struct.pack("!H", g_checksum(hdr)) + hdr[12:] + body
++
++
++def g_dhcp_option(buf: bytearray, code: int, data: bytes) -> None:
++    """net.c:764 `dhcp_add_option` (END carries no length byte)."""
++    buf.append(code)
++    if code != 255:
++        buf.append(len(data))
++        buf += data
++
++
++def g_dhcp_frame(msgtype: int, xid: int, extra=()) -> bytes:
++    """net.c:801 net_dhcp's DISCOVER / REQUEST builder, byte for byte:
++    236-byte fixed part + options + END, over UDP 68->67 checksum 0, over IP
++    0.0.0.0 -> 255.255.255.255 ident 0x1234/0x1235, over a broadcast frame."""
++    body = bytearray(236)
++    body[0] = 1                                  # BOOTREQUEST
++    body[1] = 1                                  # htype = Ethernet
++    body[2] = 6                                  # hlen
++    struct.pack_into("!I", body, 4, xid)
++    struct.pack_into("!H", body, 10, 0x8000)     # flags: broadcast requested
++    body[28:34] = OUR_MAC                        # chaddr
++    struct.pack_into("!I", body, 232, 0x63825363)  # magic cookie
++
++    opts = bytearray()
++    g_dhcp_option(opts, 53, bytes([msgtype]))
++    if msgtype == 1:                             # DISCOVER: parameter list
++        g_dhcp_option(opts, 55, bytes([1, 3, 6]))
++    for code, data in extra:
++        g_dhcp_option(opts, code, data)
++    g_dhcp_option(opts, 255, b"")
++
++    udp_len = 8 + 236 + len(opts)
++    udp = struct.pack("!HHHH", 68, 67, udp_len, 0) + bytes(body) + bytes(opts)
++    ip = g_ipv4(17, b"\x00\x00\x00\x00", BCAST_IP, udp,
++                0x1234 if msgtype == 1 else 0x1235)
++    return g_eth(ip, 0x0800)
++
++
++def g_arp_frame(target_ip: bytes) -> bytes:
++    """net.c:415 net_arp_resolve's request: broadcast, sender = us."""
++    payload = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
++    payload += OUR_MAC + R.ip4(R.GUEST_IP) + b"\x00" * 6 + target_ip
++    return g_eth(payload, 0x0806)
++
++
++def g_icmp_frame(target_ip: bytes, dst_mac: bytes) -> bytes:
++    """net.c:476 net_ping: ident 0x1234, seq 1, payload 0x41..0x60 (32 B)."""
++    data = bytes((i + 0x41) & 0xFF for i in range(32))
++    icmp = struct.pack("!BBHHH", 8, 0, 0, 0x1234, 1) + data
++    icmp = icmp[:2] + struct.pack("!H", g_checksum(icmp)) + icmp[4:]
++    ip = g_ipv4(1, R.ip4(R.GUEST_IP), target_ip, icmp, 1)
++    return g_eth(ip, 0x0800, dst=dst_mac)
++
++
++# ---------------------------------------------------------------------------
++# The guest's accept filters, ported from net.c.  A reply passes only if the
++# frozen kernel's own comparisons would pass.
++# ---------------------------------------------------------------------------
++
++def guest_accepts_arp_reply(frame: bytes):
++    """net.c:441-465 (local-subnet path)."""
++    if len(frame) < 14 + 28:
++        return False, "too short (%d)" % len(frame)
++    if struct.unpack("!H", frame[12:14])[0] != 0x0806:
++        return False, "ethertype"
++    if struct.unpack("!H", frame[14 + 6:14 + 8])[0] != 2:      # opcode
++        return False, "opcode != ARP_REPLY"
++    return True, frame[22:28]                                   # sender_mac
++
++
++def guest_accepts_dhcp_reply(frame: bytes, want_msgtype: int, xid: int):
++    """net.c:902-935 (OFFER) and 1046-1075 (ACK).  Same gates, in order."""
++    if len(frame) < 14 + 20 + 8 + 236:
++        return False, "too short (%d)" % len(frame)
++    if struct.unpack("!H", frame[12:14])[0] != 0x0800:
++        return False, "ethertype"
++    if frame[14 + 9] != 17:
++        return False, "ip.protocol != UDP"
++    sport, dport = struct.unpack("!HH", frame[34:38])
++    if sport != 67:
++        return False, "udp.src != 67"
++    if dport != 68:
++        return False, "udp.dst != 68"
++    dhcp = frame[42:]
++    opts_len = len(frame) - (14 + 20 + 8 + 236)
++    if opts_len < 4:
++        return False, "opts_len < 4"
++    mt = R.dhcp_find_option(dhcp[236:], 53)
++    if not mt or len(mt) != 1:
++        return False, "option 53 missing/short"
++    if want_msgtype == 5 and struct.unpack("!I", dhcp[4:8])[0] != xid:
++        return False, "xid not echoed"          # the ACK path checks xid
++    if mt[0] != want_msgtype:
++        return False, "message type %d != %d" % (mt[0], want_msgtype)
++    return True, dhcp
++
++
++def guest_accepts_icmp_reply(frame: bytes):
++    """net.c:534-556."""
++    if len(frame) < 14 + 20 + 8:
++        return False, "too short (%d)" % len(frame)
++    if struct.unpack("!H", frame[12:14])[0] != 0x0800:
++        return False, "ethertype"
++    if frame[14 + 9] != 1:
++        return False, "ip.protocol != ICMP"
++    if frame[34] != 0:
++        return False, "icmp.type != ECHO_REPLY"
++    return True, frame
++
++
++# ---------------------------------------------------------------------------
++# Vectors
++# ---------------------------------------------------------------------------
++
++def test_frames_match_the_guest_builder():
++    """Sanity on the test's own side: the frames it feeds are what net.c
++    builds, including the pad and the header checksums.  Without this the
++    vectors below could be passing against a request no guest ever sends."""
++    d = g_dhcp_frame(1, 0x12345678)
++    # 14 eth + 20 ip + 8 udp + 236 dhcp fixed + options 53(3) 55(5) END(1)
++    check(len(d) == 14 + 20 + 8 + 236 + 3 + 5 + 1,
++          "DISCOVER frame length %d (236 fixed + 53/55/END)" % len(d))
++    ip = d[14:34]
++    check(g_checksum(ip) == 0, "DISCOVER IP header checksum verifies to 0")
++    check(struct.unpack("!H", d[40:42])[0] == 0,
++          "DISCOVER UDP checksum is 0 (what the guest sends)")
++    check(struct.unpack("!HH", d[34:38]) == (68, 67),
++          "DISCOVER is UDP 68 -> 67 (net.c:866)")
++    arp = g_arp_frame(R.ip4(R.GW_IP))
++    check(len(arp) == 60, "ARP request padded to the 60-byte minimum (%d)"
++          % len(arp))
++    ic = g_icmp_frame(R.ip4(R.GW_IP), bytes(6))
++    check(len(ic) == 14 + 20 + 8 + 32, "ICMP request is 74 bytes")
++    check(g_checksum(ic[34:34 + 40]) == 0,
++          "ICMP request checksum verifies to 0")
++    check(ic[42:74] == bytes((i + 0x41) for i in range(32)),
++          "ICMP request payload is 0x41..0x60 as net.c:481 builds it")
++
++
++def test_arp_reply():
++    r = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    reply = r.handle(g_arp_frame(R.ip4(R.GW_IP)))
++    check(reply is not None, "ARP request for the gateway gets a reply")
++    ok, why = guest_accepts_arp_reply(reply)
++    check(ok, "ARP reply passes the guest's filter (%s)" % why)
++    if ok:
++        check(why == R.mac(R.GW_MAC_DEFAULT),
++              "ARP reply sender_mac is the gateway MAC %s" % why)
++        check(reply[14 + 24:14 + 28] == R.ip4(R.GUEST_IP),
++              "ARP reply target_ip is the requester's address")
++        check(reply[0:6] == BCAST_MAC,
++              "ARP reply is broadcast (slirp's shape; the guest never checks)")
++        check(len(reply) == 60, "ARP reply padded to 60 bytes (%d)" % len(reply))
++    # An ARP request for something else is still answered (slirp answers for
++    # the addresses it owns); a non-request is not.
++    req_only = bytearray(g_arp_frame(R.ip4(R.GW_IP)))
++    struct.pack_into("!H", req_only, 14 + 6, 2)       # opcode = reply
++    check(r.handle(bytes(req_only)) is None,
++          "an ARP *reply* from the guest is not answered (no loop)")
++
++
++def test_dhcp_discover_offer():
++    r = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    frame = g_dhcp_frame(1, 0x12345678)
++    reply = r.handle(frame)
++    check(reply is not None, "DISCOVER gets an OFFER")
++    ok, why = guest_accepts_dhcp_reply(reply, 2, 0)
++    check(ok, "OFFER passes the guest's filter (%s)" % why)
++    if not ok:
++        return
++    dhcp = why
++    check(dhcp[0] == 2, "OFFER op = BOOTREPLY")
++    check(dhcp[28:34] == OUR_MAC, "OFFER echoes chaddr")
++    check(struct.unpack("!I", dhcp[4:8])[0] == 0x12345678,
++          "OFFER echoes xid 0x12345678")
++    yiaddr = dhcp[16:20]
++    check(yiaddr == R.ip4(R.GUEST_IP),
++          "OFFER yiaddr = %s (the receipt the guest's own integration test "
++          "asserts)" % R.ipstr(yiaddr))
++    opts = dhcp[236:]
++    check(opts[0] == 53, "option 53 (message type) leads the list, as in slirp")
++    sid = R.dhcp_find_option(opts, 54)
++    check(sid == R.ip4(R.GW_IP),
++          "option 54 server id = %s (net.c:929 reads it)" % R.ipstr(sid))
++    sm = R.dhcp_find_option(opts, 1)
++    check(sm == bytes([255, 255, 255, 0]),
++          "option 1 subnet mask = 255.255.255.0 (net.c:933 -> subnet_mask, "
++          "which is what makes the gateway on-link)")
++    rtr = R.dhcp_find_option(opts, 3)
++    check(rtr == R.ip4(R.GW_IP),
++          "option 3 router = %s" % R.ipstr(rtr))
++    dns = R.dhcp_find_option(opts, 6)
++    check(dns == R.ip4(R.DNS_IP),
++          "option 6 DNS = %s (net.c:938 -> dns_set_servers)" % R.ipstr(dns))
++    lease = R.dhcp_find_option(opts, 51)
++    check(lease is not None and len(lease) == 4,
++          "option 51 lease time present (%s s)"
++          % (struct.unpack("!I", lease)[0] if lease else "?"))
++    check(opts[-1] == 255, "the option list ends with END (255)")
++    # The reply is L2+L3 broadcast: the client holds no address yet, which is
++    # the exact failure net.c:1010's comment names.
++    check(reply[0:6] == BCAST_MAC and reply[30:34] == BCAST_IP,
++          "OFFER is broadcast at L2 and L3 (a unicast ACK to an unconfigured "
++          "address is the measured WHPX failure mode)")
++    ip = reply[14:34]
++    check(g_checksum(ip) == 0, "OFFER IP header checksum verifies to 0")
++    total = struct.unpack("!H", ip[2:4])[0]
++    check(total == len(reply) - 14,
++          "OFFER ip.total_length %d == the %d bytes behind the Ethernet header"
++          % (total, len(reply) - 14))
++    ulen = struct.unpack("!H", reply[38:40])[0]
++    check(ulen == total - 20, "OFFER udp.length %d == total_length - 20" % ulen)
++
++
++def test_dhcp_request_ack():
++    r = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    xid = 0x12345678
++    offer = r.handle(g_dhcp_frame(1, xid))
++    ok, dhcp = guest_accepts_dhcp_reply(offer, 2, 0)
++    check(ok, "OFFER accepted before the REQUEST is built")
++    # The guest's REQUEST carries option 50 (the offered address) and 54 (the
++    # server id it read), both big-endian on the wire.
++    req = g_dhcp_frame(3, xid, extra=((50, dhcp[16:20]),
++                                      (54, R.ip4(R.GW_IP))))
++    reply = r.handle(req)
++    check(reply is not None, "REQUEST gets an ACK")
++    ok, why = guest_accepts_dhcp_reply(reply, 5, xid)
++    check(ok, "ACK passes the guest's filter, xid included (%s)" % why)
++    if ok:
++        ack = why
++        check(ack[16:20] == R.ip4(R.GUEST_IP),
++              "ACK yiaddr = 10.0.2.15 -> our_ip")
++        rtr = R.dhcp_find_option(ack[236:], 3)
++        check(rtr == R.ip4(R.GW_IP),
++              "ACK option 3 = 10.0.2.2 -> gateway_ip (net.c:1073)")
++    # A mismatched xid must be ignored by the *guest*, and the responder must
++    # still answer the xid it was given (it echoes, never invents).
++    bad = r.handle(g_dhcp_frame(3, 0xDEADBEEF, extra=((50, dhcp[16:20]),)))
++    ok2, _ = guest_accepts_dhcp_reply(bad, 5, xid)
++    check(not ok2, "an ACK to a different xid is rejected by the guest filter")
++    ok3, _ = guest_accepts_dhcp_reply(bad, 5, 0xDEADBEEF)
++    check(ok3, "the responder echoes whatever xid it was given (no lease state)")
++
++
++def test_icmp_echo_reply():
++    gw_mac = R.mac(R.GW_MAC_DEFAULT)
++    r = R.Responder(gw_mac, quiet=True)
++    req = g_icmp_frame(R.ip4(R.GW_IP), gw_mac)
++    reply = r.handle(req)
++    check(reply is not None, "ICMP echo request gets a reply")
++    ok, why = guest_accepts_icmp_reply(reply)
++    check(ok, "echo reply passes the guest's filter (%s)" % why)
++    if not ok:
++        return
++    ricmp = reply[34:]
++    check(ricmp[0] == 0 and ricmp[1] == 0, "echo reply type 0 code 0")
++    check(struct.unpack("!H", ricmp[4:6])[0] == 0x1234,
++          "echo reply keeps ident 0x1234")
++    check(struct.unpack("!H", ricmp[6:8])[0] == 1, "echo reply keeps seq 1")
++    check(ricmp[8:40] == bytes((i + 0x41) for i in range(32)),
++          "echo reply returns the 32 payload bytes unchanged (0x41..0x60)")
++    check(g_checksum(ricmp[:40]) == 0,
++          "echo reply ICMP checksum verifies to 0")
++    rip = reply[14:34]
++    check(g_checksum(rip) == 0, "echo reply IP header checksum verifies to 0")
++    check(rip[12:16] == R.ip4(R.GW_IP) and rip[16:20] == R.ip4(R.GUEST_IP),
++          "echo reply swapped src/dst (10.0.2.2 -> 10.0.2.15)")
++    check(reply[6:12] == gw_mac and reply[0:6] == OUR_MAC,
++          "echo reply is unicast to us from the gateway MAC")
++    check(struct.unpack("!H", rip[4:6])[0] == 1,
++          "echo reply keeps the request's ip.ident (1)")
++
++
++def test_determinism_and_the_drop_lever():
++    a = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    b = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    frames = [g_arp_frame(R.ip4(R.GW_IP)),
++              g_dhcp_frame(1, 0x12345678),
++              g_dhcp_frame(3, 0x12345678, extra=((50, R.ip4(R.GUEST_IP)),)),
++              g_icmp_frame(R.ip4(R.GW_IP), R.mac(R.GW_MAC_DEFAULT))]
++    check(all(a.handle(f) == b.handle(f) for f in frames),
++          "two responder instances answer identically (no hidden state)")
++    check(all(a.handle(f) == a.handle(f) for f in frames),
++          "replaying the same frame answers identically (idempotent)")
++
++    silent = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True,
++                         drop="arp,icmp,dhcp")
++    check(all(silent.handle(f) is None for f in frames),
++          "--drop=arp,icmp,dhcp withholds every reply (the NC lever)")
++    only_arp = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True, drop="icmp,dhcp")
++    check(only_arp.handle(frames[0]) is not None and
++          only_arp.handle(frames[3]) is None,
++          "--drop is per-protocol, not all-or-nothing")
++
++
++def test_junk_does_not_answer():
++    r = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
++    junk = [b"", b"\x00" * 13, b"\xff" * 14,
++            g_eth(b"\x00" * 20, 0x86DD),                 # IPv6: not N2 scope
++            g_eth(struct.pack("!BBHHHBBH", 0x45, 0, 40, 0, 0, 64, 6, 0)
++                  + b"\x00" * 32, 0x0800),               # TCP: ignored
++            g_dhcp_frame(1, 1)[:60]]                     # truncated DHCP
++    check(all(r.handle(f) is None for f in junk),
++          "junk / out-of-scope frames get no reply (nothing invented)")
++
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++def test_reply_goes_to_the_peer_not_to_the_endpoint():
++    """Regression vector for the bug the first N2 wire run exposed.
++
++    The responder *binds* the endpoint the emulator *connects to* (see
++    src/devices.c: `--tap=` does a UDP connect).  So `sendto(reply,
++    (host, port))` sends the reply to the responder's own socket and the
++    emulator never sees it -- measured as a wire log full of correct OFFERs
++    next to a guest printing `[dhcp] FAIL: no OFFER received`.  The reply has
++    to go to the peer address `recvfrom` reported.
++
++    Protocol vectors above cannot see this (they call `Responder.handle`
++    directly), so it gets its own socket-level vector: run the real tool as a
++    subprocess, send one DISCOVER from a *connected* client socket, and assert
++    the OFFER arrives on that client -- and on nothing else.
++    """
++    import socket
++    import subprocess
++    import time
++
++    endpoint = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    endpoint.bind(("127.0.0.1", 0))
++    port = endpoint.getsockname()[1]
++    endpoint.close()                       # freed for the responder to bind
++
++    sentinel = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    sentinel.bind(("127.0.0.1", 0))        # must stay silent for the whole run
++    sentinel.settimeout(0.5)
++    sentinel_port = sentinel.getsockname()[1]
++
++    proc = subprocess.Popen(
++        [sys.executable, os.path.join(ROOT, "tools", "tap_responder.py"),
++         "--port", str(port), "--timeout", "5", "--quiet"],
++        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
++
++    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    client.connect(("127.0.0.1", port))    # exactly what the emulator does
++    client.settimeout(4.0)
++    reply = b""
++    try:
++        deadline = time.monotonic() + 4.0
++        while time.monotonic() < deadline:
++            try:
++                sentinel.recvfrom(65536)
++            except socket.timeout:
++                pass
++            client.send(g_dhcp_frame(1, 0x12345678))
++            try:
++                reply = client.recv(65536)
++                break
++            except socket.timeout:
++                continue
++    finally:
++        client.close()
++        proc.terminate()
++        proc.wait(timeout=10)
++
++    check(bool(reply), "a connected client receives the OFFER (not only the "
++                       "responder's own socket)")
++    check(len(reply) > 42 and reply[14 + 20 + 8 + 0] == 2,
++          "what the client received is a BOOTREPLY (%d bytes)" % len(reply))
++    opts = reply[14 + 20 + 8 + 236:]          # DHCP fixed part ends here
++    check(len(opts) >= 3 and opts[0] == 53 and opts[2] == 2,
++          "the client's reply is an OFFER (option 53 = 2)")
++    silent = True
++    try:
++        sentinel.settimeout(0.2)
++        sentinel.recvfrom(65536)
++        silent = False
++    except socket.timeout:
++        pass
++    sentinel.close()
++    check(silent, "no reply leaked to any other socket on the host (port %d)"
++          % sentinel_port)
++
++
++def main():
++    for fn in (test_frames_match_the_guest_builder,
++               test_arp_reply,
++               test_dhcp_discover_offer,
++               test_dhcp_request_ack,
++               test_icmp_echo_reply,
++               test_reply_goes_to_the_peer_not_to_the_endpoint,
++               test_determinism_and_the_drop_lever,
++               test_junk_does_not_answer):
++        print("--- %s" % fn.__name__)
++        fn()
++    if FAILED:
++        print("test-tap-responder: %d FAILURE(S): %s"
++              % (len(FAILED), ", ".join(FAILED)))
++        return 1
++    print("test-tap-responder: all tests passed")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/tap_responder.py b/tools/tap_responder.py
+new file mode 100755
+index 0000000..c696f9a
+--- /dev/null
++++ b/tools/tap_responder.py
+@@ -0,0 +1,485 @@
++#!/usr/bin/env python3
++"""tools/tap_responder.py -- NET N2: the host side of the TAP socket.
++
++Ground rule 1 (fixed, N0 artifact) makes the transport UDP datagrams that ARE
++Ethernet frames at `127.0.0.1:8080`, with the emulator *connecting* and the
++host side *binding*.  N1 put the first frame on that wire; N2 is the peer that
++answers, in the shape of QEMU's `-netdev user` (slirp), because that is the
++receipt shape the guest already names:
++
++    [net] FAIL: no ICMP echo reply (is QEMU -netdev user configured?)
++    il_assert_grep_fixed "$LOG" "[dhcp] PASS: IP 10.0.2.15, gateway 10.0.2.2"
++        -- AuraLite-OS@0ed0d29 tests/integration/cases/test_e1000e.sh:49
++
++Two modes:
++
++  capture (N1's lane)  record every datagram as one hex line, answer nothing.
++  slirp   (N2)         answer ARP for the gateway, DHCP DISCOVER/REQUEST with
++                       OFFER/ACK, and ICMP echo with an echo reply.
++
++What is measured, and from where
++--------------------------------
++Everything the guest asserts is measured from AuraLite-OS@0ed0d29
++`kernel/net/net.c` -- the x86_64 stack, NOT `kernel/arch/i386/net32.c`, which
++is a different port whose `[net] PASS: lease + ARP + echo reply` receipt this
++kernel never prints (NET_PLAN N2's DoD quoted the wrong file; corrected here):
++
++  * slirp addressing: net 10.0.2.0/24, guest `10.0.2.15`, gateway/DHCP server
++    `10.0.2.2`, DNS `10.0.2.3` (`net.c:39-47` OUR_IP_O*/GW_IP_O*, plus the X3
++    comment "the default server list (QEMU SLIRP 10.0.2.3)").
++  * the OFFER/ACK filters (`net.c:900-960`, `1043-1105`): ethertype IPv4,
++    `ip.protocol == 17`, `udp.src == 67`, `udp.dst == 68`, frame
++    >= 14+20+8+236, `opts_len >= 4`, option 53 present with the right message
++    type, and -- for the ACK only -- `xid` echoed.  Options 54/1/6 are read
++    from the OFFER; option 3 (router) sets `gateway_ip` from the ACK.
++  * the ARP reply filter (`net.c:437-465`): ethertype 0x0806, `opcode == 2`,
++    length >= 42, and the guest takes `sender_mac` verbatim -- it never checks
++    `target_ip`.
++  * the ICMP reply filter (`net.c:527-556`): ethertype 0x0800,
++    `ip.protocol == 1`, `icmp.type == 0`, frame >= 42.  The request is
++    `ident 0x1234`, `seq 1`, 32 payload bytes `0x41..0x60`, `ttl 64`
++    (`net.c:476`).
++
++What is NOT measured (NET_PLAN ledger D7): the gateway's MAC address.  No
++source reachable from this tree pins it -- libslirp's `bootp.c` was not
++fetchable here and AuraLite-OS never records an `[net] ARP reply: gateway is
++...` tape.  slirp's published scheme derives the MAC from the host IP
++(`52:55:<the four IP bytes>`), so `10.0.2.2` -> `52:55:0a:00:02:02`; that is
++the default here and `--gw-mac` exists so anyone holding a real `-netdev user`
++tape can pin it.  No guest assertion depends on the value.
++
++Determinism: every byte of every reply is a pure function of the request -- no
++clock, no lease bookkeeping, no counters leaking into packets -- so two runs of
++the same guest produce identical wires.
++"""
++
++import argparse
++import binascii
++import socket
++import struct
++import sys
++import time
++
++# ---- slirp's 10.0.2.0/24 (measured, see the module docstring) --------------
++GUEST_IP = (10, 0, 2, 15)
++GW_IP = (10, 0, 2, 2)
++DNS_IP = (10, 0, 2, 3)
++GW_MAC_DEFAULT = "52:55:0a:00:02:02"
++LEASE_SECONDS = 3600
++
++ETHERTYPE_IPV4 = 0x0800
++ETHERTYPE_ARP = 0x0806
++IP_PROTO_ICMP = 1
++IP_PROTO_UDP = 17
++ARP_REQUEST = 1
++ARP_REPLY = 2
++ICMP_ECHO_REQ = 8
++ICMP_ECHO_REP = 0
++
++DHCP_SERVER_PORT = 67
++DHCP_CLIENT_PORT = 68
++DHCP_BOOTREQUEST = 1
++DHCP_BOOTREPLY = 2
++DHCP_DISCOVER = 1
++DHCP_OFFER = 2
++DHCP_REQUEST = 3
++DHCP_ACK = 5
++DHCP_MAGIC_COOKIE = 0x63825363
++OPT_SUBNET_MASK = 1
++OPT_ROUTER = 3
++OPT_DNS = 6
++OPT_REQUESTED_IP = 50
++OPT_LEASE_TIME = 51
++OPT_MSG_TYPE = 53
++OPT_SERVER_ID = 54
++OPT_END = 255
++
++DHCP_FIXED_LEN = 236   # op..file(128) + cookie(4): the guest's sizeof(dhcp_pkt)
++BROADCAST_MAC = b"\xff" * 6
++BROADCAST_IP = b"\xff\xff\xff\xff"
++
++
++def mac(s: str) -> bytes:
++    return bytes(int(b, 16) for b in s.split(":"))
++
++
++def macstr(b: bytes) -> str:
++    return ":".join("%02x" % x for x in b)
++
++
++def ip4(t) -> bytes:
++    return bytes(t)
++
++
++def ipstr(b: bytes) -> str:
++    return ".".join(str(x) for x in b)
++
++
++def csum(data: bytes) -> int:
++    """RFC 1071 one's complement -- the same `checksum()` the guest builds at
++    kernel/net/net.c:171: 16-bit words, carries folded, result complemented,
++    an odd tail padded with a zero byte."""
++    if len(data) % 2:
++        data += b"\x00"
++    acc = 0
++    for i in range(0, len(data), 2):
++        acc += (data[i] << 8) | data[i + 1]
++    while acc >> 16:
++        acc = (acc & 0xFFFF) + (acc >> 16)
++    return (~acc) & 0xFFFF
++
++
++def eth_pad(frame: bytes) -> bytes:
++    """`net_eth_send` pads to the 60-byte minimum, so the guest's own frames
++    arrive padded; replies are padded too, keeping the wire symmetric."""
++    return frame + b"\x00" * (60 - len(frame)) if len(frame) < 60 else frame
++
++
++# ============================ request parsing ==============================
++
++def parse_eth(frame: bytes):
++    if len(frame) < 14:
++        return None
++    et = struct.unpack("!H", frame[12:14])[0]
++    return frame[0:6], frame[6:12], et, frame[14:]
++
++
++def build_eth(dst: bytes, src: bytes, ethertype: int, payload: bytes) -> bytes:
++    return eth_pad(dst + src + struct.pack("!H", ethertype) + payload)
++
++
++def parse_arp(payload: bytes):
++    """-> (opcode, sender_mac, sender_ip, target_ip) or None."""
++    if len(payload) < 28:
++        return None
++    hw, proto, hlen, plen, op = struct.unpack("!HHBBH", payload[0:8])
++    if hw != 1 or proto != ETHERTYPE_IPV4 or hlen != 6 or plen != 4:
++        return None
++    return op, payload[8:14], payload[14:18], payload[24:28]
++
++
++def build_arp_reply(dst_mac: bytes, src_mac: bytes,
++                    sender_ip: bytes, target_ip: bytes) -> bytes:
++    payload = struct.pack("!HHBBH", 1, ETHERTYPE_IPV4, 6, 4, ARP_REPLY)
++    payload += src_mac + sender_ip + dst_mac + target_ip
++    return build_eth(dst_mac, src_mac, ETHERTYPE_ARP, payload)
++
++
++def parse_ipv4(payload: bytes):
++    """-> (proto, src, dst, body, ident) or None."""
++    if len(payload) < 20 or (payload[0] >> 4) != 4:
++        return None
++    ihl = (payload[0] & 0xF) * 4
++    if ihl < 20 or len(payload) < ihl:
++        return None
++    total_len = struct.unpack("!H", payload[2:4])[0]
++    ident = struct.unpack("!H", payload[4:6])[0]
++    proto = payload[9]
++    end = min(total_len, len(payload)) if total_len >= ihl else len(payload)
++    return proto, payload[12:16], payload[16:20], payload[ihl:end], ident
++
++
++def build_ipv4(proto: int, src: bytes, dst: bytes, body: bytes,
++               ident: int = 0, ttl: int = 255) -> bytes:
++    hdr = struct.pack("!BBHHHBBH", (4 << 4) | 5, 0, 20 + len(body), ident,
++                      0, ttl, proto, 0) + src + dst
++    return hdr[0:10] + struct.pack("!H", csum(hdr)) + hdr[12:20] + body
++
++
++def parse_udp(body: bytes):
++    if len(body) < 8:
++        return None
++    sport, dport, _ulen, _ck = struct.unpack("!HHHH", body[0:8])
++    return sport, dport, body[8:]
++
++
++def build_udp(sport: int, dport: int, data: bytes,
++              src_ip: bytes, dst_ip: bytes, compute_csum: bool) -> bytes:
++    length = 8 + len(data)
++    if compute_csum:
++        pseudo = src_ip + dst_ip + struct.pack("!BBH", 0, IP_PROTO_UDP, length)
++        ck = csum(pseudo + struct.pack("!HHHH", sport, dport, length, 0) + data)
++        if ck == 0:
++            ck = 0xFFFF            # RFC 768: zero means "no checksum"
++    else:
++        ck = 0                     # legal over IPv4, and what the guest sends
++    return struct.pack("!HHHH", sport, dport, length, ck) + data
++
++
++def dhcp_find_option(opts: bytes, code: int):
++    """The guest's own walker (net.c:777): pad (0) skipped, END (255) stops, a
++    truncated TLV stops.  Replies are validated with the same code path the
++    guest uses, not a more forgiving one."""
++    i = 0
++    while i < len(opts):
++        c = opts[i]
++        if c == OPT_END:
++            return None
++        if c == 0:
++            i += 1
++            continue
++        if i + 1 >= len(opts):
++            return None
++        ln = opts[i + 1]
++        if c == code:
++            return opts[i + 2:i + 2 + ln]
++        i += 2 + ln
++    return None
++
++
++def parse_dhcp(payload: bytes):
++    """-> dict or None.  Requires the 236-byte fixed part plus >= 4 option
++    bytes, which is the guest's own `opts_len < 4` gate."""
++    if len(payload) < DHCP_FIXED_LEN + 4:
++        return None
++    if payload[0] != DHCP_BOOTREQUEST:
++        return None
++    if struct.unpack("!I", payload[232:236])[0] != DHCP_MAGIC_COOKIE:
++        return None
++    chaddr = payload[28:44]
++    hlen = payload[2]
++    opts = payload[DHCP_FIXED_LEN:]
++    mt = dhcp_find_option(opts, OPT_MSG_TYPE)
++    if not mt or len(mt) != 1:
++        return None
++    return {
++        "htype": payload[1], "hlen": hlen,
++        "xid": struct.unpack("!I", payload[4:8])[0],
++        "flags": struct.unpack("!H", payload[10:12])[0],
++        "chaddr": chaddr,
++        "chaddr_mac": chaddr[0:hlen] if 0 < hlen <= 16 else chaddr[0:6],
++        "msgtype": mt[0],
++        "requested_ip": dhcp_find_option(opts, OPT_REQUESTED_IP),
++        "server_id": dhcp_find_option(opts, OPT_SERVER_ID),
++    }
++
++
++def build_dhcp_reply(req: dict, msgtype: int, yiaddr: bytes) -> bytes:
++    """One BOOTREPLY the way slirp's dhcp_reply builds it: the 236-byte fixed
++    part (xid/chaddr echoed, sname/file zero) then options in slirp's order --
++    53 message type, 54 server id, 51 lease time, 1 mask, 3 router, 6 DNS,
++    END.  The guest reads 53+54+1+6 from the OFFER and 53+3 (+yiaddr, xid)
++    from the ACK, so one option list serves both."""
++    body = bytearray(DHCP_FIXED_LEN)
++    body[0] = DHCP_BOOTREPLY
++    body[1] = req["htype"] or 1
++    body[2] = req["hlen"] or 6
++    body[3] = 0                                    # hops
++    struct.pack_into("!I", body, 4, req["xid"])    # xid echoed
++    struct.pack_into("!H", body, 8, 0)             # secs
++    struct.pack_into("!H", body, 10, 0)            # flags
++    body[12:16] = b"\x00\x00\x00\x00"              # ciaddr
++    body[16:20] = yiaddr                           # yiaddr
++    body[20:24] = ip4(GW_IP)                       # siaddr
++    body[24:28] = b"\x00\x00\x00\x00"              # giaddr
++    body[28:44] = req["chaddr"]                    # chaddr, all 16 bytes
++    struct.pack_into("!I", body, 232, DHCP_MAGIC_COOKIE)
++
++    opts = bytearray()
++    opts += bytes([OPT_MSG_TYPE, 1, msgtype])
++    opts += bytes([OPT_SERVER_ID, 4]) + ip4(GW_IP)
++    opts += bytes([OPT_LEASE_TIME, 4]) + struct.pack("!I", LEASE_SECONDS)
++    opts += bytes([OPT_SUBNET_MASK, 4]) + ip4((255, 255, 255, 0))
++    opts += bytes([OPT_ROUTER, 4]) + ip4(GW_IP)
++    opts += bytes([OPT_DNS, 4]) + ip4(DNS_IP)
++    opts += bytes([OPT_END])
++    return bytes(body) + bytes(opts)
++
++
++# ================================ the loop =================================
++
++class Responder:
++    """Answers one frame; returns the reply frame or None.  A pure function of
++    the request -- no clock, no lease table, no counters -- so two runs of the
++    same guest see an identical wire."""
++
++    def __init__(self, gw_mac: bytes, udp_checksum: bool = False,
++                 quiet: bool = False, drop: str = ""):
++        self.gw_mac = gw_mac
++        self.udp_checksum = udp_checksum
++        self.quiet = quiet
++        self.drop = frozenset(d for d in drop.split(",") if d)
++        self.stats = {"arp": 0, "dhcp": 0, "icmp": 0, "ignored": 0}
++
++    def log(self, msg: str) -> None:
++        if not self.quiet:
++            print(msg, flush=True)
++
++    def handle(self, frame: bytes):
++        p = parse_eth(frame)
++        if not p:
++            return None
++        _dst, src, et, payload = p
++
++        if et == ETHERTYPE_ARP:
++            a = parse_arp(payload)
++            if not a:
++                return None
++            op, smac, sip, tip = a
++            if op != ARP_REQUEST:
++                return None
++            if "arp" in self.drop:
++                self.log("  [drop] ARP request for %s (negative control)"
++                         % ipstr(tip))
++                return None
++            self.stats["arp"] += 1
++            self.log("  ARP  who-has %s tell %s -> reply %s is at %s"
++                     % (ipstr(tip), ipstr(sip), ipstr(tip),
++                        macstr(self.gw_mac)))
++            # slirp broadcasts the reply -- during DHCP the request comes from
++            # 0.0.0.0, and the guest only ever checks `opcode == 2`.
++            return build_arp_reply(BROADCAST_MAC, self.gw_mac, tip, sip)
++
++        if et != ETHERTYPE_IPV4:
++            return None
++        v = parse_ipv4(payload)
++        if not v:
++            return None
++        proto, ipsrc, _ipdst, body, ident = v
++
++        if proto == IP_PROTO_ICMP:
++            if len(body) < 8 or body[0] != ICMP_ECHO_REQ:
++                return None
++            if "icmp" in self.drop:
++                self.log("  [drop] ICMP echo request (negative control)")
++                return None
++            self.stats["icmp"] += 1
++            icid, icseq = struct.unpack("!HH", body[4:8])
++            self.log("  ICMP echo request from %s (id 0x%04x seq %u, %d payload"
++                     " bytes) -> echo reply"
++                     % (ipstr(ipsrc), icid, icseq, len(body) - 8))
++            # slirp's icmp_input echo path: swap addresses, type 0, keep
++            # ident/seq/payload byte for byte, recompute both checksums.
++            icmp = bytearray(body)
++            icmp[0] = ICMP_ECHO_REP
++            icmp[1] = 0
++            icmp[2:4] = b"\x00\x00"
++            icmp[2:4] = struct.pack("!H", csum(bytes(icmp)))
++            return build_eth(src, self.gw_mac, ETHERTYPE_IPV4,
++                             build_ipv4(IP_PROTO_ICMP, ip4(GW_IP), ipsrc,
++                                        bytes(icmp), ident=ident))
++
++        if proto != IP_PROTO_UDP:
++            return None
++        u = parse_udp(body)
++        if not u:
++            return None
++        sport, dport, data = u
++        if sport != DHCP_CLIENT_PORT or dport != DHCP_SERVER_PORT:
++            return None
++        req = parse_dhcp(data)
++        if not req:
++            self.stats["ignored"] += 1
++            self.log("  DHCP: malformed request ignored")
++            return None
++        if "dhcp" in self.drop:
++            self.log("  [drop] DHCP message type %d (negative control)"
++                     % req["msgtype"])
++            return None
++        if req["msgtype"] == DHCP_DISCOVER:
++            self.log("  DHCP DISCOVER xid=0x%08x chaddr=%s -> OFFER %s"
++                     % (req["xid"], macstr(req["chaddr_mac"]),
++                        ipstr(ip4(GUEST_IP))))
++            reply = build_dhcp_reply(req, DHCP_OFFER, ip4(GUEST_IP))
++        elif req["msgtype"] == DHCP_REQUEST:
++            want = req["requested_ip"] or ip4(GUEST_IP)
++            self.log("  DHCP REQUEST xid=0x%08x for %s -> ACK %s"
++                     % (req["xid"], ipstr(want), ipstr(want)))
++            reply = build_dhcp_reply(req, DHCP_ACK, want)
++        else:
++            self.stats["ignored"] += 1
++            self.log("  DHCP message type %d ignored" % req["msgtype"])
++            return None
++        self.stats["dhcp"] += 1
++
++        # Broadcast at L2 and L3.  The client set the RFC 2131 broadcast flag
++        # and still holds no address -- exactly the failure its own comment
++        # names ("OFFER-received/ACK-never" when the server unicasts the ACK to
++        # the still-unconfigured address), so unicasting is not an option.
++        udp = build_udp(DHCP_SERVER_PORT, DHCP_CLIENT_PORT, reply,
++                        ip4(GW_IP), BROADCAST_IP, self.udp_checksum)
++        ip = build_ipv4(IP_PROTO_UDP, ip4(GW_IP), BROADCAST_IP, udp,
++                        ident=0x1234)
++        return build_eth(BROADCAST_MAC, self.gw_mac, ETHERTYPE_IPV4, ip)
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(
++        description="the host side of the emulator's TAP socket (NET N2)")
++    ap.add_argument("--mode", choices=("slirp", "capture"), default="slirp",
++                    help="capture = N1's record-only lane")
++    ap.add_argument("--host", default="127.0.0.1")
++    ap.add_argument("--port", type=int, default=8080)
++    ap.add_argument("--gw-mac", default=GW_MAC_DEFAULT,
++                    help="gateway/DHCP-server MAC (ledger D7: unmeasured)")
++    ap.add_argument("--out", help="hex frame log of everything received")
++    ap.add_argument("--count", type=int, default=0,
++                    help="stop after N received frames (0 = until --timeout)")
++    ap.add_argument("--timeout", type=float, default=0.0,
++                    help="seconds to run; 0 = until interrupted")
++    ap.add_argument("--udp-checksum", action="store_true",
++                    help="compute the DHCP reply's UDP checksum (the guest "
++                         "never validates it and sends 0 itself)")
++    ap.add_argument("--drop", default="",
++                    help="comma list of replies to withhold: arp,icmp,dhcp "
++                         "(the negative-control lever)")
++    ap.add_argument("--quiet", action="store_true")
++    a = ap.parse_args(argv)
++
++    r = Responder(mac(a.gw_mac), a.udp_checksum, a.quiet, a.drop)
++
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    s.bind((a.host, a.port))
++    if not a.quiet:
++        print("responder: mode=%s bound %s:%d gw-ip=%s gw-mac=%s"
++              % (a.mode, a.host, a.port, ipstr(ip4(GW_IP)), a.gw_mac),
++              flush=True)
++
++    out = open(a.out, "w", encoding="ascii") if a.out else None
++    seen = 0
++    deadline = (time.monotonic() + a.timeout) if a.timeout else None
++    try:
++        while True:
++            if deadline is not None:
++                remain = deadline - time.monotonic()
++                if remain <= 0:
++                    break
++                s.settimeout(remain)
++            try:
++                frame, peer = s.recvfrom(65536)
++            except socket.timeout:
++                break
++            if not frame:
++                continue
++            seen += 1
++            if out:
++                out.write(binascii.hexlify(frame).decode("ascii") + "\n")
++                out.flush()
++            if a.mode != "capture":
++                reply = r.handle(frame)
++                if reply:
++                    # Back to the PEER, not to (host, port): the endpoint we
++                    # bound is the one the emulator connected *to*, so sending
++                    # there delivers the reply to ourselves.  Measured the hard
++                    # way -- the first N2 wire run had the responder answering
++                    # its own OFFER while the guest printed
++                    # `[dhcp] FAIL: no OFFER received`.
++                    s.sendto(reply, peer)
++            if a.count and seen >= a.count:
++                break
++    except KeyboardInterrupt:
++        pass
++    finally:
++        if out:
++            out.close()
++        s.close()
++    if not a.quiet:
++        print("responder: %d frame(s) in, replies arp=%d dhcp=%d icmp=%d "
++              "ignored=%d" % (seen, r.stats["arp"], r.stats["dhcp"],
++                              r.stats["icmp"], r.stats["ignored"]), flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.47.3
+

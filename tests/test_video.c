@@ -292,6 +292,144 @@ static void test_gc_mode3_path(void) {
     printf("ok vga gc graphics/mode-3 path (stage2 INT 0x10 contract)\n");
 }
 
+/* VIDEO V4 regression vector for the heap overflow the mode clamp used to
+ * miss.  Before the fix, enabling any mode whose YRES * line_offset exceeded
+ * the 800x600x4 = 1920000-byte VRAM window made QEMU's "clear the screen"
+ * memset run past the end of it:
+ *
+ *   ./x86emu --platform=haswell --vbe=1024x768x32 --max-instr=1000
+ *     unsanitized: RC=134, `free(): invalid pointer`
+ *     ASan+UBSan:  RC=1,   heap-buffer-overflow WRITE of size 3145728
+ *                          at dispi_data_write, src/devices.c:1055
+ *                          "0 bytes after 1920000-byte region"
+ *   ./x86emu --platform=haswell --vbe=1600x1200x32   -> WRITE of size 7680000,   RC=1
+ *   ./x86emu --platform=haswell --vbe=16000x12000x32 -> WRITE of size 768000000, RC=139
+ *
+ * The expected numbers below are QEMU's `vbe_fixup_regs` arithmetic on that
+ * window, not this model's opinion of a sensible mode: linelength =
+ * VIRT_WIDTH * bits / 8, maxy = vbe_size / linelength, YRES pulled down to
+ * maxy -- so the clear is YRES * linelength <= vbe_size by construction.
+ *
+ * One structural detail shapes every case: the fixup runs from the register
+ * write itself (QEMU groups XRES/YRES/BPP/VIRT_WIDTH/X_OFFSET/Y_OFFSET into
+ * one `store, then vbe_fixup_regs` arm) AND from the 0->1 enable edge, but the
+ * edge first RESETS VIRT_WIDTH and both offsets to 0.  So a value written
+ * before enabling is erased before it can be clamped; the clamps on those
+ * three registers are only observable by writing them while already enabled. */
+static void test_dispi_mode_clamped_to_vram(void) {
+    fx_t f; fx_init(&f);
+    const uint32_t VRAM = 800u * 600u * 4u;        /* 1920000 */
+
+    /* 1024x768x32: linelength 4096 -> maxy = 1920000/4096 = 468.  This is the
+     * exact mode that aborted the unsanitized emulator, so reaching the
+     * readback at all means the clear stayed inside the window. */
+    vbe_mode_set(&f.m, 1024, 768, 32);
+    io_write(&f.m, 0x1CE, 2, 0x02);
+    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* YRES clamped from 768 */
+    io_write(&f.m, 0x1CE, 2, 0x07);
+    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* VIRT_HEIGHT = maxy */
+    assert(468u * 4096u <= VRAM);
+
+    /* 16000x12000x32, the largest pair the write handler accepts at all:
+     * linelength 64000 -> maxy = 30, and the clear is 30*64000 = 1920000 --
+     * EXACTLY the window, so one unclamped line would overflow. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 16000, 12000, 32);
+    io_write(&f.m, 0x1CE, 2, 0x02);
+    assert(io_read(&f.m, 0x1CF, 2) == 30);
+    io_write(&f.m, 0x1CE, 2, 0x07);
+    assert(io_read(&f.m, 0x1CF, 2) == 30);
+    assert(30u * 64000u == VRAM);
+
+    /* YRES 0 -> 1 (QEMU: "if YRES == 0, YRES = 1") -- not 0, not maxy. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 0, 32);
+    io_write(&f.m, 0x1CE, 2, 0x02);
+    assert(io_read(&f.m, 0x1CF, 2) == 1);
+
+    /* XRES 0 -> 8, which is what keeps linelength off zero and maxy off a
+     * division by zero.  The write handler stores 0 verbatim (it only rejects
+     * >MAX and unaligned values), so this clamp belongs to the fixup alone. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 0, 600, 32);
+    io_write(&f.m, 0x1CE, 2, 0x01);
+    assert(io_read(&f.m, 0x1CF, 2) == 8);
+    io_write(&f.m, 0x1CE, 2, 0x06);
+    assert(io_read(&f.m, 0x1CF, 2) == 8);          /* VIRT_WIDTH raised to XRES */
+    io_write(&f.m, 0x1CE, 2, 0x07);
+    assert(io_read(&f.m, 0x1CF, 2) == 60000);      /* 1920000 / (8*4) */
+
+    /* BPP the write handler accepts but QEMU's depth switch does not list is
+     * normalised to 8 by the fixup's default arm (33 is stored verbatim by the
+     * handler -- only 0/4/8/15/16/24/32 are gated there). */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 600, 33);
+    io_write(&f.m, 0x1CE, 2, 0x03);
+    assert(io_read(&f.m, 0x1CF, 2) == 8);
+
+    /* VIRT_WIDTH, written while enabled: 65535 & ~7 = 65528, over MAX, so
+     * 16000 -- and maxy follows at 1920000/(16000*4) = 30. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 600, 32);
+    io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 65535);
+    assert(io_read(&f.m, 0x1CF, 2) == 16000);
+    io_write(&f.m, 0x1CE, 2, 0x07);
+    assert(io_read(&f.m, 0x1CF, 2) == 30);
+    /* and the ~7 rounding on its own: 9 -> 8, then raised back to XRES */
+    io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 9);
+    assert(io_read(&f.m, 0x1CF, 2) == 800);
+
+    /* The offset ladder, rung by rung.  Rung 1 (clamp to MAX, nothing zeroed)
+     * needs a mode small enough that the clamped maxima still FIT: at 8x1x8bpp
+     * linelength is 8, so 16000/4 + 12000*8 + 1*8 = 100008 <= 1920000. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 8, 1, 8);
+    io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
+    assert(io_read(&f.m, 0x1CF, 2) == 16000);      /* X_OFFSET -> MAX_XRES */
+    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
+    assert(io_read(&f.m, 0x1CF, 2) == 12000);      /* Y_OFFSET -> MAX_YRES */
+
+    /* Rung 2: Y_OFFSET alone is zeroed, X_OFFSET survives.  It needs
+     * 12000 * linelength + YRES * linelength > VRAM, and since Y_OFFSET is
+     * clamped to MAX_YRES = 12000 first, that means linelength >= 160 -- so
+     * 40x1x32 (linelength 160): 12000*160 + 1*160 = 1920160 > 1920000, while
+     * the retest with Y_OFFSET = 0 leaves 25 + 160 = 185, which fits.  At
+     * 8x1x8 or 8x1x32 this rung is unreachable by construction: the clamped
+     * Y_OFFSET can only reach 12000*8 = 96000 and 12000*32 = 384000 bytes. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 40, 1, 32);
+    io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 100);
+    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* 25 bytes, fits as-is */
+    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
+    assert(io_read(&f.m, 0x1CF, 2) == 0);          /* clamped to 12000, then zeroed */
+    io_write(&f.m, 0x1CE, 2, 0x08);
+    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* X_OFFSET untouched */
+
+    /* Rung 3: neither fits, so both are zeroed.  At 800x600x32 the clamped
+     * maxima give 16000 + 38400000 + 1920000 > VRAM, and dropping Y_OFFSET
+     * still leaves 16000 + 1920000 > VRAM. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 600, 32);
+    io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
+    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
+    io_write(&f.m, 0x1CE, 2, 0x08);
+    assert(io_read(&f.m, 0x1CF, 2) == 0);
+    io_write(&f.m, 0x1CE, 2, 0x09);
+    assert(io_read(&f.m, 0x1CF, 2) == 0);
+
+    /* The documented mode is untouched by every clamp: 800x600x32 gives
+     * linelength 3200, maxy 600, clear 1920000 == the window exactly. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 600, 32);
+    io_write(&f.m, 0x1CE, 2, 0x02);
+    assert(io_read(&f.m, 0x1CF, 2) == 600);
+    io_write(&f.m, 0x1CE, 2, 0x07);
+    assert(io_read(&f.m, 0x1CF, 2) == 600);
+    assert(600u * 3200u == VRAM);
+    fx_done(&f);
+    printf("ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow)\n");
+}
+
 int main(void) {
     test_cells_layout();
     test_crtc_cursor_pair();
@@ -302,6 +440,7 @@ int main(void) {
     test_dispi_mem_bank();
     test_dispi_enable_display();
     test_vbe_mode_set_clear();
+    test_dispi_mode_clamped_to_vram();
     test_gc_mode3_path();
     printf("test-video: all tests passed\n");
     return 0;

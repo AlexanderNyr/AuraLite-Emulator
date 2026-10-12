@@ -28,7 +28,8 @@
   matrix stays green with USB present (`MATRIX_DETERMINISM=1`, all pairs
   byte-identical) and its AHCI/fs receipt lines are byte-identical to the S5-era
   lane logs. The USB plan (U0–U5) is closed.
-- The VIDEO plan (V0–V3) is closed.  VGA text mode 3 is a real display now
+- The VIDEO plan (V0–V3, plus the post-closure fix V4) is closed.  VGA text
+  mode 3 is a real display now
   (80x25 cells at `0xB8000`, the CRTC `0x3D4/0x3D5` cursor pair, 8x16 glyphs
   from the guest's own PSF2 font -- 256/256 byte-identical to
   `psf2_default_font.inc`, `--dump-text`/`--no-fb` measured on the guest's
@@ -44,6 +45,61 @@
   `--vbe=WxHxBPP`) run twice each with six byte-identical artifact pairs and
   display assertions per mode; historical firmware/K0–K8 receipts do not
   move and `make test` + `make test-sanitize` stay green.
+- **V4 fixed a host heap overflow in that mode-set** (defect **D6**, found
+  by ASan after the plan was closed): `dispi_fixup` was a *partial*
+  transcription of QEMU's `vbe_fixup_regs` — it raised `VIRT_WIDTH` to
+  `XRES` and derived `VIRT_HEIGHT` but never clamped `YRES`, which is the
+  one adjustment that bounds the clear-to-screen, so the `memset` ran on
+  the guest's own height out of a window sized to the published 800×600
+  framebuffer (1920000 B).  Measured on the built emulator with no guest
+  involved: `--vbe=1024x768x32` → ASan RC=1, `heap-buffer-overflow WRITE
+  of size 3145728 at dispi_data_write, src/devices.c:1055`, unsanitized
+  RC=134 `free(): invalid pointer`; `--vbe=1600x1200x32` → WRITE of size
+  7680000; `--vbe=16000x12000x32` → WRITE of size 768000000, RC=139;
+  `--vbe=800x600x32` → RC=0.  Same class as QEMU's CVE-2016-3712.  The
+  fix transcribes the whole QEMU function in QEMU's order (depth switch
+  with the default arm assigning 8, the three width clamps, `maxy =
+  vbe_size / linelength`, `YRES` → 1/MAX/`maxy`, the three-rung offset
+  ladder, `VIRT_HEIGHT = maxy`), moves the ENABLE arm to QEMU's shape
+  (fixup + `VGA_GFX_MISC` + display flip + clear all inside the 0→1 edge,
+  `bank_offset = 0` in the else), and bounds the clear with an explicit
+  `min(clear, vram)` as belt-and-braces.  Two divergences are recorded
+  rather than hidden: no `vbe_start_addr` (this model renders from `m->fb`
+  at offset 0, so the ladder's result has no consumer — the clamps still
+  run, being observable through readbacks), and BPP 4 (QEMU's write
+  handler rejects it so its `case 4:` is dead code; ours has accepted it
+  since V2, and following QEMU's expression literally into a zero
+  linelength would divide by zero in `maxy`).
+  `test_dispi_mode_clamped_to_vram` is the regression vector (10 → **11
+  vectors**, RC=0 plain and under ASan+UBSan), with every expected number
+  computed from QEMU's arithmetic first: 1024×768×32 → YRES **468**,
+  16000×12000×32 → **30** (clear 1920000, exactly the window), 800×600×32
+  → **600** (also exactly the window — the documented mode is untouched),
+  YRES 0 → 1, XRES 0 → 8 with VIRT_HEIGHT 60000, BPP 33 → 8, VIRT_WIDTH
+  65535 → 16000, VIRT_WIDTH 9 → 800, plus each rung of the offset ladder
+  in the mode where it is reachable (rung 2 needs `linelength ≥ 160`
+  precisely because Y_OFFSET is clamped to 12000 first, so it uses
+  40×1×32 and is *unreachable* at 8×1×8 or 8×1×32).  The NC is the pre-fix
+  `src/devices.c` with that vector compiled against it: **RC=1**, same
+  `WRITE of size 3145728`, aborting before the first readback.  A one-off
+  sweep backs it up — **5236 mode combinations** and **146672 register
+  pokes** under ASan+UBSan asserting `YRES * line_offset <= VRAM` with
+  QEMU's own expression: 0 violations post-fix, RC=1 on the first
+  combination pre-fix.  Historical video artifacts were proved stable
+  rather than assumed: `test_video_modes.sh` SKIPs here (no frozen
+  `AuraLite-OS` build), so pre-fix and post-fix binaries were run side by
+  side on four lanes — firmware boot, `--vbe=800x600x32`, `--vbe=off`,
+  `--no-fb` — and all `--log`/`--dump-fb` pairs are **byte-identical**,
+  with the `--no-fb` framebuffer coming out at `c3b3d73f6bbb…`, the sha
+  V3 recorded.  All ten pre-existing vectors pass unmodified.  `make test`
+  (incl. `boot integration test: ok` and the NET N2/N3 receipts, now green
+  against the changed `src/`), `make test-sanitize` and `make fuzz
+  FUZZ_PROGRAMS=256` stay green.  Deferred: display panning /
+  `vbe_start_addr`, QEMU's `vbe_update_vgaregs` re-assertion (this model's
+  `VGA_GFX_MISC` path consumes no sizing register, so the CVE-2016-3712
+  surface does not exist here), the BPP-4 divergence, and growing the VRAM
+  window to QEMU's 16 MiB (it would move the guest-visible firmware
+  contract and would not remove the need for the clamp).
 - The NET plan's N0 (RX-ready e1000 + TAP ingress) is measured.  The
   NIC is opt-in (`--tap=` only — without it no PCI function exists and
   the historical no-NIC receipts stay byte-stable): PCI 0:4.0
@@ -60,10 +116,163 @@
   (`--max-instr=4500000000`) is byte-identical (both tapes sha256
   `82614cd6f896aa9a…`) with the `[net] using NIC: e1000` gate,
   `BAR0 at phys 0xfebc0000`, `STATUS=0x00000002 (LU=1)` and
-  `MAC from RAL/RAH`.  TX stays N1 (measured `[e1000] TX timeout`
-  receipts; `[dhcp] FAIL: DISCOVER transmit failed` → `[net] fallback
-  IP active`).  NC reddens the ingress vector (`test_net.c:85`,
+  `MAC from RAL/RAH`.  NC reddens the ingress vector (`test_net.c:85`,
   RC=134); `make test` + `make test-sanitize` stay green.
+- The NET plan's N1 (TX-ready) is measured.  The TDT/TCTL doorbell walks
+  TDH over the legacy TX ring, the frame leaves as one TAP datagram
+  (`TCTL.EN` gated) and the descriptors are completed **inside the
+  doorbell store** — because the guest's `e1000_send()` spins on
+  `status & 0x01` with a 100000-PAUSE budget, a tick-deferred completion
+  would still burn it.  Causes land in ICR as `TXQE|TXDW` (`0x81` for a
+  single-descriptor send); the register-write fallback gained QEMU
+  `macreg_writeops[]` parity (`IMS |=`, `ICR &= ~val`, `ICS`, 16-bit
+  heads, `TDLEN/RDLEN & 0xfff80`).  `tests/test_net.c` runs 7 vectors
+  (2 N0 + 5 N1).  The wire lane (`make test-net-tx` →
+  `tests/integration/n1_tx_tap.sh`) puts a 489-byte payload
+  (`tests/nic_tx.asm`) on the **real firmware-boot transport** off a
+  throwaway `--disk=` image and holds the ground-rule endpoint with
+  `n1_tap_responder.py`: twice, byte-identical, the guest prints
+  `N1TXOK  status=01 tdh=01 icr=81` and the wire carries
+  `ffffffffffff52540012345608004e3154584f4b` (20 bytes in, 20 bytes
+  out).  The same payload without `--tap=` reports
+  `N1TXFAIL  status=00 tdh=ff icr=ff` (open-bus BAR0) — the opt-in pin.
+  The frozen-guest lane SKIPs here (the AuraLite-OS toolchain is not
+  installable in this tree) and prints its reproduction line instead.
+  NC removes the descriptor writeback: `test_net.c:167`, RC=134, and the
+  wire receipt flips to `N1TXFAIL status=00 tdh=01 icr=80`.  `make test`
+  (now incl. `test-net-tx`), `make test-sanitize` and the hand-run
+  sanitized wire lane stay green.  Deliberately not modelled yet: the
+  INTx line (no PCI cfg `0x3C`, no ack path — a raised line would strand
+  the 8259A ISR bit under a polling guest), TX statistics counters,
+  context/TSO descriptors, VLAN and `CMD.IFCS` FCS insertion.
+- The NET plan's N2 (host responder) is measured — and it needed **no
+  emulator source change at all** (`git status --porcelain src/` empty),
+  so every historical lane is byte-stable by construction.
+  `tools/tap_responder.py` holds the ground-rule endpoint
+  `UDP 127.0.0.1:8080` and answers DHCP (DISCOVER→OFFER,
+  REQUEST→ACK), ARP who-has for the gateway and ICMP echo, with slirp's
+  user-mode addressing read out of the guest's own source
+  (`kernel/net/net.c:39-47`: guest `10.0.2.15`, gateway `10.0.2.2`, DNS
+  `10.0.2.3`).  It is stateless — no lease table, no ARP cache, no
+  sequence numbers — so two instances and a replayed frame answer
+  identically.  `tests/test_tap_responder.py` runs 9 vectors
+  (`make test-tap-responder`) that build requests with a second,
+  independent transcription of `net.c`'s builders and feed the replies
+  back through `net.c`'s own accept filters.  The wire lane
+  (`make test-net-rx` → `tests/integration/n2_responder.sh`) runs
+  `tests/nic_net.c` — a freestanding x86_64 guest stand-in on the **K1
+  kernel-load transport**, chosen over N1's firmware-boot one because
+  that delivers a single 512-byte block and maps only
+  `0x100000..0x1FFFFF` (`PD[0] = 0x19B`), too little for DHCP+ARP+ICMP
+  plus a 64-deep RX ring.  Twice, byte-identical (serial tape
+  `d5ac2cb1ccdb76af…`, the four wire frames `3b6de9b8de3ab3c4…`,
+  responder log `2c0075bf2856b66d…`): `[dhcp] PASS: IP 10.0.2.15,
+  gateway 10.0.2.2`, `[net] ARP reply: gateway is 52:55:0a:00:02:02`,
+  `[net] ICMP payload verified (ident+seq+32 bytes)`, `[net] PASS:
+  lease + ARP + echo reply (payload verified)`, `N2OK`, and
+  `responder: 4 frame(s) in, replies arp=1 dhcp=2 icmp=1 ignored=0`.
+  The same payload without `--tap=` reports the guest's own timeout
+  rather than hanging (`[e1000] TX timeout: desc[0].status=0x00
+  TDH=4294967295 TDT=4294967295` → `N2FAIL`), because an open-bus BAR0
+  reads all-ones and `STATUS.LU` therefore *reads set*.  NC is measured
+  on both sides: `--drop=arp,icmp,dhcp` (lane D, runs every time) gives
+  `replies arp=0 dhcp=0 icmp=0`, exactly one wire frame and
+  `[dhcp] FAIL: no OFFER received` / `N2FAIL`; removing the RX
+  descriptor **length** writeback (`src/e1000.c:372`) by hand gives the
+  same failure while the responder still logs a full exchange.  The
+  phase's most useful measurement is what is *not* a control: removing
+  the **DD** writeback (`src/e1000.c:373`) leaves the run green, because
+  `e1000_hw_rx_drain` gates on `pkt_len > 0` and never inspects DD — the
+  payload now requires DD anyway (strictly tighter than the guest) and
+  says so in a comment.  New ledger entry **D7**: the gateway MAC
+  follows slirp's `52:55:` + IP-bytes convention but could not be
+  measured (libslirp unreachable from this sandbox, four mirrors tried),
+  gates nothing, and is pinned behind `--gw-mac`.  `make test` (now
+  incl. `test-tap-responder` + `test-net-rx`, with `test-net-tx`
+  re-green), `make test-sanitize` and `make fuzz FUZZ_PROGRAMS=256`
+  (`6144 instructions compared -- all states match`, `0 host-level
+  crashes`) stay green.  Still not modelled: the INTx line (**D4**),
+  DNS/TCP receipts (N3), DHCP lease state and renewal, ICMP other than
+  echo, IPv6.
+- The NET plan's N3 (end-to-end close-out) is measured — and, like N2,
+  it needed **no emulator source change at all**
+  (`git status --porcelain src/` empty), so `src/e1000.c` is
+  byte-identical to N1's and the plan is now **closed: N0–N3 ✅**.
+  `tools/tap_responder.py` (485 → 1024 lines) answers the two
+  self-tests that follow the ping in `kernel/kernel.c:428-430`:
+  `net_dns_self_test()` and `tcp_x5_self_test()`.  DNS arrives on
+  **UDP/53** from the guest's fixed local port 12345 (`dns.h:19`) and
+  is answered with a 45-byte A record for `93.184.216.34`, TTL 3600,
+  the id echoed (the guest's `dns_next_id()` is not deterministic) and
+  TC clear — TC set would push the guest down the TCP retry path.  The
+  same answer rides the **RFC 1035 §4.2.2 TCP carriage** with the
+  two-byte length prefix, framed the way `dns.c:187` frames it: prefix
+  and message as two separate sends, one segment back, and that segment
+  acknowledges the data instead of being preceded by a bare ACK.  TCP is
+  a real connection table (`TCP_ISN = 0x5A5A0000`, a constant so the
+  tape is deterministic; `TCP_MAX_CONNS = 64`, because 16 is the
+  *guest's* bound and a server must not refuse a 17th client):
+  SYN → SYN-ACK with MSS 1460 + SACK-permitted (`hdr=28`), a
+  retransmitted SYN → a byte-identical SYN-ACK, the final bare ACK →
+  silence, `FIN|ACK` → `FIN|ACK`, `RST` → tuple dropped, an unknown
+  tuple → **no reply** (an RST would be wrong — `tcp.c:290` accepts any
+  segment on a live 4-tuple), table full → `RST|ACK` acking `seq+1`.
+  ARP now answers who-has for **any on-link address**, not just the
+  gateway, because `net_arp_resolve` (`net.c:356`) ARPs the target for a
+  local address and only routes off-subnet traffic through the gateway —
+  with the gateway log line byte-identical to N2's and the suffix
+  `(on-subnet)` on the rest.  `tests/test_tap_responder.py` grows 9 →
+  **16 vectors, 135 `ok`, RC=0**, each reply fed back through a
+  transcription of the guest's own accept filter
+  (`tcp_recv_segment_timeout`, `dns_parse_response`, the ARP reply
+  check).  `tests/nic_net.c` grows 552 → 1125 lines and now runs the
+  whole online path on the wire, printing N2's receipts verbatim first;
+  its marker moved `N2OK`/`N2FAIL` → `N3OK`/`N3FAIL`, which is why N3
+  also touches `n2_responder.sh` (that harness now pins N2's four frames
+  as `head -4` of the tape and leaves the total to N3's).
+  `tests/integration/n3_net_e2e.sh` (new, 292 lines,
+  `make test-net-e2e`, wired into `make test`) runs four lanes:
+  **A** ×2 — **76 frames** on the wire, byte-identical between runs
+  (frames `c76a94ff9a0f1744…`, responder log `44193467f66ed7f9…`,
+  payload `f5176d456c219828…` — all three reproduced byte for byte in a
+  *second* harness run in a different workdir, inside the verification
+  clone; the serial tapes are byte-identical within a run but embed the
+  payload path, so their shas are workdir-dependent and are listed in
+  `docs/plans/NET_PLAN.md` §3.4), receipts `[dns] PASS:
+  'example.com' -> 93.184.216.34`, `… over TCP (45-byte message, prefix
+  ok)`, `[tcp-x5] PASS: 16 concurrent connections held and closed
+  cleanly`, `[net] PASS: DNS over UDP + DNS over TCP + 16 concurrent TCP
+  connections`, `N3OK`, and
+  `replies arp=2 dhcp=2 icmp=1 dns=2 tcp=17 ignored=0` — the 76 count as
+  ARP 2 + DHCP 2 + ICMP 1 + DNS/UDP 1 + SYN 17 + bare ACK 34 + FIN|ACK
+  17 + ACK|PSH 2; **B** — no `--tap=`, still the guest's own
+  `[e1000] TX timeout` → `N3FAIL` and not one `[dns]`/`[tcp` line;
+  **C** — the frozen-guest DoD strings, SKIP here (`AuraLite-OS` does
+  not build in this sandbox); **D**, the phase's NC — `--no-tcp`,
+  harness RC=1, **10 frames**, `tcp=0`, and exactly **3** `[tcp] RTO
+  waiting for SYN-ACK, retransmitting SYN` lines, which is
+  `TCP_MAX_RETRIES` from `tcp.c:766` counted off the guest's own ladder
+  rather than a harness constant.  `--drop=dns` is explicitly *not* a
+  substitute for that lever: it leaves the handshakes succeeding and
+  hangs the query instead of exercising the table.  Four new ledger
+  entries, all measured: **D8** (ARP blind to non-gateway addresses —
+  receipt `[dns] FAIL: could not resolve the server's MAC`), **D9**
+  (TCP checksums were gated on `--udp-checksum`, so FIN-ACK/RST went out
+  with checksum 0, which RFC 793 forbids and `tcp.c:319` drops),
+  **D10** (the odd-length checksum tail: the payload's `checksum()` and
+  the vectors' `g_checksum()` added `p[len-1]` instead of
+  `p[len-1] << 8`; invisible while every length was even, and it showed
+  up as a sum off by `0xFF00` on the first odd segment — 49 bytes
+  carrying a 29-byte DNS query — which the responder correctly refused),
+  and **D11** (`SO_REUSEADDR` lets two UDP sockets bind the same port,
+  so a leftover responder silently split a lane's datagrams:
+  `3 frame(s) in, replies … tcp=0` while the next lane was perfect; both
+  harnesses now refuse to start a lane on a busy port).  `make test`,
+  `make test-sanitize` and `make fuzz FUZZ_PROGRAMS=256` stay green.
+  Still not modelled: the INTx line (**D4**), the measured gateway MAC
+  (**D7**), TCP retransmission timers of our own / window scaling /
+  SACK sending / `TIME_WAIT`, DHCP lease state and renewal, DNS beyond
+  A/IN for one name (no AAAA, no NXDOMAIN, no cache, no EDNS0), IPv6.
 - The physical address decoder handles overlapping ECAM and fixed BAR regions by choosing the most-specific region.
 - A framebuffer is available as `framebuffer.ppm`.
 - The CPU, memory, PCI and device models do not depend on a particular firmware name or binary layout.

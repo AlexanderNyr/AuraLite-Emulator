@@ -972,20 +972,81 @@ typedef struct {
 } dispi_t;
 static dispi_t g_dispi;
 
+/* VIDEO V4: QEMU hw/display/vga.c `vbe_fixup_regs`, complete.
+ *
+ * The dispi interface has no way to report an error to the guest, so QEMU's
+ * contract is "adjust the registers to the closest valid value" -- and one of
+ * those adjustments is load-bearing for host memory safety: YRES is clamped to
+ * `vbe_size / linelength`, i.e. to the number of lines that actually FIT in
+ * VRAM. `vbe_ioport_write_data` then clears the screen with
+ * `memset(vram, 0, YRES * vbe_line_offset)`, which is bounded by VRAM *only
+ * because* of that clamp.
+ *
+ * This file used to carry a partial transcription (VIRT_WIDTH up, VIRT_HEIGHT
+ * derived) with the YRES clamp missing, so the memset ran on the guest's own
+ * unclamped height: defect D6 / CVE-class heap overflow, measured at
+ * devices.c:1055 with `--vbe=1024x768x32` (WRITE of size 3145728 into the
+ * 1920000-byte window, ASan RC=1, unsanitized `free(): invalid pointer`
+ * RC=134) and `--vbe=16000x12000x32` (WRITE of size 768000000, RC=139).
+ * Every clamp below is QEMU's, in QEMU's order; the two places this
+ * transcription legitimately differs are marked. */
 static void dispi_fixup(void) {
-    /* QEMU vbe_fixup_regs (behavioural core): only meaningful while
-     * enabled; VIRT_WIDTH clamps up to XRES; VIRT_HEIGHT derives from the
-     * real VRAM size unless it already fits; the line offset derives. */
     uint16_t *r = g_dispi.regs;
-    if (!(r[DISPI_ENABLE] & DISPI_ENABLED)) return;
+    uint32_t bits, linelength, maxy, offset;
+
+    if (!(r[DISPI_ENABLE] & DISPI_ENABLED)) return;   /* vbe is turned off */
+
+    /* check depth -- the default arm assigns 8, so an impossible BPP cannot
+     * reach the width math below (QEMU does the same in the same place). */
+    switch (r[DISPI_BPP]) {
+    case 4: case 8: case 16: case 24: case 32: bits = r[DISPI_BPP]; break;
+    case 15:                                   bits = 16;          break;
+    default:                                   bits = r[DISPI_BPP] = 8; break;
+    }
+
+    /* check width */
+    r[DISPI_XRES] = (uint16_t)(r[DISPI_XRES] & ~7u);
+    if (r[DISPI_XRES] == 0) r[DISPI_XRES] = 8;
+    if (r[DISPI_XRES] > DISPI_MAX_XRES) r[DISPI_XRES] = DISPI_MAX_XRES;
+    r[DISPI_VIRT_WIDTH] = (uint16_t)(r[DISPI_VIRT_WIDTH] & ~7u);
+    if (r[DISPI_VIRT_WIDTH] > DISPI_MAX_XRES) r[DISPI_VIRT_WIDTH] = DISPI_MAX_XRES;
     if (r[DISPI_VIRT_WIDTH] < r[DISPI_XRES]) r[DISPI_VIRT_WIDTH] = r[DISPI_XRES];
-    unsigned bits = (r[DISPI_BPP] == 15) ? 16 : r[DISPI_BPP];
-    unsigned linelength = (unsigned)r[DISPI_VIRT_WIDTH] * ((bits + 7) / 8);
-    if (linelength == 0) return;
+
+    /* check height -- THIS is the clamp that bounds the clear-to-screen */
+    linelength = (uint32_t)r[DISPI_VIRT_WIDTH] * bits / 8;
+    maxy = (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
+    if (r[DISPI_YRES] == 0) r[DISPI_YRES] = 1;
+    if (r[DISPI_YRES] > DISPI_MAX_YRES) r[DISPI_YRES] = DISPI_MAX_YRES;
+    if (r[DISPI_YRES] > maxy) r[DISPI_YRES] = (uint16_t)maxy;
+
+    /* check offset.  QEMU folds the result into `s->vbe_start_addr`, which its
+     * display code uses to pan inside VRAM; this model has no panning consumer
+     * (the visible display is rendered from `m->fb` at offset 0), so the value
+     * is not kept -- but the clamps are performed anyway, because they are
+     * observable through the register readbacks a guest client polls. */
+    if (r[DISPI_X_OFFSET] > DISPI_MAX_XRES) r[DISPI_X_OFFSET] = DISPI_MAX_XRES;
+    if (r[DISPI_Y_OFFSET] > DISPI_MAX_YRES) r[DISPI_Y_OFFSET] = DISPI_MAX_YRES;
+    offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
+    offset += (uint32_t)r[DISPI_Y_OFFSET] * linelength;
+    if (offset + (uint32_t)r[DISPI_YRES] * linelength >
+        (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
+        r[DISPI_Y_OFFSET] = 0;
+        offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
+        if (offset + (uint32_t)r[DISPI_YRES] * linelength >
+            (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
+            r[DISPI_X_OFFSET] = 0;
+            offset = 0;
+        }
+    }
+    (void)offset;
+
+    /* update vga state.  QEMU assigns VIRT_HEIGHT = maxy unconditionally here;
+     * the earlier transcription kept a guest-set VIRT_HEIGHT when it already
+     * fitted.  QEMU's form is the one reproduced -- it is also what makes
+     * VIRT_HEIGHT read back as exactly VRAM/linelength, which the existing V2
+     * vector asserts. */
+    r[DISPI_VIRT_HEIGHT] = (uint16_t)maxy;
     g_dispi.line_offset = linelength;
-    unsigned maxy = (unsigned)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
-    if (r[DISPI_VIRT_HEIGHT] == 0 || r[DISPI_VIRT_HEIGHT] > maxy)
-        r[DISPI_VIRT_HEIGHT] = (uint16_t)maxy;
 }
 
 static uint32_t dispi_index_read(void *ctx, uint16_t port, int size) {
@@ -1038,32 +1099,52 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
         break;
     case DISPI_ENABLE: {
         uint16_t old = g_dispi.regs[DISPI_ENABLE];
-        if ((v & DISPI_ENABLED) && !(old & DISPI_ENABLED)) {
-            /* QEMU 0->1 edge: VIRT_WIDTH/offsets reset, display -> LFB */
+        int edge = (v & DISPI_ENABLED) && !(old & DISPI_ENABLED);
+        if (edge) {
+            /* QEMU vbe_ioport_write_data, ENABLE case, 0->1 branch: reset
+             * VIRT_WIDTH and both offsets, set ENABLED, then -- and only then
+             * -- fixup, update the vga registers and clear the screen.  The
+             * order is the safety property: `dispi_fixup` is what clamps YRES
+             * down to the lines that fit in VRAM, so the memset below must run
+             * on the fixed-up value and never on the guest's raw one.  Running
+             * fixup outside the edge (as this file did before V4) is not what
+             * makes the overflow reachable, but it is not QEMU either, and the
+             * comment above the memset used to claim a bound nothing enforced.
+             *
+             * `prev_text` is this model's own addition: QEMU restores the
+             * display from its full VGA register state on the 1->0 edge, while
+             * here the display source is a single text/graphics flag, so the
+             * pre-enable state has to be captured to be returned to. */
             g_dispi.regs[DISPI_VIRT_WIDTH] = 0;
             g_dispi.regs[DISPI_X_OFFSET] = 0;
             g_dispi.regs[DISPI_Y_OFFSET] = 0;
             g_dispi.prev_text = vga_display_is_text(g_dispi.m);
-        }
-        g_dispi.regs[DISPI_ENABLE] = v;
-        dispi_fixup();
-        if (v & DISPI_ENABLED) {
-            /* QEMU vbe_ioport_write_data: "clear the screen" on every
-             * ENABLED store unless DISPI_NOCLEARMEM -- memset(vram, 0,
-             * YRES * vbe_line_offset).  Our VRAM is the LFB buffer. */
-            if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb)
-                memset(g_dispi.m->fb, 0,
-                       (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset);
+            g_dispi.regs[DISPI_ENABLE] |= DISPI_ENABLED;
+            dispi_fixup();
             /* QEMU: "graphic mode + memory map 1" in VGA_GFX_MISC */
             g_vga.gr[VGA_GFX_MISC] = (uint8_t)((g_vga.gr[VGA_GFX_MISC] & ~0x0cu) |
                                                0x04u | VGA_GR06_GRAPHICS_MODE);
-            if (!(old & DISPI_ENABLED))
-                vga_set_display_mode(g_dispi.m, 0);
-        } else if (old & DISPI_ENABLED) {
-            /* QEMU 1->0 edge: bank window resets, display -> previous */
+            vga_set_display_mode(g_dispi.m, 0);
+            /* QEMU: "clear the screen" unless DISPI_NOCLEARMEM.  Our VRAM is
+             * the LFB window, so the bound is YRES * line_offset <= the window
+             * size -- guaranteed by the YRES clamp in dispi_fixup, and asserted
+             * here rather than trusted, because the cost of being wrong is host
+             * heap corruption. */
+            if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb) {
+                size_t clear = (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset;
+                size_t vram = (size_t)g_dispi.m->fb_w * (size_t)g_dispi.m->fb_h * 4u;
+                if (clear > vram) clear = vram;      /* belt and braces */
+                memset(g_dispi.m->fb, 0, clear);
+            }
+        } else {
+            /* QEMU's else arm: `s->bank_offset = 0`, and no fixup, no clear,
+             * no display change -- which covers both the 1->0 disable and a
+             * 1->1 flag rewrite (e.g. adding DISPI_8BIT_DAC while enabled). */
             g_dispi.bank_offset = 0;
-            vga_set_display_mode(g_dispi.m, g_dispi.prev_text);
+            if ((old & DISPI_ENABLED) && !(v & DISPI_ENABLED))
+                vga_set_display_mode(g_dispi.m, g_dispi.prev_text);
         }
+        g_dispi.regs[DISPI_ENABLE] = v;
         break;
     }
     case DISPI_BANK:

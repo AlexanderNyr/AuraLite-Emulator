@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes
+.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder
 all: x86emu
 
 # C11 differential fuzzer knobs (bigger numbers = nightly runs)
@@ -89,7 +89,53 @@ test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/
 test-boot: x86emu firmware/firmware.bin disk/disk.img
 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
 
-test: test-unit test-table test-kload test-ring3 test-boot
+# NET N1: the TX wire lane.  The payload (tests/nic_tx.asm) rides the real
+# firmware-boot transport off a throwaway --disk= image, so this needs nasm +
+# python3 (it SKIPs, exit 0, when either is missing) and the ground-rule TAP
+# endpoint UDP 127.0.0.1:8080 free on the host.  The frozen-guest lane inside
+# it SKIPs unless KERNEL/INITRD point at the frozen AuraLite-OS build.
+test-net-tx: x86emu firmware/firmware.bin tests/nic_tx.asm \
+             tests/integration/n1_tx_tap.sh tests/integration/n1_tap_responder.py
+	sh tests/integration/n1_tx_tap.sh
+
+# NET N2: the RX wire lane + the host responder.  tools/tap_responder.py is the
+# host side of the --tap= socket: it holds slirp's user-mode addressing (guest
+# 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3) and answers exactly the three
+# protocols the frozen guest speaks.  Its protocol vectors are pure Python -- no
+# sockets, no emulator -- so test-tap-responder runs everywhere python3 does.
+# The wire payload rides the K1 kernel-load transport (--kernel=), not N1's
+# firmware-boot single 512-byte block: DHCP + ARP + ICMP together are far more
+# than 512 bytes of code, and the firmware memory map (RAM 0x100000-0x1FFFFF
+# only) leaves no room for a 64-deep RX ring.  tests/nic_net.c reproduces the
+# frozen guest's own protocol code, byte for byte on the wire, from
+# AuraLite-OS@0ed0d29 kernel/net/net.c and drivers/e1000/e1000.c.
+tests/nic_net.elf: tests/nic_net.c tests/nic_net.ld
+	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+	    -mcmodel=kernel -mno-sse -mno-sse2 -mno-mmx -mno-red-zone -nostdlib -no-pie \
+	    -Wl,-z,max-page-size=0x1000 -T tests/nic_net.ld \
+	    tests/nic_net.c -o $@
+
+test-tap-responder: tools/tap_responder.py tests/test_tap_responder.py
+	python3 tests/test_tap_responder.py
+
+test-net-rx: x86emu tests/nic_net.elf tools/tap_responder.py \
+             tests/test_tap_responder.py tests/integration/n2_responder.sh
+	sh tests/integration/n2_responder.sh
+
+# NET N3: the end-to-end close-out.  Same payload and same responder as N2, but
+# the tape now runs what the frozen guest runs at boot once DHCP has succeeded
+# (kernel/kernel.c:428-430): net_self_test (the ping N2 closed),
+# net_dns_self_test and tcp_x5_self_test.  So the responder grew a DNS answer
+# (UDP/53 plus the RFC 1035 TCP carriage) and a TCP connection table -- 16
+# concurrent connections to 10.0.2.3:53, opened in sequence, held, closed -- and
+# it answers who-has for any on-link address, not just the gateway, because
+# net_arp_resolve ARPs the TARGET for a local address (net.c:405+).
+# 76 frames on the wire, byte-identical twice; --no-tcp is the NC.
+test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+              tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+	sh tests/integration/n3_net_e2e.sh
+
+test: test-unit test-table test-kload test-ring3 test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu

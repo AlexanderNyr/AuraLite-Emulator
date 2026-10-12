@@ -18,7 +18,9 @@ published through `boot_info.fb`) is live since the KERNEL-BOOT phases
 and stays the graphics path; this plan makes the *legacy + VBE* surfaces
 honest so the BIOS/stage2 path and any VBE client have real hardware.
 
-**Status: complete — V0 ✅, V1 ✅, V2 ✅, V3 ✅ (plan closed; NET / COMPAT follow in their own plans)**
+**Status: complete — V0 ✅, V1 ✅, V2 ✅, V3 ✅ (plan closed), plus V4 ✅ — a
+post-closure heap-overflow fix in the dispi mode clamp, found by ASan after the
+plan was closed and shipped as its own phase**
 
 | Phase | Scope | Status | Deliverable |
 |---|---|---|---|
@@ -26,6 +28,7 @@ honest so the BIOS/stage2 path and any VBE client have real hardware.
 | V1 | VGA text mode 3: `0xB8000` text window + CRTC cursor pair (0x3D4/0x3D5), glyph rendering into the display output, `--no-fb` lane so the guest's `fb.c` fallback engages | ✅ done | `patches/0043-VIDEO-V1-vga-text.patch` |
 | V2 | Bochs VBE dispi (0x1CE/0x1CF): the `VBE_DISPI` register file, LFB window + video-memory sizing (the QEMU `-vga std` contract) | ✅ done | `patches/0044-VIDEO-V2-vbe-dispi.patch` |
 | V3 | Mode switching (text 3 ↔ VBE graphics), determinism ×2, sanitize, docs close-out | ✅ done | `patches/0045-VIDEO-V3-video-mode-switch.patch` |
+| V4 | **Post-closure fix**: `dispi_fixup` was a partial transcription of QEMU's `vbe_fixup_regs` — the YRES-to-VRAM clamp was missing, so enabling any mode bigger than 800×600 overflowed the host heap (defect **D6**) | ✅ done | `patches/0050-VIDEO-V4-vbe-mode-clamp.patch` |
 
 Note: the *guest* keeps its own roadmap (`AuraLite-OS/docs/BOOTLOADER_ROADMAP.md`
 BL1–BL8) and its display driver consumes `boot_info.fb` (Limine/GOP or
@@ -108,7 +111,7 @@ set in ENABLE, reads of XRES/YRES/BPP return the maxima (16000/12000/32)
 machine's previous display.  The LFB is the device's video memory —
 here the existing `0xD0000000` VRAM window.
 
-## 2. Defect ledger (drives V1–V3)
+## 2. Defect ledger (drove V1–V3; **D6** was found after the close-out and drove V4)
 
 1. **No VGA text display path** — `0xB8000` is plain RAM; the guest's
    BIOS-path console is invisible (`--dump-fb` shows only the LFB).
@@ -123,6 +126,31 @@ here the existing `0xD0000000` VRAM window.
    must show the text console when the machine is in mode 3 and the LFB
    when VBE is enabled (the visible-display contract `--dump-fb`
    renders).
+6. **D6 — the dispi mode registers were not clamped to VRAM, so enabling
+   a mode bigger than the window overflowed the host heap** (found after
+   V3 closed, fixed by V4). `dispi_fixup` was a partial transcription of
+   QEMU's `vbe_fixup_regs`: it raised `VIRT_WIDTH` to `XRES` and derived
+   `VIRT_HEIGHT`, but it never clamped `YRES` — the one adjustment that
+   bounds QEMU's clear-to-screen. Repro, measured on the built emulator
+   with no guest involved:
+
+   ```
+   ./x86emu --platform=haswell --vbe=1024x768x32  --max-instr=1000
+     unsanitized: RC=134, `free(): invalid pointer`
+     ASan+UBSan:  RC=1,   heap-buffer-overflow WRITE of size 3145728
+                          at dispi_data_write, src/devices.c:1055
+                          "0 bytes after 1920000-byte region"
+   ./x86emu --platform=haswell --vbe=1600x1200x32   -> WRITE of size 7680000,   RC=1
+   ./x86emu --platform=haswell --vbe=16000x12000x32 -> WRITE of size 768000000, RC=139 (segfault)
+   ./x86emu --platform=haswell --vbe=800x600x32     -> RC=0 (the documented mode)
+   ```
+
+   The overflow is ~400× the window in the extreme case, i.e. any guest
+   or CLI user that asks for a common resolution like 1024×768 corrupts
+   host memory. This is the same class QEMU fixed as CVE-2016-3712 — its
+   commit note says the point of `vbe_fixup_regs` is that "the sanity
+   checks … are effective", and without them "which is good for one or
+   another buffer overflow".
 
 ## 3. Phases
 
@@ -268,7 +296,284 @@ removing the NOCLEARMEM clear reddens the clear vector (RC=134,
 `test_video.c:258`). `make test` + `make test-sanitize` green; the
 firmware lane and the K0–K8 kernel receipts do not move.
 
-## 4. Standing constraints
+## 4. V4 — post-closure fix: the dispi mode clamp (heap overflow, D6)
+
+✅ done — `patches/0050-VIDEO-V4-vbe-mode-clamp.patch`. This is a section
+of its own rather than a `### V4` under §3 because §3 documents the four
+phases the plan was written for and closed; V4 was found afterwards, by
+ASan, and changes `src/` — which V3's close-out had declared stable.
+
+V3 closed this plan, and then ASan found D6: a **host heap overflow
+reachable from the CLI and from any guest** that programs a VBE mode
+bigger than the 800×600 framebuffer window. It is filed as its own phase
+because it changes `src/`, which V1–V3's close-out had declared stable.
+
+#### 4.1 Root cause, measured against the primary source
+
+QEMU's `hw/display/vga.c` `vbe_fixup_regs` is the dispi interface's
+whole error-reporting mechanism — the comment above it says so:
+
+```c
+/* Sanity check vbe register writes.
+ *
+ * As we don't have a way to signal errors to the guest in the bochs
+ * dispi interface we'll go adjust the registers to the closest valid
+ * value.
+ */
+```
+
+and `vbe_ioport_write_data` then clears the screen with
+
+```c
+memset(s->vram_ptr, 0,
+       s->vbe_regs[VBE_DISPI_INDEX_YRES] * s->vbe_line_offset);
+```
+
+That memset is bounded **only** because `vbe_fixup_regs` clamps YRES to
+the number of lines that fit:
+
+```c
+linelength = r[VBE_DISPI_INDEX_VIRT_WIDTH] * bits / 8;
+maxy = s->vbe_size / linelength;
+if (r[VBE_DISPI_INDEX_YRES] == 0)                r[YRES] = 1;
+if (r[VBE_DISPI_INDEX_YRES] > VBE_DISPI_MAX_YRES) r[YRES] = VBE_DISPI_MAX_YRES;
+if (r[VBE_DISPI_INDEX_YRES] > maxy)               r[YRES] = maxy;   /* <-- the bound */
+```
+
+This file's `dispi_fixup` carried the VIRT_WIDTH raise and the
+VIRT_HEIGHT derivation and **none of the clamps** — no `YRES → maxy`, no
+`YRES == 0 → 1`, no `XRES &= ~7 / == 0 → 8 / > MAX → MAX`, no
+`VIRT_WIDTH &= ~7 / > MAX`, no offset ladder, and `VIRT_HEIGHT` was
+conditional where QEMU assigns it outright. The memset therefore ran on
+the guest's own unclamped height: `--vbe=1024x768x32` clears 3145728
+bytes out of a 1920000-byte `calloc`, and `--vbe=16000x12000x32` clears
+768000000 — ~400× the window (receipts in D6 above).
+
+The full QEMU function was fetched for this phase
+(`gitlab.com/qemu-project/qemu/-/raw/master/hw/display/vga.c`) rather
+than reconstructed, and `dispi_fixup` is now a line-for-line
+transcription of it in QEMU's order: depth switch (with the default arm
+*assigning* 8), width checks, height checks, the three-rung offset
+ladder, then `VIRT_HEIGHT = maxy` and `vbe_line_offset = linelength`.
+
+Two places legitimately differ, both marked in the source:
+
+- **No `vbe_start_addr`.** QEMU folds the offset ladder's result into
+  `s->vbe_start_addr = offset / 4` for its display code to pan inside
+  VRAM. This model renders the visible display from `m->fb` at offset 0,
+  so there is no consumer — but the clamps are still performed, because
+  they are observable through the register readbacks a guest client
+  polls (and the vector below asserts all three rungs).
+- **BPP 4.** QEMU's *write handler* accepts only 8/15/16/24/32, so its
+  fixup `case 4:` is dead code; this model's handler also accepts 4 (a
+  pre-existing V2 divergence, not touched here), which means `bits = 4`
+  and `linelength = VIRT_WIDTH * 4 / 8`. That is bounded and safe.
+  Following QEMU's expression *literally* into a zero linelength would
+  divide by zero in `maxy`, so the transcription keeps the division
+  guarded — the divergence is recorded rather than silently "fixed" into
+  a crash.
+
+The `DISPI_ENABLE` arm was also brought to QEMU's shape: fixup, the
+`VGA_GFX_MISC` update, the display flip and the clear all happen
+**inside the 0→1 edge** (QEMU's `else` arm is just `s->bank_offset = 0`,
+which covers both 1→0 and a 1→1 flag rewrite). Previously fixup ran on
+*every* ENABLE write. That was not what made the overflow reachable —
+the clear only runs on the edge — but the comment above the memset
+claimed a bound nothing enforced, and the ordering is exactly the
+property D6 turned on, so it is now QEMU's ordering with the reason
+written down.
+
+Finally the memset itself is bounded explicitly rather than trusted:
+
+```c
+size_t clear = (size_t)regs[DISPI_YRES] * g_dispi.line_offset;
+size_t vram  = (size_t)m->fb_w * m->fb_h * 4u;
+if (clear > vram) clear = vram;      /* belt and braces */
+memset(m->fb, 0, clear);
+```
+
+The clamp in `dispi_fixup` already guarantees `clear <= vram`
+(`YRES <= maxy = vram / linelength`), and the vector asserts that
+arithmetic for the boundary modes; the extra min() is there so that a
+future edit to the fixup cannot silently turn into host heap corruption
+again. It is not the fix and is not a substitute for it — removing the
+fixup clamp still reddens the vector, because the *readbacks* are what
+it asserts.
+
+#### 4.2 Regression vector (ships in the same patch)
+
+`tests/test_video.c` → `test_dispi_mode_clamped_to_vram` (10 → **11
+vectors**, `test-video: all tests passed`, RC=0 both plain and under
+ASan+UBSan). Every expected number is QEMU's arithmetic on the
+1920000-byte window, computed independently before being asserted:
+
+| Mode / write | linelength | maxy | YRES | clear | |
+|---|---|---|---|---|---|
+| 1024×768×32 (the crashing mode) | 4096 | 468 | **468** | 1916928 | ≤ VRAM |
+| 16000×12000×32 (largest accepted) | 64000 | 30 | **30** | 1920000 | **== VRAM** |
+| 800×600×32 (the documented mode) | 3200 | 600 | **600** | 1920000 | **== VRAM** |
+| 800×**0**×32 | 3200 | 600 | **1** | 3200 | YRES 0 → 1 |
+| **0**×600×32 | 32 | 60000 | 600 | 19200 | XRES 0 → 8, VIRT_HEIGHT 60000 |
+| 800×600×**33** | 800 | 2400 | 600 | 480000 | BPP → 8 by the default arm |
+| VIRT_WIDTH 65535 while enabled | 64000 | 30 | 30 | 1920000 | 65528 → MAX 16000 |
+| VIRT_WIDTH 9 while enabled | 3200 | 600 | 600 | 1920000 | 9 & ~7 = 8 → raised to XRES |
+
+plus all three rungs of the offset ladder, each needing its own mode
+because the rungs are arithmetic, not flags:
+
+- **rung 1** (clamp to MAX, nothing zeroed) needs the clamped maxima to
+  still fit: 8×1×8, `16000/4 + 12000*8 + 1*8 = 100008 ≤ 1920000`, so
+  X_OFFSET reads back **16000** and Y_OFFSET **12000**;
+- **rung 2** (Y_OFFSET zeroed, X_OFFSET survives) needs
+  `12000 * linelength + YRES * linelength > VRAM`, and since Y_OFFSET is
+  clamped to 12000 first that means `linelength ≥ 160` → 40×1×32:
+  `12000*160 + 160 = 1920160 > 1920000`, retest `25 + 0 + 160 = 185`
+  fits, so X_OFFSET stays **100** and Y_OFFSET becomes **0**. At 8×1×8 or
+  8×1×32 this rung is *unreachable by construction* (12000×8 = 96000 and
+  12000×32 = 384000 bytes cannot exceed the window) — which is why the
+  vector uses a third mode rather than reusing the first;
+- **rung 3** (both zeroed): 800×600×32 with both at their maxima,
+  `16000 + 38400000 + 1920000 > VRAM` and `16000 + 1920000 > VRAM`, so
+  both read back **0**.
+
+One structural detail shaped every case and is recorded in the vector's
+comment: the fixup runs from the register write itself (QEMU groups
+XRES/YRES/BPP/VIRT_WIDTH/X_OFFSET/Y_OFFSET into one `store, then
+vbe_fixup_regs` arm) *and* from the 0→1 enable edge — but the edge first
+**resets** VIRT_WIDTH and both offsets to 0. A value written before
+enabling is therefore erased before it can be clamped, so those three
+registers' clamps are only observable by writing them while already
+enabled. Getting this wrong produced two false assertions during
+development, both caught by the vector rather than by reasoning.
+
+#### 4.3 The phase's negative control, measured
+
+The NC is the pre-fix `src/devices.c` (`git show HEAD:src/devices.c`,
+i.e. the V3 state) with the new vector compiled against it:
+
+```
+cc -fsanitize=address,undefined -fno-sanitize-recover=all … tests/test_video.c <pre-fix src>
+  -> RC=1
+     ERROR: AddressSanitizer: heap-buffer-overflow
+     WRITE of size 3145728 … 0 bytes after 1920000-byte region
+     ABORTING (before the vector's first readback is even reached)
+```
+
+and the same binary with the fix in place: `RC=0`, `ok vga dispi mode
+clamped to VRAM (YRES/XRES/offsets, the V4 overflow)`, all 11 vectors
+green. So the vector does not merely pass after the fix — it is the
+thing that fails before it.
+
+Beyond the vector, a one-off exhaustive sweep was run under
+ASan+UBSan (not a `make` target; the permanent gate is the vector):
+**5236 mode combinations** (17 hostile XRES × 14 YRES × 11 BPP values,
+each enabled with and without `DISPI_NOCLEARMEM`) plus **146672 register
+pokes** (every index 0x00–0x09 written as 65535, 1 and 0 while enabled,
+which re-runs the fixup each time, plus a 64-value BANK sweep),
+asserting after each step that `YRES * line_offset <= VRAM` using QEMU's
+own `VIRT_WIDTH * bits / 8` expression:
+
+```
+post-fix:  0 violations, RC=0, no ASan/UBSan report
+pre-fix:   RC=1 on the FIRST combination (WRITE of size 2621440, same site)
+```
+
+#### 4.4 Historical receipts did not move
+
+`tests/integration/test_video_modes.sh` SKIPs in this sandbox (it needs
+the frozen `AuraLite-OS` build), so the V3 artifact shas could not be
+re-measured directly. They were proved stable a stronger way instead:
+the pre-fix and post-fix emulators were run side by side on four lanes
+and every `--log` and `--dump-fb` pair compared byte for byte —
+
+| Lane | pre-fix vs post-fix | `--dump-fb` sha256 |
+|---|---|---|
+| firmware boot, 600000 instr | **IDENTICAL** (rc 0/0) | `15c96625cfec…` |
+| `--vbe=800x600x32` (V3's mode-gfx recipe) | **IDENTICAL** (rc 0/0) | `15c96625cfec…` |
+| `--vbe=off` (V3's disable path) | **IDENTICAL** (rc 0/0) | `15c96625cfec…` |
+| `--no-fb` (V1's guest lane) | **IDENTICAL** (rc 0/0) | `c3b3d73f6bbb…` |
+
+The last row is the load-bearing one: `c3b3d73f6bbb` is the sha V3
+recorded for its txt lane in §V3 above, reproduced here from a different
+binary — so the V1/V3 artifacts are unchanged by V4, not merely
+unchanged by V4's own run. All ten pre-existing `test_video.c` vectors
+also still pass unmodified, including `ok vga dispi mode regs (XRES x8,
+YRES/BPP rejects, GETCAPS maxima)` and `ok vga dispi enable/display` —
+the write-handler gates and the GETCAPS maxima (16000/12000/32, which
+QEMU also returns unconditionally) are untouched; only the fixup grew.
+
+#### 4.5 Gates
+
+`make test` **RC=0** (`boot integration test: ok`, so the firmware GPU
+probe 0:2:0 `0x8086:0x0412` / BAR0 `0xD0000000` / `pixel[0]=0x00200000`
+contract did not move; `test-tap-responder: all tests passed`; `N2
+responder receipts: ALL PASS`; `N3 end-to-end receipts: ALL PASS`, so
+the NET lanes just closed are green against the changed `src/` too);
+`make test-sanitize` **RC=0** (ASan+UBSan); `make fuzz
+FUZZ_PROGRAMS=256` — `256 programs, 6144 instructions compared -- all
+states match`, `crash invariant: 64 garbage streams, 33 clean faults, 2
+halts, 0 host-level crashes`.
+
+Changed by V4: `src/devices.c` (the fixup, the ENABLE arm, the bounded
+clear) and `tests/test_video.c` (the vector). Nothing else — no CLI
+flag, no register map, no documented mode.
+
+#### 4.6 The delivered patch, verified
+
+`patches/0050-VIDEO-V4-vbe-mode-clamp.patch`, `git format-patch -1` of this
+phase's commit, on top of the parent `07b2f15 "N3 update"`. As in
+`NET_PLAN.md` §3.9, its size, line count and commit sha are deliberately
+not quoted here: all three are properties of the artifact that *contains*
+this section, so any number written down goes stale the moment the
+section is amended. The check is a procedure:
+
+```sh
+git clone …/AuraLite-Emulator $CLONE && cd $CLONE
+git checkout 07b2f15                              # the parent
+git am  …/patches/0050-VIDEO-V4-vbe-mode-clamp.patch
+git diff --quiet $REPO_HEAD HEAD                  # empty: the tree is the commit's
+make test                                         # RC=0
+```
+
+Run against the delivered patch that produced: `git am` clean, **tree
+identical** to the phase commit, and `make test` **RC=0** with
+`test-video: all tests passed` including the new
+`ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow)`,
+`boot integration test: ok`, `test-tap-responder: all tests passed`,
+`N2 responder receipts: ALL PASS`, `N3 end-to-end receipts: ALL PASS`,
+and the same two environment SKIPs as §3.9 of the NET plan (`nasm`
+missing → `test-net-tx`; no frozen `AuraLite-OS` build → the guest
+lanes). Seeding that clone uses the recipe recorded there — the three
+`nasm` artifacts with their inputs backdated below them, because
+`.DELETE_ON_ERROR:` turns a failed rebuild into a *deleted*
+`firmware/firmware.bin`.
+
+`git am` reports `106 lines add whitespace errors` for this patch. Every
+one is inside the nested `patches/0049-NET-N3-net-e2e.patch` that this
+commit carries (house convention: a phase's commit ships the previous
+phase's patch, and 0049 in turn carries 0048 — so the warnings nest).
+Of the six files V4 authors, five have **zero** trailing-whitespace
+lines; the sixth, `src/devices.c`, has exactly one, on the `line_offset`
+comment inside `dispi_t`, and it is **pre-existing** — the parent commit
+has the same single line, and V4 did not touch it.
+
+**Not in V4** (measured, deferred): `vbe_start_addr` / display panning
+(no consumer in this model — the offsets are clamped and readable but
+the visible display still renders from offset 0); QEMU's
+`vbe_update_vgaregs` and the CVE-2016-3712 re-assertion of VGA registers
+on every GR/CR write (this model's `VGA_GFX_MISC` write path only routes
+text↔graphics display and consumes no sizing register, so there is no
+overflow surface there to re-assert against — measured: `vga_io_write`
+at `src/devices.c:852` touches nothing but the display flag); the BPP-4
+write-handler divergence from QEMU's accepted set (bounded, recorded
+above); and growing the VRAM window itself (QEMU's std-VGA carries 16
+MiB, this model's window is sized to the published 800×600 framebuffer
+that `boot_info.fb` and the `0x00200000` marker contract fix — growing
+it would move the guest-visible firmware contract, which §5 forbids, and
+it would not remove the need for the clamp anyway, only reduce how often
+it fires).
+
+## 5. Standing constraints
 
 - The guest-visible firmware contract (`firmware/sample_firmware.nas`)
   does not change; its GPU probe (`0:2:0`, `0x8086:0x0412`, BAR0
