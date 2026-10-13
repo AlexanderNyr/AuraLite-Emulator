@@ -53,6 +53,7 @@ void machine_reset(machine_t *m) {
     int trace = m->cpu.trace;      /* cpu_reset() wipes it; debug knob survives */
 
     cpu_reset(&m->cpu);
+    perf_tlb_flush(m);    /* PERF P2: reset boundary, even if RAM survives */
     pic_init(m);
     pit_init(m);
     kbc_init(m);                   /* output port back to 0x01 (SRST# high) */

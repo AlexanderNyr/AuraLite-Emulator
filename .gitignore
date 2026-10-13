@@ -1,5 +1,6 @@
 # Build outputs
 /x86emu
+/x86emu-bench
 /firmware/*.bin
 /disk/*.bin
 /disk/*.img

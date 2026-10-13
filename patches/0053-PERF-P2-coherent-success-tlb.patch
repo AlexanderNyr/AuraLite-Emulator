@@ -1,0 +1,1066 @@
+From e760db0f2edb661648b113083cbd795bfbcd2241 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 18:09:19 +0000
+Subject: [PATCH] PERF P2: coherent success-only translation cache
+
+P1-followup gprof: translate 79,798,615 calls and 22.10% sampled CPU in five boot runs. Add a 256-slot machine-wide TLB keyed by 4KiB VA subpage, CR3/CR0/CR4/EFER/AC/CPL/desc_sv/mode. Cache only successful walks over ordinary RAM-backed page-table entries with A20 open. Preserve every old fault walk and delivery. Invalidations: all guest/device-DMA RAM stores (global generation), CR0/CR3/CR4, LMSW, WRMSR EFER, no-fault INVLPG, machine reset and loader direct pre-execution table construction.
+
+Same-patch test_tlb.c asserts warm hit and PTE 5MiB-to-6MiB remap; same-value control writes and INVLPG, exact nonpresent/NX/WP/U/S fault CR2/error/RIP, 2MiB/1GiB leaves, A20-off, dynamic MMIO root, SMP context keys. Single NC removes only RAM-store invalidation in a scratch mem.c: NEW_VALUE assertion fails, inner RC=134/script RC=1/make RC=2. Boot stats: 15,863,692 hits, 4,668 misses, 4,669 flushes; post-profile mem_read calls 313,666,250 to 78,188,375 across five runs. Two alternate pre/post triples kept all seven work counts identical; local wall ratios 1.15-1.35x, not an absolute gate.
+
+Measured make test RC=0, make test-sanitize RC=0, make fuzz FUZZ_PROGRAMS=256 RC=0 (6,144 compared, 0 host crashes), make bench BENCH_REPS=3 RC=0. Four historical firmware/video stdout/log/PPM pairs byte-identical with no --stats. Frozen guest lanes SKIP without toolchain. See PERF_PLAN.md, CHANGELOG, ROADMAP, STATUS.
+---
+ CHANGELOG.md                   |  54 +++++
+ Makefile                       |  20 +-
+ ROADMAP.md                     |  15 +-
+ docs/STATUS.md                 |  26 +++
+ docs/plans/PERF_PLAN.md        | 141 +++++++++++--
+ src/chipset.c                  |   1 +
+ src/cpu.c                      |  68 ++++++-
+ src/kloader.c                  |   4 +
+ src/machine.h                  |  35 ++++
+ src/main.c                     |   4 +
+ src/mem.c                      |   5 +
+ tests/integration/p2_tlb_nc.sh |  44 ++++
+ tests/test_tlb.c               | 353 +++++++++++++++++++++++++++++++++
+ 13 files changed, 739 insertions(+), 31 deletions(-)
+ create mode 100755 tests/integration/p2_tlb_nc.sh
+ create mode 100644 tests/test_tlb.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 25c0746..d0dcddd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,60 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Changed — patch 0053 (PERF P2, coherent success-only TLB)
++
++- **Measured D6:** after P1, five O2 gprof boots gave `translate`
++  79,798,615 calls, **22.10%** of sampled CPU time (0.40 / 1.81 s).
++  A 256-slot, 4KiB-subpage successful-translation TLB now lives in
++  `machine_t` (NOT in the K6 vCPU copies). Key: VA page, full CR3/CR0/
++  CR4/EFER, RFLAGS.AC, CPL, descriptor-supervisor override and access
++  mode. Only a *successful* old walk through ordinary RAM-backed PTEs
++  with A20 open is cached; faults, dynamic MMIO/ROM tables, disabled A20
++  and all nonpaging paths still take the old walk. 2MiB/1GiB PS leaves
++  cache correct per-4KiB subpage physical bases.
++- Coherence is intentionally conservative: **every guest or device-DMA
++  RAM `mem_write`** advances a global generation (O(1)); MOV CR0/CR3/
++  CR4, LMSW, WRMSR EFER, INVLPG and machine reset also flush. The direct
++  *pre-execution* K1 loader table writes have an explicit flush before
++  CPU start. No device DMA bypass was found in `src/`: USB, AHCI and
++  e1000 writes use `mem_write`; VGA's raw text pointer is read-only.
++  INVLPG remains a **no-fault operand hint** (K2); it flushes globally.
++  `--stats` now adds internal-only TLB hits/misses/flushes, opt-in;
++  default stdout, K6 virtual clock and P0 work count do not change.
++- `tests/test_tlb.c`: warm hit followed by 5MiB→6MiB PTE rewrite and
++  exact new data; MOV CR3 / CR0 / CR4, LMSW, WRMSR EFER and no-fault
++  INVLPG; warmed read→nonpresent #PF (err=0) / NX fetch (err=0x11) /
++  supervisor WP write (err=0x3) / CPL3 U/S read (err=0x5), all with
++  matching CR2 and handler RIP; 2MiB/1GiB PS offsets; disabled A20;
++  dynamic MMIO page-table root that changes **without** RAM write;
++  SMP contexts with CR3/AC keys. `test-tlb: all vectors passed`.
++- **NC P2 (one per phase):** `tests/integration/p2_tlb_nc.sh` mutates a
++  scratch copy of `mem.c`, removes only the RAM-store TLB flush and runs
++  the **same** P2 vector. After a warmed PTE is rewritten,
++  `assert(c->gpr[RAX] == NEW_VALUE)` fails: binary **RC=134**, wrapper
++  **RC=1**, `make test-tlb-nc` **RC=2** (`make` reports Error 1). Receipt
++  `P2 NC: FAILED AS DESIGNED (RAM-store flush is necessary for PTE
++  coherence)`; production checkout untouched.
++- Firmware boot measured 15,863,692 hits / 4,668 misses / 4,669 flushes,
++  4,837,677 executed attempts; five post-P2 gprof boots kept 79,798,615
++  `translate` calls but cut `mem_read` calls from 313,666,250 to
++  78,188,375. Alternating O2 pre/post triples across seven tapes kept
++  identical work counts and gave local paired ratios **1.15–1.35×**
++  (haswell 429→328 and 420→333 ms). No fixed host-time CI threshold or
++  portable speedup claim. Four historical 600k-cap firmware/video stdout,
++  ring-log and PPM pairs are byte-identical RC=0/0, framebuffer SHA
++  prefixes `15c96625cfec5acc` / `c3b3d73f6bbb08ab`.
++  `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256`, and
++  `make bench BENCH_REPS=3` all **RC=0** (N2/N3 ALL PASS; 6,144 diff-fuzz
++  instructions match, 0 host crashes). Frozen guest lanes SKIP due
++  missing build toolchain, not counted as passing guest receipts.
++  In a fresh clone at parent `f7c3bd7`, `git am` applied cleanly to the
++  identical tree; after seeding nasm outputs, `make test`,
++  `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256`, `make bench
++  BENCH_REPS=3` each passed RC=0, while `make test-tlb-nc` failed RC=2
++  on the exact stale-PTE assertion as designed.
++
++
+ ### Changed — patch 0052 (PERF P1, profile-guided 8-byte RAM read)
+ 
+ - **Measured hotspot D5, not a speculative refactor:** five O2 `-pg`
+diff --git a/Makefile b/Makefile
+index 2a0b445..4707046 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -110,6 +110,18 @@ test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.
+ test-perf-mem-nc: tests/test_perf_mem.c tests/integration/p1_mem_nc.sh src/mem.c
+ 	sh tests/integration/p1_mem_nc.sh
+ 
++# PERF P2: successful-translation TLB under page-table writes, CR3/
++# INVLPG, fault error/RIP/CR2, mode/permission keys, PS leaves and SMP.
++test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tlb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-tlb -lm
++	./test-tlb
++	rm -f test-tlb
++
++# Exactly one P2 NC.  The wrapper MUST fail: scratch mem.c without the
++# RAM-store epoch bump returns a stale warmed PTE after guest/DMA writes.
++test-tlb-nc: tests/test_tlb.c tests/integration/p2_tlb_nc.sh src/mem.c
++	sh tests/integration/p2_tlb_nc.sh
++
+ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+@@ -159,7 +171,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
++test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -169,7 +181,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P0: wall-clock bench.  NOT part of 'make test': its numbers are this
+ # machine's, so a gate on them would be a gate on the runner.  What it DOES
+@@ -201,4 +213,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem framebuffer.ppm tests/kload_fixture.elf
++	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index f581eac..80c11a1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,7 +31,7 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2–P5 📋 | honest seven-tape bench; profile-guided 8-byte RAM read (ROM/A20/boundaries preserved); next measured translation TLB, decode cache, dispatch | P0–P5 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3–P5 📋 | honest bench, profile-guided RAM read, success-only translation TLB with conservative guest/DMA coherence; next decode cache if measured | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+@@ -65,9 +65,16 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+   pre/post with identical work counts, historical tapes byte-identical~~
+   shipped.  Local ratios 1.18–1.83× across two paired 3-rep series have
+   visible host variance; no fixed cross-runner wall-time gate.
+-- `0053` — PERF P2 (planned, NOT implemented): re-profile address translation
+-  after P1; if still hot, define TLB keys and invalidation from measured
+-  CR3/INVLPG/page-table-write behavior before caching anything.
++- ~~`0053` — PERF P2: P1-followup O2 gprof measured `translate` 22.10%
++  of samples / 79,798,615 calls over five boots; success-only shared TLB
++  with 4KiB subpage keys including CR3/CR0/CR4/EFER/AC/CPL/desc_sv/mode,
++  conservative O(1) global generation flush on EVERY guest/DMA RAM store,
++  MOV CR0/CR3/CR4/LMSW/WRMSR EFER/INVLPG/reset; dynamic MMIO/ROM tables
++  and A20-off walks uncached. Real #PF err/RIP/CR2 vectors, PTE-rewrite NC,
++  seven-tape paired measurement, byte-identical historical receipts~~ shipped.
++- `0054` — PERF P3 (planned, NOT implemented): re-profile decode after
++  P2, then scope self-modifying-code/mode/fetch invalidation before any
++  decode-cache implementation.
+ 
+ 
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index f225fba..71a1921 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -597,6 +597,32 @@
+   `make test-perf-mem-nc` failed RC=2 by design. Frozen AuraLite-OS
+   lanes still SKIP without its guest build toolchain. P2–P5 remain planned.
+ 
++- PERF P2 delivered (`patches/0053-PERF-P2-coherent-success-tlb.patch`):
++  after P1, five O2 gprof firmware boots measured `translate` 79,798,615
++  calls, 22.10% of samples. A 256-entry shared success-only TLB caches
++  4KiB subpage translations after the existing permission checks; full
++  CR3/CR0/CR4/EFER, AC, CPL, descriptor override and access mode key
++  the result. Only ordinary RAM-backed page-table reads with A20 open
++  may be cached. Global generation flushes on every guest/DMA RAM store,
++  CR0/CR3/CR4/LMSW/EFER/INVLPG/reset and K1 loader boot; faulting,
++  ROM/MMIO-backed and A20-closed walks remain uncached. Fresh `--stats`
++  on the boot tape: 15,863,692 hits, 4,668 misses, 4,669 flushes,
++  4,837,677 actual instruction attempts; `mem_read` in five profiled
++  boots fell 313,666,250→78,188,375 calls. P2 vectors include live
++  PTE remap, all four #PF CR2/error/RIP verdicts, large PS pages,
++  dynamic MMIO root and SMP keying; the single NC removes the RAM-write
++  flush in a scratch copy and reddens `assert(c->gpr[RAX] == NEW_VALUE)`
++  (binary RC=134, wrapper RC=1, make RC=2). Seven alternating pre/post
++  tapes kept work counts identical; local paired time ratios 1.15–1.35×
++  with no absolute timing gate. Four historical video/firmware stdout,
++  log and PPM receipts byte-identical. `make test`, `make test-sanitize`,
++  `make fuzz FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` all RC=0;
++  in a fresh clone from `f7c3bd7`, `git am` gave the identical tree;
++  after nasm-artifact seeding, `make test`, `make test-sanitize`, `make
++  fuzz FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` each passed RC=0;
++  P2 NC failed RC=2 by design. Frozen AuraLite-OS lanes SKIP without
++  the missing guest toolchain. P3–P5 remain planned.
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/PERF_PLAN.md b/docs/plans/PERF_PLAN.md
+index 625cc94..325c607 100644
+--- a/docs/plans/PERF_PLAN.md
++++ b/docs/plans/PERF_PLAN.md
+@@ -7,8 +7,9 @@
+ > `make test-sanitize` remain green at each phase boundary.
+ 
+ **Status: P0 ✅ (`patches/0051-PERF-P0-honest-benchmark.patch`),
+-P1 ✅ (`patches/0052-PERF-P1-profiled-ram-read.patch`);
+-P2–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
++P1 ✅ (`patches/0052-PERF-P1-profiled-ram-read.patch`),
++P2 ✅ (`patches/0053-PERF-P2-coherent-success-tlb.patch`);
++P3–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
+ first, RAM fast path, translation TLB, decode cache, profiling/dispatch,
+ then hardening and closure. Future phases are scoped, not pre-approved for
+ implementation: measure an actual hotspot before writing an optimization.
+@@ -17,7 +18,7 @@ implementation: measure an actual hotspot before writing an optimization.
+ |---|---|---|---|
+ | P0 | Work counter + opt-in `--stats`; seven-tape wall-time rig; cap/idle negative control | `make test-perf`, `make bench`, `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256` | ✅ 0051 |
+ | P1 | Measured-hot 8-byte full-span RAM read fast path; ROM/MMIO/A20/boundary remain on old path | six bus vectors + LE-swap NC, differential fuzz, seven P0 tapes paired pre/post | ✅ 0052 |
+-| P2 | Guest-translation TLB with measured invalidation (CR3, INVLPG, paging-mode/permissions) | page-fault/Ring3/SMEP/SMAP vector suite + differential fuzz + P0 tapes | 📋 |
++| P2 | Success-only 4KiB-subpage TLB; conservative RAM-store/DMA and control-operation flushes, security-context key | warm-PTE rewrite, #PF CR2/err/RIP, CPL3/WP/NX, MMIO, PS, SMP vectors, NC + differential fuzz + P0 tapes | ✅ 0053 |
+ | P3 | Decode cache, with explicit invalidation for writes to code, A20 and mode transitions | self-modifying code + mode-transition vectors + differential fuzz + P0 tapes | 📋 |
+ | P4 | Profile-guided dispatch optimization only if the profile justifies it | `-pg`/gprof before/after + `make fuzz` + P0 tape ratios | 📋 |
+ | P5 | Repeated-run regression policy, sanitizer, closed defect ledger, documentation | all gates, historical byte-identical lanes, one NC, fresh-clone `git am` | 📋 |
+@@ -76,6 +77,7 @@ implementation: measure an actual hotspot before writing an optimization.
+ | D3 | Every gate in `Makefile` compared state; a slowdown could pass all of them. | P0 wall-time median from five runs of each tape; report only. Later P1–P5 compare paired builds on same host, not absolute machine-external thresholds. |
+ | D4 | Appending `--no-fb` to all tapes made `gfx-fb` identical to `text-no-fb`. | P0 per-tape argv verbatim; printed labels correspond to distinct CLI paths. |
+ | D5 | Five `-O2 -pg` firmware runs: `mem_read` **313,666,250** calls, **45.66%** of profile samples, **235,535,030** calls from `translate`'s 8-byte page-table walk. The old RAM case loops `size` times, bounds-checking every byte. | P1 one 8-byte `memcpy` (no alignment/aliasing UB) after ROM checks, only if A20 open and all 8 RAM bytes in bounds; big-endian hosts use the old LE loop. Post profile: same 313,666,250 calls, 14.37% of samples. |
++| D6 | After P1, five O2 gprof boots: `translate` **79,798,615** calls, **22.10%** of samples (0.40/1.81 s); page-table reads still dominate. An unconditional cache would stale after guest/DMA page-table writes or a permission switch and could suppress #PF. | P2 success-only, RAM-backed 256-slot cache: global generation bump on every RAM `mem_write` + explicit INVLPG/CR/EFER/reset; key includes CR3, CPL/descriptor override, mode, WP/SMEP/SMAP/NXE and AC. Dynamic MMIO/ROM tables and A20-off walks never cached. NC drops RAM flush and reddens the exact PTE-rewrite assertion. |
+ 
+ ## 3. P0 — one patch, measured gates
+ 
+@@ -290,15 +292,128 @@ SKIP; no claim is made about a new guest build.
+ Do not put a checksum or size of this patch into itself: those numbers
+ change when its documentation changes, causing an amend loop.
+ 
+-## 5. Planned phases — gate before optimization
+-
+-**P2 (translation TLB).** Only if the P1 follow-up profile shows address
+-translation is hot. State a key containing all permission/mode bits
+-relevant to the lookup, and explicitly invalidate on CR3 reload, INVLPG,
+-CR0/CR4/EFER mode changes and page-table writes. Compare the old walk
+-against the cache for page-present/error-code/RIP/CR2 under Ring3 NX,
+-U/S, WP and SMP. NC disables invalidation for a page-table update; vector
+-must redden. A timing win alone cannot authorize altered fault ordering.
++## 5. P2 — coherent success-only translation cache, one patch
++
++### 5.1 Evidence and narrow contract
++
++After P1, five O2 `-pg` firmware boots aggregated by `gprof -b` measured
++`translate` **79,798,615** calls and **22.10%** of sampled time (0.40 of
++1.81 s). Each page-table walk rereads 2–4 entries via `mem_read` even on
++unmodified code fetches. P2 is justified by *that* hotspot, not by a
++hypothetical guest TLB requirement. The first P2 boot with `--stats` kept
++`executed=4837677`, `vtime=4837677`, and measured **15,863,692** TLB hits,
++**4,668** misses and **4,669** global flushes; numbers are for this exact
++firmware lane only.
++
++`src/machine.h` holds 256 direct-mapped entries, shared by the machine so
++K6 vCPU load/store does **not** copy a large array each instruction. The
++entry key is 4KiB VA subpage, full CR3/CR0/CR4/EFER, RFLAGS.AC, CPL,
++`desc_sv` and read/write/execute mode. This also handles 2MiB and 1GiB PS
++leaves by caching each touched 4KiB subpage's physical base. Only successful
++walks are inserted **after** every old permission check. Faulting/nonpresent
++walks are **never** negative-cached: the original walker still raises every
++#PF, with its original CR2, error bits, RIP and IDT delivery ordering.
++No virtual clock or `cpu.executed_steps` semantics changed. `--stats`
++adds `tlb_hits/tlb_misses/tlb_flushes` opt-in; without it, stdout is
++unchanged.
++
++For a cacheable walk, all PML4E/PDPTE/PDE/PTE reads must have started in
++ordinary RAM, outside the low BIOS ROM alias (`0xE0000..0xFFFFF`), with
++A20 open. A dynamic MMIO-backed PML4E is NOT cached (regression vector
++switches callback root without a RAM write); closed-A20 walks always use
++the old path. `mem_write` to RAM -- from the guest or from device DMA
++(USB, AHCI, e1000; measured all use this bus API) -- increments a global
++generation. This invalidates **all** contexts in O(1), including writes to
++ordinary data, because table ownership is not tracked. ROM/MMIO writes
++never mutate cached *ordinary-RAM* tables. MOV CR0/CR3/CR4, LMSW, WRMSR
++EFER, INVLPG and machine reset explicitly flush; INVLPG remains a
++no-fault operand hint (K2), with a conservative *whole-TLB* flush.
++`kloader.c` invalidates after its direct pre-execution table construction.
++Direct raw `m->ram` writes by an external *host harness after CPU start*
++are outside the guest/DMA bus API; such a harness must call
++`perf_tlb_flush` after modifying a live page table. Production devices
++only read raw VGA text RAM; their DMA writes use `mem_write`.
++
++### 5.2 Same-patch vectors and one negative control
++
++`tests/test_tlb.c` shares the production `translate` path through actual
++long-mode instructions, not a copied paging model. Its groups assert:
++
++1. warm cache hit; guest `mem_write` PTE remaps VA from 5MiB to 6MiB;
++   next `MOV RAX,[RBX]` MUST return `NEW_VALUE`;
++2. guest `MOV CR3` switches root; `INVLPG [unmapped]` flushes without
++   reading/faulting its operand; same-value guest MOV CR0/MOV CR4,
++   WRMSR EFER and LMSW also flush;
++3. warmed successful read → nonpresent #PF (CR2=VA, err=0, RIP=handler),
++   NX fetch (err=0x11), supervisor WP write (err=0x3), CPL3 U/S read
++   (err=0x5), with the original delivered handler RIP;
++4. 2MiB/1GiB PS leaves preserve the right 4KiB offset; closed-A20
++   bypasses cached entries; a dynamic MMIO page-table root is re-read
++   every time (uncacheable); shared SMP contexts with distinct CR3/AC
++   cannot borrow each other's result.
++
++`make test-tlb` joins both `make test` and `make test-sanitize`, RC=0 with
++`test-tlb: all vectors passed`. **Exactly one NC for P2:**
++`tests/integration/p2_tlb_nc.sh` copies `mem.c` into a scratch directory
++and removes ONLY the RAM-store generation bump, then builds/runs the
++**same** P2 vector. On the warmed PTE rewrite its first `assert(c->gpr[RAX]
++== NEW_VALUE)` fails: inner binary **RC=134**, NC script **RC=1**,
++`make test-tlb-nc` **RC=2** (`make` wraps recipe Error 1). Receipt:
++`P2 NC: FAILED AS DESIGNED (RAM-store flush is necessary for PTE
++coherence)`. No production source is mutated. No timing-dependent assert
++is used to prove correctness.
++
++### 5.3 Measured performance and historical identity
++
++Five post-P2 O2 `-pg` firmware boots: `translate` calls remained
++**79,798,615**, but its self time fell from 0.40 to **0.21** sampled seconds
++(22.10%→18.92% of the sampled profile). `mem_read` fell from
++**313,666,250** to **78,188,375** calls: cache hits removed the repeated
++page-table walks; the guest work count stayed 4,837,677 on every run.
++Sampling percentages and host wall time are not cross-machine performance
++contracts. Two alternating pre1/post1/pre2/post2 O2 series, seven tapes
++×3 repetitions each, produced identical work counts on all tapes:
++
++| Tape | Work | Pair 1 pre→post (ms; ratio) | Pair 2 pre→post (ms; ratio) |
++|---|---:|---:|---:|
++| boot-haswell | 4,837,677 | 429→328; 1.31× | 420→333; 1.26× |
++| boot-broadwell | 4,807,694 | 422→326; 1.29× | 417→325; 1.28× |
++| boot-baytrail | 4,807,650 | 418→342; 1.22× | 419→343; 1.22× |
++| text-no-fb | 4,837,677 | 447→332; 1.35× | 419→348; 1.20× |
++| gfx-fb | 4,837,677 | 428→372; 1.15× | 420→330; 1.27× |
++| vbe-800x600x32 | 4,837,677 | 421→354; 1.19× | 420→362; 1.16× |
++| smp2 | 4,837,677 | 767→568; 1.35× | 708→566; 1.25× |
++
++Four historical 600k-cap tapes (firmware boot, VBE on/off and `--no-fb`)
++using the SAME `--log` and `--dump-fb` paths: pre/post stdout, ring logs
++and PPM were byte-identical, RC=0/0; PPM SHA256 prefixes
++`15c96625cfec5acc` (first three) and `c3b3d73f6bbb08ab` (no-fb).
++`make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256` and
++`make bench BENCH_REPS=3` all **RC=0**; 6,144 differential instructions
++matched, zero host crashes; N2/N3 ALL PASS. Frozen guest lanes SKIP
++(missing its build toolchain), so this does not assert guest QEMU-parity
++speed. No wall-time threshold is gated in CI.
++
++### 5.4 Fresh-clone patch gate (measured)
++
++From parent `f7c3bd7` (P1), `git am
++"$REPO/patches/0053-PERF-P2-coherent-success-tlb.patch"` applied cleanly;
++`HEAD^{tree}` was **identical** to the development tree. The three
++ignored nasm artifacts were seeded as in `NET_PLAN.md` §3.9; `make -n`
++reported both firmware and disk targets up to date. In that fresh clone:
++`make test` **RC=0** (`test-tlb: all vectors passed`, boot integration
++ok, N2/N3 ALL PASS), `make test-sanitize` **RC=0**, `make fuzz
++FUZZ_PROGRAMS=256` **RC=0** (6,144 instructions, all states match,
++zero host crashes), `make bench BENCH_REPS=3` **RC=0** (all seven tapes
++executed deterministic work, none capped), and the one P2 NC `make
++test-tlb-nc` **RC=2** (scratch binary RC=134, script RC=1,
++`assert(c->gpr[RAX] == NEW_VALUE)`). Frozen guest lanes SKIP without
++its absent toolchain; no claim of guest speed.
++
++Do not embed the patch's own SHA or size inside it; doing so creates an
++amend loop rather than additional evidence.
++
++## 6. Planned phases — gate before optimization
+ 
+ **P3 (decode cache).** Only if measured decoding is hot after P2. Cache
+ keys include instruction bytes, address/operand sizes, mode, prefixes
+@@ -321,7 +436,7 @@ close the defect ledger with per-defect vectors, include the one NC for
+ P5, re-run all guest-visible historical receipts, and verify `git am` in
+ a fresh clone.
+ 
+-## 6. Standing constraints
++## 7. Standing constraints
+ 
+ 1. Do not change `instr_count`/`vtime_instr` semantics: they are the K6
+    guest clock and include K3 idle quanta. An optimization that returns
+diff --git a/src/chipset.c b/src/chipset.c
+index 1657c1f..3a5c51c 100644
+--- a/src/chipset.c
++++ b/src/chipset.c
+@@ -53,6 +53,7 @@ void machine_reset(machine_t *m) {
+     int trace = m->cpu.trace;      /* cpu_reset() wipes it; debug knob survives */
+ 
+     cpu_reset(&m->cpu);
++    perf_tlb_flush(m);    /* PERF P2: reset boundary, even if RAM survives */
+     pic_init(m);
+     pit_init(m);
+     kbc_init(m);                   /* output port back to 0x01 (SRST# high) */
+diff --git a/src/cpu.c b/src/cpu.c
+index 035e1b8..0a349c5 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -121,10 +121,43 @@ static void page_fault(machine_t *m, uint64_t vaddr, int mode, int present_chain
+ #define T_READ 0
+ #define T_WRITE 1
+ #define T_EXEC 2
++/* A cached walk may only have read side-effect-free RAM-backed page-table
++ * entries.  The low ROM alias is inside RAM_SIZE and must be excluded;
++ * disabled A20 changes the addresses of page-table reads, so take the old
++ * walk instead.  The physical bus gives RAM priority over registered MMIO
++ * in this range (src/mem.c), including caller-registered test MMIO. */
++static int perf_tlb_plain_table(machine_t *m, uint64_t phys) {
++    return m->chipset.a20 && phys <= (uint64_t)RAM_SIZE - 8 &&
++           !(phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE);
++}
+ static int translate(machine_t *m, uint64_t vaddr, uint64_t *out_phys, int mode) {
+     cpu_t *c = &m->cpu;
+     if (!(c->cr0 & (1ULL<<31))) { *out_phys = vaddr; return 1; } /* paging disabled */
+     int user_cpl = (cpl_now(c) == 3) && !c->desc_sv;   /* K4: implicit descriptor reads are supervisor */
++    /* PERF P2: only SUCCESSFUL walks are cached.  Key the whole security
++     * context: CR3 (ASID), CR0.WP, CR4.SMEP/SMAP, EFER.NXE, RFLAGS.AC,
++     * effective CPL including descriptor-supervisor override, and access
++     * mode.  Whole control regs in the key are conservative; no access
++     * should ever hit a translation with weaker permissions.  Cache is
++     * shared across SMP contexts, never copied on a vCPU slot switch. */
++    uint64_t page = vaddr >> 12;
++    uint64_t slot = (page ^ (page >> 9) ^ (c->cr3 >> 12)) & (PERF_TLB_SLOTS - 1);
++    perf_tlb_entry_t *hit = &m->perf_tlb[slot];
++    uint8_t ac = (uint8_t)((c->rflags >> 18) & 1);
++    uint8_t cpl = (uint8_t)cpl_now(c);
++    uint8_t desc_sv = (uint8_t)(c->desc_sv != 0);
++    if (m->chipset.a20 && hit->valid &&
++        hit->generation == m->perf_tlb_generation &&
++        hit->linear_page == page && hit->cr3 == c->cr3 &&
++        hit->cr0 == c->cr0 && hit->cr4 == c->cr4 && hit->efer == c->efer &&
++        hit->ac == ac && hit->cpl == cpl && hit->desc_sv == desc_sv &&
++        hit->mode == mode) {
++        ++m->perf_tlb_hits;
++        *out_phys = hit->phys_page | (vaddr & 0xFFFULL);
++        return 1;
++    }
++    ++m->perf_tlb_misses;
++    int cacheable = m->chipset.a20;
+     uint64_t cr3 = c->cr3 & ~0xFFFULL;
+     int idx4 = (int)((vaddr >> 39) & 0x1FF);
+     int idx3 = (int)((vaddr >> 30) & 0x1FF);
+@@ -132,23 +165,27 @@ static int translate(machine_t *m, uint64_t vaddr, uint64_t *out_phys, int mode)
+     int idx1 = (int)((vaddr >> 12) & 0x1FF);
+     int eff_us = 1, eff_w = 1, nx_any = 0;
+ 
++    cacheable &= perf_tlb_plain_table(m, cr3 + (uint64_t)idx4*8);
+     uint64_t pml4e = mem_read(m, cr3 + (uint64_t)idx4*8, 8);
+     if (!(pml4e & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
+     eff_us &= (int)((pml4e >> 2) & 1); eff_w &= (int)((pml4e >> 1) & 1); nx_any |= (int)(pml4e >> 63);
+     uint64_t pdpt = pml4e & 0x000FFFFFFFFFF000ULL;
+ 
++    cacheable &= perf_tlb_plain_table(m, pdpt + (uint64_t)idx3*8);
+     uint64_t pdpte = mem_read(m, pdpt + (uint64_t)idx3*8, 8);
+     if (!(pdpte & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
+     eff_us &= (int)((pdpte >> 2) & 1); eff_w &= (int)((pdpte >> 1) & 1); nx_any |= (int)(pdpte >> 63);
+     if (pdpte & (1ULL<<7)) { *out_phys = (pdpte & 0xFFFFFC0000000ULL) | (vaddr & 0x3FFFFFFFULL); goto check; }
+     {
+         uint64_t pd = pdpte & 0x000FFFFFFFFFF000ULL;
++        cacheable &= perf_tlb_plain_table(m, pd + (uint64_t)idx2*8);
+         uint64_t pde = mem_read(m, pd + (uint64_t)idx2*8, 8);
+         if (!(pde & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
+         eff_us &= (int)((pde >> 2) & 1); eff_w &= (int)((pde >> 1) & 1); nx_any |= (int)(pde >> 63);
+         if (pde & (1ULL<<7)) { *out_phys = (pde & 0x000FFFFFFFE00000ULL) | (vaddr & 0x1FFFFFULL); goto check; }
+         {
+             uint64_t pt = pde & 0x000FFFFFFFFFF000ULL;
++            cacheable &= perf_tlb_plain_table(m, pt + (uint64_t)idx1*8);
+             uint64_t pte = mem_read(m, pt + (uint64_t)idx1*8, 8);
+             if (!(pte & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
+             eff_us &= (int)((pte >> 2) & 1); eff_w &= (int)((pte >> 1) & 1); nx_any |= (int)(pte >> 63);
+@@ -165,6 +202,16 @@ check:
+     }
+     if (mode == T_EXEC && nx_any && (c->efer & (1ULL<<11))) { page_fault(m, vaddr, mode, 1, 1); return 0; }
+     if (mode == T_WRITE && !eff_w && (user_cpl || (c->cr0 & (1ULL<<16)))) { page_fault(m, vaddr, mode, 1, 0); return 0; }
++    if (cacheable) {
++        hit->generation = m->perf_tlb_generation;
++        hit->linear_page = page;
++        hit->phys_page = *out_phys & ~0xFFFULL;
++        hit->cr3 = c->cr3; hit->cr0 = c->cr0;
++        hit->cr4 = c->cr4; hit->efer = c->efer;
++        hit->ac = ac; hit->cpl = cpl; hit->desc_sv = desc_sv;
++        hit->mode = (uint8_t)mode;
++        hit->valid = 1;
++    }
+     return 1;
+ }
+ 
+@@ -2024,7 +2071,7 @@ really_slow:
+                 break; } }
+         case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
+                      cpu_set_msr(c, idx, val);
+-                     if (idx==0xC0000080) c->efer = val;
++                     if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
+                      /* K3: GS-base MSRs are the architected long-mode
+                       * segment base for GS addressing -- keep the decoder's
+                       * seg[] shadow in sync (measured: AuraLite's
+@@ -2058,6 +2105,7 @@ really_slow:
+                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
+                      }
+                      else if (crn==2) c->cr2=v; else if (crn==3) c->cr3=v; else if (crn==4) c->cr4=v;
++                     if (crn==0 || crn==3 || crn==4) perf_tlb_flush(m);
+                      break; }
+         case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
+                      rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
+@@ -2106,17 +2154,17 @@ really_slow:
+                          else { uint64_t v = rm_read(&d,&rm,2);
+                                 uint64_t nc = (c->cr0 & 0xFFFFFFFFFFFF0000ull) | (v & 0xFFFF);
+                                 if ((c->cr0 & 1) && !(v & 1)) nc |= 1; /* PE is sticky under LMSW */
+-                                c->cr0 = nc; }
++                                c->cr0 = nc; perf_tlb_flush(m); }
+                          break;
+                      }
+-                     if (ext==7) { /* INVLPG: the operand is a page HINT, never a
+-                                      memory read -- real silicon does not fault on
+-                                      an unmapped address (SDM: no TLB entry, no
+-                                      operation). We keep no TLB model, so INVLPG
+-                                      is a pure no-op. K2: measured -- AuraLite's
+-                                      paging_unmap() INVLPG faulted through our
+-                                      eager linear read below and re-entered the
+-                                      kernel's own #PF handler mid-self-test. */
++                     if (ext==7) { /* INVLPG: the operand is a page HINT, not
++                                      a memory read -- never fault on an unmapped
++                                      operand.  P2 flushes the shared TLB in
++                                      O(1); a full flush is conservative but
++                                      avoids mis-keying large-page aliases.
++                                      K2 measured an eager read causing a
++                                      recursive fault in paging_unmap(). */
++                         perf_tlb_flush(m);
+                          break; }
+                      if (ext==5) { faultf(c, "#UD 0F 01 /5 reserved"); break; }
+                      uint64_t base = (rm.seg>=0)? d.c->seg[rm.seg].base:0; uint64_t addr=base+rm_ea(&d,&rm);
+diff --git a/src/kloader.c b/src/kloader.c
+index 51607c4..dd44511 100644
+--- a/src/kloader.c
++++ b/src/kloader.c
+@@ -439,6 +439,10 @@ int kload_boot(machine_t *m, const char *elf_path, const char *initrd_path) {
+     uint32_t mmap_n = kfill_boot_info(m, map_hi, initrd_phys, initrd_size);
+     free(initrd_img);
+ 
++    /* PERF P2: this loader built tables via direct pre-execution RAM
++     * memcpy/pt_entries writes rather than guest mem_write; discard any
++     * earlier mapping before starting CPU execution. */
++    perf_tlb_flush(m);
+     /* ---- CPU state: exactly the boot.asm contract ---- */
+     cpu_reset(&m->cpu);
+     m->cpu.cr0 = 0x80000023ULL;                  /* PE|MP|NE|PG */
+diff --git a/src/machine.h b/src/machine.h
+index 473cbee..8c27d3c 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -51,6 +51,22 @@ typedef struct io_port {
+     const char *name;
+ } io_port_t;
+ 
++/* PERF P2: one shared (machine-wide) successful-translation cache.  The
++ * 4-KiB key works for both 4-KiB pages and the current 2-MiB/1-GiB PS
++ * leaves: each cached subpage gets its own physical base.  A shared table
++ * avoids copying cache arrays at EVERY vCPU load/store (K6), and the key
++ * includes CR3/permission context; RAM writes invalidate every context.
++ * Negative caching is deliberately forbidden: the original walk must raise
++ * EVERY fault, with the original CR2/error code/RIP and delivery ordering.
++ */
++#define PERF_TLB_SLOTS 256u
++
++typedef struct perf_tlb_entry {
++    uint64_t generation, linear_page, phys_page;
++    uint64_t cr3, cr0, cr4, efer;
++    uint8_t ac, cpl, desc_sv, mode, valid;
++} perf_tlb_entry_t;
++
+ /* ---- Event log for the GUI / debugging ---- */
+ #define LOG_RING 4096
+ typedef struct {
+@@ -85,6 +101,12 @@ struct machine {
+     size_t   rom_len;
+ 
+     mmio_region_t *mmio_list;
++    /* P2: internal-only TLB.  No guest CPU field and no K6 clock change.
++     * Generation invalidation is O(1) on each guest/DMA RAM write; on the
++     * impossible wrap to 0, explicitly clear validity before reuse. */
++    perf_tlb_entry_t perf_tlb[PERF_TLB_SLOTS];
++    uint64_t perf_tlb_generation;
++    uint64_t perf_tlb_hits, perf_tlb_misses, perf_tlb_flushes;
+     io_port_t io[65536];
+ 
+     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
+@@ -158,6 +180,19 @@ struct machine {
+ };
+ typedef struct machine machine_t;
+ 
++/* PERF P2: flush on any RAM write and on every paging-control operation.
++ * This is deliberately global rather than CR3/linear scoped: device DMA
++ * writes may update a page table through mem_write, and the current bus has
++ * no tracked page-table ownership.  Conservatism is correct; the benchmark
++ * determines whether it is fast enough to keep. */
++static inline void perf_tlb_flush(machine_t *m) {
++    ++m->perf_tlb_flushes;
++    if (++m->perf_tlb_generation == 0) {
++        for (size_t i = 0; i < PERF_TLB_SLOTS; ++i) m->perf_tlb[i].valid = 0;
++        m->perf_tlb_generation = 1;
++    }
++}
++
+ /* K6: swap a vcpu context between its slot and the live m->cpu/m->lapic
+  * pair.  Both are complete no-ops when n_vcpus == 1, so every existing
+  * code path (unit suites included) keeps its byte-exact behavior and
+diff --git a/src/main.c b/src/main.c
+index 5b00988..83baa65 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -474,6 +474,10 @@ int main(int argc, char **argv) {
+         printf("[stats] cap=%llu cap_reached=%d n_vcpus=%d\n",
+                (unsigned long long)max_instr,
+                (m->vtime_instr >= max_instr) ? 1 : 0, nctx);
++        printf("[stats] tlb_hits=%llu tlb_misses=%llu tlb_flushes=%llu\n",
++               (unsigned long long)m->perf_tlb_hits,
++               (unsigned long long)m->perf_tlb_misses,
++               (unsigned long long)m->perf_tlb_flushes);
+     }
+ 
+     printf("\n---- last log lines ----\n");
+diff --git a/src/mem.c b/src/mem.c
+index 932f43f..0bb61f9 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -137,6 +137,11 @@ void mem_write(machine_t *m, uint64_t phys, int size, uint64_t val) {
+             uint64_t a = phys + i;
+             if (a < RAM_SIZE) m->ram[a] = (uint8_t)(val >> (8*i));
+         }
++        /* PERF P2: a guest OR DMA RAM store may have modified any paging
++         * level.  Even if this write was ordinary data, flush conservatively
++         * rather than reuse a translation that might now have stale rights,
++         * physical mapping or fault ordering. */
++        perf_tlb_flush(m);
+         return;
+     }
+     mmio_region_t *r = find_mmio(m, phys);
+diff --git a/tests/integration/p2_tlb_nc.sh b/tests/integration/p2_tlb_nc.sh
+new file mode 100755
+index 0000000..0f36e1b
+--- /dev/null
++++ b/tests/integration/p2_tlb_nc.sh
+@@ -0,0 +1,44 @@
++#!/bin/sh
++# PERF P2 -- the one negative control: drop the RAM-store TLB invalidation
++# in a scratch copy of mem.c.  The SAME test_tlb.c as the positive gate must
++# fail after a warmed 4KiB mapping is rewritten through mem_write (the
++# physical page changes 5MiB -> 6MiB).  A success on the mutated source
++# would mean the vector does not actually guard stale PTEs.  No checkout
++# file is changed.  Script exits 1 when the expected assertion is observed;
++# make wraps the failing recipe and exits 2.
++set -eu
++root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
++cd "$root"
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++cp src/mem.c "$tmp/mem.c"
++python3 - "$tmp/mem.c" <<'PY'
++from pathlib import Path
++import sys
++p = Path(sys.argv[1]); s = p.read_text()
++a = '        perf_tlb_flush(m);\n        return;'
++b = '        /* P2 NC: deliberately leave stale PTE entries */\n        return;'
++assert s.count(a) == 1, 'NC mutation anchor must be the unique RAM-store flush'
++p.write_text(s.replace(a, b, 1))
++PY
++${CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -Isrc -Itests \
++    tests/test_tlb.c "$tmp/mem.c" src/cpu.c src/io.c src/platform.c \
++    src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c \
++    src/ioapic.c -o "$tmp/test-tlb-nc" -lm
++ulimit -c 0 || true
++set +e
++"$tmp/test-tlb-nc" >"$tmp/out" 2>"$tmp/err"
++rc=$?
++set -e
++if [ "$rc" -eq 0 ]; then
++    echo 'NC BROKEN: stale PTE returned the new data without a RAM-store flush' >&2
++    exit 2
++fi
++if ! grep -F -q -e 'c->gpr[RAX] == NEW_VALUE' "$tmp/err"; then
++    echo "NC BROKEN: failed for another reason (inner rc=$rc):" >&2
++    cat "$tmp/err" >&2
++    exit 2
++fi
++printf 'P2 NC: inner rc=%s; assert c->gpr[RAX] == NEW_VALUE failed after warmed PTE write\n' "$rc"
++echo 'P2 NC: FAILED AS DESIGNED (RAM-store flush is necessary for PTE coherence)'
++exit 1
+diff --git a/tests/test_tlb.c b/tests/test_tlb.c
+new file mode 100644
+index 0000000..385eeb7
+--- /dev/null
++++ b/tests/test_tlb.c
+@@ -0,0 +1,353 @@
++/* PERF P2: successful-translation TLB invariants.  The old walker is the
++ * oracle for fault ordering.  These vectors exercise warm cache entries,
++ * guest/DMA PTE writes, CR3/CR4/AC/CPL keys, large pages, and INVLPG.
++ * No wall time is asserted.  The P2 NC removes the mem_write RAM flush in a
++ * scratch source copy and MUST fail the exact PTE-rewrite assertion below.
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "platform.h"
++#include "harness.h"
++
++#define P  1ull
++#define W  2ull
++#define US 4ull
++#define PS 0x80ull
++#define NX (1ull<<63)
++#define VA 0x400000ull
++#define OLD_VALUE 0x1122334455667788ull
++#define NEW_VALUE 0x8877665544332211ull
++
++static machine_t g_m;
++static int mmio_root_alt, mmio_root_reads;
++static uint64_t mmio_root_read(void *ctx, uint64_t phys, int size) {
++    (void)ctx;
++    assert(size == 8 && phys == 0xFEBC0000ull);
++    ++mmio_root_reads;
++    return (mmio_root_alt ? 0x21000ull : 0x11000ull) | P | W | US;
++}
++static void mmio_root_write(void *ctx, uint64_t phys, int size, uint64_t v) {
++    (void)ctx; (void)phys; (void)size; (void)v;
++    assert(!"P2 MMIO root is read-only");
++}
++static void w64(uint64_t pa, uint64_t val) { mem_write(&g_m, pa, 8, val); }
++static uint64_t r64(uint64_t pa) { return mem_read(&g_m, pa, 8); }
++static void gate(int vec, uint16_t sel, uint64_t off) {
++    uint64_t a = 0x0C00 + (uint64_t)vec * 16;
++    w64(a, (off & 0xFFFF) | ((uint64_t)sel << 16) | ((uint64_t)0x8F << 40) |
++           ((off & 0xFFFF0000ull) << 32));
++    w64(a + 8, off >> 32);
++}
++
++static void fixture(void) {
++    setup_machine(&g_m);
++    cpu_t *c = &g_m.cpu;
++    /* 4-level long-mode walk: identity-map the first 2MiB via a large
++     * page, then map VA (4MiB) through PT[0] to physical 5MiB.  The
++     * alternate root at 0x20000 maps the SAME VA to physical 6MiB. */
++    w64(0x10000, 0x11000 | P | W | US);  /* PML4[0] */
++    w64(0x11000, 0x12000 | P | W | US);  /* PDPT[0] */
++    w64(0x12000, P | W | US | PS);        /* PD[0] identity 2MiB */
++    w64(0x12010, 0x13000 | P | W | US); /* PD[2] -> PT */
++    w64(0x13000, 0x500000 | P | W | US); /* PT[0] -> 5MiB */
++    w64(0x20000, 0x21000 | P | W | US);
++    w64(0x21000, 0x22000 | P | W | US);
++    w64(0x22000, P | W | US | PS);
++    w64(0x22010, 0x23000 | P | W | US);
++    w64(0x23000, 0x600000 | P | W | US);
++    w64(0x500000, OLD_VALUE);
++    w64(0x600000, NEW_VALUE);
++    c->cr3 = 0x10000;
++    c->cr4 = 0x20;                           /* PAE */
++    c->efer = (1ull<<8) | (1ull<<10) | (1ull<<11); /* LME LMA NXE */
++    c->cr0 = 0x80010033ull;                  /* PG|WP|PE */
++    c->idtr_base = 0x0C00; c->idtr_limit = 256 * 16 - 1;
++    w64(0x2000 + 4, 0x30000);               /* TSS.RSP0 */
++    c->tr_base = 0x2000; c->tr_limit = 103;
++    for (int v = 0; v < 32; v++) gate(v, 8, 0x9000 + (uint64_t)v * 8);
++    memset(g_m.ram + 0x9000, 0xF4, 32 * 8);
++    c->seg[SEG_CS] = (segment_t){ .sel = 8, .base = 0, .limit = ~0u, .l = 1 };
++    c->seg[SEG_SS] = (segment_t){ .sel = 0x10, .base = 0, .limit = ~0u };
++    c->gpr[RSP] = 0x8000;
++    c->gpr[RBX] = VA;
++    /* MOV RAX,[RBX] in long mode.  Written before any cached code fetch. */
++    const uint8_t code[] = { 0x48, 0x8B, 0x03 };
++    memcpy(g_m.ram + 0x1000, code, sizeof code);
++}
++static void read_once(void) {
++    g_m.cpu.rip = 0x1000;
++    assert(cpu_step(&g_m.cpu) == 0);
++    assert(!g_m.cpu.fault && !g_m.cpu.exception_taken);
++}
++static void pte_rewrite(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    uint64_t before = g_m.perf_tlb_hits;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    assert(g_m.perf_tlb_hits > before);       /* real cache hit, not a no-op cache */
++    uint64_t gen = g_m.perf_tlb_generation;
++    /* Guest/DMA write changes the PTE's physical page.  The NC deletes
++     * the RAM-store generation bump.  The warmed entry then returns the
++     * OLD value and this assertion fails -- not a timing-dependent NC. */
++    w64(0x13000, 0x600000 | P | W | US);
++    read_once();
++    assert(c->gpr[RAX] == NEW_VALUE); /* P2 NC: without invalidation, OLD wins */
++    assert(g_m.perf_tlb_generation != gen);
++    puts("ok p2 warm hit, then PTE write invalidates (OLD -> NEW)");
++}
++static void cr3_and_invlpg(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    /* CR3 write by guest instruction, with the alternate root already
++     * populated; bypassing stale root MUST give the new data. */
++    const uint8_t movcr3[] = { 0x0F, 0x22, 0xD8 }; /* MOV CR3,RAX */
++    memcpy(g_m.ram + 0x1100, movcr3, sizeof movcr3);
++    c->gpr[RAX] = 0x20000;
++    uint64_t gen = g_m.perf_tlb_generation;
++    c->rip = 0x1100;
++    assert(cpu_step(c) == 0 && !c->fault);
++    assert(c->cr3 == 0x20000 && g_m.perf_tlb_generation != gen);
++    read_once();
++    assert(c->gpr[RAX] == NEW_VALUE);
++    /* INVLPG [RBX] must not read its operand.  Hint an UNMAPPED VA and
++     * assert no #PF and global flush.  The original K2 no-fault behavior
++     * must survive P2 even when there is no TLB entry for the hint. */
++    const uint8_t invlpg[] = { 0x0F, 0x01, 0x3B }; /* INVLPG [RBX] */
++    memcpy(g_m.ram + 0x1200, invlpg, sizeof invlpg);
++    c->gpr[RBX] = 0x3000000000ull; /* unmapped */
++    gen = g_m.perf_tlb_generation;
++    c->rip = 0x1200;
++    assert(cpu_step(c) == 0 && !c->fault && !c->exception_taken);
++    assert(g_m.perf_tlb_generation != gen);
++    c->gpr[RBX] = VA;
++    read_once();
++    assert(c->gpr[RAX] == NEW_VALUE);
++    puts("ok p2 MOV CR3 and no-fault INVLPG invalidate the shared TLB");
++}
++static void faults_after_warm(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    /* Warm success must not mask a later not-present #PF.  Error bits:
++     * P=0, W=0, U=0, I=0; the guest's exception gate is at 0x9000+14*8. */
++    w64(0x13000, 0);
++    c->rip = 0x1000;
++    (void)cpu_step(c);
++    assert(c->cr2 == VA);
++    assert(c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0);            /* #PF error code */
++    puts("ok p2 warm success -> nonpresent fault has exact CR2/err/RIP");
++
++    fixture();
++    c = &g_m.cpu;
++    read_once();
++    /* Warm READ then PTE NX; instruction fetch at VA must fault with
++     * present-chain=1, I/D=1 (EFER.NXE), W/R=0 and correct CR2. */
++    w64(0x13000, 0x500000 | P | W | US | NX);
++    c->rip = VA;
++    (void)cpu_step(c);
++    assert(c->cr2 == VA);
++    assert(c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0x11);         /* P|I/D */
++    puts("ok p2 READ success -> NX fetch fault has exact CR2/err/RIP");
++}
++static void mode_control_flushes(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    uint64_t gen;
++    /* Same-value writes still flush: the old full walk would re-read
++     * tables after every architected CR0/CR4/EFER/LMSW operation. */
++    const uint8_t cr0[] = { 0x0F, 0x22, 0xC0 };   /* MOV CR0,RAX */
++    memcpy(g_m.ram + 0x1100, cr0, sizeof cr0);
++    c->gpr[RAX] = c->cr0;
++    gen = g_m.perf_tlb_generation;
++    c->rip = 0x1100;
++    assert(cpu_step(c) == 0 && !c->fault);
++    assert(g_m.perf_tlb_generation != gen);
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++
++    const uint8_t cr4[] = { 0x0F, 0x22, 0xE0 };   /* MOV CR4,RAX */
++    memcpy(g_m.ram + 0x1200, cr4, sizeof cr4);
++    c->gpr[RAX] = c->cr4;
++    gen = g_m.perf_tlb_generation;
++    c->rip = 0x1200;
++    assert(cpu_step(c) == 0 && !c->fault);
++    assert(g_m.perf_tlb_generation != gen);
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++
++    const uint8_t wrmsr[] = { 0x0F, 0x30 };      /* WRMSR EFER */
++    memcpy(g_m.ram + 0x1300, wrmsr, sizeof wrmsr);
++    c->gpr[RCX] = 0xC0000080;
++    c->gpr[RAX] = (uint32_t)c->efer;
++    c->gpr[RDX] = c->efer >> 32;
++    gen = g_m.perf_tlb_generation;
++    c->rip = 0x1300;
++    assert(cpu_step(c) == 0 && !c->fault);
++    assert(g_m.perf_tlb_generation != gen);
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++
++    const uint8_t lmsw[] = { 0x0F, 0x01, 0xF0 }; /* LMSW AX */
++    memcpy(g_m.ram + 0x1400, lmsw, sizeof lmsw);
++    c->gpr[RAX] = (uint16_t)c->cr0;
++    gen = g_m.perf_tlb_generation;
++    c->rip = 0x1400;
++    assert(cpu_step(c) == 0 && !c->fault);
++    assert(g_m.perf_tlb_generation != gen);
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    puts("ok p2 MOV CR0/CR4, WRMSR EFER and LMSW flush");
++}
++static void permissions_after_warm(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    /* Supervisor WP=1: same VA was readable, but its newly read-only
++     * PTE must raise #PF on WRITE with err=P|W (3), not reuse the read
++     * mapping.  Fault/RIP/CR2 are exactly the original walker contract. */
++    w64(0x13000, 0x500000 | P | US);
++    const uint8_t store[] = { 0x48, 0x89, 0x03 }; /* MOV [RBX], RAX */
++    memcpy(g_m.ram + 0x1000, store, sizeof store);
++    c->rip = 0x1000;
++    (void)cpu_step(c);
++    assert(c->cr2 == VA);
++    assert(c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 3);
++    puts("ok p2 READ success -> RO WRITE #PF err=P|W with WP");
++
++    fixture();
++    c = &g_m.cpu;
++    read_once();
++    /* CPL3 user read after a warm supervisor read, but the PTE has U/S
++     * cleared via a guest write.  Code remains in the US=1 2MiB page,
++     * so the fault source is VA, not the instruction fetch. */
++    w64(0x13000, 0x500000 | P | W);
++    c->seg[SEG_CS].sel = 0x1B;
++    c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x1F000;
++    c->rip = 0x1000;
++    (void)cpu_step(c);
++    assert(c->cr2 == VA);
++    assert(c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0x5);         /* P|U/S */
++    puts("ok p2 supervisor READ success -> CPL3 U/S fault err=P|U");
++}
++static void large_pages_and_a20(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* PD[0] is a 2MiB PS leaf, which must cache with the RIGHT physical
++     * 4KiB subpage offset; an unaligned data address exercises the offset. */
++    w64(0x1A1234, 0x7D6C5B4A39281706ull);
++    c->gpr[RBX] = 0x1A1234;
++    read_once();
++    assert(c->gpr[RAX] == 0x7D6C5B4A39281706ull);
++    read_once();
++    assert(c->gpr[RAX] == 0x7D6C5B4A39281706ull);
++    /* Convert PDPT[0] into a 1GiB PS leaf (identity map): VA maps to
++     * phys 4MiB, not phys 5MiB from the old PT.  w64 flushes the TLB. */
++    w64(0x11000, P | W | US | PS);
++    w64(0x400000, 0xAABBCCDDEEFF1234ull);
++    c->gpr[RBX] = VA;
++    read_once();
++    assert(c->gpr[RAX] == 0xAABBCCDDEEFF1234ull);
++    puts("ok p2 2MiB/1GiB PS leaves use correct 4KiB subpage offset");
++
++    fixture();
++    c = &g_m.cpu;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    /* Turning A20 OFF is not a RAM write; bypass all TLB hits and walk
++     * the page tables through the old bus.  The PTE still resolves to
++     * 5MiB but mem_read masks bit20 -> 4MiB.  Turning A20 back ON may
++     * reuse the cached entry if no table was written (we write 4MiB
++     * first, which intentionally flushes before the next measurement). */
++    w64(0x400000, 0x0D0C0B0A09080706ull);
++    g_m.chipset.a20 = 0;
++    read_once();
++    assert(c->gpr[RAX] == 0x0D0C0B0A09080706ull);
++    g_m.chipset.a20 = 1;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    puts("ok p2 closed A20 bypasses TLB, open A20 preserves prior bus");
++}
++static void mmio_table_uncacheable(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* A page-table ROOT in MMIO is a permitted physical-bus read.  It may
++     * return a new PML4E on every call without calling mem_write, so it
++     * MUST NOT be cached.  The callback switches between the existing
++     * 5MiB/6MiB PDPT trees without any explicit flush. */
++    mmio_root_alt = mmio_root_reads = 0;
++    mem_register_mmio(&g_m, 0xFEBC0000ull, 0x1000, mmio_root_read,
++                      mmio_root_write, NULL, "P2 dynamic MMIO PML4");
++    c->cr3 = 0xFEBC0000ull;
++    read_once();
++    assert(c->gpr[RAX] == OLD_VALUE);
++    uint64_t hits = g_m.perf_tlb_hits;
++    mmio_root_alt = 1;
++    read_once();
++    assert(c->gpr[RAX] == NEW_VALUE);
++    assert(mmio_root_reads >= 2);
++    /* Code fetches use the same MMIO PML4E; no successful translation
++     * with a side-effecting table may be cached, even for code. */
++    assert(g_m.perf_tlb_hits == hits);
++    mmio_region_t *r = g_m.mmio_list;
++    assert(r && r->base == 0xFEBC0000ull);
++    g_m.mmio_list = r->next;
++    free(r);
++    puts("ok p2 dynamic MMIO-backed page table never cached");
++}
++static void smp_and_mode_key(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    read_once();
++    /* Direct CR3 change by harness (no MOV CR3) must also miss due to
++     * ASID key; the alternate root gives the new mapping. */
++    c->cr3 = 0x20000;
++    uint64_t misses = g_m.perf_tlb_misses;
++    read_once();
++    assert(c->gpr[RAX] == NEW_VALUE && g_m.perf_tlb_misses > misses);
++    /* A K6 context switch copies CPU state but NOT the machine-wide TLB.
++     * vCPU0 and vCPU1 with distinct CR3/CS/RFLAGS cannot share a hit. */
++    g_m.n_vcpus = 2;
++    g_m.vcpu[0].c = g_m.cpu;
++    g_m.vcpu[1].c = g_m.cpu;
++    g_m.vcpu[1].c.cr3 = 0x10000;
++    /* A cached entry with the SAME CR3 and security context may validly
++     * be shared across vCPUs.  Change AC as well to pin a distinct key,
++     * rather than wrongly demanding a miss for an identical context. */
++    g_m.vcpu[1].c.rflags |= 1ull << 18;
++    g_m.vcpu[0].state = g_m.vcpu[1].state = VCPU_RUN;
++    vcpu_load(&g_m, 1);
++    misses = g_m.perf_tlb_misses;
++    read_once();
++    assert(g_m.cpu.gpr[RAX] == OLD_VALUE && g_m.perf_tlb_misses > misses);
++    vcpu_store(&g_m, 1);
++    vcpu_load(&g_m, 0);
++    read_once();
++    assert(g_m.cpu.gpr[RAX] == NEW_VALUE);
++    puts("ok p2 direct CR3 key + SMP context separation");
++}
++int main(void) {
++    pte_rewrite();
++    cr3_and_invlpg();
++    mode_control_flushes();
++    faults_after_warm();
++    permissions_after_warm();
++    large_pages_and_a20();
++    mmio_table_uncacheable();
++    smp_and_mode_key();
++    puts("test-tlb: all vectors passed");
++    return 0;
++}
+-- 
+2.47.3
+

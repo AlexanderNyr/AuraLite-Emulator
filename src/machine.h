@@ -51,6 +51,42 @@ typedef struct io_port {
     const char *name;
 } io_port_t;
 
+/* PERF P2: one shared (machine-wide) successful-translation cache.  The
+ * 4-KiB key works for both 4-KiB pages and the current 2-MiB/1-GiB PS
+ * leaves: each cached subpage gets its own physical base.  A shared table
+ * avoids copying cache arrays at EVERY vCPU load/store (K6), and the key
+ * includes CR3/permission context; RAM writes invalidate every context.
+ * Negative caching is deliberately forbidden: the original walk must raise
+ * EVERY fault, with the original CR2/error code/RIP and delivery ordering.
+ */
+#define PERF_TLB_SLOTS 256u
+
+typedef struct perf_tlb_entry {
+    uint64_t generation, linear_page, phys_page;
+    uint64_t cr3, cr0, cr4, efer;
+    uint8_t ac, cpl, desc_sv, mode, valid;
+} perf_tlb_entry_t;
+
+/* PERF P3: cache ONLY the prefix/opcode predecode of a RAM-backed
+ * instruction, never ModRM's dynamic effective address or immediates.
+ * Use P2's global RAM-write generation: one store to guest code or any
+ * page table invalidates both translation and predecode, in O(1).  A cache
+ * entry records the decoded prefixes, the opcode and the byte cursor
+ * after it; it may only be installed when the P2 execute translation is
+ * a successful plain-RAM walk and all prefix/opcode bytes stay in one
+ * 4KiB page.  Faulting fetches, side-effecting MMIO/ROM and page-crossing
+ * prefix streams remain on the original per-byte fetch path. */
+#define PERF_DECODE_SLOTS 512u
+typedef struct perf_decode_entry {
+    uint64_t generation, rip, cs_base, next_pc;
+    uint64_t cr0, cr3, cr4, efer;
+    uint16_t cs_sel;
+    uint8_t cs_l, cs_db, ac, desc_sv;
+    uint8_t opcode, valid;
+    int addrsize, opsize, has_rex, rex_w, rex_r, rex_x, rex_b;
+    int seg_override, rep;
+} perf_decode_entry_t;
+
 /* ---- Event log for the GUI / debugging ---- */
 #define LOG_RING 4096
 typedef struct {
@@ -85,6 +121,14 @@ struct machine {
     size_t   rom_len;
 
     mmio_region_t *mmio_list;
+    /* P2: internal-only TLB.  No guest CPU field and no K6 clock change.
+     * Generation invalidation is O(1) on each guest/DMA RAM write; on the
+     * impossible wrap to 0, explicitly clear validity before reuse. */
+    perf_tlb_entry_t perf_tlb[PERF_TLB_SLOTS];
+    uint64_t perf_tlb_generation;
+    uint64_t perf_tlb_hits, perf_tlb_misses, perf_tlb_flushes;
+    perf_decode_entry_t perf_decode[PERF_DECODE_SLOTS];
+    uint64_t perf_decode_hits, perf_decode_misses;
     io_port_t io[65536];
 
     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
@@ -158,10 +202,55 @@ struct machine {
 };
 typedef struct machine machine_t;
 
+/* PERF P2: flush on any RAM write and on every paging-control operation.
+ * This is deliberately global rather than CR3/linear scoped: device DMA
+ * writes may update a page table through mem_write, and the current bus has
+ * no tracked page-table ownership.  Conservatism is correct; the benchmark
+ * determines whether it is fast enough to keep. */
+static inline void perf_tlb_flush(machine_t *m) {
+    ++m->perf_tlb_flushes;
+    if (++m->perf_tlb_generation == 0) {
+        for (size_t i = 0; i < PERF_TLB_SLOTS; ++i) m->perf_tlb[i].valid = 0;
+        /* The shared epoch also guards P3 predecode; clear both tables
+         * before the mathematically impossible uint64_t wrap is reused. */
+        for (size_t i = 0; i < PERF_DECODE_SLOTS; ++i) m->perf_decode[i].valid = 0;
+        m->perf_tlb_generation = 1;
+    }
+}
+
 /* K6: swap a vcpu context between its slot and the live m->cpu/m->lapic
  * pair.  Both are complete no-ops when n_vcpus == 1, so every existing
  * code path (unit suites included) keeps its byte-exact behavior and
  * never pays for the multiplexing. */
+/* PERF P0: instruction attempts actually executed across every execution context.
+ *
+ * This is the throughput numerator, and it is deliberately NOT any of the
+ * two clocks that already exist:
+ *   - cpu.instr_count is the K6 clock.  It also carries the K3 idle quantum
+ *     (+512 per all-idle HLT slot, cpu.c) and it is guest-visible through
+ *     PIT/RTC/LAPIC/RDTSC, so its semantics are frozen by contract.
+ *   - vtime_instr is the machine-wide master clock; it equals the BSP's
+ *     instr_count when there is one context (the K6 identity) and is the
+ *     number --max-instr budgets against, idle quantum included.
+ *   - neither distinguishes "attempted an instruction" from "sat in HLT"
+ *     while virtual time flowed.  That distinction is a throughput measure.
+ * cpu.executed_steps increments only in cpu_step's done block, including
+ * faulting attempts.  An idle-only run reports 0 here even as its
+ * instr_count climbs by 512 per slot.
+ *
+ * Slot 0 lives in m->cpu (the K6 exit path re-loads it, and with a single
+ * context the slot is never written); the rest are authoritative in their
+ * slots.  n_vcpus is 0 for the historical single-context machine -- only the
+ * --smp>=2 wiring sets it -- so the effective context count is max(1, n).
+ * Shared by main.c's --stats block and tests/test_perf.c so the test asserts
+ * the shipped formula rather than a copy of it. */
+static inline uint64_t machine_executed_total(const machine_t *m) {
+    int n = m->n_vcpus > 1 ? m->n_vcpus : 1;
+    uint64_t sum = m->cpu.executed_steps;
+    for (int i = 1; i < n && i < EM_MAX_VCPU; i++) sum += m->vcpu[i].c.executed_steps;
+    return sum;
+}
+
 static inline void vcpu_load(machine_t *m, int i) {
     if (m->n_vcpus > 1) {
         m->cpu = m->vcpu[i].c;

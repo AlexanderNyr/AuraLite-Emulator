@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
     int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
     int cfg_no_fb = 0;              /* --no-fb: no linear fb published -- VGA text box (VIDEO V1) */
+    int cfg_stats = 0;              /* --stats: PERF P0 measurement block (opt-in) */
     const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
     const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
     const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
         else if (!strncmp(argv[i], "--dump-text=", 12)) text_out = argv[i]+12;
         else if (!strcmp(argv[i], "--no-fb")) cfg_no_fb = 1;
+        else if (!strcmp(argv[i], "--stats")) cfg_stats = 1;   /* PERF P0 */
         else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
         else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
@@ -184,7 +186,10 @@ int main(int argc, char **argv) {
                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
-                   "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n", argv[0]);
+                   "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n"
+                  "          [--stats] print the PERF P0 measurement block: executed_steps / instr_count /\n"
+                  "                      vtime / cap.  Executed attempts, not idle clock\n"
+                  "                      quanta, are the throughput numerator (faults count)\n", argv[0]);
             return 0;
         }
     }
@@ -432,6 +437,52 @@ int main(int argc, char **argv) {
     if (m->guest_entry_seen && m->fb && m->fb[0] == 0x00200000u)
         mlog(&m->log, "[guest] framebuffer marker OK: pixel[0]=0x%08x", m->fb[0]);
     dump_regs(&m->cpu);
+
+    /* PERF P0: the measurement block, opt-in so every existing tape keeps its
+     * byte-exact stdout (make test greps it; the V/NET lanes hash it).
+     *
+     * Three counters, three different meanings, and the difference is the
+     * defect this phase exists to make visible:
+     *   executed_steps     instruction attempts actually executed, summed over every vCPU.
+     *               Faults count as attempts (not architectural retirement).
+     *               The only correct MIPS numerator for this run loop.
+     *   instr_count the K6 clock: executed_steps PLUS 512 per all-idle HLT slot.
+     *               Guest-visible, frozen by contract, and a fine way to
+     *               overstate throughput on an idle-heavy tape.
+     *   vtime       the machine-wide master clock; equals the BSP's
+     *               instr_count when n_vcpus==1 (the K6 identity).
+     * cap_reached=1 means the run was cut off, so its wall time measures the
+     * cap and not the workload -- tests/perf_bench.sh refuses to report MIPS
+     * for such a tape. */
+    if (cfg_stats) {
+        int nctx = m->n_vcpus > 1 ? m->n_vcpus : 1;
+        uint64_t idle_sum = 0;
+        printf("\n---- stats (PERF P0) ----\n");
+        for (int i = 0; i < nctx && i < EM_MAX_VCPU; i++) {
+            const cpu_t *vc = (m->n_vcpus > 1 && i > 0) ? &m->vcpu[i].c : &m->cpu;
+            idle_sum += vc->instr_count - vc->executed_steps;
+            printf("[stats] vcpu=%d executed_steps=%llu instr_count=%llu halted=%d fault=%d\n",
+                   i, (unsigned long long)vc->executed_steps,
+                   (unsigned long long)vc->instr_count,
+                   vc->halted ? 1 : 0, vc->fault ? 1 : 0);
+        }
+        printf("[stats] executed=%llu idle_quantum=%llu instr_count_bsp=%llu vtime=%llu\n",
+               (unsigned long long)machine_executed_total(m),
+               (unsigned long long)idle_sum,
+               (unsigned long long)m->cpu.instr_count,
+               (unsigned long long)m->vtime_instr);
+        printf("[stats] cap=%llu cap_reached=%d n_vcpus=%d\n",
+               (unsigned long long)max_instr,
+               (m->vtime_instr >= max_instr) ? 1 : 0, nctx);
+        printf("[stats] tlb_hits=%llu tlb_misses=%llu tlb_flushes=%llu\n",
+               (unsigned long long)m->perf_tlb_hits,
+               (unsigned long long)m->perf_tlb_misses,
+               (unsigned long long)m->perf_tlb_flushes);
+        printf("[stats] decode_hits=%llu decode_misses=%llu\n",
+               (unsigned long long)m->perf_decode_hits,
+               (unsigned long long)m->perf_decode_misses);
+    }
+
     printf("\n---- last log lines ----\n");
     int start = m->log.count < 60 ? 0 : m->log.count - 60;
     for (int i = start; i < m->log.count; i++) {

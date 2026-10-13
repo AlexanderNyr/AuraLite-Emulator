@@ -121,10 +121,43 @@ static void page_fault(machine_t *m, uint64_t vaddr, int mode, int present_chain
 #define T_READ 0
 #define T_WRITE 1
 #define T_EXEC 2
+/* A cached walk may only have read side-effect-free RAM-backed page-table
+ * entries.  The low ROM alias is inside RAM_SIZE and must be excluded;
+ * disabled A20 changes the addresses of page-table reads, so take the old
+ * walk instead.  The physical bus gives RAM priority over registered MMIO
+ * in this range (src/mem.c), including caller-registered test MMIO. */
+static int perf_tlb_plain_table(machine_t *m, uint64_t phys) {
+    return m->chipset.a20 && phys <= (uint64_t)RAM_SIZE - 8 &&
+           !(phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE);
+}
 static int translate(machine_t *m, uint64_t vaddr, uint64_t *out_phys, int mode) {
     cpu_t *c = &m->cpu;
     if (!(c->cr0 & (1ULL<<31))) { *out_phys = vaddr; return 1; } /* paging disabled */
     int user_cpl = (cpl_now(c) == 3) && !c->desc_sv;   /* K4: implicit descriptor reads are supervisor */
+    /* PERF P2: only SUCCESSFUL walks are cached.  Key the whole security
+     * context: CR3 (ASID), CR0.WP, CR4.SMEP/SMAP, EFER.NXE, RFLAGS.AC,
+     * effective CPL including descriptor-supervisor override, and access
+     * mode.  Whole control regs in the key are conservative; no access
+     * should ever hit a translation with weaker permissions.  Cache is
+     * shared across SMP contexts, never copied on a vCPU slot switch. */
+    uint64_t page = vaddr >> 12;
+    uint64_t slot = (page ^ (page >> 9) ^ (c->cr3 >> 12)) & (PERF_TLB_SLOTS - 1);
+    perf_tlb_entry_t *hit = &m->perf_tlb[slot];
+    uint8_t ac = (uint8_t)((c->rflags >> 18) & 1);
+    uint8_t cpl = (uint8_t)cpl_now(c);
+    uint8_t desc_sv = (uint8_t)(c->desc_sv != 0);
+    if (m->chipset.a20 && hit->valid &&
+        hit->generation == m->perf_tlb_generation &&
+        hit->linear_page == page && hit->cr3 == c->cr3 &&
+        hit->cr0 == c->cr0 && hit->cr4 == c->cr4 && hit->efer == c->efer &&
+        hit->ac == ac && hit->cpl == cpl && hit->desc_sv == desc_sv &&
+        hit->mode == mode) {
+        ++m->perf_tlb_hits;
+        *out_phys = hit->phys_page | (vaddr & 0xFFFULL);
+        return 1;
+    }
+    ++m->perf_tlb_misses;
+    int cacheable = m->chipset.a20;
     uint64_t cr3 = c->cr3 & ~0xFFFULL;
     int idx4 = (int)((vaddr >> 39) & 0x1FF);
     int idx3 = (int)((vaddr >> 30) & 0x1FF);
@@ -132,23 +165,27 @@ static int translate(machine_t *m, uint64_t vaddr, uint64_t *out_phys, int mode)
     int idx1 = (int)((vaddr >> 12) & 0x1FF);
     int eff_us = 1, eff_w = 1, nx_any = 0;
 
+    cacheable &= perf_tlb_plain_table(m, cr3 + (uint64_t)idx4*8);
     uint64_t pml4e = mem_read(m, cr3 + (uint64_t)idx4*8, 8);
     if (!(pml4e & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
     eff_us &= (int)((pml4e >> 2) & 1); eff_w &= (int)((pml4e >> 1) & 1); nx_any |= (int)(pml4e >> 63);
     uint64_t pdpt = pml4e & 0x000FFFFFFFFFF000ULL;
 
+    cacheable &= perf_tlb_plain_table(m, pdpt + (uint64_t)idx3*8);
     uint64_t pdpte = mem_read(m, pdpt + (uint64_t)idx3*8, 8);
     if (!(pdpte & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
     eff_us &= (int)((pdpte >> 2) & 1); eff_w &= (int)((pdpte >> 1) & 1); nx_any |= (int)(pdpte >> 63);
     if (pdpte & (1ULL<<7)) { *out_phys = (pdpte & 0xFFFFFC0000000ULL) | (vaddr & 0x3FFFFFFFULL); goto check; }
     {
         uint64_t pd = pdpte & 0x000FFFFFFFFFF000ULL;
+        cacheable &= perf_tlb_plain_table(m, pd + (uint64_t)idx2*8);
         uint64_t pde = mem_read(m, pd + (uint64_t)idx2*8, 8);
         if (!(pde & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
         eff_us &= (int)((pde >> 2) & 1); eff_w &= (int)((pde >> 1) & 1); nx_any |= (int)(pde >> 63);
         if (pde & (1ULL<<7)) { *out_phys = (pde & 0x000FFFFFFFE00000ULL) | (vaddr & 0x1FFFFFULL); goto check; }
         {
             uint64_t pt = pde & 0x000FFFFFFFFFF000ULL;
+            cacheable &= perf_tlb_plain_table(m, pt + (uint64_t)idx1*8);
             uint64_t pte = mem_read(m, pt + (uint64_t)idx1*8, 8);
             if (!(pte & 1)) { page_fault(m, vaddr, mode, 0, 0); return 0; }
             eff_us &= (int)((pte >> 2) & 1); eff_w &= (int)((pte >> 1) & 1); nx_any |= (int)(pte >> 63);
@@ -165,6 +202,16 @@ check:
     }
     if (mode == T_EXEC && nx_any && (c->efer & (1ULL<<11))) { page_fault(m, vaddr, mode, 1, 1); return 0; }
     if (mode == T_WRITE && !eff_w && (user_cpl || (c->cr0 & (1ULL<<16)))) { page_fault(m, vaddr, mode, 1, 0); return 0; }
+    if (cacheable) {
+        hit->generation = m->perf_tlb_generation;
+        hit->linear_page = page;
+        hit->phys_page = *out_phys & ~0xFFFULL;
+        hit->cr3 = c->cr3; hit->cr0 = c->cr0;
+        hit->cr4 = c->cr4; hit->efer = c->efer;
+        hit->ac = ac; hit->cpl = cpl; hit->desc_sv = desc_sv;
+        hit->mode = (uint8_t)mode;
+        hit->valid = 1;
+    }
     return 1;
 }
 
@@ -483,6 +530,85 @@ typedef struct {
     int rep;
 } dctx_t;
 
+/* PERF P3: the cache is a preDECODE cache for the prefix/opcode bytes only.
+ * An actual ModRM decode reads current GPRs and may itself fetch SIB/disps,
+ * so caching rm_t would freeze live effective addresses -- never do it.
+ * Only store after a successful ordinary-RAM P2 EXEC walk, and only when
+ * the entire parsed prefix/opcode stream is on ONE 4KiB page.  The P2 RAM-
+ * store epoch invalidates self-modifying code, PTE changes and device DMA;
+ * control changes also bump it and are in the key.  Debug fetch logging and
+ * --trace take the original slow path. */
+static size_t perf_decode_slot(cpu_t *c) {
+    uint64_t page_mix = c->rip ^ (c->rip >> 9) ^ (c->cr3 >> 12);
+    return (size_t)(page_mix & (PERF_DECODE_SLOTS - 1));
+}
+static int perf_decode_hit(machine_t *m, dctx_t *d, uint8_t *op) {
+    cpu_t *c = d->c;
+    if (dbg_u_on != 0 || c->trace || !m->chipset.a20 || !(c->cr0 & (1ULL<<31)))
+        return 0;
+    perf_decode_entry_t *e = &m->perf_decode[perf_decode_slot(c)];
+    if (!e->valid || e->generation != m->perf_tlb_generation ||
+        e->rip != c->rip || e->cs_base != c->seg[SEG_CS].base ||
+        e->cs_sel != c->seg[SEG_CS].sel || e->cs_l != c->seg[SEG_CS].l ||
+        e->cs_db != c->seg[SEG_CS].d_b || e->cr0 != c->cr0 ||
+        e->cr3 != c->cr3 || e->cr4 != c->cr4 || e->efer != c->efer ||
+        e->ac != ((c->rflags >> 18) & 1) ||
+        e->desc_sv != (c->desc_sv != 0)) {
+        ++m->perf_decode_misses;
+        return 0;
+    }
+    ++m->perf_decode_hits;
+    d->pc = e->next_pc;
+    d->addrsize = e->addrsize; d->opsize = e->opsize;
+    d->has_rex = e->has_rex;
+    d->rex_w = e->rex_w; d->rex_r = e->rex_r;
+    d->rex_x = e->rex_x; d->rex_b = e->rex_b;
+    d->seg_override = e->seg_override; d->rep = e->rep;
+    *op = e->opcode;
+    return 1;
+}
+static void perf_decode_store(machine_t *m, dctx_t *d, uint8_t op) {
+    cpu_t *c = d->c;
+    if (dbg_u_on != 0 || c->trace || !m->chipset.a20 || !(c->cr0 & (1ULL<<31)))
+        return;
+    if (d->pc <= d->start_pc || d->pc - d->start_pc > 15) return;
+    uint64_t first = c->seg[SEG_CS].base + d->start_pc;
+    uint64_t last = c->seg[SEG_CS].base + d->pc - 1;
+    if (last < first || (first >> 12) != (last >> 12)) return;
+    /* A P2 EXEC entry only exists if EVERY table entry came from ordinary
+     * RAM with A20 open.  If a side-effecting MMIO table participated in
+     * the walk, this check fails and we keep fetching each byte live. */
+    uint64_t page = first >> 12;
+    uint64_t slot = (page ^ (page >> 9) ^ (c->cr3 >> 12)) & (PERF_TLB_SLOTS - 1);
+    const perf_tlb_entry_t *t = &m->perf_tlb[slot];
+    if (!t->valid || t->generation != m->perf_tlb_generation ||
+        t->linear_page != page || t->cr3 != c->cr3 ||
+        t->cr0 != c->cr0 || t->cr4 != c->cr4 || t->efer != c->efer ||
+        t->ac != ((c->rflags >> 18) & 1) ||
+        t->cpl != (c->seg[SEG_CS].sel & 3) ||
+        t->desc_sv != (c->desc_sv != 0) || t->mode != T_EXEC ||
+        t->phys_page > (uint64_t)RAM_SIZE - 4096 ||
+        (t->phys_page >= ROM_ALIAS_LOW_BASE &&
+         t->phys_page < ROM_ALIAS_LOW_BASE + ROM_SIZE)) return;
+    perf_decode_entry_t *e = &m->perf_decode[perf_decode_slot(c)];
+    e->generation = m->perf_tlb_generation;
+    e->rip = c->rip; e->cs_base = c->seg[SEG_CS].base;
+    e->next_pc = d->pc;
+    e->cr0 = c->cr0; e->cr3 = c->cr3;
+    e->cr4 = c->cr4; e->efer = c->efer;
+    e->cs_sel = c->seg[SEG_CS].sel;
+    e->cs_l = c->seg[SEG_CS].l; e->cs_db = c->seg[SEG_CS].d_b;
+    e->ac = (uint8_t)((c->rflags >> 18) & 1);
+    e->desc_sv = (uint8_t)(c->desc_sv != 0);
+    e->addrsize = d->addrsize; e->opsize = d->opsize;
+    e->has_rex = d->has_rex;
+    e->rex_w = d->rex_w; e->rex_r = d->rex_r;
+    e->rex_x = d->rex_x; e->rex_b = d->rex_b;
+    e->seg_override = d->seg_override; e->rep = d->rep;
+    e->opcode = op;
+    e->valid = 1;
+}
+
 static uint64_t read_code_v(machine_t *m, uint64_t vaddr, int size) {
     uint64_t phys;
     if (!translate(m, vaddr, &phys, T_EXEC)) /* fault already raised */
@@ -789,7 +915,7 @@ int cpu_step(cpu_t *c) {
             if (!peer_busy) {
                         /* K3: virtual time must not freeze while the CPU idles in HLT
              * -- PIT/LAPIC/RTC all derive from instr_count (K6: vtime). Charge
-             * a time quantum (it counts toward --max-instr like retired work)
+             * a time quantum (it counts toward --max-instr like executed work)
              * and wake on whatever arrives.  */
                 c->instr_count += 512;
                 m->vtime_instr += 512;   /* K6: master clock advances too */
@@ -844,7 +970,8 @@ int cpu_step(cpu_t *c) {
     d.opsize = cpu_op_size_default(c);
 
     uint8_t op;
-    for (;;) {
+    int predecoded = perf_decode_hit(m, &d, &op);
+    if (!predecoded) for (;;) {
         op = fetch8(&d);
         if (op == 0x66) { d.opsize = (default_as==16) ? 4 : 2; continue; } /* toggles byte-count between 2 and 4 */
         if (op == 0x67) { d.addrsize = (default_as==32)?16:(default_as==16?32:default_as); continue; }
@@ -870,6 +997,7 @@ int cpu_step(cpu_t *c) {
      * same guard covers the nested 0F opcode fetch below. */
     if (c->fault || c->exception_taken) goto done;
     if (d.has_rex && d.rex_w) d.opsize = 8; /* REX.W -> 64-bit operand size = 8 bytes */
+    if (!predecoded) perf_decode_store(m, &d, op);
     int osz = d.opsize;
 
     if (c->trace) {
@@ -950,13 +1078,19 @@ slow_decode:
     goto really_slow;
 
 group1: {
-        d.pc = d.start_pc; /* restart decode of this instruction cleanly */
-        /* re-skip prefixes */
-        for (;;) {
-            uint8_t b = fetch8(&d);
-            if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) continue;
-            if (default_as==64 && b>=0x40 && b<=0x4F) continue;
-            op = b; break;
+        /* The original group1 path re-fetches the opcode from start_pc.
+         * For a P3 hit only the proven RAM prefix/opcode bytes were already
+         * decoded, so preserve the saved cursor; live ModRM/SIB/displacement
+         * and immediate fetches below are NEVER reused.  On the slow path,
+         * including ROM/MMIO/debug, keep the old re-fetch exactly intact. */
+        if (!predecoded) {
+            d.pc = d.start_pc;
+            for (;;) {
+                uint8_t b = fetch8(&d);
+                if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) continue;
+                if (default_as==64 && b>=0x40 && b<=0x4F) continue;
+                op = b; break;
+            }
         }
         int size = (op==0x80) ? 1 : osz;
         rm_t rm = MODRM();
@@ -1954,7 +2088,7 @@ really_slow:
             if (ext==7) elem ^=  (1ULL << ib);
             if (ext!=4) rm_write(&d,&rm,osz,elem);
             break; }
-        case 0x31: { /* RDTSC: virtual time = retired instructions x per-platform
+        case 0x31: { /* RDTSC: virtual time = executed instruction attempts x per-platform
                         ratio (platform_t::tsc_per_instr) — deterministic */
             uint64_t t = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
             /* K6: TSCs are machine-synchronized (as on silicon); with one
@@ -2024,7 +2158,7 @@ really_slow:
                 break; } }
         case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
                      cpu_set_msr(c, idx, val);
-                     if (idx==0xC0000080) c->efer = val;
+                     if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
                      /* K3: GS-base MSRs are the architected long-mode
                       * segment base for GS addressing -- keep the decoder's
                       * seg[] shadow in sync (measured: AuraLite's
@@ -2058,6 +2192,7 @@ really_slow:
                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
                      }
                      else if (crn==2) c->cr2=v; else if (crn==3) c->cr3=v; else if (crn==4) c->cr4=v;
+                     if (crn==0 || crn==3 || crn==4) perf_tlb_flush(m);
                      break; }
         case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
                      rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
@@ -2106,17 +2241,17 @@ really_slow:
                          else { uint64_t v = rm_read(&d,&rm,2);
                                 uint64_t nc = (c->cr0 & 0xFFFFFFFFFFFF0000ull) | (v & 0xFFFF);
                                 if ((c->cr0 & 1) && !(v & 1)) nc |= 1; /* PE is sticky under LMSW */
-                                c->cr0 = nc; }
+                                c->cr0 = nc; perf_tlb_flush(m); }
                          break;
                      }
-                     if (ext==7) { /* INVLPG: the operand is a page HINT, never a
-                                      memory read -- real silicon does not fault on
-                                      an unmapped address (SDM: no TLB entry, no
-                                      operation). We keep no TLB model, so INVLPG
-                                      is a pure no-op. K2: measured -- AuraLite's
-                                      paging_unmap() INVLPG faulted through our
-                                      eager linear read below and re-entered the
-                                      kernel's own #PF handler mid-self-test. */
+                     if (ext==7) { /* INVLPG: the operand is a page HINT, not
+                                      a memory read -- never fault on an unmapped
+                                      operand.  P2 flushes the shared TLB in
+                                      O(1); a full flush is conservative but
+                                      avoids mis-keying large-page aliases.
+                                      K2 measured an eager read causing a
+                                      recursive fault in paging_unmap(). */
+                         perf_tlb_flush(m);
                          break; }
                      if (ext==5) { faultf(c, "#UD 0F 01 /5 reserved"); break; }
                      uint64_t base = (rm.seg>=0)? d.c->seg[rm.seg].base:0; uint64_t addr=base+rm_ea(&d,&rm);
@@ -2685,6 +2820,8 @@ really_slow:
 done:
     if (!c->fault && !c->exception_taken) c->rip = d.pc;
     c->instr_count++;
+    c->executed_steps++;  /* PERF P0: executed attempts only, including faults.
+                           * Idle slots do not reach done and do not count. */
     m->vtime_instr++;   /* K6: the machine-wide master clock */
     pit_tick(m);   /* CHIPSET H2: virtual-time advance; no-op until pit_init */
     rtc_tick(m);   /* CHIPSET H3: same D6 timebase; update-ended IRQ8 here */

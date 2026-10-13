@@ -1,0 +1,1056 @@
+From 2a10cf4dbee63dbf79f82b1d3ae685cbc0563730 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 16:29:00 +0000
+Subject: [PATCH] PERF P0: measure executed work before optimizing
+
+Add an opt-in --stats count of cpu_step done-path attempts, distinct from the K3/K6 guest clock (which charges +512 on all-idle HLT slots). The shared machine_executed_total handles historical n_vcpus=0 and the SMP slot. Six unit vectors pin the clock/work divergence, faults, K6 identity, context summation and cap independence.
+
+Add a seven-tape, repeated, median host-wall bench (separate always-built O2 binary so the sanitizer target cannot silently contaminate results). Gate deterministic work accounting, nonzero work and the cap not being reached; never gate a fixed host timing. The one P0 negative control uses the cap as the numerator and fails, with 10.34x inflation on the firmware boot tape.
+
+Measured: make test RC=0; make test-sanitize RC=0; make fuzz FUZZ_PROGRAMS=256 RC=0 (256 programs, 6144 instructions, all states match, zero host crashes); make bench BENCH_REPS=3 RC=0; make bench-nc BENCH_REPS=3 RC=2 (inner recipe RC=1, FAILED AS DESIGNED). Four historical pre/post firmware/video tape stdout/log/PPM pairs are byte-identical without --stats. Guest toolchain unavailable; frozen-guest lanes SKIP. See docs/plans/PERF_PLAN.md and same-phase CHANGELOG/ROADMAP/STATUS.
+---
+ .gitignore              |   1 +
+ CHANGELOG.md            |  52 +++++++++
+ Makefile                |  42 ++++++-
+ ROADMAP.md              |  13 ++-
+ docs/STATUS.md          |  26 +++++
+ docs/plans/PERF_PLAN.md | 235 ++++++++++++++++++++++++++++++++++++++++
+ src/cpu.c               |   6 +-
+ src/cpu.h               |  13 +++
+ src/machine.h           |  29 +++++
+ src/main.c              |  46 +++++++-
+ tests/perf_bench.sh     | 211 ++++++++++++++++++++++++++++++++++++
+ tests/test_perf.c       | 166 ++++++++++++++++++++++++++++
+ 12 files changed, 832 insertions(+), 8 deletions(-)
+ create mode 100644 docs/plans/PERF_PLAN.md
+ create mode 100755 tests/perf_bench.sh
+ create mode 100644 tests/test_perf.c
+
+diff --git a/.gitignore b/.gitignore
+index c27a585..fbbbcbb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ # Build outputs
+ /x86emu
++/x86emu-bench
+ /firmware/*.bin
+ /disk/*.bin
+ /disk/*.img
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ef84e38..702525f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,58 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0051 (PERF P0, honest benchmark before optimization)
++
++- The missing performance baseline is now *measured*, not inferred from a
++  `--max-instr` ceiling. During P0 scoping a 20M cap / 0.685s was mistakenly
++  reported as **28.69 MIPS**; the built binary actually stopped at
++  `instr=4837677`, or **7.06 Msteps/s** on that run (cap/actual = 4.13×).
++  Independently, `STI;HLT` + two idle cpu_step slots yields
++  `instr_count=vtime=1026` but only **2** instruction attempts: the K3
++  `+512` all-idle virtual-time quantum is the K6 *guest clock*, not work.
++  Changing this clock to "fix" MIPS would violate the frozen guest timing
++  contract, so the repair adds `cpu.executed_steps` alongside it. The new
++  metric counts a faulting attempt too and is **not** ISA retirement.
++- `--stats` is opt-in, reporting per-vCPU executed steps, machine total,
++  idle delta, BSP instruction clock, virtual clock and cap-reached flag;
++  without it stdout does not change. `machine_executed_total` handles
++  `n_vcpus=0` (historical UP case) and sums slot 1 when `--smp=2`.
++  `tests/test_perf.c`: six deterministic vectors, including `STI;HLT` with
++  two idle slots (`executed_steps=2`, `instr_count=vtime=1026`), K6 identity,
++  faulting UD2, context-count 0/1/2 and a bigger budget on a stopped tape.
++- `make bench` rebuilds **separate O2 `x86emu-bench`** even after
++  `make test-sanitize` has replaced `x86emu` with O1 ASan+UBSan; seven
++  firmware tapes × odd number of repetitions (default 5) yield the median
++  whole-process wall time, Msteps/s and ns/attempt. It rejects non-
++  deterministic work counts, a run cut off by its cap or a zero-work tape;
++  it never gates on a fixed host timing. Measured here at O2 with 5 reps:
++  boot-haswell 4,837,677 steps / 678 ms / 7.14 Msteps/s; boot-broadwell
++  4,807,694 / 666 ms / 7.22; boot-baytrail 4,807,650 / 668 ms / 7.20;
++  text-no-fb 4,837,677 / 676 ms / 7.16; gfx-fb 4,837,677 / 671 ms /
++  7.21; VBE 800x600x32 4,837,677 / 671 ms / 7.21; SMP2 4,837,677 /
++  985 ms / 4.91. **These wall times belong to this machine only**.
++- **NC P0 (one per phase):** `make bench-nc BENCH_REPS=3` uses the *same*
++  wall measurements but divides the cap instead of the executed count;
++  receipt `perf bench NC: FAILED AS DESIGNED (cap-based MIPS is not a
++  measurement)`. Direct `tests/perf_bench.sh --reps=3 --nc` exits
++  **RC=1**; `make bench-nc BENCH_REPS=3` exits **RC=2** because make
++  reports the recipe's Error 1 as its own failure. On haswell boot: 50M / 4,837,677 = **10.34×**
++  overstatement. The shipped harness uses 4,837,677 and passes RC=0.
++- Pre/post at the same `--log`/`--dump-fb` paths: four historical 600k-
++  cap lanes (boot, VBE on, VBE off, no-fb), stdout, ring-log and PPM all
++  **byte-identical**, each RC=0/0; framebuffer SHA prefixes
++  `15c96625cfec5acc` (boot/on/off) and `c3b3d73f6bbb08ab` (no-fb).
++  `make test` **RC=0** (`test-perf: all vectors passed`, N2/N3 receipts),
++  `make test-sanitize` **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0**
++  (256 programs, 6144 instructions, all states match, 0 host crashes).
++  `docs/plans/PERF_PLAN.md` begins the phase ledger and records exact gates,
++  remaining P1–P5, constraints and the known missing guest toolchain.
++  The phase patch also applied cleanly with `git am` on `a3f76b5` in a fresh
++  clone, producing the identical tree; after seeding the nasm artifacts,
++  that clone passed `make test` and `make test-sanitize` RC=0, `make bench
++  BENCH_REPS=3` RC=0; `make bench-nc BENCH_REPS=3` RC=2 as designed.
++
++
+ ### Fixed — patch 0050 (VIDEO V4, dispi mode clamp: host heap overflow)
+ 
+ - **A host heap overflow reachable from the CLI and from any guest**, found
+diff --git a/Makefile b/Makefile
+index bee41d0..eddc838 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,9 +7,14 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary
+ all: x86emu
+ 
++# PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
++# sample rather than an average of two; the script rejects an even value.
++BENCH_REPS    ?= 5
++BENCH_CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror
++
+ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
+ FUZZ_PROGRAMS ?= 512
+ FUZZ_INSTR    ?= 24
+@@ -86,6 +91,13 @@ test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/
+ 	./test-table
+ 	rm -f test-table
+ 
++# PERF P0: the honest work counter (cpu.retired) and machine_retired_total().
++# Deterministic -- no vector here reads a clock; wall time is bench's job.
++test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
++	./test-perf
++	rm -f test-perf
++
+ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+@@ -135,7 +147,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
++test: test-unit test-table test-kload test-ring3 test-perf test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -145,7 +157,29 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++
++# PERF P0: wall-clock bench.  NOT part of 'make test': its numbers are this
++# machine's, so a gate on them would be a gate on the runner.  What it DOES
++# gate is deterministic -- per-tape accounting identical across repetitions,
++# no tape cut off by its --max-instr cap, and MIPS computed from executed
++# instruction attempts rather than from the cap.  Compare ratios between two builds
++# on one machine; never compare against a figure quoted in the docs.
++# Always rebuild a separate O2 binary: `make test-sanitize` overwrites x86emu
++# with an O1 ASan+UBSan binary (its timestamps still look up-to-date to make).
++# Without this, the same `make bench` command can measure two DIFFERENT
++# builds depending on which test target ran immediately before it.  No flags
++# from CFLAGS/CPPFLAGS are silently inherited; BENCH_CFLAGS is explicit.
++bench-binary:
++	$(CC) $(BENCH_CFLAGS) -Isrc $(SRC) -o x86emu-bench -lm
++
++bench: bench-binary firmware/firmware.bin disk/disk.img
++	EMUX=./x86emu-bench bash tests/perf_bench.sh --reps=$(BENCH_REPS)
++
++# The P0 negative control: the same measurement with the cap as the MIPS
++# numerator.  Exits 1 by design and is not part of any passing gate.
++bench-nc: bench-binary firmware/firmware.bin disk/disk.img
++	EMUX=./x86emu-bench bash tests/perf_bench.sh --reps=$(BENCH_REPS) --nc
+ 
+ # C11 differential fuzzer vs the host CPU (ptrace single-step) + crash
+ # invariant sweep. Deliberately NOT part of 'make test': needs ptrace.
+@@ -155,4 +189,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload framebuffer.ppm tests/kload_fixture.elf
++	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf framebuffer.ppm tests/kload_fixture.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index bc7c3cd..81fdb62 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,7 +31,7 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| `docs/plans/PERF_PLAN.md` | 📋 planned | measurement rig first; RAM fast path (per-byte loops today), translation TLB, decode cache, threaded dispatch | P0–P5 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1–P5 📋 | seven-tape honest instruction-attempt/wall-time bench; next RAM fast path, translation TLB, decode cache, profile-guided dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+@@ -53,6 +53,17 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ ## Immediate queue (next patches)
+ 
++- ~~`0051` — PERF P0: honest instruction-attempt counter and opt-in `--stats`,
++  seven-tape O2 benchmark on a separate binary, cap-based MIPS negative
++  control, deterministic work-count gates, six unit vectors, all historical
++  receipts unchanged~~ shipped.  `make bench BENCH_REPS=5` reports local
++  machine-relative wall time, not a cross-host performance assertion.
++- `0052` — PERF P1 (proposed, **not yet implemented**): profile the RAM byte
++  path, add only a justified contiguous fast path with MMIO/ROM/A20 boundary
++  vectors and the same-phase NC; report paired before/after ratios.
++
++
++
+ - ~~`0008` — CORE C7: string ops + REP semantics~~ shipped
+ - ~~`0009` — CORE C8: XCHG/CMOVcc/SETcc/MOVSX/CBW family/LOOP/JCXZ/BSWAP/XADD/CMPXCHG~~ shipped
+ - ~~`0010` — CORE C9: CPUID leaves, RDTSC, PAUSE/fences~~ shipped
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index fb0d846..57e1aa7 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -547,6 +547,32 @@
+   negative-control lane is byte-identical on re-run and prints the
+   unattached receipt verbatim, `make test` + `make test-sanitize` green.
+ 
++- PERF P0 delivered (`patches/0051-PERF-P0-honest-benchmark.patch`): a
++  separate `cpu.executed_steps` counter increments only on the cpu_step
++  `done:` path, never on the K3 +512 all-idle clock quantum; the K6
++  guest-visible `instr_count`/`vtime_instr` semantics stay unchanged.
++  `--stats` opts into per-vCPU attempts, machine-wide executed total,
++  idle delta, virtual clock and cap flag; without it, the four firmware/
++  video tapes are byte-identical pre/post in stdout, log and framebuffer.
++  `tests/test_perf.c` pins STI;HLT + two idle slots as 2 executed steps
++  versus `instr_count=vtime=1026`, the K6 identity, faulting attempt,
++  single/multi-context summation, and cap-independent completed work.
++  `make bench` uses a separately rebuilt O2 binary (the ASan lane replaces
++  `x86emu` with O1 ASan), seven firmware tapes ×5 median host wall-time,
++  stable work-count gates and no timing threshold. On this runner boot-
++  haswell did 4,837,677 attempts in 678 ms (7.14 Msteps/s) and halted
++  well below the 50M cap; the NC divides that SAME wall time by the
++  cap instead, prints 10.34× inflation, and fails by design: script
++  RC=1, `make bench-nc` RC=2 (`make` reports the recipe's Error 1).
++  `make test` RC=0, `make test-sanitize` RC=0, `make fuzz
++  FUZZ_PROGRAMS=256` RC=0 (6,144 instructions compared, no host crash).
++  In a fresh clone at `a3f76b5`, `git am` applied cleanly and yielded the
++  same tree; after seeding prebuilt nasm artifacts, `make test` and `make
++  test-sanitize` passed RC=0, `make bench BENCH_REPS=3` RC=0, and the
++  NC `make bench-nc BENCH_REPS=3` failed RC=2 as designed. Frozen
++  AuraLite-OS guest lanes SKIP without its missing build tools. P1–P5
++  are planned, not delivered.
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/PERF_PLAN.md b/docs/plans/PERF_PLAN.md
+new file mode 100644
+index 0000000..29d5221
+--- /dev/null
++++ b/docs/plans/PERF_PLAN.md
+@@ -0,0 +1,235 @@
++# PERF plan — measure before optimizing the interpreter
++
++> **House style** (`ROADMAP.md`, `CORE_PLAN.md`): each phase is one
++> `git format-patch` in `patches/`, carrying its implementation, regression
++> vector, negative control and docs together. A measured defect and a passing
++> test, not an attractive optimization, authorize each change. `make test` and
++> `make test-sanitize` remain green at each phase boundary.
++
++**Status: P0 ✅ delivered (`patches/0051-PERF-P0-honest-benchmark.patch`);
++P1–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
++first, RAM fast path, translation TLB, decode cache, profiling/dispatch,
++then hardening and closure. Each phase below is scoped, not pre-approved for
++implementation: measure its actual hotspot before writing the optimization.
++
++| Phase | Deliverable | Gate | Status |
++|---|---|---|---|
++| P0 | Work counter + opt-in `--stats`; seven-tape wall-time rig; cap/idle negative control | `make test-perf`, `make bench`, `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256` | ✅ 0051 |
++| P1 | RAM contiguous fast path for proven hot cases; all MMIO/A20/ROM cases use slow path | state-by-state differential fuzz + all P0 tapes measured before/after | 📋 |
++| P2 | Guest-translation TLB with measured invalidation (CR3, INVLPG, paging-mode/permissions) | page-fault/Ring3/SMEP/SMAP vector suite + differential fuzz + P0 tapes | 📋 |
++| P3 | Decode cache, with explicit invalidation for writes to code, A20 and mode transitions | self-modifying code + mode-transition vectors + differential fuzz + P0 tapes | 📋 |
++| P4 | Profile-guided dispatch optimization only if the profile justifies it | `-pg`/gprof before/after + `make fuzz` + P0 tape ratios | 📋 |
++| P5 | Repeated-run regression policy, sanitizer, closed defect ledger, documentation | all gates, historical byte-identical lanes, one NC, fresh-clone `git am` | 📋 |
++
++## 1. Measured baseline (`AuraLite-Emulator@a3f76b5` → P0)
++
++- Before P0 there was **no benchmark** in `Makefile` or `tests/` and no
++  host wall-clock gate. All existing gates compared guest STATE. The boot
++  run with `--platform=haswell --max-instr=20000000 --no-fb` took 0.685 s
++  but halted at `instr=4837677`. Dividing the *cap* 20M by that time gave
++  **28.69 MIPS**; dividing the actual count by the same time gave **7.06
++  MIPS**. The first number was mistakenly quoted during plan selection;
++  this phase arose because the error was caught by checking the register
++  dump. The precise wall number is machine-relative; the miscount factor
++  20000000/4837677 ≈ 4.13 is not.
++- Worse, `cpu.instr_count` is itself **not** the work count. On `STI;HLT`
++  followed by two idle slots, `cpu_step` charges `+512` per slot to both
++  `cpu.instr_count` and `m->vtime_instr` (`src/cpu.c`'s all-idle branch)
++  while executing **zero** further instructions. A measured tiny C harness
++  (`/tmp/t_idle.c`) returned `instr_count=vtime=1026` for just two actual
++  steps. That identity is the K6 guest-clock contract; altering either
++  clock to manufacture a performance numerator would break PIT/RTC/LAPIC/
++  RDTSC and the historical boot tapes.
++- `cpu_step` reaches a single `done:` block for a dispatched instruction,
++  including faults (`src/cpu.c` near the end of the function), but returns
++  earlier for HLT idle slots and reset bookkeeping. P0 adds
++  `cpu.executed_steps++` beside `instr_count++` **only** in that block. A
++  faulting attempt counts once: this is an instruction-*attempt* metric,
++  **not** architectural retirement. `--stats` prints a per-vCPU count,
++  a machine-wide sum (`machine_executed_total`), `idle_quantum`, BSP clock,
++  virtual clock and cap flag; without the option, stdout is unchanged.
++- `m->n_vcpus==0` is the **normal single-context machine** (`main.c` only
++  sets it to 2 for `--smp>=2`). P0's first `--stats` draft looped 0 times
++  and printed `executed=0` on UP despite `instr_count=4837677`. It was
++  caught by running the built binary and repaired by making the effective
++  context count max(1, n) in a shared helper, with an explicit unit vector.
++- First bench draft accidentally appended `--no-fb` to **every** tape;
++  this made `gfx-fb` and `text-no-fb` the same workload. Identical receipts
++  exposed it. P0 now passes each tape's arguments verbatim. No timing
++  assertion gates on a fixed ns/instruction or MIPS: this would fail on a
++  slower or noisier runner without a code regression.
++- The local frozen guest (`AuraLite-OS@0ed0d29`) has no `build/kernel.elf`
++  or `build/initrd.tar`; clang, ld.lld, nasm, mformat/mcopy, lld-link,
++  llvm-rc and rustc are unavailable. P0's seven tapes use the existing
++  sample firmware plus three pre-existing nasm artifacts. `--kernel=`
++  guest lanes remain SKIP here and are not silently replaced with a fake
++  kernel measurement.
++
++## 2. Defect ledger
++
++| ID | Symptom, repro and source | P0 remedy / later work |
++|---|---|---|
++| D0 | 20M cap / 0.685 s → false 28.69 MIPS though `instr=4837677` / 0.685 s → ~7.06. No bench existed. | P0 `make bench`: parse actual `executed=`, reject `cap_reached=1`, print ratio; NC uses cap as numerator and fails (RC 1). |
++| D1 | `STI;HLT` + two idle slots: `instr_count=vtime=1026` while only 2 instructions were attempted; K3 `+512` is intentional. | P0 separate `executed_steps=2`, `idle_quantum=1024`, K6 identity unchanged; deterministic unit vector. |
++| D2 | `m->n_vcpus=0` for a normal UP run; naive summation counted zero work. | P0 `machine_executed_total` counts BSP for 0/1 contexts; vector tests 0,1,2. |
++| D3 | Every gate in `Makefile` compared state; a slowdown could pass all of them. | P0 wall-time median from five runs of each tape; report only. Later P1–P5 compare paired builds on same host, not absolute machine-external thresholds. |
++| D4 | Appending `--no-fb` to all tapes made `gfx-fb` identical to `text-no-fb`. | P0 per-tape argv verbatim; printed labels correspond to distinct CLI paths. |
++
++## 3. P0 — one patch, measured gates
++
++### 3.1 Code and vector
++
++`src/cpu.h`: `executed_steps`, reset by the existing `cpu_reset` `memset`.
++`src/cpu.c`: increment once alongside `instr_count` at `done:` only; **never**
++in the K3 all-idle branch. `src/machine.h`:
++`machine_executed_total()` — same implementation shared by the regression
++vector and the product. `src/main.c`: opt-in `--stats`; it emits nothing
++when the flag is absent, after the historical CPU register dump, before
++last log lines. `tests/test_perf.c`: six deterministic vectors: NOP×1000
+++ HLT = 1001 steps; STI+HLT+two idle slots = 2 steps/1026 vtime; K6 identity
++at 514; faulting UD2 attempt counted once; context counts 0/1/2 =
++10/10/17; bigger step budget cannot inflate an already halted tape.
++`test-perf` joins `make test` **and** `make test-sanitize`.
++
++### 3.2 Bench and negative control
++
++`make bench [BENCH_REPS=5]` compiles a separate O2 `x86emu-bench`
++with `BENCH_CFLAGS` and runs seven firmware tapes. The separate binary is
++necessary: `make test-sanitize` replaces `x86emu` with O1 ASan+UBSan and
++make cannot infer changed CFLAGS from timestamps. `bench-binary` is phony
++and rebuilds before each bench run, so the default measurement does not
++silently inherit the last test's flags. `tests/perf_bench.sh` can still be
++run with `EMUX=path/to/other-build` to compare an explicit build.
++The tapes are: haswell, broadwell,
++baytrail, text-no-fb, gfx-fb, VBE 800x600x32 and two-vCPU. Each tape is
++repeated an odd number of times (default 5), and the **actual sample
++median** of the outside-the-process wall time is reported in ms, with
++Msteps/s (labeled `mips` for familiar comparison), ns/attempt, and the
++cap-based *wrong* number so the difference cannot hide. It gates the
++non-timing facts: every repetition must report identical
++executed/vtime/idle/cap status, executed > 0, no tape hits its cap. Even
++sample counts are rejected. The ratio between cap and actual work is a
++property of the workload, not of the stopwatch.
++
++**NC P0, one for the phase:** `make bench-nc BENCH_REPS=3` / `bash
++ tests/perf_bench.sh --reps=3 --nc` measures exactly the same tapes but
++**presents the cap as the MIPS numerator**. Receipt: `perf bench NC:
++FAILED AS DESIGNED (cap-based MIPS is not a measurement)`; the direct
++script exits **RC=1**, while `make bench-nc` reports **RC=2** (`make` wraps
++the failed recipe: `Error 1`). Both forms are intentionally red;
++for haswell boot the inflation factor was **10.34×** (50M / 4,837,677).
++This NC fails for a semantic reason, not because of wall-time jitter.
++`make bench` on the same tape uses 4,837,677; it passes RC=0.
++
++### 3.3 Measured local baseline (O2, 5 reps; machine-relative)
++
++| Tape | Steps attempted | Median (ms) | Msteps/s | ns/step | Cap-based / actual |
++|---|---:|---:|---:|---:|---:|
++| boot-haswell | 4,837,677 | 678 | 7.14 | 140.1 | 10.34× |
++| boot-broadwell | 4,807,694 | 666 | 7.22 | 138.5 | 10.40× |
++| boot-baytrail | 4,807,650 | 668 | 7.20 | 138.9 | 10.40× |
++| text-no-fb | 4,837,677 | 676 | 7.16 | 139.7 | 10.34× |
++| gfx-fb | 4,837,677 | 671 | 7.21 | 138.7 | 10.34× |
++| vbe-800x600x32 | 4,837,677 | 671 | 7.21 | 138.7 | 10.34× |
++| smp2 | 4,837,677 | 985 | 4.91 | 203.6 | 4.13× |
++
++These are not golden wall-time asserts; workloads may differ by platform,
++and 2-vCPU scheduling overhead is not an optimization result. Profiles,
++CPU governor, available cores and thermal state affect any host timing.
++The printed *work counts* were identical over all 5 repetitions. Do not
++compare these ms values to another machine. For a future change, benchmark
++before and after on the **same** runner, preferably alternating builds to
++control host drift, while separately asserting byte-identical guest output
++and a fixed count of work per tape.
++
++### 3.4 Historical receipts and gates
++
++Built pre-P0 from `HEAD=a3f76b5` in `/tmp/p0_pre`, built P0 separately.
++Four historical 600k-cap tapes (firmware boot, `--vbe=800x600x32`,
++`--vbe=off`, `--no-fb`) with the **same** `--log` and `--dump-fb` paths:
++pre/post stdout+log+PPM were byte-identical, RC=0/0 for each. First
++comparison used different filenames for the output PPM, causing one
++*path-echo line* in stdout to differ while bytes of log+PPM matched; a
++controlled rerun with the same pathname fixed the harness artifact and
++proved byte identity. PPM SHA-256 prefixes: first three
++`15c96625cfec5acc`, `--no-fb` `c3b3d73f6bbb08ab` (same as VIDEO V4).
++`make test`: RC=0 (`test-perf: all vectors passed`, `boot integration test:
++ok`, N2/N3 receipts ALL PASS); `make test-sanitize`: RC=0; `make fuzz
++FUZZ_PROGRAMS=256`: RC=0 (`256 programs, 6144 instructions compared --
++all states match`, `0 host-level crashes`). SKIP on nasm-driven lanes and
++the frozen guest: the required tools/artifacts are absent, not a passing
++claim about those lanes.
++
++### 3.5 Fresh-clone patch verification (measured)
++
++Clone at **`a3f76b5`**; set git committer identity in the clone, then apply
++`git am "$REPO/patches/0051-PERF-P0-honest-benchmark.patch"` (`$REPO` is
++the source checkout). `git am` applied cleanly. `git rev-parse HEAD^{tree}`
++was **identical** to the development tree. Seed the three nasm-generated
++files using `NET_PLAN.md` §3.9; `make -n firmware/firmware.bin disk/disk.img`
++reported both **up to date**. In this fresh clone: `make test` **RC=0**
++(`test-perf: all vectors passed`, boot integration ok, N2/N3 ALL PASS),
++`make test-sanitize` **RC=0**, `make bench BENCH_REPS=3` **RC=0** (all seven
++work counts deterministic, none capped), `make bench-nc BENCH_REPS=3`
++**RC=2** (`perf bench NC: FAILED AS DESIGNED`, inner script RC=1).
++The clone required local committer identity for `git am`; without it,
++Git returns `fatal: empty ident name` **before applying the patch**.
++Do not bake a patch size, tree hash or host timing into this document:
++the patch itself must not contain itself, and quoting its own sha/size
++creates an amend loop. Historical tapes do not move with `--stats` absent.
++
++## 4. Planned phases — gate before optimization
++
++**P1 (RAM fast path).** First profile `mem.c` per-byte loops under `-pg`/
++gprof or targeted step counters. Only contiguous RAM spans with measured
++hot frequency may bypass byte walking; accesses crossing RAM/ROM/MMIO
++boundaries, A20 masking, open bus and I/O hooks must retain their old
++observable order. Differential fuzz and edge-crossing vectors are in the
++*same* patch. NC forces the fast path across a boundary; the new vector
++must redden. Report paired before/after ratios from `make bench`, not an
++absolute MIPS goal.
++
++**P2 (translation TLB).** Only if the P1 follow-up profile shows address
++translation is hot. State a key containing all permission/mode bits
++relevant to the lookup, and explicitly invalidate on CR3 reload, INVLPG,
++CR0/CR4/EFER mode changes and page-table writes. Compare the old walk
++against the cache for page-present/error-code/RIP/CR2 under Ring3 NX,
++U/S, WP and SMP. NC disables invalidation for a page-table update; vector
++must redden. A timing win alone cannot authorize altered fault ordering.
++
++**P3 (decode cache).** Only if measured decoding is hot after P2. Cache
++keys include instruction bytes, address/operand sizes, mode, prefixes
++and fetch translation. Invalidate on self-modifying code, mode/paging
++changes and resets; do not fold a fetch fault into a stale cached decode.
++NC deliberately leaves one invalidation out. Use `make fuzz` + P0 tapes.
++
++**P4 (profile/dispatch).** `perf` and `valgrind` are **absent** here;
++`gprof` is available. Capture a `-pg` baseline and call graph before
++any table/threaded-dispatch change in the nested `cpu.c` opcode switches;
++stop if the suspected dispatch cost is not in the profile. Preserve
++single-/two-byte, prefix and exception paths. NC swaps one dispatch table
++entry, requiring the ISA vector to fail. All state/fault/fetch counts and
++P0 tapes must remain identical; no timing-only assertion.
++
++**P5 (hardening/close).** Re-measure all P0 tapes before/after on one host
++with the same compiler and input artifacts, collect confidence intervals
++for any performance claim rather than pinning a one-run wall time in CI,
++close the defect ledger with per-defect vectors, include the one NC for
++P5, re-run all guest-visible historical receipts, and verify `git am` in
++a fresh clone.
++
++## 5. Standing constraints
++
++1. Do not change `instr_count`/`vtime_instr` semantics: they are the K6
++   guest clock and include K3 idle quanta. An optimization that returns
++   the same stdout but a different guest clock is a **regression**.
++2. `--stats` is opt-in. The default stdout and every historical firmware,
++   video, STORE, USB, NET tape must remain byte-identical; e1000 remains
++   opt-in with `--tap=`, GPU 0:2:0 `8086:0412`, BAR0 `0xD0000000` and
++   `pixel[0]=0x00200000` stay unchanged.
++3. `make test` and `make test-sanitize` RC=0 at every phase; `make fuzz`
++   paired before/after for CPU paths; deterministic work counts. Wall time
++   is a **report** and is never compared to a cross-host constant in CI.
++4. One phase = one patch under `patches/` (`git format-patch`); fixes,
++   vectors, one NC with RC and assert, CHANGELOG/STATUS/ROADMAP/plan
++   updates in that same patch. The patch file does **not** contain itself.
+diff --git a/src/cpu.c b/src/cpu.c
+index f39658e..035e1b8 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -789,7 +789,7 @@ int cpu_step(cpu_t *c) {
+             if (!peer_busy) {
+                         /* K3: virtual time must not freeze while the CPU idles in HLT
+              * -- PIT/LAPIC/RTC all derive from instr_count (K6: vtime). Charge
+-             * a time quantum (it counts toward --max-instr like retired work)
++             * a time quantum (it counts toward --max-instr like executed work)
+              * and wake on whatever arrives.  */
+                 c->instr_count += 512;
+                 m->vtime_instr += 512;   /* K6: master clock advances too */
+@@ -1954,7 +1954,7 @@ really_slow:
+             if (ext==7) elem ^=  (1ULL << ib);
+             if (ext!=4) rm_write(&d,&rm,osz,elem);
+             break; }
+-        case 0x31: { /* RDTSC: virtual time = retired instructions x per-platform
++        case 0x31: { /* RDTSC: virtual time = executed instruction attempts x per-platform
+                         ratio (platform_t::tsc_per_instr) — deterministic */
+             uint64_t t = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
+             /* K6: TSCs are machine-synchronized (as on silicon); with one
+@@ -2685,6 +2685,8 @@ really_slow:
+ done:
+     if (!c->fault && !c->exception_taken) c->rip = d.pc;
+     c->instr_count++;
++    c->executed_steps++;  /* PERF P0: executed attempts only, including faults.
++                           * Idle slots do not reach done and do not count. */
+     m->vtime_instr++;   /* K6: the machine-wide master clock */
+     pit_tick(m);   /* CHIPSET H2: virtual-time advance; no-op until pit_init */
+     rtc_tick(m);   /* CHIPSET H3: same D6 timebase; update-ended IRQ8 here */
+diff --git a/src/cpu.h b/src/cpu.h
+index b487fa2..ab911e6 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -88,6 +88,19 @@ typedef struct cpu {
+     uint64_t fault_rip;
+ 
+     uint64_t instr_count;
++    /* PERF P0: instruction attempts actually EXECUTED by this context.  instr_count
++     * cannot serve as a throughput numerator: the K3 idle quantum adds 512
++     * to it per all-idle HLT slot WITHOUT retiring anything (cpu.c, the
++     * `!peer_busy` arm), and K6 makes it the guest-visible vtime base, so
++     * its semantics are frozen by contract.  This counter increments only
++     * in cpu_step's done block, so it is 0 for a run that only idled
++     * and equals instr_count for a run that never idled.  This counts
++     * faulting attempts too, not architecturally retired instructions;
++     * "MIPS" below means guest instruction attempts per wall second.
++     * Reported by
++     * --stats; no guest-visible state and no historical tape depends on
++     * it. */
++    uint64_t executed_steps;
+     int trace;               /* if non-zero, print each instruction */
+ 
+     machine_t *mach;         /* back-reference to owning machine (memory/io) */
+diff --git a/src/machine.h b/src/machine.h
+index f22d95a..473cbee 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -162,6 +162,35 @@ typedef struct machine machine_t;
+  * pair.  Both are complete no-ops when n_vcpus == 1, so every existing
+  * code path (unit suites included) keeps its byte-exact behavior and
+  * never pays for the multiplexing. */
++/* PERF P0: instruction attempts actually executed across every execution context.
++ *
++ * This is the throughput numerator, and it is deliberately NOT any of the
++ * two clocks that already exist:
++ *   - cpu.instr_count is the K6 clock.  It also carries the K3 idle quantum
++ *     (+512 per all-idle HLT slot, cpu.c) and it is guest-visible through
++ *     PIT/RTC/LAPIC/RDTSC, so its semantics are frozen by contract.
++ *   - vtime_instr is the machine-wide master clock; it equals the BSP's
++ *     instr_count when there is one context (the K6 identity) and is the
++ *     number --max-instr budgets against, idle quantum included.
++ *   - neither distinguishes "attempted an instruction" from "sat in HLT"
++ *     while virtual time flowed.  That distinction is a throughput measure.
++ * cpu.executed_steps increments only in cpu_step's done block, including
++ * faulting attempts.  An idle-only run reports 0 here even as its
++ * instr_count climbs by 512 per slot.
++ *
++ * Slot 0 lives in m->cpu (the K6 exit path re-loads it, and with a single
++ * context the slot is never written); the rest are authoritative in their
++ * slots.  n_vcpus is 0 for the historical single-context machine -- only the
++ * --smp>=2 wiring sets it -- so the effective context count is max(1, n).
++ * Shared by main.c's --stats block and tests/test_perf.c so the test asserts
++ * the shipped formula rather than a copy of it. */
++static inline uint64_t machine_executed_total(const machine_t *m) {
++    int n = m->n_vcpus > 1 ? m->n_vcpus : 1;
++    uint64_t sum = m->cpu.executed_steps;
++    for (int i = 1; i < n && i < EM_MAX_VCPU; i++) sum += m->vcpu[i].c.executed_steps;
++    return sum;
++}
++
+ static inline void vcpu_load(machine_t *m, int i) {
+     if (m->n_vcpus > 1) {
+         m->cpu = m->vcpu[i].c;
+diff --git a/src/main.c b/src/main.c
+index 70ee017..5b00988 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
+     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
+     int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
+     int cfg_no_fb = 0;              /* --no-fb: no linear fb published -- VGA text box (VIDEO V1) */
++    int cfg_stats = 0;              /* --stats: PERF P0 measurement block (opt-in) */
+     const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
+     const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
+     const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
+@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
+         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
+         else if (!strncmp(argv[i], "--dump-text=", 12)) text_out = argv[i]+12;
+         else if (!strcmp(argv[i], "--no-fb")) cfg_no_fb = 1;
++        else if (!strcmp(argv[i], "--stats")) cfg_stats = 1;   /* PERF P0 */
+         else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
+@@ -184,7 +186,10 @@ int main(int argc, char **argv) {
+                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
+                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
+-                   "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n", argv[0]);
++                   "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n"
++                  "          [--stats] print the PERF P0 measurement block: executed_steps / instr_count /\n"
++                  "                      vtime / cap.  Executed attempts, not idle clock\n"
++                  "                      quanta, are the throughput numerator (faults count)\n", argv[0]);
+             return 0;
+         }
+     }
+@@ -432,6 +437,45 @@ int main(int argc, char **argv) {
+     if (m->guest_entry_seen && m->fb && m->fb[0] == 0x00200000u)
+         mlog(&m->log, "[guest] framebuffer marker OK: pixel[0]=0x%08x", m->fb[0]);
+     dump_regs(&m->cpu);
++
++    /* PERF P0: the measurement block, opt-in so every existing tape keeps its
++     * byte-exact stdout (make test greps it; the V/NET lanes hash it).
++     *
++     * Three counters, three different meanings, and the difference is the
++     * defect this phase exists to make visible:
++     *   executed_steps     instruction attempts actually executed, summed over every vCPU.
++     *               Faults count as attempts (not architectural retirement).
++     *               The only correct MIPS numerator for this run loop.
++     *   instr_count the K6 clock: executed_steps PLUS 512 per all-idle HLT slot.
++     *               Guest-visible, frozen by contract, and a fine way to
++     *               overstate throughput on an idle-heavy tape.
++     *   vtime       the machine-wide master clock; equals the BSP's
++     *               instr_count when n_vcpus==1 (the K6 identity).
++     * cap_reached=1 means the run was cut off, so its wall time measures the
++     * cap and not the workload -- tests/perf_bench.sh refuses to report MIPS
++     * for such a tape. */
++    if (cfg_stats) {
++        int nctx = m->n_vcpus > 1 ? m->n_vcpus : 1;
++        uint64_t idle_sum = 0;
++        printf("\n---- stats (PERF P0) ----\n");
++        for (int i = 0; i < nctx && i < EM_MAX_VCPU; i++) {
++            const cpu_t *vc = (m->n_vcpus > 1 && i > 0) ? &m->vcpu[i].c : &m->cpu;
++            idle_sum += vc->instr_count - vc->executed_steps;
++            printf("[stats] vcpu=%d executed_steps=%llu instr_count=%llu halted=%d fault=%d\n",
++                   i, (unsigned long long)vc->executed_steps,
++                   (unsigned long long)vc->instr_count,
++                   vc->halted ? 1 : 0, vc->fault ? 1 : 0);
++        }
++        printf("[stats] executed=%llu idle_quantum=%llu instr_count_bsp=%llu vtime=%llu\n",
++               (unsigned long long)machine_executed_total(m),
++               (unsigned long long)idle_sum,
++               (unsigned long long)m->cpu.instr_count,
++               (unsigned long long)m->vtime_instr);
++        printf("[stats] cap=%llu cap_reached=%d n_vcpus=%d\n",
++               (unsigned long long)max_instr,
++               (m->vtime_instr >= max_instr) ? 1 : 0, nctx);
++    }
++
+     printf("\n---- last log lines ----\n");
+     int start = m->log.count < 60 ? 0 : m->log.count - 60;
+     for (int i = start; i < m->log.count; i++) {
+diff --git a/tests/perf_bench.sh b/tests/perf_bench.sh
+new file mode 100755
+index 0000000..2529bbc
+--- /dev/null
++++ b/tests/perf_bench.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++# tests/perf_bench.sh -- PERF P0: the wall-clock bench.
++#
++# Before P0 this project had no way to state how fast it is.  Every gate in
++# the suite compares STATE (make test, make fuzz's "all states match", the
++# byte-identical lane tapes) and none compares TIME, so "no performance
++# regressions" -- which ROADMAP.md lists as a COMPAT risk -- was not a claim
++# anything could check.  This script is the measurement; it gates accounting,
++# not a host-dependent wall-time threshold.  Later phases compare builds on
++# the same host.
++#
++# It measures host wall time from OUTSIDE the emulator (process spawn to
++# exit), not with a clock inside the run loop: an internal clock would start
++# after machine construction and stop before teardown, i.e. it would report
++# the emulator as faster than it is.  The cost is that the number includes
++# process startup and is therefore machine-relative -- which is fine, because
++# P1/P3 are justified by the ratio between two builds on ONE machine, and no
++# absolute figure here is portable.  What IS portable, and what the gates
++# below assert, is the instruction accounting.
++#
++# The numerator matters more than the stopwatch.  Three candidates exist and
++# two of them are wrong:
++#
++#   --max-instr     a limit, not a measurement.  The firmware-boot tape stops
++#                   at 4837677 attempts; this harness caps at 50000000.
++#                   Dividing the cap by wall time overstates throughput by
++#                   ~10x on that tape.  This is the mistake P0 exists to make
++#                   impossible, and it was made for real while scoping this
++#                   phase (a "28.69 MIPS" figure from a 20M cap on a tape that
++#                   executed 4.84M).
++#   instr_count     the K6 clock: executed work PLUS 512 per all-idle HLT slot
++#                   (src/cpu.c), and guest-visible through PIT/RTC/LAPIC/RDTSC.
++#                   Correct for a tape that never idles, inflated for one that
++#                   does.  tests/test_perf.c vector 2 pins the divergence.
++#   executed_steps  instruction attempts actually executed, summed over every context
++#                   by machine_executed_total() (src/machine.h) and reported by
++#                   --stats as `executed=`.  Faulting attempts count too, so
++#                   this is a guest-steps/s metric, NOT ISA-level retirement.
++#                   The only honest throughput numerator for this run loop.
++#
++# Gates, all deterministic (no gate here depends on a timing):
++#   1. every repetition of a tape reports the SAME executed/vtime/idle numbers
++#      -- a benchmark whose workload varies between runs measures noise;
++#   2. no tape may reach its --max-instr cap, because then wall time measured
++#      the cap and not the workload (the script refuses to report such a tape);
++#   3. executed > 0, so a tape that silently did nothing cannot report MIPS;
++#   4. self-check: cap-based MIPS >= executed-based MIPS, with strict > and a
++#      printed inflation factor for any tape that stopped before its cap.
++#
++# Usage: tests/perf_bench.sh [--reps=N] [--nc]
++#   --reps=N   repetitions per tape (default 5, must be odd for an exact median)
++#   --nc       the phase negative control: report the SAME measurement with the
++#              cap as numerator, assert that it inflates, and exit 1.  This is
++#              the documented NC for P0 and is not part of `make test`.
++#
++# Requires the built x86emu plus firmware/firmware.bin and disk/disk.img (the
++# nasm artifacts; see docs/plans/NET_PLAN.md 3.9 for the seeding recipe).  The
++# --kernel= tapes are deliberately absent: the frozen guest cannot be built
++# here (clang/ld.lld/nasm/mformat/mcopy/lld-link/llvm-rc/rustc are all
++# missing), so a kernel lane would SKIP rather than measure.
++set -euo pipefail
++export LC_ALL=C
++
++EMUX=${EMUX:-./x86emu}
++REPS=5
++NC=0
++for a in "$@"; do
++    case $a in
++        --reps=*) REPS=${a#--reps=} ;;
++        --nc)     NC=1 ;;
++        *) echo "usage: $0 [--reps=N] [--nc]" >&2; exit 2 ;;
++    esac
++done
++case $REPS in (*[!0-9]*|'') echo "--reps wants a positive integer" >&2; exit 2;; esac
++[ "$REPS" -ge 1 ] || { echo "--reps wants >= 1" >&2; exit 2; }
++if [ $((REPS % 2)) -eq 0 ]; then
++    echo "--reps must be odd so the median is an actual sample, not an average of two" >&2
++    exit 2
++fi
++
++[ -x "$EMUX" ] || { echo "MISSING: $EMUX is not executable (make x86emu)" >&2; exit 1; }
++for f in firmware/firmware.bin disk/disk.img; do
++    [ -f "$f" ] || { echo "MISSING: $f (nasm artifact -- see NET_PLAN.md 3.9)" >&2; exit 1; }
++done
++
++# name|cap|extra args...   The cap is deliberately generous on every tape so
++# that gate 2 passes by stopping early, not by being cut off.
++# Per-tape arguments are used verbatim -- the harness adds only
++# --max-instr and --stats.  (An earlier draft appended --no-fb to every tape,
++# which silently made gfx-fb and text-no-fb the same measurement; the two
++# rows came out byte-identical and that is how it was caught.)
++TAPES=(
++    "boot-haswell|50000000|--platform=haswell"
++    "boot-broadwell|50000000|--platform=broadwell"
++    "boot-baytrail|50000000|--platform=baytrail"
++    "text-no-fb|50000000|--platform=haswell --no-fb"
++    "gfx-fb|50000000|--platform=haswell"
++    "vbe-800x600x32|50000000|--platform=haswell --vbe=800x600x32"
++    "smp2|20000000|--platform=haswell --smp=2 --cpus=2"
++)
++
++# bash, not the #!/bin/sh of the other harnesses, for one reason: TIMEFORMAT
++# gives millisecond resolution.  POSIX `time` resolves to 10 ms, which on the
++# shortest tape here (~0.18 s) is a ~5% error in the measurement itself --
++# larger than the effect a dispatch-table change is supposed to show.
++TIMEFORMAT='%3R'
++trap 'rm -f /tmp/perf_bench.$$.out' EXIT
++
++median_ns() {   # stdin: one "seconds" float per line -> stdout: median in ns
++    sort -g | awk '{a[NR]=$1} END {printf "%.0f", a[int((NR+1)/2)] * 1e9}'
++}
++
++stat() {        # $1=stats text  $2=key
++    printf '%s\n' "$1" | sed -n "s/.*[ ]$2=\([0-9]*\).*/\1/p" | head -1
++}
++
++fail=0
++rows=""
++if [ "$NC" -eq 0 ]; then
++    printf '%-16s %5s %10s %12s %9s %9s %10s %8s\n' \
++        tape reps med_ms executed mips ns/instr cap_mips inflate
++fi
++for t in "${TAPES[@]}"; do
++    IFS='|' read -r name cap args <<< "$t"
++    times=(); first=""
++    for _ in $(seq 1 "$REPS"); do
++        # shellcheck disable=SC2086
++        s=$( { TIMEFORMAT='%3R'; time "$EMUX" $args --max-instr="$cap" \
++                 --stats >/tmp/perf_bench.$$.out 2>/dev/null; } 2>&1 )
++        times+=("$s")
++        st=$(cat /tmp/perf_bench.$$.out)
++        exec_n=$(stat "$st" executed); vt=$(stat "$st" vtime)
++        idle=$(stat "$st" idle_quantum); cr=$(stat "$st" cap_reached)
++        line="executed=$exec_n vtime=$vt idle=$idle cap_reached=$cr"
++        if [ -z "$first" ]; then first=$line
++        elif [ "$first" != "$line" ]; then
++            echo "NONDETERMINISTIC: $name" >&2
++            echo "  rep1: $first" >&2; echo "  repN: $line" >&2
++            fail=1
++        fi
++    done
++    rm -f /tmp/perf_bench.$$.out
++
++    # gate 3: the tape must have done work
++    if [ "${exec_n:-0}" -eq 0 ]; then
++        echo "ERROR: $name executed=0 -- nothing to measure" >&2; fail=1; continue
++    fi
++    # gate 2: a capped run measured the cap, not the workload
++    if [ "${cr:-1}" -eq 1 ]; then
++        echo "ERROR: $name hit --max-instr=$cap, so its wall time is the cap's." >&2
++        echo "       Raise the cap until the tape stops on its own." >&2
++        fail=1; continue
++    fi
++
++    med=$(printf '%s\n' "${times[@]}" | median_ns)
++    read -r mips nsinstr capmips inflate <<< "$(awk -v med="$med" -v ex="$exec_n" \
++        -v cap="$cap" 'BEGIN {
++            m  = ex / (med / 1e9) / 1e6;
++            printf "%.2f %.1f %.2f %.2f\n", m, med / ex,
++                   cap / (med / 1e9) / 1e6, (m > 0 ? (cap / (med / 1e9) / 1e6) / m : 0);
++        }')"
++
++    # gate 4: the cap can only ever overstate
++    if awk -v c="$capmips" -v m="$mips" 'BEGIN { exit !(c + 1e-9 < m) }'; then
++        echo "ERROR: $name cap-based MIPS ($capmips) < executed-based ($mips)" >&2
++        echo "       impossible unless the numerator is not the cap -- harness bug" >&2
++        fail=1
++    fi
++
++    if [ "$NC" -eq 1 ]; then
++        # The negative control reports THIS measurement with the cap as the
++        # numerator and asserts that it inflates.  It must fail: a tape that
++        # stops before its cap is the normal case here, and a harness that
++        # could not tell the two numerators apart is the defect P0 fixes.
++        rows="$rows$(printf '%-16s cap_mips=%-7s real_mips=%-6s inflate=%sx\n' \
++                     "$name" "$capmips" "$mips" "$inflate")"$'\n'
++        if awk -v i="$inflate" 'BEGIN { exit !(i > 1.05) }'; then :; else
++            echo "ERROR: $name inflate=${inflate}x -- the cap-based figure is not" >&2
++            echo "       distinguishable from the real one, so this NC proves nothing" >&2
++            fail=1
++        fi
++        continue
++    fi
++
++    printf '%-16s %5s %10s %12s %9s %9s %10s %8s\n' \
++        "$name" "$REPS" "$(awk -v n="$med" 'BEGIN{printf "%.1f", n/1e6}')" \
++        "$exec_n" "$mips" "$nsinstr" "$capmips" "${inflate}x"
++    rows="$rows$name $mips"$'\n'
++done
++
++if [ "$NC" -eq 1 ]; then
++    printf '%s' "$rows"
++    echo
++    echo "NC (PERF P0): the same wall-time measurement, but with --max-instr as the"
++    echo "MIPS numerator instead of executed instruction attempts.  Every tape above stops"
++    echo "before its cap, so every cap-based figure is inflated -- the boot tapes"
++    echo "~10x, because the guest halts at 4837677 instructions while the default"
++    echo "cap is 50000000.  This is the arithmetic that produced a real 28.69 MIPS"
++    echo "claim during P0 scoping on a tape that executed 4.84M instructions"
++    echo "(7.06 MIPS).  The shipped harness uses executed= and refuses capped"
++    echo "tapes; this variant exists to be run and to fail."
++    echo "perf bench NC: FAILED AS DESIGNED (cap-based MIPS is not a measurement)"
++    exit 1
++fi
++
++[ "$fail" -eq 0 ] || { echo "perf bench: FAILED" >&2; exit 1; }
++echo
++echo "Perf baseline: all tapes deterministic, none capped, MIPS from actual"
++echo "instruction attempts only.  These wall times are THIS machine's; compare ratios"
++echo "between two builds here, never against a number quoted elsewhere."
++echo "perf bench: ok"
+diff --git a/tests/test_perf.c b/tests/test_perf.c
+new file mode 100644
+index 0000000..dbb7c04
+--- /dev/null
++++ b/tests/test_perf.c
+@@ -0,0 +1,166 @@
++/* tests/test_perf.c -- PERF P0: the honest work counter.
++ *
++ * P0's premise is that this project had no way to state how fast it is, and
++ * every counter it did have measures something else:
++ *
++ *   cpu.instr_count  the K6 clock.  Retired instructions PLUS the K3 idle
++ *                    quantum (+512 per all-idle HLT slot, src/cpu.c), and
++ *                    guest-visible through PIT/RTC/LAPIC/RDTSC -- so its
++ *                    semantics are frozen by contract and it cannot become
++ *                    the throughput numerator.
++ *   machine.vtime    the machine-wide master clock; the K6 identity makes it
++ *                    equal the BSP's instr_count for one context, and it is
++ *                    what --max-instr budgets against, idle quantum included.
++ *   --max-instr      a limit, not a measurement.  Dividing it by wall time is
++ *                    the mistake this suite exists to make impossible: a tape
++ *                    that stops early reports the cap's number, not its own.
++ *
++ * cpu.executed_steps is the counter P0 adds.  It increments only in cpu_step's
++ * done: block (including faulting attempts), so it is 0 for a run that
++ * only idled and equals
++ * instr_count for a run that never idled.  machine_executed_total() (machine.h)
++ * sums it across contexts and is shared with main.c's --stats block, so these
++ * vectors assert the shipped formula rather than a copy of it.
++ *
++ * Every number asserted below is an invariant of the cpu_step done path, not of
++ * one run's luck: program length, the 512 quantum, the K6 identity.  Nothing
++ * here depends on wall time -- that is tests/perf_bench.sh's job, and it is
++ * deliberately machine-relative (see PERF_PLAN.md P0).
++ */
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "platform.h"
++#include "harness.h"
++
++#define FLAG_IF_BIT 9
++
++static machine_t g_m;
++
++static void fresh(void) {
++    setup_machine(&g_m);
++    g_m.n_vcpus = 0;          /* the historical single-context machine: only
++                               * main.c's --smp>=2 wiring ever sets this */
++    g_m.vtime_instr = 0;
++}
++
++/* Run `len` bytes at physical 0 for at most `steps` cpu_step calls. */
++static void run(const uint8_t *prog, size_t len, int steps) {
++    memcpy(g_m.ram, prog, len);
++    g_m.cpu.rip = 0;
++    g_m.cpu.gpr[RSP] = 0x8000;
++    for (int i = 0; i < steps; i++)
++        if (cpu_step(&g_m.cpu) != 0) break;
++}
++
++int main(void) {
++    /* ---- 1. executed_steps counts exactly the instructions executed ------------
++     * 1000 x NOP (0x90, one byte each) then HLT.  run_program stops on the
++     * first non-zero cpu_step return, and HLT with IF=0 returns -1, so the
++     * count is the program length and not "however far it got". */
++    {
++        fresh();
++        static uint8_t prog[1001];
++        memset(prog, 0x90, 1000);
++        prog[1000] = 0xF4;                       /* HLT */
++        run(prog, sizeof prog, 5000);
++        assert(g_m.cpu.executed_steps == 1001);
++        /* No idle slot was ever taken, so the clock and the work agree --
++         * this is the UP firmware-boot shape (measured: executed_steps ==
++         * instr_count == 4837677 when cap is 50000000). */
++        assert(g_m.cpu.instr_count == 1001);
++        assert(g_m.cpu.instr_count - g_m.cpu.executed_steps == 0);
++        printf("ok   1000 x NOP + HLT executes exactly 1001, no idle inflation\n");
++    }
++
++    /* ---- 2. the idle quantum inflates the clock and NOT the work --------
++     * STI;HLT is the K3 "sti;hlt stays alive" case: cpu_step returns 0 and
++     * the caller keeps stepping, so every further slot takes the all-idle
++     * branch and charges +512 to instr_count and vtime while retiring
++     * nothing.  Two idle slots: 2 + 512 + 512 = 1026. */
++    {
++        fresh();
++        const uint8_t prog[] = { 0xFB, 0xF4 };   /* STI ; HLT */
++        run(prog, sizeof prog, 4);
++        assert(g_m.cpu.executed_steps == 2);
++        assert(g_m.cpu.instr_count == 1026);
++        assert(g_m.vtime_instr == 1026);
++        assert(g_m.cpu.instr_count - g_m.cpu.executed_steps == 1024);
++        assert(g_m.cpu.halted == 1);
++        assert((g_m.cpu.rflags >> FLAG_IF_BIT) & 1);
++        printf("ok   idle slots charge the clock 512 each and execute 0 "
++               "(executed_steps=2, instr_count=vtime=1026)\n");
++    }
++
++    /* ---- 3. the K6 identity still holds ---------------------------------
++     * P0 adds a counter; it must not disturb the one the guest's clock is
++     * built on.  With one context, vtime_instr equals the BSP's instr_count
++     * bit for bit -- including the idle quantum, which is the point: vtime
++     * is a clock, not a work count. */
++    {
++        fresh();
++        const uint8_t prog[] = { 0xFB, 0xF4 };
++        run(prog, sizeof prog, 3);
++        assert(g_m.vtime_instr == g_m.cpu.instr_count);
++        assert(g_m.vtime_instr == 514);          /* 2 executed_steps + one quantum */
++        printf("ok   K6 identity vtime == BSP instr_count preserved (514)\n");
++    }
++
++    /* ---- 4. a faulting instruction is attempted ------------------------------
++     * cpu_step's done: block counts the attempt (instr_count++) and then
++     * reports the fault, so executed_steps follows it.  Asserted so that P1's
++     * translation cache cannot quietly change which attempts are counted. */
++    {
++        fresh();
++        /* UD2.  Deliberately not 0x06 (PUSH ES): the harness machine is real
++         * mode -- CR0=0x60000010 with EFER.LMA clear -- where 0x06 is a VALID
++         * 16-bit instruction and would retire without faulting. */
++        const uint8_t prog[] = { 0x0F, 0x0B };   /* UD2 -> #UD */
++        run(prog, sizeof prog, 4);
++        assert(g_m.cpu.fault == 1);
++        assert(g_m.cpu.executed_steps == 1);
++        assert(g_m.cpu.instr_count == 1);
++        printf("ok   a faulting attempt is counted once (executed_steps=1, fault=1)\n");
++    }
++
++    /* ---- 5. machine_executed_total sums the contexts ---------------------
++     * Slot 0 lives in m->cpu (the K6 exit path re-loads it and a single
++     * context never writes the slot); the rest are authoritative in their
++     * slots.  n_vcpus is 0 for the historical machine, so the effective
++     * context count is max(1, n) -- with 0 the loop must still count the
++     * BSP, which is the bug this vector pins. */
++    {
++        fresh();
++        g_m.cpu.executed_steps = 10;
++        assert(g_m.n_vcpus == 0);
++        assert(machine_executed_total(&g_m) == 10);
++
++        g_m.n_vcpus = 1;
++        assert(machine_executed_total(&g_m) == 10);
++
++        g_m.n_vcpus = 2;
++        g_m.vcpu[1].c.executed_steps = 7;
++        assert(machine_executed_total(&g_m) == 17);
++        printf("ok   machine_executed_total: 10 for n_vcpus 0 and 1, 17 for 2\n");
++    }
++
++    /* ---- 6. executed_steps scales with the program, not with the step budget ---
++     * The same tape stepped 10000 times instead of 5000 executes the same
++     * number: HLT with IF=0 ends the run, so a bigger budget cannot inflate
++     * the count.  This is the unit-level form of the cap-vs-real check that
++     * tests/perf_bench.sh applies to whole tapes. */
++    {
++        fresh();
++        static uint8_t prog[1001];
++        memset(prog, 0x90, 1000);
++        prog[1000] = 0xF4;
++        run(prog, sizeof prog, 10000);
++        assert(g_m.cpu.executed_steps == 1001);
++        assert(machine_executed_total(&g_m) == 1001);
++        printf("ok   a larger step budget does not inflate executed_steps (1001)\n");
++    }
++
++    printf("test-perf: all vectors passed\n");
++    return 0;
++}
+-- 
+2.47.3
+

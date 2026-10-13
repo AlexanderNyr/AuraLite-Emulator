@@ -1,10 +1,209 @@
 # Changelog
 
-All notable changes to AuraLite-Emulator are recorded here. The project
-ships as a `patches/` series on top of the baseline commit `33e2c5c`; each
-entry names its patch and the measured defect(s) it repaired.
+All notable changes to AuraLite-Emulator are recorded here. The recent
+`patches/` series (NET N0 onward) is based on the actual GitHub `main`
+commit `e79b7be`, not the older historical `33e2c5c` milestone. Each
+patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
+
+### Changed — patch 0055 (PERF P5, paired confidence + close-out)
+
+- P4's required profile gate was **NO-GO**, not a delivered dispatch
+  optimization: O2 gprof did not isolate switch cost, and the scratch
+  two-switch collapse had mixed paired results (Haswell/Broadwell both
+  slower in two series). Evidence in `docs/research/PERF_P4_GATE.md`; no
+  CPU change and no fictional dispatch-table NC.
+- New `make bench-compare PERF_BEFORE=... PERF_AFTER=...` reports seeded
+  paired-bootstrap 95% intervals after checking every seven-tape pair
+  for identical executed steps, idle, BSP/K6 clock, vCPU count, and
+  uncapped deterministic work. Nine-pair local P2→P3 remeasurement:
+  six UP lanes 1.237–1.279× point estimates; SMP 1.002× with interval
+  [0.977,1.026], so no SMP speed claim. No wall-time CI thresholds.
+- P5 adds five deterministic comparator vectors and one NC: scratch
+  equality-guard removal causes the SAME virtual-clock mismatch vector
+  to fail `AssertionError: ValueError not raised` (binary RC=1, wrapper
+  RC=1, make RC=2). P3→P5 binaries are bit-identical; nine available
+  historical firmware/video/SMP stdout/stderr/log/PPM pairs are byte-
+  identical. Defect ledger D0–D8 cross-references concrete vectors.
+  Frozen AuraLite-OS end-to-end lanes SKIP without its toolchain.
+
+### Changed — patch 0054 (PERF P3, RAM-only prefix/opcode predecode)
+
+- Measured post-P2 `decode_modrm` 8% and `fetch8` 6% of sampled CPU time;
+  `group1` took 970,913 redundant prefix/opcode re-fetch paths in one
+  4,837,677-attempt boot. A 512-slot machine-level prefix/opcode-only cache
+  now avoids those fetches on a successful same-page plain-RAM EXEC walk;
+  P2's RAM-write epoch and full paging/mode key provide coherence. Live
+  ModRM/SIB/imm, ROM/MMIO, cross-page and trace/debug stay on original
+  paths. `--stats` adds decode hits/misses without changing default output.
+- `test-decode` exercises opcode SMC, PTE remap, dynamic SIB/imm, boundary,
+  mode, trace, NX #PF with exact err/CR2/RIP, A20, nonpaging, MMIO
+  execute and a live MMIO immediate under a cached RAM opcode;
+  one scratch NC disables only the P3 epoch comparison: inner RC=134,
+  wrapper RC=1, make RC=2 at `assert(!(c->rflags & CF))`. The ring3
+  test's post-start raw instruction injector now explicitly flushes the
+  shared epoch after each host-side memcpy (as required for direct RAM
+  writes outside `mem_write`); its guest asserts remain unchanged.
+- Paired three-rep local P2→P3 medians: UP tapes 1.17–1.35× across two
+  series; SMP2 only ~1.02×, no meaningful claim. Work counts unchanged;
+  four historical stdout/stderr/log/PPM tapes byte-identical with the same
+  paths. Frozen guest toolchain absent (SKIP); no guest speed claim.
+
+### Changed — patch 0053 (PERF P2, coherent success-only TLB)
+
+- **Measured D6:** after P1, five O2 gprof boots gave `translate`
+  79,798,615 calls, **22.10%** of sampled CPU time (0.40 / 1.81 s).
+  A 256-slot, 4KiB-subpage successful-translation TLB now lives in
+  `machine_t` (NOT in the K6 vCPU copies). Key: VA page, full CR3/CR0/
+  CR4/EFER, RFLAGS.AC, CPL, descriptor-supervisor override and access
+  mode. Only a *successful* old walk through ordinary RAM-backed PTEs
+  with A20 open is cached; faults, dynamic MMIO/ROM tables, disabled A20
+  and all nonpaging paths still take the old walk. 2MiB/1GiB PS leaves
+  cache correct per-4KiB subpage physical bases.
+- Coherence is intentionally conservative: **every guest or device-DMA
+  RAM `mem_write`** advances a global generation (O(1)); MOV CR0/CR3/
+  CR4, LMSW, WRMSR EFER, INVLPG and machine reset also flush. The direct
+  *pre-execution* K1 loader table writes have an explicit flush before
+  CPU start. No device DMA bypass was found in `src/`: USB, AHCI and
+  e1000 writes use `mem_write`; VGA's raw text pointer is read-only.
+  INVLPG remains a **no-fault operand hint** (K2); it flushes globally.
+  `--stats` now adds internal-only TLB hits/misses/flushes, opt-in;
+  default stdout, K6 virtual clock and P0 work count do not change.
+- `tests/test_tlb.c`: warm hit followed by 5MiB→6MiB PTE rewrite and
+  exact new data; MOV CR3 / CR0 / CR4, LMSW, WRMSR EFER and no-fault
+  INVLPG; warmed read→nonpresent #PF (err=0) / NX fetch (err=0x11) /
+  supervisor WP write (err=0x3) / CPL3 U/S read (err=0x5), all with
+  matching CR2 and handler RIP; 2MiB/1GiB PS offsets; disabled A20;
+  dynamic MMIO page-table root that changes **without** RAM write;
+  SMP contexts with CR3/AC keys. `test-tlb: all vectors passed`.
+- **NC P2 (one per phase):** `tests/integration/p2_tlb_nc.sh` mutates a
+  scratch copy of `mem.c`, removes only the RAM-store TLB flush and runs
+  the **same** P2 vector. After a warmed PTE is rewritten,
+  `assert(c->gpr[RAX] == NEW_VALUE)` fails: binary **RC=134**, wrapper
+  **RC=1**, `make test-tlb-nc` **RC=2** (`make` reports Error 1). Receipt
+  `P2 NC: FAILED AS DESIGNED (RAM-store flush is necessary for PTE
+  coherence)`; production checkout untouched.
+- Firmware boot measured 15,863,692 hits / 4,668 misses / 4,669 flushes,
+  4,837,677 executed attempts; five post-P2 gprof boots kept 79,798,615
+  `translate` calls but cut `mem_read` calls from 313,666,250 to
+  78,188,375. Alternating O2 pre/post triples across seven tapes kept
+  identical work counts and gave local paired ratios **1.15–1.35×**
+  (haswell 429→328 and 420→333 ms). No fixed host-time CI threshold or
+  portable speedup claim. Four historical 600k-cap firmware/video stdout,
+  ring-log and PPM pairs are byte-identical RC=0/0, framebuffer SHA
+  prefixes `15c96625cfec5acc` / `c3b3d73f6bbb08ab`.
+  `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256`, and
+  `make bench BENCH_REPS=3` all **RC=0** (N2/N3 ALL PASS; 6,144 diff-fuzz
+  instructions match, 0 host crashes). Frozen guest lanes SKIP due
+  missing build toolchain, not counted as passing guest receipts.
+  In a fresh clone at parent `f7c3bd7`, `git am` applied cleanly to the
+  identical tree; after seeding nasm outputs, `make test`,
+  `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256`, `make bench
+  BENCH_REPS=3` each passed RC=0, while `make test-tlb-nc` failed RC=2
+  on the exact stale-PTE assertion as designed.
+
+
+### Changed — patch 0052 (PERF P1, profile-guided 8-byte RAM read)
+
+- **Measured hotspot D5, not a speculative refactor:** five O2 `-pg`
+  firmware runs aggregated by gprof: `mem_read` 313,666,250 calls,
+  45.66% of sampled time (1.21 / 2.65 s), including 235,535,030 calls
+  from `translate`'s 8-byte page-table walks. `mem_write` had only
+  2,514,365 calls / 0.00% of samples and was **not** changed. Only an
+  8-byte read *entirely inside RAM*, with A20 open, after both ROM alias
+  checks, takes an unaligned-safe `memcpy` on little-endian hosts. Closed
+  A20, partial reads at RAM end, ROM/BIOS (low alias lives *inside* RAM!),
+  MMIO, other widths and all writes follow the exact old path. Post-change
+  five-run profile: same 313,666,250 calls, 14.37% (0.26 / 1.81 s);
+  percentages are noisy samples, not a portable performance guarantee.
+- `tests/test_perf_mem.c` six vector groups: unaligned LE read; last 8/7/1
+  RAM bytes + FF fill/clipped writes; low/top ROM aliases and wrap;
+  closed-A20 start-only masking; untouched 1/2/4 widths; high MMIO BAR
+  callback versus existing RAM priority. `test-perf-mem: all vectors
+  passed` in both `make test` and `make test-sanitize`. Initial test
+  draft expected RAM at `0x1FFFFE` with A20 closed (which masks to the
+  **ROM** alias `0x0FFFFE`) and reddened RC=134; fixed the vector to
+  `0x3FFFFE` → `0x2FFFFE` (RAM), not the emulator.
+- **NC P1, one for the phase:** `tests/integration/p1_mem_nc.sh` makes a
+  scratch copy of `mem.c`, changes only the fast-path return to
+  `__builtin_bswap64(v)`, compiles the *same* regression vector. Inner
+  binary **RC=134** on `assert(mem_read(&g_m, 0x123, 8) ==
+  0x1716151413121110ULL)`, script **RC=1**, `make test-perf-mem-nc`
+  **RC=2**. Receipt: `P1 NC: FAILED AS DESIGNED (swapped-endian RAM fast
+  path is detected)`; production code and test checkout untouched.
+- O2 alternate pre1/post1/pre2/post2 on the same host, seven tapes ×3
+  repetitions: work counts identical on every tape (haswell
+  **4,837,677**), none reached cap. Haswell medians were 691→514 ms and
+  783→427 ms (paired ratios 1.34× and 1.83×); all seven tapes' paired
+  ratios fell between 1.18× and 1.83×. Even pre1/pre2 and post1/post2
+  differed substantially: **do not quote a universal speedup** or assert
+  a fixed wall-time gate. Four historical 600k-cap firmware/video tape
+  stdout, ring log and PPM were byte-identical before/after; SHA-256 PPM
+  prefixes `15c96625cfec5acc` (boot/VBE/on-off) and
+  `c3b3d73f6bbb08ab` (no-fb). `make test` **RC=0**, `make test-sanitize`
+  **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0** (6,144 instructions,
+  all states match; zero host crashes). Frozen guest lanes SKIP: missing
+  toolchain and build artifacts; not silently counted as passing.
+  `docs/plans/PERF_PLAN.md` §4 records the before/after profile, paired
+  timing table, boundary proof and fresh-clone verification: `git am`
+  cleanly on P0 produced the same tree; after seeding the three ignored
+  nasm artifacts, `make test`, `make test-sanitize`, `make fuzz
+  FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` each passed RC=0; the
+  P1 NC failed by design with `make` RC=2.
+
+
+### Added — patch 0051 (PERF P0, honest benchmark before optimization)
+
+- The missing performance baseline is now *measured*, not inferred from a
+  `--max-instr` ceiling. During P0 scoping a 20M cap / 0.685s was mistakenly
+  reported as **28.69 MIPS**; the built binary actually stopped at
+  `instr=4837677`, or **7.06 Msteps/s** on that run (cap/actual = 4.13×).
+  Independently, `STI;HLT` + two idle cpu_step slots yields
+  `instr_count=vtime=1026` but only **2** instruction attempts: the K3
+  `+512` all-idle virtual-time quantum is the K6 *guest clock*, not work.
+  Changing this clock to "fix" MIPS would violate the frozen guest timing
+  contract, so the repair adds `cpu.executed_steps` alongside it. The new
+  metric counts a faulting attempt too and is **not** ISA retirement.
+- `--stats` is opt-in, reporting per-vCPU executed steps, machine total,
+  idle delta, BSP instruction clock, virtual clock and cap-reached flag;
+  without it stdout does not change. `machine_executed_total` handles
+  `n_vcpus=0` (historical UP case) and sums slot 1 when `--smp=2`.
+  `tests/test_perf.c`: six deterministic vectors, including `STI;HLT` with
+  two idle slots (`executed_steps=2`, `instr_count=vtime=1026`), K6 identity,
+  faulting UD2, context-count 0/1/2 and a bigger budget on a stopped tape.
+- `make bench` rebuilds **separate O2 `x86emu-bench`** even after
+  `make test-sanitize` has replaced `x86emu` with O1 ASan+UBSan; seven
+  firmware tapes × odd number of repetitions (default 5) yield the median
+  whole-process wall time, Msteps/s and ns/attempt. It rejects non-
+  deterministic work counts, a run cut off by its cap or a zero-work tape;
+  it never gates on a fixed host timing. Measured here at O2 with 5 reps:
+  boot-haswell 4,837,677 steps / 678 ms / 7.14 Msteps/s; boot-broadwell
+  4,807,694 / 666 ms / 7.22; boot-baytrail 4,807,650 / 668 ms / 7.20;
+  text-no-fb 4,837,677 / 676 ms / 7.16; gfx-fb 4,837,677 / 671 ms /
+  7.21; VBE 800x600x32 4,837,677 / 671 ms / 7.21; SMP2 4,837,677 /
+  985 ms / 4.91. **These wall times belong to this machine only**.
+- **NC P0 (one per phase):** `make bench-nc BENCH_REPS=3` uses the *same*
+  wall measurements but divides the cap instead of the executed count;
+  receipt `perf bench NC: FAILED AS DESIGNED (cap-based MIPS is not a
+  measurement)`. Direct `tests/perf_bench.sh --reps=3 --nc` exits
+  **RC=1**; `make bench-nc BENCH_REPS=3` exits **RC=2** because make
+  reports the recipe's Error 1 as its own failure. On haswell boot: 50M / 4,837,677 = **10.34×**
+  overstatement. The shipped harness uses 4,837,677 and passes RC=0.
+- Pre/post at the same `--log`/`--dump-fb` paths: four historical 600k-
+  cap lanes (boot, VBE on, VBE off, no-fb), stdout, ring-log and PPM all
+  **byte-identical**, each RC=0/0; framebuffer SHA prefixes
+  `15c96625cfec5acc` (boot/on/off) and `c3b3d73f6bbb08ab` (no-fb).
+  `make test` **RC=0** (`test-perf: all vectors passed`, N2/N3 receipts),
+  `make test-sanitize` **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0**
+  (256 programs, 6144 instructions, all states match, 0 host crashes).
+  `docs/plans/PERF_PLAN.md` begins the phase ledger and records exact gates,
+  remaining P1–P5, constraints and the known missing guest toolchain.
+  The phase patch also applied cleanly with `git am` on `a3f76b5` in a fresh
+  clone, producing the identical tree; after seeding the nasm artifacts,
+  that clone passed `make test` and `make test-sanitize` RC=0, `make bench
+  BENCH_REPS=3` RC=0; `make bench-nc BENCH_REPS=3` RC=2 as designed.
+
 
 ### Fixed — patch 0050 (VIDEO V4, dispi mode clamp: host heap overflow)
 

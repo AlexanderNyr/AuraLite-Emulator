@@ -1,0 +1,720 @@
+From 1e771cd766d77928eecc4a8471d1bca2d30c081a Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 12 Oct 2026 19:48:07 +0000
+Subject: [PATCH] PERF P5: paired confidence and deterministic close-out
+
+---
+ CHANGELOG.md                       |  28 +++++-
+ Makefile                           |  24 ++++-
+ ROADMAP.md                         |  11 +-
+ docs/STATUS.md                     |  18 ++++
+ docs/plans/PERF_PLAN.md            | 156 ++++++++++++++++++++++++-----
+ docs/research/PERF_P4_GATE.md      |  35 +++++++
+ tests/integration/p5_compare_nc.sh |  35 +++++++
+ tests/integration/p5_history.sh    |  58 +++++++++++
+ tests/perf_compare.py              | 138 +++++++++++++++++++++++++
+ tests/test_perf_compare.py         |  63 ++++++++++++
+ 10 files changed, 535 insertions(+), 31 deletions(-)
+ create mode 100644 docs/research/PERF_P4_GATE.md
+ create mode 100755 tests/integration/p5_compare_nc.sh
+ create mode 100755 tests/integration/p5_history.sh
+ create mode 100755 tests/perf_compare.py
+ create mode 100755 tests/test_perf_compare.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c243cdd..f14ab2b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,11 +1,33 @@
+ # Changelog
+ 
+-All notable changes to AuraLite-Emulator are recorded here. The project
+-ships as a `patches/` series on top of the baseline commit `33e2c5c`; each
+-entry names its patch and the measured defect(s) it repaired.
++All notable changes to AuraLite-Emulator are recorded here. The recent
++`patches/` series (NET N0 onward) is based on the actual GitHub `main`
++commit `e79b7be`, not the older historical `33e2c5c` milestone. Each
++patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Changed — patch 0055 (PERF P5, paired confidence + close-out)
++
++- P4's required profile gate was **NO-GO**, not a delivered dispatch
++  optimization: O2 gprof did not isolate switch cost, and the scratch
++  two-switch collapse had mixed paired results (Haswell/Broadwell both
++  slower in two series). Evidence in `docs/research/PERF_P4_GATE.md`; no
++  CPU change and no fictional dispatch-table NC.
++- New `make bench-compare PERF_BEFORE=... PERF_AFTER=...` reports seeded
++  paired-bootstrap 95% intervals after checking every seven-tape pair
++  for identical executed steps, idle, BSP/K6 clock, vCPU count, and
++  uncapped deterministic work. Nine-pair local P2→P3 remeasurement:
++  six UP lanes 1.237–1.279× point estimates; SMP 1.002× with interval
++  [0.977,1.026], so no SMP speed claim. No wall-time CI thresholds.
++- P5 adds five deterministic comparator vectors and one NC: scratch
++  equality-guard removal causes the SAME virtual-clock mismatch vector
++  to fail `AssertionError: ValueError not raised` (binary RC=1, wrapper
++  RC=1, make RC=2). P3→P5 binaries are bit-identical; nine available
++  historical firmware/video/SMP stdout/stderr/log/PPM pairs are byte-
++  identical. Defect ledger D0–D8 cross-references concrete vectors.
++  Frozen AuraLite-OS end-to-end lanes SKIP without its toolchain.
++
+ ### Changed — patch 0054 (PERF P3, RAM-only prefix/opcode predecode)
+ 
+ - Measured post-P2 `decode_modrm` 8% and `fetch8` 6% of sampled CPU time;
+diff --git a/Makefile b/Makefile
+index e2314af..8c89c38 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,13 +7,14 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+ # sample rather than an average of two; the script rejects an even value.
+ BENCH_REPS    ?= 5
+ BENCH_CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror
++BENCH_PAIR_REPS ?= 9
+ 
+ # C11 differential fuzzer knobs (bigger numbers = nightly runs)
+ FUZZ_PROGRAMS ?= 512
+@@ -182,7 +183,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
++test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -192,7 +193,24 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++
++# PERF P5: confidence intervals are reports; guest work/clock equality is a
++# deterministic gate.  No implicit binary rebuild (sanitizers must not leak
++# into one side).  Set PERF_BEFORE and PERF_AFTER to explicit O2 binaries.
++test-perf-compare: tests/perf_compare.py tests/test_perf_compare.py
++	python3 tests/test_perf_compare.py
++
++test-perf-compare-nc: tests/integration/p5_compare_nc.sh tests/perf_compare.py tests/test_perf_compare.py
++	sh tests/integration/p5_compare_nc.sh
++
++test-perf-history: tests/integration/p5_history.sh firmware/firmware.bin disk/disk.img
++	@test -n "$(PERF_BEFORE)" -a -n "$(PERF_AFTER)" || { echo 'set PERF_BEFORE and PERF_AFTER' >&2; exit 1; }
++	bash tests/integration/p5_history.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
++
++bench-compare: tests/perf_compare.py firmware/firmware.bin disk/disk.img
++	@test -n "$(PERF_BEFORE)" -a -n "$(PERF_AFTER)" || { echo 'set PERF_BEFORE and PERF_AFTER to explicit binary paths' >&2; exit 1; }
++	python3 tests/perf_compare.py --before "$(PERF_BEFORE)" --after "$(PERF_AFTER)" --reps=$(BENCH_PAIR_REPS)
+ 
+ # PERF P0: wall-clock bench.  NOT part of 'make test': its numbers are this
+ # machine's, so a gate on them would be a gate on the runner.  What it DOES
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 2bf5a42..679a738 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,7 +31,7 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4–P5 📋 | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; next profile-guided dispatch if measured | P0–P5 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+@@ -78,6 +78,15 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+   shared RAM-write epoch, SMC/PTE/NX/MMIO/mode vectors and one deliberate
+   stale-opcode NC, seven paired P0 tapes, historical byte identity~~ shipped.
+   SMP2 ratio ~1.02×; no universal speed claim.
++- `P4` — measured NO-GO, not a patch: the switch cost was not isolated in
++  O2 gprof and a scratch direct-group1 route had mixed seven-tape paired
++  results. See `docs/research/PERF_P4_GATE.md`; no dispatch table or NC
++  was invented. Reopen only with a genuinely hot dispatch profile.
++- ~~`0055` — PERF P5: paired nine-rep seven-tape O2 comparison with seeded
++  bootstrap local 95% intervals, exact guest work/K6 clock equality and
++  a deliberate mismatched-clock NC, defect D0–D8 vector ledger, nine
++  byte-identical historical lanes, full gates and fresh-clone git am~~
++  shipped. SMP interval includes 1; no claimed P5 runtime speedup.
+ 
+ 
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index b810700..5f4d736 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -637,6 +637,24 @@
+   instruction injection. Full gates/fresh-clone receipt in PERF_PLAN §6.4.
+   Frozen AuraLite-OS toolchain absent: guest lanes SKIP. P4–P5 planned.
+ 
++- PERF P4 measured NO-GO: gprof on P3 did not isolate opcode-switch
++  cost, and a scratch-only direct-group1 dispatch experiment gave mixed
++  paired results (including two Haswell/Broadwell slowdowns). No CPU
++  dispatcher or bogus phase patch was shipped. Reproduction:
++  `docs/research/PERF_P4_GATE.md`.
++- PERF P5 (`patches/0055-PERF-P5-paired-confidence-closeout.patch`): the
++  seven-tape comparator now measures alternating before/after O2 pairs,
++  rejects unequal guest steps/idle/BSP clock/vtime/vCPU count and capped or
++  nondeterministic runs, then reports seeded 95% *local* bootstrap intervals
++  without timing CI thresholds. Nine-pair P2→P3 UP estimates 1.237–1.279×;
++  SMP 1.002× [0.977,1.026] has no speed claim. P3→P5 binaries are
++  bit-identical; nine available historical stdout/stderr/log/PPM lanes are
++  byte-identical; N2/N3 wire gates remain x2. Five P5 comparator vectors
++  pass, and its single NC removes the work-equality guard and fails
++  `AssertionError: ValueError not raised` (inner 1, make 2). D0–D8 map
++  to concrete vectors in PERF_PLAN. Full gates/fresh-clone verdict in §8.4.
++  Frozen guest lanes SKIP without its absent toolchain.
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/PERF_PLAN.md b/docs/plans/PERF_PLAN.md
+index dfff52b..22e4131 100644
+--- a/docs/plans/PERF_PLAN.md
++++ b/docs/plans/PERF_PLAN.md
+@@ -10,10 +10,11 @@
+ P1 ✅ (`patches/0052-PERF-P1-profiled-ram-read.patch`),
+ P2 ✅ (`patches/0053-PERF-P2-coherent-success-tlb.patch`),
+ P3 ✅ (`patches/0054-PERF-P3-ram-prefix-predecode.patch`);
+-P4–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
+-first, RAM fast path, translation TLB, decode cache, profiling/dispatch,
+-then hardening and closure. Future phases are scoped, not pre-approved for
+-implementation: measure an actual hotspot before writing an optimization.
++P4 **NO-GO** (measured dispatch hypothesis rejected; no CPU patch),
++P5 ✅ (`patches/0055-PERF-P5-paired-confidence-closeout.patch`).** P4's
++"stop if not hot" gate is an outcome, NOT a claimed dispatch optimization.
++The P5 close-out adds paired uncertainty estimates and a guest-work/clock
++gate without changing the emulator binary.
+ 
+ | Phase | Deliverable | Gate | Status |
+ |---|---|---|---|
+@@ -21,8 +22,8 @@ implementation: measure an actual hotspot before writing an optimization.
+ | P1 | Measured-hot 8-byte full-span RAM read fast path; ROM/MMIO/A20/boundary remain on old path | six bus vectors + LE-swap NC, differential fuzz, seven P0 tapes paired pre/post | ✅ 0052 |
+ | P2 | Success-only 4KiB-subpage TLB; conservative RAM-store/DMA and control-operation flushes, security-context key | warm-PTE rewrite, #PF CR2/err/RIP, CPL3/WP/NX, MMIO, PS, SMP vectors, NC + differential fuzz + P0 tapes | ✅ 0053 |
+ | P3 | RAM-only single-page prefix/opcode predecode; dynamic ModRM/SIB/imm never cached; shared P2 write generation | SMC/PTE/MMIO/NX/mode/boundary vectors + one NC + fuzz + paired P0 tapes | ✅ 0054 |
+-| P4 | Profile-guided dispatch optimization only if the profile justifies it | `-pg`/gprof before/after + `make fuzz` + P0 tape ratios | 📋 |
+-| P5 | Repeated-run regression policy, sanitizer, closed defect ledger, documentation | all gates, historical byte-identical lanes, one NC, fresh-clone `git am` | 📋 |
++| P4 | Profile-guided dispatch ONLY if measured; no change if gate fails | O2 `-pg`/gprof + gcov + paired seven-tape scratch probe | NO-GO; no patch |
++| P5 | Paired local bootstrap CI + strict work/clock gate + history/ledger close-out | unit vectors + one NC, all gates, 9 available historical lanes, fresh-clone `git am` | ✅ 0055 |
+ 
+ ## 1. Measured baseline (`AuraLite-Emulator@a3f76b5` → P0)
+ 
+@@ -496,24 +497,131 @@ fresh clone and its source tree checked again; the full gate run above
+ used the identical code and vectors. Frozen AuraLite-OS lanes SKIP
+ without its toolchain, so no guest speed is claimed.
+ 
+-## 6. Planned phases — gate before optimization
+-
+-**P4 (profile/dispatch).** `perf` and `valgrind` are **absent** here;
+-`gprof` is available. Capture a `-pg` baseline and call graph before
+-any table/threaded-dispatch change in the nested `cpu.c` opcode switches;
+-stop if the suspected dispatch cost is not in the profile. Preserve
+-single-/two-byte, prefix and exception paths. NC swaps one dispatch table
+-entry, requiring the ISA vector to fail. All state/fault/fetch counts and
+-P0 tapes must remain identical; no timing-only assertion.
+-
+-**P5 (hardening/close).** Re-measure all P0 tapes before/after on one host
+-with the same compiler and input artifacts, collect confidence intervals
+-for any performance claim rather than pinning a one-run wall time in CI,
+-close the defect ledger with per-defect vectors, include the one NC for
+-P5, re-run all guest-visible historical receipts, and verify `git am` in
+-a fresh clone.
+-
+-## 7. Standing constraints
++## 7. P4 — profile gate closed (NO-GO; no implementation patch)
++
++The reproducible primary evidence is in
++[`docs/research/PERF_P4_GATE.md`](../research/PERF_P4_GATE.md). On P3,
++five O2 `-pg` boot runs gave `cpu_step` 16.67% *inclusive of all instruction
++execution*, `perf_decode_hit` 11.31%, `translate` 19.05%; the profile did
++NOT isolate switch dispatch as a hot operation. Coverage counted 3,876,786
++visits to the second switch per 4,837,677 executed attempts (970,913
++`group1`), but counts alone are not time. A scratch-only direct group1
++route removed that extra switch; two alternating 3-rep seven-tape series
++were mixed (Haswell 202→205 and 208→220 ms; Broadwell 206→238 and
++209→220 ms, Baytrail improved, SMP ~unchanged). There is no robust
++speedup and no CPU dispatch change. The conditional "swap a dispatch table
++entry" NC in the original P4 scope is **not applicable**: no table was
++introduced, and neither a false patch nor a fabricated NC is shipped.
++P4 is an explicit measured NO-GO, not a delivered optimization.
++
++## 8. P5 — paired confidence + deterministic close-out, one patch
++
++### 8.1 Measured defect and the measurement contract
++
++**D8 (measurement gap):** P0–P3 quoted medians from 3–5 repetitions;
++these are useful local measurements but don't show sampling uncertainty.
++P5 adds `tests/perf_compare.py` (invoked by `make bench-compare` with two
++**explicit O2 binary paths**; it never silently rebuilds or compares an
++O1 sanitizer binary with an O2 binary). It runs all seven P0 argv/caps,
++nine alternating-order pre/post pairs each by default, times processes
++externally with `perf_counter_ns`, and requires exit=0, nonzero attempted
++work, no cap, deterministic per-tape repetitions, and equality across builds
++of executed steps, idle quantum, BSP `instr_count`, `vtime`, and vCPU count.
++A different K6 clock is a **hard failure** even if stdout is otherwise
++unchanged. Only after this deterministic gate does it report the geometric
++mean of within-pair pre/post elapsed-time ratios and a seeded 10,000-draw
++paired-bootstrap 2.5/97.5-percentile **95% descriptive interval** on log
++ratios. No CI endpoint is a CI test threshold: nine pairs on one machine
++can't guarantee cross-host speed. Prefixes/operand bytes and P3/P4 CPU
++code are unchanged by P5.
++
++Nine-pair remeasurement on one host, same `cc -std=c11 -O2 -Wall -Wextra
++-Werror -Isrc src/*.c -lm`, shared firmware/disk bytes, P2→P3:
++
++| P0 tape | Work | Geometric mean ratio | Local paired-bootstrap 95% interval |
++|---|---:|---:|---:|
++| boot-haswell | 4,837,677 | 1.257× | [1.227×, 1.292×] |
++| boot-broadwell | 4,807,694 | 1.268× | [1.242×, 1.305×] |
++| boot-baytrail | 4,807,650 | 1.237× | [1.174×, 1.280×] |
++| text-no-fb | 4,837,677 | 1.279× | [1.231×, 1.365×] |
++| gfx-fb | 4,837,677 | 1.252× | [1.213×, 1.293×] |
++| vbe-800x600x32 | 4,837,677 | 1.269× | [1.225×, 1.311×] |
++| smp2 | 4,837,677 | 1.002× | [0.977×, 1.026×] |
++
++The SMP interval includes one: **no SMP speed claim**. P3→P5 was
++recompiled with the same flags: the two x86emu binaries are bit-for-bit
++identical (SHA256 `04ebac0ea66a5d58…`). Nine-pair ratios by tape are
++1.001, 0.996, 1.014, 0.967, 0.987, 1.014, 1.004; **every** corresponding
++interval includes 1. The remaining wall variation is host noise, not P5
++speedup or regression. All 7×9 pairs had identical guest work and clocks;
++none capped. The actual sample counts and exact ratios are the local
++receipt, not portable constant-speed promises.
++
++### 8.2 Regression vectors, defect ledger, and one NC
++
++`make test-perf-compare` runs five deterministic Python vectors: SMP idle
++steps (2) distinct from K6 vtime (1026), reject empty/capped runs, reject
++missing/duplicate global stats, reject mismatched guest work/clock, and
++seeded bootstrap behavior without a timing assertion. The **one P5 NC**
++(`make test-perf-compare-nc`) changes only the equality guard in a scratch
++copy of the comparator; the SAME clock-mismatch vector fails with
++`AssertionError: ValueError not raised` (inner RC=1, wrapper RC=1,
++make RC=2). It does not mutate `src/`.
++
++| Defect | Concrete vector / gate (all in this patch series) | Closure |
++|---|---|---|
++| D0 cap-as-numerator | `make test-perf`, `make bench-nc` | P0 separately counts executed steps; cap NC red. |
++| D1 K3 idle inflation | `make test-perf`, P5 `test_paired_idle_not_cap` | 2 attempts vs 1026 vtime pinned. |
++| D2 UP n_vcpus=0 | `make test-perf` | BSP sum tested for 0/1/2 slots. |
++| D3 no time measurement | `make bench`, P5 `make bench-compare` | medians and local paired intervals; timing not a CI threshold. |
++| D4 accidental no-fb everywhere | `make bench` seven distinct argv and P5 history no-fb vs gfx | PPM SHA prefixes differ: `c3b3…` vs `15c9…`. |
++| D5 slow 8-byte RAM reads | `make test-perf-mem`, one P1 LE-swap NC | P1 fast path only for entire A20-open RAM span. |
++| D6 repeated successful page walks | `make test-tlb`, one P2 stale-PTE NC | RAM/PTE/DMA coherence, exact #PF err/RIP/CR2. |
++| D7 repeated group1 prefix re-fetch | `make test-decode`, one P3 stale-opcode NC | P3 RAM-only predecode; dynamic ModRM/imm, MMIO, NX still live. |
++| D8 unquantified local timing uncertainty / mismatched work | P5 `make test-perf-compare`, one P5 work-equality NC | Paired CI report only after the guest-work/clock gate. |
++
++P4 did **not** establish a defect in opcode dispatch; it is a no-go study,
++not silently added to this table as a fixed defect.
++
++### 8.3 Historical identity and gates
++
++`make test-perf-history PERF_BEFORE=... PERF_AFTER=...` replays nine
++available 600k-cap firmware/video/SMP lanes using the SAME `--log` and
++`--dump-fb` paths. Pre/post stdout, stderr, log and PPM were **byte-
++identical** on all nine (Haswell, VBE on/off, no-fb, Sandybridge,
++Ivybridge, Broadwell, Baytrail, SMP2; RC=0/0). N2/N3 wire tests in
++`make test` each run x2 with byte-identical receipts (N2/N3 ALL PASS).
++Frozen AuraLite-OS guest kernel/initrd and build toolchain are absent,
++so guest STORE/USB/VIDEO/NET end-to-end lanes legitimately **SKIP**; the
++firmware and protocol fixtures are not misrepresented as a fresh guest
++boot. The one P5 NC fails by design, and default emulator stdout/clock
++remains unchanged because no runtime source is modified.
++
++### 8.4 Final fresh-clone `git am` receipt
++
++From P3 parent `6d700d2`, the P5 patch applied with `git am` in a
++fresh clone, and `HEAD^{tree}` matched the development tree. The ignored
++nasm firmware/disk artifacts were seeded from the same development
++checkout; `make -n` showed both up to date (nasm unavailable). In that
++clone, `make test` **RC=0** (five P5 vectors, N2/N3 ALL PASS; frozen OS
++lanes SKIP), `make test-sanitize` **RC=0**, `make fuzz
++FUZZ_PROGRAMS=256` **RC=0** (6,144 compared instructions; zero host
++crashes), `make bench BENCH_REPS=3` **RC=0** (all seven deterministic),
++`make test-perf-history` **RC=0** (nine byte-identical pairs, distinct
++no-fb vs gfx), and `make bench-compare` with nine pairs **RC=0**.
++A second independent local P2→P5 comparator series yielded UP point
++ratios 1.176–1.308× (all local intervals above 1) and SMP 0.994×
++[0.951×, 1.036×] (still no SMP speed claim). The single P5 NC gave
++scratch Python **RC=1**, wrapper **RC=1**, make **RC=2** on
++`test_work_mismatch_rejected: AssertionError: ValueError not raised`.
++
++The final patch's receipt-only documentation amendment was then applied
++via `git am` in another fresh clone, checked for identical final tree,
++and its P5 vectors re-run. The full-gate fresh clone used the identical
++source, scripts and vectors. No CPU, bus or K6 clock changes were made in
++P5, and no out-of-host speed guarantee is claimed.
++
++## 9. Standing constraints
+ 
+ 1. Do not change `instr_count`/`vtime_instr` semantics: they are the K6
+    guest clock and include K3 idle quanta. An optimization that returns
+diff --git a/docs/research/PERF_P4_GATE.md b/docs/research/PERF_P4_GATE.md
+new file mode 100644
+index 0000000..7facbf2
+--- /dev/null
++++ b/docs/research/PERF_P4_GATE.md
+@@ -0,0 +1,35 @@
++# PERF P4 — измерительный gate: оптимизация dispatch НЕ разрешена
++
++Дата: 2026-10-12. База: `6d700d2` (завершённая P3); рабочий код репозитория **не изменён**. Это исследовательский отчёт, **не фазовый `.patch`**: P4 не объявлена завершённой и не получила фиктивного ускорения. План `docs/plans/PERF_PLAN.md` требует остановиться, если профиль не подтверждает цену диспетчеризации.
++
++## 1. Профиль до изменений
++
++Собран отдельный `-O2 -g -pg` бинарник из `src/*.c`, выполнены пять Haswell-загрузок с 50-миллионным лимитом (каждая закончилась на **4 837 677** попытках), затем `gprof -s`/`gprof -b` суммировали пять `gmon`-файлов. В плоском профиле всего **0,84 с** выборок с шагом **0,01 с**: `translate` **19,05% / 0,16 с**, `cpu_step` **16,67% / 0,14 с** собственного времени, `perf_decode_hit` **11,31% / 0,10 с**, `decode_modrm` **3,57% / 0,03 с**. `cpu_step` включает **всё исполнение инструкций**, а не только ветвление switch: его процент нельзя объявлять «стоимостью dispatch». В call graph у `cpu_step` ещё **0,49 с** времени дочерних вызовов. Разрешение выборки недостаточно, чтобы достоверно выделить выигрыш от одного перехода.
++
++Отдельный двадцатипроходный `-O2 -g -pg` профиль с `gprof -l` дал **3,17 с** выборок: на строку первого `switch(op)` было отнесено **0,01 с / 0,32%**. Строчных записей для второго и третьего switch как отдельных измеримых горячих точек не появилось; это не доказывает нулевую стоимость, но запрещает утверждать, что именно там измерен bottleneck. Атрибуция `_init` и строк при оптимизации шумна, поэтому эти данные — указание на предел метода, не абсолютная оценка стоимости ветвления. `perf` и `valgrind` в окружении отсутствуют.
++
++O2 `gcov` на одной такой же загрузке: первый `switch(op)` исполняется **4 837 677** раз; его `default` — **3 876 786** раз, второй `switch(op)` — **3 876 786** раз; в `group1` попадает **970 913**, а в `really_slow` **2 905 873**. Частота прохода через switch измерена; его *цена во времени* — нет.
++
++Воспроизведение профиля: компилировать `cc -std=c11 -O2 -g -pg -fno-omit-frame-pointer -Wall -Wextra -Werror -Isrc src/*.c -o /tmp/p4-profile/x86emu -lm`, запускать из корня репозитория (относительные firmware/disk-артефакты), сохранять `gmon.out` после каждого запуска, агрегировать `gprof -s /tmp/p4-profile/x86emu gmon.1 ... gmon.5` и читать `gprof -b /tmp/p4-profile/x86emu gmon.sum`. Для coverage: `--coverage -O2` и `gcov -o <binary>-cpu.gcno src/cpu.c` **из корня репозитория**.
++
++## 2. Непоставляемая структурная проба
++
++В `/tmp/p4-trial/cpu.c` (вне репозитория) проверена **ровно одна** гипотеза: направлять `0x80/0x81/0x83` сразу из первого switch в прежний `group1`, а остальные `default` — прямо в `really_slow`, убрав второй switch. Декодирование ModRM, повторный fetch в медленном случае, immediate, исключения и часы не менялись. Это проба, **не принятый фикс**; полный набор ISA/#PF-гейтов к ней не запускался. Она скомпилирована теми же `-O2 -Wall -Wextra -Werror`, что и контрольный P3-бинарник, и сохранила число попыток на семи P0-лентах.
++
++Две чередующиеся пары `pre1/post1/pre2/post2`, по три повтора на ленту, одна машина; миллисекунды — медианы:
++
++| Лента | Пара 1 P3→проба | Пара 2 P3→проба |
++|---|---:|---:|
++| boot-haswell | 202→205 (0,985×) | 208→220 (0,945×) |
++| boot-broadwell | 206→238 (0,866×) | 209→220 (0,950×) |
++| boot-baytrail | 240→204 (1,176×) | 220→203 (1,084×) |
++| text-no-fb | 212→212 (1,000×) | 212→205 (1,034×) |
++| gfx-fb | 207→210 (0,986×) | 211→203 (1,039×) |
++| vbe-800x600x32 | 213→207 (1,029×) | 212→202 (1,050×) |
++| smp2 | 477→480 (0,994×) | 484→482 (1,004×) |
++
++Здесь нет устойчивого выигрыша: обе Haswell- и Broadwell-пары ухудшились, SMP практически без изменений, результаты других лент неоднородны. Работа (`executed`) на каждой ленте совпала, но сама по себе этого мало для выпуска изменений в dispatch.
++
++## 3. Решение
++
++**NO-GO для табличного/threaded dispatch и для проверенной двухуровневой перестановки**: горячая стоимость именно dispatch не установлена профилем, а узкая контрольная проба не показала устойчивого улучшения. Измерительный gate плана сработал: исходный `src/cpu.c` остаётся без P4-изменений; `.patch` «для галочки», NC вымышленной таблицы и утверждение об ускорении **не создаются**. P4 остаётся остановленной, а не завершённой оптимизацией. Возвращаться к ней имеет смысл с более точным профилировщиком/контролируемой нагрузкой, где именно ветвление, а не выполнение обработчика, показано горячим. P5 (отдельная фаза повторных измерений и hardening) может выполняться без насильственной поставки P4.
+diff --git a/tests/integration/p5_compare_nc.sh b/tests/integration/p5_compare_nc.sh
+new file mode 100755
+index 0000000..330ab55
+--- /dev/null
++++ b/tests/integration/p5_compare_nc.sh
+@@ -0,0 +1,35 @@
++#!/bin/sh
++# P5's ONE negative control: remove ONLY the cross-build guest-work/clock
++# equality check from a scratch comparator. The same vector must go red.
++set -eu
++root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
++cd "$root"
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++cp tests/perf_compare.py "$tmp/perf_compare.py"
++python3 - "$tmp/perf_compare.py" <<'PY'
++from pathlib import Path
++import sys
++p = Path(sys.argv[1]); s = p.read_text()
++a = '    if any(before[k] != after[k] for k in WORK_KEYS):'
++b = '    if False:  # P5 NC: accept changed guest clock/work as speedup'
++assert s.count(a) == 1, 'one work-equality guard must exist'
++p.write_text(s.replace(a, b, 1))
++PY
++set +e
++PERF_COMPARE_MODULE="$tmp/perf_compare.py" python3 tests/test_perf_compare.py >"$tmp/out" 2>"$tmp/err"
++rc=$?
++set -e
++if [ "$rc" -eq 0 ]; then
++    echo 'P5 NC BROKEN: mismatched virtual clocks were accepted as equal' >&2
++    exit 2
++fi
++if ! grep -F -q -e 'AssertionError: ValueError not raised' "$tmp/err" || \
++   ! grep -F -q -e 'test_work_mismatch_rejected' "$tmp/err"; then
++    echo "P5 NC BROKEN: failed for another reason (inner rc=$rc):" >&2
++    cat "$tmp/err" >&2
++    exit 2
++fi
++printf 'P5 NC: inner rc=%s; test_work_mismatch_rejected: ValueError not raised\n' "$rc"
++echo 'P5 NC: FAILED AS DESIGNED (cross-build guest work/clock equality is required)'
++exit 1
+diff --git a/tests/integration/p5_history.sh b/tests/integration/p5_history.sh
+new file mode 100755
+index 0000000..0cb2bf5
+--- /dev/null
++++ b/tests/integration/p5_history.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++# PERF P5: paired historical firmware/video receipts using identical output
++# paths for each binary.  Relative artifact names resolve from the repo root.
++# This complements N2/N3's separate x2 wire gates in `make test`.
++set -euo pipefail
++root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
++cd "$root"
++[ "$#" -eq 2 ] || { echo "usage: $0 BEFORE_BINARY AFTER_BINARY" >&2; exit 2; }
++pre=$(realpath "$1"); post=$(realpath "$2")
++[ -x "$pre" ] && [ -x "$post" ] || { echo 'missing executable' >&2; exit 2; }
++for artifact in firmware/firmware.bin disk/disk.img; do
++    [ -f "$artifact" ] || { echo "missing $artifact" >&2; exit 2; }
++done
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++# Deliberately keep the first four original P2/P3 firmware/video lane shapes
++# (including the exact --dump-fb and --log option paths).
++lanes=(
++ 'boot-haswell|--platform=haswell'
++ 'vbe-on|--platform=haswell --vbe=800x600x32'
++ 'vbe-off|--platform=haswell --vbe=off'
++ 'no-fb|--platform=haswell --no-fb'
++ 'boot-sandybridge|--platform=sandybridge'
++ 'boot-ivybridge|--platform=ivybridge'
++ 'boot-broadwell|--platform=broadwell'
++ 'boot-baytrail|--platform=baytrail'
++ 'smp2|--platform=haswell --smp=2 --cpus=2'
++)
++for lane in "${lanes[@]}"; do
++    IFS='|' read -r name opts <<< "$lane"
++    for side in pre post; do
++        if [ "$side" = pre ]; then bin=$pre; else bin=$post; fi
++        # Same names in stdout for both runs, independent of output directory.
++        # shellcheck disable=SC2086
++        "$bin" $opts --max-instr=600000 --log="$work/shared.log" \
++            --dump-fb="$work/shared.ppm" >"$work/$side.out" 2>"$work/$side.err"
++        cp "$work/shared.log" "$work/$side.log"
++        cp "$work/shared.ppm" "$work/$side.ppm"
++    done
++    for artifact in out err log ppm; do
++        if ! cmp -s "$work/pre.$artifact" "$work/post.$artifact"; then
++            echo "P5 HISTORY DIFF: $name $artifact" >&2
++            exit 1
++        fi
++    done
++    if [ "$name" = boot-haswell ]; then
++        cp "$work/pre.ppm" "$work/gfx.ppm"
++    elif [ "$name" = no-fb ]; then
++        # D4: reject a harness that secretly appended --no-fb to gfx too.
++        if cmp -s "$work/gfx.ppm" "$work/pre.ppm"; then
++            echo 'P5 HISTORY D4: gfx and no-fb framebuffers unexpectedly equal' >&2
++            exit 1
++        fi
++        echo 'P5 HISTORY D4: gfx and no-fb framebuffers are distinct'
++    fi
++    echo "P5 HISTORY: $name stdout/stderr/log/PPM byte-identical (RC=0/0)"
++done
++echo 'P5 HISTORY: all nine available firmware/video/SMP lanes byte-identical'
+diff --git a/tests/perf_compare.py b/tests/perf_compare.py
+new file mode 100755
+index 0000000..e37273e
+--- /dev/null
++++ b/tests/perf_compare.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""PERF P5: paired seven-tape wall comparison with a bootstrap CI.
++
++Never gate on wall time: the gates here are return codes, identical guest
++work/clock and non-capped runs. Run from the repository root, with the same
++firmware/disk artifacts and O2 compiler flags for both explicit binaries.
++The bootstrap percentile interval describes paired *local* timing noise,
++not a cross-machine prediction or an independent-replication guarantee.
++"""
++import argparse
++import math
++import os
++import random
++import re
++import statistics
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++TAPES = (
++    ("boot-haswell", 50000000, ("--platform=haswell",)),
++    ("boot-broadwell", 50000000, ("--platform=broadwell",)),
++    ("boot-baytrail", 50000000, ("--platform=baytrail",)),
++    ("text-no-fb", 50000000, ("--platform=haswell", "--no-fb")),
++    ("gfx-fb", 50000000, ("--platform=haswell",)),
++    ("vbe-800x600x32", 50000000, ("--platform=haswell", "--vbe=800x600x32")),
++    ("smp2", 20000000, ("--platform=haswell", "--smp=2", "--cpus=2")),
++)
++WORK_KEYS = ("executed", "idle_quantum", "instr_count_bsp", "vtime", "n_vcpus")
++REQUIRED = WORK_KEYS + ("cap_reached",)
++
++
++def parse_stats(text):
++    """Parse each value exactly once from the opt-in stats lines."""
++    stats = {}
++    for line in text.splitlines():
++        if not line.startswith("[stats] "):
++            continue
++        for key, val in re.findall(r"\b([a-z_]+)=([0-9]+)\b", line):
++            if key not in REQUIRED:
++                continue  # vcpu= appears twice on SMP; only global work keys matter
++            if key in stats:
++                raise ValueError(f"duplicate stats key {key}")
++            stats[key] = int(val)
++    missing = set(REQUIRED) - stats.keys()
++    if missing:
++        raise ValueError("missing stats: " + ",".join(sorted(missing)))
++    return stats
++
++
++def check_pair(before, after, tape):
++    """P5 correctness gate, shared by real measurements and the NC vector."""
++    for label, state in (("before", before), ("after", after)):
++        if state["executed"] <= 0:
++            raise ValueError(f"{tape}: {label} executed=0")
++        if state["cap_reached"] != 0:
++            raise ValueError(f"{tape}: {label} hit --max-instr")
++    if any(before[k] != after[k] for k in WORK_KEYS):
++        raise ValueError(f"{tape}: WORK MISMATCH: " +
++                         ", ".join(f"{k}={before[k]}/{after[k]}" for k in WORK_KEYS))
++
++
++def paired_interval(pairs, draws=10000, seed=20261012):
++    """Geometric mean of paired speedup; 2.5/97.5 percentile resampling CI."""
++    if len(pairs) < 3 or draws < 100:
++        raise ValueError("need >=3 pairs and >=100 bootstrap draws")
++    logs = [math.log(pre / post) for pre, post in pairs]
++    if not all(math.isfinite(x) for x in logs):
++        raise ValueError("non-finite timing")
++    point = math.exp(statistics.mean(logs))
++    rng = random.Random(seed)
++    samples = sorted(math.exp(sum(logs[rng.randrange(len(logs))]
++                                  for _ in logs) / len(logs)) for _ in range(draws))
++    return point, samples[int(.025 * draws)], samples[int(.975 * draws)]
++
++
++def run(binary, args, cap):
++    start = time.perf_counter_ns()
++    p = subprocess.run([str(binary), *args, f"--max-instr={cap}", "--stats"],
++                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++                       check=False)
++    elapsed = time.perf_counter_ns() - start
++    if p.returncode:
++        raise ValueError(f"{binary}: rc={p.returncode}; stderr={p.stderr[-400:]}")
++    return elapsed, parse_stats(p.stdout)
++
++
++def compare(before, after, reps):
++    print(f"{'tape':<17} {'work':>9} {'reps':>5} {'ratio':>8} {'95% paired CI':>19}", flush=True)
++    for idx, (name, cap, args) in enumerate(TAPES):
++        pairs = []
++        reference = None
++        for rep in range(reps):
++            # Reverse order every other pair to reduce linear host drift.
++            if rep % 2:
++                post_ns, post = run(after, args, cap)
++                pre_ns, pre = run(before, args, cap)
++            else:
++                pre_ns, pre = run(before, args, cap)
++                post_ns, post = run(after, args, cap)
++            check_pair(pre, post, name)
++            state = tuple(pre[k] for k in WORK_KEYS)
++            if reference is None:
++                reference = state
++            elif state != reference:
++                raise ValueError(f"{name}: NONDETERMINISTIC work across repetitions")
++            pairs.append((pre_ns, post_ns))
++        ratio, lo, hi = paired_interval(pairs, seed=20261012 + idx)
++        print(f"{name:<17} {reference[0]:>9} {reps:>5} {ratio:>7.3f}x "
++              f"[{lo:.3f}x, {hi:.3f}x]", flush=True)
++    print("paired bench: identical work/clock, uncapped tapes; wall ratios are reports, NOT CI gates")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--before", required=True, type=Path)
++    parser.add_argument("--after", required=True, type=Path)
++    parser.add_argument("--reps", type=int, default=9)
++    a = parser.parse_args()
++    if a.reps < 3:
++        parser.error("--reps must be >=3 (a percentile CI from fewer pairs is misleading)")
++    for p in (a.before, a.after):
++        if not p.is_file() or not os.access(p, os.X_OK):
++            parser.error(f"not executable: {p}")
++    for artifact in ("firmware/firmware.bin", "disk/disk.img"):
++        if not Path(artifact).is_file():
++            parser.error(f"missing shared input artifact: {artifact}")
++    try:
++        compare(a.before.resolve(), a.after.resolve(), a.reps)
++    except ValueError as exc:
++        print(f"paired bench: {exc}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/test_perf_compare.py b/tests/test_perf_compare.py
+new file mode 100755
+index 0000000..f03f284
+--- /dev/null
++++ b/tests/test_perf_compare.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""P5 deterministic correctness vectors; intentionally no wall-time assertions."""
++import importlib.util
++import os
++import unittest
++from pathlib import Path
++
++MODULE = Path(os.environ.get("PERF_COMPARE_MODULE", Path(__file__).with_name("perf_compare.py")))
++spec = importlib.util.spec_from_file_location("perf_compare", MODULE)
++p = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(p)
++
++SAMPLE = """[stats] vcpu=0 executed_steps=2 instr_count=1026 halted=1 fault=0
++[stats] vcpu=1 executed_steps=0 instr_count=512 halted=1 fault=0
++[stats] executed=2 idle_quantum=1024 instr_count_bsp=1026 vtime=1026
++[stats] cap=50000000 cap_reached=0 n_vcpus=2
++[stats] tlb_hits=5 tlb_misses=3 tlb_flushes=2
++[stats] decode_hits=1 decode_misses=4
++"""
++
++
++class ComparatorVectors(unittest.TestCase):
++    def test_paired_idle_not_cap(self):
++        s = p.parse_stats(SAMPLE)
++        self.assertEqual((s["executed"], s["vtime"], s["idle_quantum"]),
++                         (2, 1026, 1024))
++        p.check_pair(s, dict(s), "idle")
++
++    def test_no_phantom_work_or_capped_sample(self):
++        s = p.parse_stats(SAMPLE)
++        with self.assertRaisesRegex(ValueError, "executed=0"):
++            p.check_pair({**s, "executed": 0}, s, "zero")
++        with self.assertRaisesRegex(ValueError, "hit --max-instr"):
++            p.check_pair(s, {**s, "cap_reached": 1}, "cap")
++
++    def test_missing_and_duplicate_global_stats(self):
++        with self.assertRaisesRegex(ValueError, "missing stats"):
++            p.parse_stats("[stats] executed=2\n")
++        with self.assertRaisesRegex(ValueError, "duplicate stats key executed"):
++            p.parse_stats(SAMPLE + "[stats] executed=2\n")
++
++    def test_work_mismatch_rejected(self):
++        # The one P5 NC disables precisely this guard in a scratch comparator.
++        # Same cap and stdout-like line count cannot hide a changed K6 clock.
++        s = p.parse_stats(SAMPLE)
++        with self.assertRaisesRegex(ValueError, "WORK MISMATCH: .*vtime=1026/1027"):
++            p.check_pair(s, {**s, "vtime": 1027}, "clock")
++        with self.assertRaisesRegex(ValueError, "WORK MISMATCH: executed=2/3"):
++            p.check_pair(s, {**s, "executed": 3}, "steps")
++
++    def test_bootstrap_seed_and_no_timing_gate(self):
++        pairs = [(200, 100)] * 9
++        ratio, lo, hi = p.paired_interval(pairs)
++        self.assertAlmostEqual(ratio, 2)
++        self.assertAlmostEqual(lo, 2)
++        self.assertAlmostEqual(hi, 2)
++        self.assertEqual((ratio, lo, hi), p.paired_interval(pairs))
++        with self.assertRaisesRegex(ValueError, ">=3 pairs"):
++            p.paired_interval([(200, 100)])
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.47.3
+

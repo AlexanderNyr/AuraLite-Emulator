@@ -1,0 +1,786 @@
+From 6d700d24688d0cdde18ff160509e1e5cada56961 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 12 Oct 2026 19:05:03 +0000
+Subject: [PATCH] PERF P3: cache RAM prefix/opcode with shared write coherence
+
+---
+ CHANGELOG.md                      |  22 +++
+ Makefile                          |  17 ++-
+ ROADMAP.md                        |  11 +-
+ docs/STATUS.md                    |  14 ++
+ docs/plans/PERF_PLAN.md           |  95 ++++++++++--
+ src/cpu.c                         | 103 ++++++++++++-
+ src/machine.h                     |  25 ++++
+ src/main.c                        |   3 +
+ tests/integration/p3_decode_nc.sh |  40 +++++
+ tests/test_decode.c               | 239 ++++++++++++++++++++++++++++++
+ tests/test_ring3.c                |   4 +
+ 11 files changed, 549 insertions(+), 24 deletions(-)
+ create mode 100755 tests/integration/p3_decode_nc.sh
+ create mode 100644 tests/test_decode.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d0dcddd..c243cdd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,28 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Changed — patch 0054 (PERF P3, RAM-only prefix/opcode predecode)
++
++- Measured post-P2 `decode_modrm` 8% and `fetch8` 6% of sampled CPU time;
++  `group1` took 970,913 redundant prefix/opcode re-fetch paths in one
++  4,837,677-attempt boot. A 512-slot machine-level prefix/opcode-only cache
++  now avoids those fetches on a successful same-page plain-RAM EXEC walk;
++  P2's RAM-write epoch and full paging/mode key provide coherence. Live
++  ModRM/SIB/imm, ROM/MMIO, cross-page and trace/debug stay on original
++  paths. `--stats` adds decode hits/misses without changing default output.
++- `test-decode` exercises opcode SMC, PTE remap, dynamic SIB/imm, boundary,
++  mode, trace, NX #PF with exact err/CR2/RIP, A20, nonpaging, MMIO
++  execute and a live MMIO immediate under a cached RAM opcode;
++  one scratch NC disables only the P3 epoch comparison: inner RC=134,
++  wrapper RC=1, make RC=2 at `assert(!(c->rflags & CF))`. The ring3
++  test's post-start raw instruction injector now explicitly flushes the
++  shared epoch after each host-side memcpy (as required for direct RAM
++  writes outside `mem_write`); its guest asserts remain unchanged.
++- Paired three-rep local P2→P3 medians: UP tapes 1.17–1.35× across two
++  series; SMP2 only ~1.02×, no meaningful claim. Work counts unchanged;
++  four historical stdout/stderr/log/PPM tapes byte-identical with the same
++  paths. Frozen guest toolchain absent (SKIP); no guest speed claim.
++
+ ### Changed — patch 0053 (PERF P2, coherent success-only TLB)
+ 
+ - **Measured D6:** after P1, five O2 gprof boots gave `translate`
+diff --git a/Makefile b/Makefile
+index 4707046..e2314af 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -122,6 +122,17 @@ test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/plat
+ test-tlb-nc: tests/test_tlb.c tests/integration/p2_tlb_nc.sh src/mem.c
+ 	sh tests/integration/p2_tlb_nc.sh
+ 
++# PERF P3: narrow RAM-backed prefix/opcode predecode, live ModRM and #PF.
++test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_decode.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-decode -lm
++	./test-decode
++	rm -f test-decode
++
++# The one P3 NC removes ONLY the P3 generation check, leaving the P2
++# translation invalidation intact; the same SMC vector must then go red.
++test-decode-nc: tests/test_decode.c tests/integration/p3_decode_nc.sh src/cpu.c
++	sh tests/integration/p3_decode_nc.sh
++
+ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+@@ -171,7 +182,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
++test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -181,7 +192,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P0: wall-clock bench.  NOT part of 'make test': its numbers are this
+ # machine's, so a gate on them would be a gate on the runner.  What it DOES
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 80c11a1..2bf5a42 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,7 +31,7 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3–P5 📋 | honest bench, profile-guided RAM read, success-only translation TLB with conservative guest/DMA coherence; next decode cache if measured | P0–P5 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4–P5 📋 | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; next profile-guided dispatch if measured | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+@@ -72,9 +72,12 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+   MOV CR0/CR3/CR4/LMSW/WRMSR EFER/INVLPG/reset; dynamic MMIO/ROM tables
+   and A20-off walks uncached. Real #PF err/RIP/CR2 vectors, PTE-rewrite NC,
+   seven-tape paired measurement, byte-identical historical receipts~~ shipped.
+-- `0054` — PERF P3 (planned, NOT implemented): re-profile decode after
+-  P2, then scope self-modifying-code/mode/fetch invalidation before any
+-  decode-cache implementation.
++- ~~`0054` — PERF P3: O2 profile showed `decode_modrm` 8%, `fetch8` 6%,
++  with 970,913 redundant `group1` re-fetches per boot. Cache ONLY single-page
++  ordinary-RAM prefix/opcode on successful P2 EXEC, not live ModRM/EA/imm;
++  shared RAM-write epoch, SMC/PTE/NX/MMIO/mode vectors and one deliberate
++  stale-opcode NC, seven paired P0 tapes, historical byte identity~~ shipped.
++  SMP2 ratio ~1.02×; no universal speed claim.
+ 
+ 
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 71a1921..b810700 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -623,6 +623,20 @@
+   P2 NC failed RC=2 by design. Frozen AuraLite-OS lanes SKIP without
+   the missing guest toolchain. P3–P5 remain planned.
+ 
++- PERF P3 (`patches/0054-PERF-P3-ram-prefix-predecode.patch`): after P2,
++  `decode_modrm` sampled 8% and `fetch8` 6%; `group1` redundantly
++  re-fetched 970,913 times per boot. A shared 512-slot cache stores only
++  RAM-backed, one-page prefixes/opcode after successful P2 EXEC; dynamic
++  ModRM/SIB/imm always re-read, the P2 RAM-write epoch coheres SMC/PTE/DMA,
++  and MMIO/ROM/NX, A20-off, cross-page and debug stay live. New vectors
++  cover SMC/PTE remap, mode/trace, NX #PF err/CR2/RIP, SIB/imm and MMIO;
++  the one epoch-check NC fails deliberately (inner RC=134, make RC=2).
++  Two alternating seven-tape series show UP 1.17–1.35×, SMP ~1.02×,
++  identical instruction work; four historical stdout/stderr/log/PPM lanes
++  byte-identical. The ring3 harness now flushes after post-start raw RAM
++  instruction injection. Full gates/fresh-clone receipt in PERF_PLAN §6.4.
++  Frozen AuraLite-OS toolchain absent: guest lanes SKIP. P4–P5 planned.
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/PERF_PLAN.md b/docs/plans/PERF_PLAN.md
+index 325c607..dfff52b 100644
+--- a/docs/plans/PERF_PLAN.md
++++ b/docs/plans/PERF_PLAN.md
+@@ -8,8 +8,9 @@
+ 
+ **Status: P0 ✅ (`patches/0051-PERF-P0-honest-benchmark.patch`),
+ P1 ✅ (`patches/0052-PERF-P1-profiled-ram-read.patch`),
+-P2 ✅ (`patches/0053-PERF-P2-coherent-success-tlb.patch`);
+-P3–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
++P2 ✅ (`patches/0053-PERF-P2-coherent-success-tlb.patch`),
++P3 ✅ (`patches/0054-PERF-P3-ram-prefix-predecode.patch`);
++P4–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
+ first, RAM fast path, translation TLB, decode cache, profiling/dispatch,
+ then hardening and closure. Future phases are scoped, not pre-approved for
+ implementation: measure an actual hotspot before writing an optimization.
+@@ -19,7 +20,7 @@ implementation: measure an actual hotspot before writing an optimization.
+ | P0 | Work counter + opt-in `--stats`; seven-tape wall-time rig; cap/idle negative control | `make test-perf`, `make bench`, `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256` | ✅ 0051 |
+ | P1 | Measured-hot 8-byte full-span RAM read fast path; ROM/MMIO/A20/boundary remain on old path | six bus vectors + LE-swap NC, differential fuzz, seven P0 tapes paired pre/post | ✅ 0052 |
+ | P2 | Success-only 4KiB-subpage TLB; conservative RAM-store/DMA and control-operation flushes, security-context key | warm-PTE rewrite, #PF CR2/err/RIP, CPL3/WP/NX, MMIO, PS, SMP vectors, NC + differential fuzz + P0 tapes | ✅ 0053 |
+-| P3 | Decode cache, with explicit invalidation for writes to code, A20 and mode transitions | self-modifying code + mode-transition vectors + differential fuzz + P0 tapes | 📋 |
++| P3 | RAM-only single-page prefix/opcode predecode; dynamic ModRM/SIB/imm never cached; shared P2 write generation | SMC/PTE/MMIO/NX/mode/boundary vectors + one NC + fuzz + paired P0 tapes | ✅ 0054 |
+ | P4 | Profile-guided dispatch optimization only if the profile justifies it | `-pg`/gprof before/after + `make fuzz` + P0 tape ratios | 📋 |
+ | P5 | Repeated-run regression policy, sanitizer, closed defect ledger, documentation | all gates, historical byte-identical lanes, one NC, fresh-clone `git am` | 📋 |
+ 
+@@ -413,13 +414,89 @@ its absent toolchain; no claim of guest speed.
+ Do not embed the patch's own SHA or size inside it; doing so creates an
+ amend loop rather than additional evidence.
+ 
+-## 6. Planned phases — gate before optimization
++## 6. P3 — RAM-backed prefix/opcode predecode, one patch
++
++### 6.1 Evidence, scope and coherence
++
++Post-P2 O2 five-boot `-pg` profile: `decode_modrm` accounted for 8% of
++sampled time (19,283,235 calls / five), `fetch8` 6% (72,477,350 calls /
++five); O2 coverage counted 970,913 `group1` entries per 4,837,677
++instruction-attempt boot, and that arm re-fetches prefixes/opcode from
++`start_pc` before live ModRM/imm. Caching `rm_t` would be WRONG because
++GPR-dependent effective addresses change even when instruction bytes do not.
++
++A 512-slot machine-wide P3 cache therefore stores ONLY prefixes/opcode and
++the cursor just after opcode. It is keyed by RIP, CS base/selector/L/D_B,
++CR0/CR3/CR4/EFER, AC and descriptor-supervisor override; it uses P2's
++RAM-store generation. Install requires a successful P2 T_EXEC entry for
++ordinary RAM, A20 open, paging active, physical page fully in RAM and not
++the legacy ROM alias, and the entire prefix/opcode stream within ONE
++4KiB page. This rejects faulting/MMIO-table/MMIO-code/ROM, A20-off and
++page-crossing fetches. `--trace` and EMU_DBG_U use the original fetch path.
++Any guest/DMA `mem_write` to RAM invalidates both P2 and P3 (including
++PTEs and self-modifying code); paging/control/reset flushes share the epoch.
++Direct host writes through `m->ram` after execution begins must explicitly
++call `perf_tlb_flush()` (test_ring3's instruction injector now does this);
++pre-execution fixture writes need no flush. Dynamic ModRM/SIB/displacement,
++all immediates, operands and 0F extension bytes are always fetched/decoded
++live. The historical `group1` re-fetch is bypassed ONLY on a P3 hit;
++all old slow paths retain its original behavior and fetch ordering.
++
++### 6.2 Regression and negative control
++
++`make test-decode` checks warm hits and RAM opcode rewrite (STC→CLC),
++PTE remap 5→6MiB, dynamic SIB with changed RCX, a cached RAM opcode
++with a live side-effecting MMIO imm32 on the next page, cross-page
++prefix/opcode rejecting cache, CS.L/D_B mode key, trace bypass, warm EXEC
++then NX #PF (`CR2=0x400000`, err `0x11`, handler RIP `0x9070`, one attempt),
++A20-closed/nonpaging bypass and side-effecting MMIO execute bytes (STC then
++CLC). The single NC (`make test-decode-nc`) removes ONLY P3's generation
++comparison in a scratch `cpu.c` while P2 translation coherence remains
++intact: warmed self-modifying opcode fires the exact
++`assert(!(c->rflags & CF))`, scratch RC=134, wrapper RC=1, make RC=2.
++
++### 6.3 Paired wall measurement and identity
++
++Two alternating pre1/post1/pre2/post2 O2 series, seven tapes × three
++repetitions, each with identical deterministic instruction counts:
++
++| Tape | Work | Pair 1 P2→P3 (ms; ratio) | Pair 2 P2→P3 (ms; ratio) |
++|---|---:|---:|---:|
++| boot-haswell | 4,837,677 | 285→216; 1.32× | 264→208; 1.27× |
++| boot-broadwell | 4,807,694 | 253→206; 1.23× | 259→213; 1.22× |
++| boot-baytrail | 4,807,650 | 264→212; 1.25× | 270→231; 1.17× |
++| text-no-fb | 4,837,677 | 269→215; 1.25× | 262→213; 1.23× |
++| gfx-fb | 4,837,677 | 266→208; 1.28× | 264→195; 1.35× |
++| vbe-800x600x32 | 4,837,677 | 265→197; 1.35× | 266→204; 1.30× |
++| smp2 | 4,837,677 | 478→470; 1.02× | 482→471; 1.02× |
++
++SMP benefit is near zero, not claimed as a speedup. On a P3 Haswell
++boot, `--stats` reports 4,802,386 decode hits and 5,014 misses, but this
++is an internal counter, NOT an instruction-retirement metric. Four 600k
++historical boot/VBE-on/VBE-off/no-fb lanes, pre/post with the SAME
++`--log`/`--dump-fb` paths: stdout, stderr, ring log and PPM all
++byte-identical (RC=0/0); boot PPM SHA256 begins `15c96625cfec5acc`,
++no-fb `c3b3d73f6bbb08ab`. No cross-host wall-time threshold in CI.
++
++### 6.4 Phase gates and fresh clone
++
++From parent `e760db0` (P2), `git am` of the P3 patch in a fresh clone
++applied cleanly; `HEAD^{tree}` matched the development tree exactly.
++The ignored firmware/disk nasm artifacts were seeded from the development
++checkout; `make -n` reported both targets up to date (nasm is absent).
++In that clone, **with the final MMIO-immediate vector included**:
++`make test` RC=0 (P3 vectors, N2/N3 ALL PASS), `make test-sanitize`
++RC=0 (P3 vector under ASan+UBSan), `make fuzz FUZZ_PROGRAMS=256` RC=0
++(256 programs, 6,144 instructions compared, zero host crashes), `make
++bench BENCH_REPS=3` RC=0 (all seven deterministic, uncapped). The one
++P3 NC returned **make RC=2** (scratch binary RC=134, script RC=1;
++`assert(!(c->rflags & CF))` after the warmed opcode rewrite).
++The final patch's docs-only receipt amendment was re-applied in a new
++fresh clone and its source tree checked again; the full gate run above
++used the identical code and vectors. Frozen AuraLite-OS lanes SKIP
++without its toolchain, so no guest speed is claimed.
+ 
+-**P3 (decode cache).** Only if measured decoding is hot after P2. Cache
+-keys include instruction bytes, address/operand sizes, mode, prefixes
+-and fetch translation. Invalidate on self-modifying code, mode/paging
+-changes and resets; do not fold a fetch fault into a stale cached decode.
+-NC deliberately leaves one invalidation out. Use `make fuzz` + P0 tapes.
++## 6. Planned phases — gate before optimization
+ 
+ **P4 (profile/dispatch).** `perf` and `valgrind` are **absent** here;
+ `gprof` is available. Capture a `-pg` baseline and call graph before
+diff --git a/src/cpu.c b/src/cpu.c
+index 0a349c5..ae19b94 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -530,6 +530,85 @@ typedef struct {
+     int rep;
+ } dctx_t;
+ 
++/* PERF P3: the cache is a preDECODE cache for the prefix/opcode bytes only.
++ * An actual ModRM decode reads current GPRs and may itself fetch SIB/disps,
++ * so caching rm_t would freeze live effective addresses -- never do it.
++ * Only store after a successful ordinary-RAM P2 EXEC walk, and only when
++ * the entire parsed prefix/opcode stream is on ONE 4KiB page.  The P2 RAM-
++ * store epoch invalidates self-modifying code, PTE changes and device DMA;
++ * control changes also bump it and are in the key.  Debug fetch logging and
++ * --trace take the original slow path. */
++static size_t perf_decode_slot(cpu_t *c) {
++    uint64_t page_mix = c->rip ^ (c->rip >> 9) ^ (c->cr3 >> 12);
++    return (size_t)(page_mix & (PERF_DECODE_SLOTS - 1));
++}
++static int perf_decode_hit(machine_t *m, dctx_t *d, uint8_t *op) {
++    cpu_t *c = d->c;
++    if (dbg_u_on != 0 || c->trace || !m->chipset.a20 || !(c->cr0 & (1ULL<<31)))
++        return 0;
++    perf_decode_entry_t *e = &m->perf_decode[perf_decode_slot(c)];
++    if (!e->valid || e->generation != m->perf_tlb_generation ||
++        e->rip != c->rip || e->cs_base != c->seg[SEG_CS].base ||
++        e->cs_sel != c->seg[SEG_CS].sel || e->cs_l != c->seg[SEG_CS].l ||
++        e->cs_db != c->seg[SEG_CS].d_b || e->cr0 != c->cr0 ||
++        e->cr3 != c->cr3 || e->cr4 != c->cr4 || e->efer != c->efer ||
++        e->ac != ((c->rflags >> 18) & 1) ||
++        e->desc_sv != (c->desc_sv != 0)) {
++        ++m->perf_decode_misses;
++        return 0;
++    }
++    ++m->perf_decode_hits;
++    d->pc = e->next_pc;
++    d->addrsize = e->addrsize; d->opsize = e->opsize;
++    d->has_rex = e->has_rex;
++    d->rex_w = e->rex_w; d->rex_r = e->rex_r;
++    d->rex_x = e->rex_x; d->rex_b = e->rex_b;
++    d->seg_override = e->seg_override; d->rep = e->rep;
++    *op = e->opcode;
++    return 1;
++}
++static void perf_decode_store(machine_t *m, dctx_t *d, uint8_t op) {
++    cpu_t *c = d->c;
++    if (dbg_u_on != 0 || c->trace || !m->chipset.a20 || !(c->cr0 & (1ULL<<31)))
++        return;
++    if (d->pc <= d->start_pc || d->pc - d->start_pc > 15) return;
++    uint64_t first = c->seg[SEG_CS].base + d->start_pc;
++    uint64_t last = c->seg[SEG_CS].base + d->pc - 1;
++    if (last < first || (first >> 12) != (last >> 12)) return;
++    /* A P2 EXEC entry only exists if EVERY table entry came from ordinary
++     * RAM with A20 open.  If a side-effecting MMIO table participated in
++     * the walk, this check fails and we keep fetching each byte live. */
++    uint64_t page = first >> 12;
++    uint64_t slot = (page ^ (page >> 9) ^ (c->cr3 >> 12)) & (PERF_TLB_SLOTS - 1);
++    const perf_tlb_entry_t *t = &m->perf_tlb[slot];
++    if (!t->valid || t->generation != m->perf_tlb_generation ||
++        t->linear_page != page || t->cr3 != c->cr3 ||
++        t->cr0 != c->cr0 || t->cr4 != c->cr4 || t->efer != c->efer ||
++        t->ac != ((c->rflags >> 18) & 1) ||
++        t->cpl != (c->seg[SEG_CS].sel & 3) ||
++        t->desc_sv != (c->desc_sv != 0) || t->mode != T_EXEC ||
++        t->phys_page > (uint64_t)RAM_SIZE - 4096 ||
++        (t->phys_page >= ROM_ALIAS_LOW_BASE &&
++         t->phys_page < ROM_ALIAS_LOW_BASE + ROM_SIZE)) return;
++    perf_decode_entry_t *e = &m->perf_decode[perf_decode_slot(c)];
++    e->generation = m->perf_tlb_generation;
++    e->rip = c->rip; e->cs_base = c->seg[SEG_CS].base;
++    e->next_pc = d->pc;
++    e->cr0 = c->cr0; e->cr3 = c->cr3;
++    e->cr4 = c->cr4; e->efer = c->efer;
++    e->cs_sel = c->seg[SEG_CS].sel;
++    e->cs_l = c->seg[SEG_CS].l; e->cs_db = c->seg[SEG_CS].d_b;
++    e->ac = (uint8_t)((c->rflags >> 18) & 1);
++    e->desc_sv = (uint8_t)(c->desc_sv != 0);
++    e->addrsize = d->addrsize; e->opsize = d->opsize;
++    e->has_rex = d->has_rex;
++    e->rex_w = d->rex_w; e->rex_r = d->rex_r;
++    e->rex_x = d->rex_x; e->rex_b = d->rex_b;
++    e->seg_override = d->seg_override; e->rep = d->rep;
++    e->opcode = op;
++    e->valid = 1;
++}
++
+ static uint64_t read_code_v(machine_t *m, uint64_t vaddr, int size) {
+     uint64_t phys;
+     if (!translate(m, vaddr, &phys, T_EXEC)) /* fault already raised */
+@@ -891,7 +970,8 @@ int cpu_step(cpu_t *c) {
+     d.opsize = cpu_op_size_default(c);
+ 
+     uint8_t op;
+-    for (;;) {
++    int predecoded = perf_decode_hit(m, &d, &op);
++    if (!predecoded) for (;;) {
+         op = fetch8(&d);
+         if (op == 0x66) { d.opsize = (default_as==16) ? 4 : 2; continue; } /* toggles byte-count between 2 and 4 */
+         if (op == 0x67) { d.addrsize = (default_as==32)?16:(default_as==16?32:default_as); continue; }
+@@ -917,6 +997,7 @@ int cpu_step(cpu_t *c) {
+      * same guard covers the nested 0F opcode fetch below. */
+     if (c->fault || c->exception_taken) goto done;
+     if (d.has_rex && d.rex_w) d.opsize = 8; /* REX.W -> 64-bit operand size = 8 bytes */
++    if (!predecoded) perf_decode_store(m, &d, op);
+     int osz = d.opsize;
+ 
+     if (c->trace) {
+@@ -997,13 +1078,19 @@ slow_decode:
+     goto really_slow;
+ 
+ group1: {
+-        d.pc = d.start_pc; /* restart decode of this instruction cleanly */
+-        /* re-skip prefixes */
+-        for (;;) {
+-            uint8_t b = fetch8(&d);
+-            if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) continue;
+-            if (default_as==64 && b>=0x40 && b<=0x4F) continue;
+-            op = b; break;
++        /* The original group1 path re-fetches the opcode from start_pc.
++         * For a P3 hit only the proven RAM prefix/opcode bytes were already
++         * decoded, so preserve the saved cursor; live ModRM/SIB/displacement
++         * and immediate fetches below are NEVER reused.  On the slow path,
++         * including ROM/MMIO/debug, keep the old re-fetch exactly intact. */
++        if (!predecoded) {
++            d.pc = d.start_pc;
++            for (;;) {
++                uint8_t b = fetch8(&d);
++                if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) continue;
++                if (default_as==64 && b>=0x40 && b<=0x4F) continue;
++                op = b; break;
++            }
+         }
+         int size = (op==0x80) ? 1 : osz;
+         rm_t rm = MODRM();
+diff --git a/src/machine.h b/src/machine.h
+index 8c27d3c..a7e0be9 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -67,6 +67,26 @@ typedef struct perf_tlb_entry {
+     uint8_t ac, cpl, desc_sv, mode, valid;
+ } perf_tlb_entry_t;
+ 
++/* PERF P3: cache ONLY the prefix/opcode predecode of a RAM-backed
++ * instruction, never ModRM's dynamic effective address or immediates.
++ * Use P2's global RAM-write generation: one store to guest code or any
++ * page table invalidates both translation and predecode, in O(1).  A cache
++ * entry records the decoded prefixes, the opcode and the byte cursor
++ * after it; it may only be installed when the P2 execute translation is
++ * a successful plain-RAM walk and all prefix/opcode bytes stay in one
++ * 4KiB page.  Faulting fetches, side-effecting MMIO/ROM and page-crossing
++ * prefix streams remain on the original per-byte fetch path. */
++#define PERF_DECODE_SLOTS 512u
++typedef struct perf_decode_entry {
++    uint64_t generation, rip, cs_base, next_pc;
++    uint64_t cr0, cr3, cr4, efer;
++    uint16_t cs_sel;
++    uint8_t cs_l, cs_db, ac, desc_sv;
++    uint8_t opcode, valid;
++    int addrsize, opsize, has_rex, rex_w, rex_r, rex_x, rex_b;
++    int seg_override, rep;
++} perf_decode_entry_t;
++
+ /* ---- Event log for the GUI / debugging ---- */
+ #define LOG_RING 4096
+ typedef struct {
+@@ -107,6 +127,8 @@ struct machine {
+     perf_tlb_entry_t perf_tlb[PERF_TLB_SLOTS];
+     uint64_t perf_tlb_generation;
+     uint64_t perf_tlb_hits, perf_tlb_misses, perf_tlb_flushes;
++    perf_decode_entry_t perf_decode[PERF_DECODE_SLOTS];
++    uint64_t perf_decode_hits, perf_decode_misses;
+     io_port_t io[65536];
+ 
+     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
+@@ -189,6 +211,9 @@ static inline void perf_tlb_flush(machine_t *m) {
+     ++m->perf_tlb_flushes;
+     if (++m->perf_tlb_generation == 0) {
+         for (size_t i = 0; i < PERF_TLB_SLOTS; ++i) m->perf_tlb[i].valid = 0;
++        /* The shared epoch also guards P3 predecode; clear both tables
++         * before the mathematically impossible uint64_t wrap is reused. */
++        for (size_t i = 0; i < PERF_DECODE_SLOTS; ++i) m->perf_decode[i].valid = 0;
+         m->perf_tlb_generation = 1;
+     }
+ }
+diff --git a/src/main.c b/src/main.c
+index 83baa65..e05afdd 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -478,6 +478,9 @@ int main(int argc, char **argv) {
+                (unsigned long long)m->perf_tlb_hits,
+                (unsigned long long)m->perf_tlb_misses,
+                (unsigned long long)m->perf_tlb_flushes);
++        printf("[stats] decode_hits=%llu decode_misses=%llu\n",
++               (unsigned long long)m->perf_decode_hits,
++               (unsigned long long)m->perf_decode_misses);
+     }
+ 
+     printf("\n---- last log lines ----\n");
+diff --git a/tests/integration/p3_decode_nc.sh b/tests/integration/p3_decode_nc.sh
+new file mode 100755
+index 0000000..15bab1e
+--- /dev/null
++++ b/tests/integration/p3_decode_nc.sh
+@@ -0,0 +1,40 @@
++#!/bin/sh
++# PERF P3's ONE negative control: remove only the decode epoch match in a
++# scratch CPU source.  Keep P2's RAM/PTE translation flush intact.  The
++# ordinary warmed self-modifying opcode vector must now execute stale STC.
++set -eu
++root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
++cd "$root"
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++cp src/cpu.c "$tmp/cpu.c"
++python3 - "$tmp/cpu.c" <<'PY'
++from pathlib import Path
++import sys
++p = Path(sys.argv[1]); s = p.read_text()
++a = 'if (!e->valid || e->generation != m->perf_tlb_generation ||'
++b = 'if (!e->valid || /* P3 NC: reuse decode after a RAM store */'
++assert s.count(a) == 1, 'one decode-lookup epoch anchor required'
++p.write_text(s.replace(a, b, 1))
++PY
++${CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -Isrc -Itests \
++    tests/test_decode.c "$tmp/cpu.c" src/mem.c src/io.c src/platform.c \
++    src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c \
++    src/ioapic.c -o "$tmp/test-decode-nc" -lm
++ulimit -c 0 || true
++set +e
++"$tmp/test-decode-nc" >"$tmp/out" 2>"$tmp/err"
++rc=$?
++set -e
++if [ "$rc" -eq 0 ]; then
++    echo 'NC BROKEN: stale decode returned the new opcode without the epoch check' >&2
++    exit 2
++fi
++if ! grep -F -q -e '!(c->rflags & CF)' "$tmp/err"; then
++    echo "NC BROKEN: failed for another reason (inner rc=$rc):" >&2
++    cat "$tmp/err" >&2
++    exit 2
++fi
++printf 'P3 NC: inner rc=%s; assert !(c->rflags & CF) failed after warmed opcode rewrite\n' "$rc"
++echo 'P3 NC: FAILED AS DESIGNED (shared RAM-write generation is necessary for predecode coherence)'
++exit 1
+diff --git a/tests/test_decode.c b/tests/test_decode.c
+new file mode 100644
+index 0000000..ccd45e8
+--- /dev/null
++++ b/tests/test_decode.c
+@@ -0,0 +1,239 @@
++/* PERF P3: only ordinary-RAM, single-page prefix/opcode predecode can hit.
++ * Live ModRM (GPR-derived EA), SIB, immediate and instruction faults never
++ * come from the cache.  The NC removes ONLY the decode epoch comparison;
++ * P2's walker still flushes, so the SMC assertion must turn red. */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "platform.h"
++#include "harness.h"
++
++#define P 1ull
++#define W 2ull
++#define US 4ull
++#define VA 0x400000ull
++#define CF 1ull
++static machine_t g_m;
++static void w64(uint64_t p, uint64_t v) { mem_write(&g_m, p, 8, v); }
++static void step_at(uint64_t rip) {
++    g_m.cpu.rip = rip;
++    assert(cpu_step(&g_m.cpu) == 0);
++    assert(!g_m.cpu.fault && !g_m.cpu.exception_taken);
++}
++static void fixture(void) {
++    setup_machine(&g_m);
++    cpu_t *c = &g_m.cpu;
++    w64(0x10000, 0x11000 | P | W | US);
++    w64(0x11000, 0x12000 | P | W | US);
++    w64(0x12000, P | W | US | 0x80); /* identity-mapped 2MiB PS */
++    w64(0x12010, 0x13000 | P | W | US);
++    w64(0x13000, 0x500000 | P | W | US);
++    c->cr3 = 0x10000; c->cr4 = 0x20;
++    c->efer = (1ull << 8) | (1ull << 10) | (1ull << 11);
++    c->cr0 = 0x80010033ull;
++    c->seg[SEG_CS] = (segment_t){.sel=8, .base=0, .limit=~0u, .l=1};
++    c->seg[SEG_SS] = (segment_t){.sel=16, .base=0, .limit=~0u};
++    c->gpr[RSP] = 0x8000;
++}
++static void smc_and_pte(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* Two physical implementations of the same virtual byte, separately
++     * changed through the bus: first opcode SMC, then PTE remap. */
++    mem_write(&g_m, 0x500000, 1, 0xF9);  /* STC */
++    mem_write(&g_m, 0x600000, 1, 0xF8);  /* CLC */
++    c->rflags &= ~CF;
++    step_at(VA);
++    assert(c->rflags & CF);
++    uint64_t hits = g_m.perf_decode_hits;
++    c->rflags &= ~CF;
++    step_at(VA);
++    assert(c->rflags & CF);
++    assert(g_m.perf_decode_hits > hits); /* really exercised warm cache */
++    uint64_t gen = g_m.perf_tlb_generation;
++    mem_write(&g_m, 0x500000, 1, 0xF8);
++    assert(g_m.perf_tlb_generation != gen);
++    c->rflags |= CF;
++    step_at(VA);
++    assert(!(c->rflags & CF)); /* P3 NC: stale STC must FAIL here */
++    mem_write(&g_m, 0x500000, 1, 0xF9);
++    step_at(VA);
++    assert(c->rflags & CF);
++    w64(0x13000, 0x600000 | P | W | US);
++    step_at(VA);
++    assert(!(c->rflags & CF));
++    puts("ok p3 warm predecode, RAM opcode rewrite and PTE remap");
++}
++static void live_modrm_and_immediate(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* MOV RAX,[RBX+RCX*4], reusing SAME opcode at same RIP with a NEW
++     * dynamic SIB address.  A cached rm_t would produce the OLD operand. */
++    const uint8_t sib[] = {0x48,0x8B,0x04,0x8B};
++    memcpy(g_m.ram+0x1000, sib, sizeof sib);
++    w64(0x500000, 0x1122334455667788ull);
++    w64(0x500010, 0x8877665544332211ull);
++    c->gpr[RBX] = VA; c->gpr[RCX] = 0;
++    step_at(0x1000);
++    assert(c->gpr[RAX] == 0x1122334455667788ull);
++    uint64_t hits = g_m.perf_decode_hits;
++    c->gpr[RCX] = 4;
++    step_at(0x1000);
++    assert(g_m.perf_decode_hits > hits);
++    assert(c->gpr[RAX] == 0x8877665544332211ull);
++
++    /* ADD RAX, imm32; only prefix/opcode is saved.  This byte changes via
++     * bus between invocations, which also flushes the epoch.  More
++     * importantly, forcing an existing cached entry's immutable opcode
++     * with a NEW GPR must not snapshot the immediate into the entry. */
++    const uint8_t add[] = {0x48,0x05,0x03,0,0,0};
++    memcpy(g_m.ram+0x1100, add, sizeof add);
++    c->gpr[RAX] = 10;
++    step_at(0x1100);
++    assert(c->gpr[RAX] == 13);
++    c->gpr[RAX] = 20;
++    hits = g_m.perf_decode_hits;
++    step_at(0x1100);
++    assert(g_m.perf_decode_hits > hits && c->gpr[RAX] == 23);
++    mem_write(&g_m, 0x1102, 1, 7);
++    c->gpr[RAX] = 20;
++    step_at(0x1100);
++    assert(c->gpr[RAX] == 27);
++    puts("ok p3 live ModRM/SIB and immediate, with repeated opcode hits");
++}
++static void boundary_mode_and_trace(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* Prefix byte straddles a 4KiB boundary: never install, even after
++     * two successful executions.  These are live two-page fetches. */
++    g_m.ram[0x1FFF] = 0x66;
++    g_m.ram[0x2000] = 0xF9;
++    uint64_t hits = g_m.perf_decode_hits;
++    step_at(0x1FFF);
++    step_at(0x1FFF);
++    assert(c->rflags & CF);
++    assert(g_m.perf_decode_hits == hits);
++
++    /* CS.L and CS.D_B change the decode of 0x48 between REX and DEC.
++     * A direct mode change is stricter than an architected, flushing one. */
++    g_m.ram[0x3000] = 0x48; g_m.ram[0x3001] = 0xF9;
++    step_at(0x3000);
++    hits = g_m.perf_decode_hits;
++    step_at(0x3000);
++    assert(g_m.perf_decode_hits > hits && c->rip == 0x3002);
++    c->seg[SEG_CS].l = 0; c->seg[SEG_CS].d_b = 1;
++    c->gpr[RAX] = 2;
++    hits = g_m.perf_decode_hits;
++    step_at(0x3000);
++    assert(g_m.perf_decode_hits == hits);
++    assert(c->gpr[RAX] == 1 && c->rip == 0x3001);
++    c->seg[SEG_CS].l = 1;
++    c->trace = 1;
++    hits = g_m.perf_decode_hits;
++    step_at(0x3000);
++    assert(g_m.perf_decode_hits == hits && c->rip == 0x3002);
++    puts("ok p3 page boundary, CS mode key and trace bypass");
++}
++static int imm_reads;
++static uint64_t immediate_mmio(void *ctx, uint64_t pa, int n) {
++    (void)ctx; (void)pa; assert(n == 4);
++    return ++imm_reads == 1 ? 3 : 7;
++}
++static void immutable_opcode_live_mmio_imm(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* RAM opcode/prefix end exactly at the page boundary.  imm32 lives
++     * on the NEXT page, mapped to changing MMIO; cache MUST hit the RAM
++     * predecode while fetching the live immediate twice (no RAM write). */
++    mem_write(&g_m, 0x500FFE, 1, 0x48); /* REX.W */
++    mem_write(&g_m, 0x500FFF, 1, 0x05); /* ADD RAX, imm32 */
++    w64(0x13008, 0xFEBD0000ull | P | W | US);
++    mem_register_mmio(&g_m, 0xFEBD0000ull, 4096,
++                      immediate_mmio, NULL, NULL, "p3-imm");
++    c->gpr[RAX] = 10;
++    step_at(VA + 0xFFE);
++    assert(c->gpr[RAX] == 13);
++    uint64_t hits = g_m.perf_decode_hits;
++    c->gpr[RAX] = 10;
++    step_at(VA + 0xFFE);
++    assert(g_m.perf_decode_hits > hits);
++    assert(c->gpr[RAX] == 17 && imm_reads == 2);
++    free(g_m.mmio_list); g_m.mmio_list = NULL;
++    puts("ok p3 cached RAM opcode with changing MMIO immediate stays live");
++}
++static void gate(int vec, uint16_t sel, uint64_t off) {
++    uint64_t a = 0x0C00 + (uint64_t)vec * 16;
++    w64(a, (off & 0xFFFF) | ((uint64_t)sel << 16) |
++        ((uint64_t)0x8F << 40) | ((off & 0xFFFF0000ull) << 32));
++    w64(a + 8, off >> 32);
++}
++static void nx_after_warm(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    /* Warm the EXEC predecode, then revoke execute rights via RAM PTE.
++     * Fault must occur before opcode dispatch; old #PF CR2/err/RIP and
++     * one instruction-attempt accounting still apply. */
++    c->idtr_base = 0x0C00; c->idtr_limit = 256 * 16 - 1;
++    w64(0x2004, 0x30000); c->tr_base = 0x2000; c->tr_limit = 103;
++    gate(14, 8, 0x9000 + 14 * 8);
++    g_m.ram[0x9000 + 14 * 8] = 0xF4;
++    mem_write(&g_m, 0x500000, 1, 0xF9);
++    step_at(VA);
++    step_at(VA);
++    uint64_t hits = g_m.perf_decode_hits;
++    assert(hits > 0);
++    w64(0x13000, 0x500000 | P | W | US | (1ull << 63));
++    c->rip = VA;
++    uint64_t steps = c->executed_steps;
++    (void)cpu_step(c);
++    assert(c->cr2 == VA && c->rip == 0x9000 + 14 * 8);
++    assert(mem_read(&g_m, c->gpr[RSP], 8) == 0x11); /* P|I/D */
++    assert(c->executed_steps == steps + 1);
++    puts("ok p3 warm EXEC -> NX #PF preserves CR2/err/RIP/clock");
++}
++static void no_paging_or_a20(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    g_m.ram[0x3000] = 0xF9;
++    g_m.chipset.a20 = 0;
++    step_at(0x3000); step_at(0x3000);
++    assert(g_m.perf_decode_hits == 0);
++    g_m.chipset.a20 = 1;
++    c->cr0 &= ~(1ull << 31);
++    step_at(0x3000); step_at(0x3000);
++    assert(g_m.perf_decode_hits == 0);
++    puts("ok p3 A20-closed and nonpaging execution bypass predecode");
++}
++static int mmio_reads;
++static uint64_t mmio_code(void *ctx, uint64_t pa, int n) {
++    (void)ctx; (void)pa; assert(n == 1);
++    return ++mmio_reads == 1 ? 0xF9 : 0xF8;
++}
++static void mmio_write(void *ctx, uint64_t pa, int n, uint64_t v) {
++    (void)ctx;(void)pa;(void)n;(void)v; assert(!"MMIO code is read-only");
++}
++static void mmio_fetch(void) {
++    fixture();
++    cpu_t *c = &g_m.cpu;
++    mem_register_mmio(&g_m, 0xFEBD0000ull, 4096, mmio_code, mmio_write, NULL, "p3-code");
++    w64(0x13000, 0xFEBD0000ull | P | W | US);
++    uint64_t hits = g_m.perf_decode_hits;
++    step_at(VA); assert(c->rflags & CF);
++    step_at(VA); assert(!(c->rflags & CF));
++    assert(mmio_reads == 2 && g_m.perf_decode_hits == hits);
++    free(g_m.mmio_list); g_m.mmio_list = NULL;
++    puts("ok p3 MMIO execution remains live across two fetches");
++}
++int main(void) {
++    smc_and_pte();
++    live_modrm_and_immediate();
++    immutable_opcode_live_mmio_imm();
++    boundary_mode_and_trace();
++    nx_after_warm();
++    no_paging_or_a20();
++    mmio_fetch();
++    puts("test-decode: all vectors passed");
++    return 0;
++}
+diff --git a/tests/test_ring3.c b/tests/test_ring3.c
+index f05c0c8..4a42309 100644
+--- a/tests/test_ring3.c
++++ b/tests/test_ring3.c
+@@ -77,6 +77,10 @@ static void fx64(uint64_t user_pt_flags) {
+ /* Run one instruction from phys `pa` (already written), return step rc. */
+ static int load1(uint64_t pa, const uint8_t *bytes, size_t n) {
+     memcpy(g_m.ram + pa, bytes, n);
++    /* This test injects new instructions into the same phys/RIP AFTER
++     * execution.  Unlike guest/DMA mem_write, a direct host RAM pointer
++     * cannot automatically invalidate P2/P3; flush once after injection. */
++    perf_tlb_flush(&g_m);
+     g_m.cpu.rip = pa;
+     return cpu_step(&g_m.cpu);
+ }
+-- 
+2.47.3
+

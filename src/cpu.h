@@ -88,6 +88,19 @@ typedef struct cpu {
     uint64_t fault_rip;
 
     uint64_t instr_count;
+    /* PERF P0: instruction attempts actually EXECUTED by this context.  instr_count
+     * cannot serve as a throughput numerator: the K3 idle quantum adds 512
+     * to it per all-idle HLT slot WITHOUT retiring anything (cpu.c, the
+     * `!peer_busy` arm), and K6 makes it the guest-visible vtime base, so
+     * its semantics are frozen by contract.  This counter increments only
+     * in cpu_step's done block, so it is 0 for a run that only idled
+     * and equals instr_count for a run that never idled.  This counts
+     * faulting attempts too, not architecturally retired instructions;
+     * "MIPS" below means guest instruction attempts per wall second.
+     * Reported by
+     * --stats; no guest-visible state and no historical tape depends on
+     * it. */
+    uint64_t executed_steps;
     int trace;               /* if non-zero, print each instruction */
 
     machine_t *mach;         /* back-reference to owning machine (memory/io) */

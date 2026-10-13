@@ -1,0 +1,614 @@
+From f7c3bd7b6caf8bad6ce1258970baeca5d860e6a6 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:21:10 +0000
+Subject: [PATCH] PERF P1: profile-guided 8-byte RAM read fast path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five O2 gprof boot runs showed mem_read 313,666,250 calls / 45.66% of samples, with 235,535,030 calls from 8-byte page-table walks. Only full-span 8-byte little-endian RAM reads with A20 open now use unaligned-safe memcpy, after both ROM alias checks. MMIO, ROM, RAM boundary fill, closed A20, other widths and all writes use the old path.
+
+Six bus vectors cover endian/unaligned, RAM end, ROM aliases and crossing, A20 masking, other widths, and MMIO-vs-RAM priority. One scratch-source NC swaps only the fast-path return endian; first vector asserts the exact LE value, binary RC=134, script RC=1, make RC=2. Post gprof: same 313,666,250 calls / 14.37% samples. Alternating pre/post triples on seven tapes kept identical work counts and yielded local paired time ratios 1.18–1.83x, with visible host variation: no fixed wall-time claim.
+
+Measured: make test RC=0, make test-sanitize RC=0, make fuzz FUZZ_PROGRAMS=256 RC=0 (6,144 instructions all states match, zero host crashes), make bench BENCH_REPS=3 RC=0, four historical firmware/video stdout/log/PPM byte-identical. Frozen guest lanes SKIP without its build toolchain. See PERF_PLAN.md and same-phase CHANGELOG, ROADMAP, STATUS.
+---
+ CHANGELOG.md                   |  49 ++++++++++++
+ Makefile                       |  22 ++++--
+ ROADMAP.md                     |  15 +++-
+ docs/STATUS.md                 |  24 ++++++
+ docs/plans/PERF_PLAN.md        | 135 +++++++++++++++++++++++++++++----
+ src/mem.c                      |  15 ++++
+ tests/integration/p1_mem_nc.sh |  48 ++++++++++++
+ tests/test_perf_mem.c          | 128 +++++++++++++++++++++++++++++++
+ 8 files changed, 411 insertions(+), 25 deletions(-)
+ create mode 100755 tests/integration/p1_mem_nc.sh
+ create mode 100644 tests/test_perf_mem.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 702525f..25c0746 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,55 @@ entry names its patch and the measured defect(s) it repaired.
+ 
+ ## [Unreleased]
+ 
++### Changed — patch 0052 (PERF P1, profile-guided 8-byte RAM read)
++
++- **Measured hotspot D5, not a speculative refactor:** five O2 `-pg`
++  firmware runs aggregated by gprof: `mem_read` 313,666,250 calls,
++  45.66% of sampled time (1.21 / 2.65 s), including 235,535,030 calls
++  from `translate`'s 8-byte page-table walks. `mem_write` had only
++  2,514,365 calls / 0.00% of samples and was **not** changed. Only an
++  8-byte read *entirely inside RAM*, with A20 open, after both ROM alias
++  checks, takes an unaligned-safe `memcpy` on little-endian hosts. Closed
++  A20, partial reads at RAM end, ROM/BIOS (low alias lives *inside* RAM!),
++  MMIO, other widths and all writes follow the exact old path. Post-change
++  five-run profile: same 313,666,250 calls, 14.37% (0.26 / 1.81 s);
++  percentages are noisy samples, not a portable performance guarantee.
++- `tests/test_perf_mem.c` six vector groups: unaligned LE read; last 8/7/1
++  RAM bytes + FF fill/clipped writes; low/top ROM aliases and wrap;
++  closed-A20 start-only masking; untouched 1/2/4 widths; high MMIO BAR
++  callback versus existing RAM priority. `test-perf-mem: all vectors
++  passed` in both `make test` and `make test-sanitize`. Initial test
++  draft expected RAM at `0x1FFFFE` with A20 closed (which masks to the
++  **ROM** alias `0x0FFFFE`) and reddened RC=134; fixed the vector to
++  `0x3FFFFE` → `0x2FFFFE` (RAM), not the emulator.
++- **NC P1, one for the phase:** `tests/integration/p1_mem_nc.sh` makes a
++  scratch copy of `mem.c`, changes only the fast-path return to
++  `__builtin_bswap64(v)`, compiles the *same* regression vector. Inner
++  binary **RC=134** on `assert(mem_read(&g_m, 0x123, 8) ==
++  0x1716151413121110ULL)`, script **RC=1**, `make test-perf-mem-nc`
++  **RC=2**. Receipt: `P1 NC: FAILED AS DESIGNED (swapped-endian RAM fast
++  path is detected)`; production code and test checkout untouched.
++- O2 alternate pre1/post1/pre2/post2 on the same host, seven tapes ×3
++  repetitions: work counts identical on every tape (haswell
++  **4,837,677**), none reached cap. Haswell medians were 691→514 ms and
++  783→427 ms (paired ratios 1.34× and 1.83×); all seven tapes' paired
++  ratios fell between 1.18× and 1.83×. Even pre1/pre2 and post1/post2
++  differed substantially: **do not quote a universal speedup** or assert
++  a fixed wall-time gate. Four historical 600k-cap firmware/video tape
++  stdout, ring log and PPM were byte-identical before/after; SHA-256 PPM
++  prefixes `15c96625cfec5acc` (boot/VBE/on-off) and
++  `c3b3d73f6bbb08ab` (no-fb). `make test` **RC=0**, `make test-sanitize`
++  **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0** (6,144 instructions,
++  all states match; zero host crashes). Frozen guest lanes SKIP: missing
++  toolchain and build artifacts; not silently counted as passing.
++  `docs/plans/PERF_PLAN.md` §4 records the before/after profile, paired
++  timing table, boundary proof and fresh-clone verification: `git am`
++  cleanly on P0 produced the same tree; after seeding the three ignored
++  nasm artifacts, `make test`, `make test-sanitize`, `make fuzz
++  FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` each passed RC=0; the
++  P1 NC failed by design with `make` RC=2.
++
++
+ ### Added — patch 0051 (PERF P0, honest benchmark before optimization)
+ 
+ - The missing performance baseline is now *measured*, not inferred from a
+diff --git a/Makefile b/Makefile
+index eddc838..2a0b445 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary
++.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -91,13 +91,25 @@ test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/
+ 	./test-table
+ 	rm -f test-table
+ 
+-# PERF P0: the honest work counter (cpu.retired) and machine_retired_total().
++# PERF P0: the honest work counter (cpu.executed_steps) and machine_executed_total().
+ # Deterministic -- no vector here reads a clock; wall time is bench's job.
+ test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
+ 	./test-perf
+ 	rm -f test-perf
+ 
++# PERF P1: measured-hot 8-byte RAM read fast path.  Six deterministic
++# bus/alias/endian/width vectors; the NC mutates a scratch source copy.
++test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf_mem.c src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf-mem -lm
++	./test-perf-mem
++	rm -f test-perf-mem
++
++# Deliberately failing, never in `make test`: inner assertion failure is the
++# proof that swapping the fast path's LE bytes changes guest-visible state.
++test-perf-mem-nc: tests/test_perf_mem.c tests/integration/p1_mem_nc.sh src/mem.c
++	sh tests/integration/p1_mem_nc.sh
++
+ test-boot: x86emu firmware/firmware.bin disk/disk.img
+ 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
+ 
+@@ -147,7 +159,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-perf test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
++test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -157,7 +169,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P0: wall-clock bench.  NOT part of 'make test': its numbers are this
+ # machine's, so a gate on them would be a gate on the runner.  What it DOES
+@@ -189,4 +201,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf framebuffer.ppm tests/kload_fixture.elf
++	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem framebuffer.ppm tests/kload_fixture.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 81fdb62..f581eac 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,7 +31,7 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1–P5 📋 | seven-tape honest instruction-attempt/wall-time bench; next RAM fast path, translation TLB, decode cache, profile-guided dispatch | P0–P5 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2–P5 📋 | honest seven-tape bench; profile-guided 8-byte RAM read (ROM/A20/boundaries preserved); next measured translation TLB, decode cache, dispatch | P0–P5 |
+ | `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+ | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+@@ -58,9 +58,16 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+   control, deterministic work-count gates, six unit vectors, all historical
+   receipts unchanged~~ shipped.  `make bench BENCH_REPS=5` reports local
+   machine-relative wall time, not a cross-host performance assertion.
+-- `0052` — PERF P1 (proposed, **not yet implemented**): profile the RAM byte
+-  path, add only a justified contiguous fast path with MMIO/ROM/A20 boundary
+-  vectors and the same-phase NC; report paired before/after ratios.
++- ~~`0052` — PERF P1: five-run O2 gprof baseline showed `mem_read` at
++  45.66% of sampled time (313,666,250 calls; 235,535,030 page-walk reads).
++  Optimize only in-range, A20-open 8-byte RAM reads with unaligned-safe
++  memcpy; six bus vectors, LE-swap NC, full gates, seven-tape alternating
++  pre/post with identical work counts, historical tapes byte-identical~~
++  shipped.  Local ratios 1.18–1.83× across two paired 3-rep series have
++  visible host variance; no fixed cross-runner wall-time gate.
++- `0053` — PERF P2 (planned, NOT implemented): re-profile address translation
++  after P1; if still hot, define TLB keys and invalidation from measured
++  CR3/INVLPG/page-table-write behavior before caching anything.
+ 
+ 
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 57e1aa7..f225fba 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -573,6 +573,30 @@
+   AuraLite-OS guest lanes SKIP without its missing build tools. P1–P5
+   are planned, not delivered.
+ 
++- PERF P1 delivered (`patches/0052-PERF-P1-profiled-ram-read.patch`):
++  after five O2 gprof firmware runs measured 313,666,250 `mem_read`
++  calls (45.66% of samples; 235,535,030 from 8-byte page-table walks),
++  `mem_read` has a narrowly guarded 8-byte RAM `memcpy` path. It runs
++  only on little-endian hosts with A20 open, entirely inside RAM and
++  *after* both ROM alias checks; no write path, MMIO, disabled A20,
++  partial boundary or non-8 width changes. Five post-change gprof runs:
++  the same 313,666,250 calls, 14.37% of samples. Six deterministic
++  bus vectors pass, including the low BIOS ROM alias at `0xE0000` (which
++  lives inside RAM), RAM-end FF fills, A20, MMIO and unaligned LE loads.
++  The phase NC byte-swaps only a scratch fast-path return, causing the
++  first LE assertion to fail (inner RC=134, wrapper RC=1, make RC=2).
++  Seven tapes × two paired pre/post triples kept *identical* executed
++  work counts and no capped run, with local wall-time ratios 1.18–1.83×
++  and obvious host-frequency variation: not a CI wall-time threshold.
++  Four historical firmware/video stdout+log+PPM triples remain
++  byte-identical pre/post. `make test`, `make test-sanitize` and
++  `make fuzz FUZZ_PROGRAMS=256` all RC=0. In a fresh clone at the
++  P0 parent, `git am` produced an identical tree; after seeding the
++  ignored nasm binaries, `make test`, `make test-sanitize`, `make fuzz
++  FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` all passed RC=0;
++  `make test-perf-mem-nc` failed RC=2 by design. Frozen AuraLite-OS
++  lanes still SKIP without its guest build toolchain. P2–P5 remain planned.
++
+ ## Current limits
+ 
+ This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+diff --git a/docs/plans/PERF_PLAN.md b/docs/plans/PERF_PLAN.md
+index 29d5221..625cc94 100644
+--- a/docs/plans/PERF_PLAN.md
++++ b/docs/plans/PERF_PLAN.md
+@@ -6,16 +6,17 @@
+ > test, not an attractive optimization, authorize each change. `make test` and
+ > `make test-sanitize` remain green at each phase boundary.
+ 
+-**Status: P0 ✅ delivered (`patches/0051-PERF-P0-honest-benchmark.patch`);
+-P1–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
++**Status: P0 ✅ (`patches/0051-PERF-P0-honest-benchmark.patch`),
++P1 ✅ (`patches/0052-PERF-P1-profiled-ram-read.patch`);
++P2–P5 📋 planned, NOT implemented.** The PERF work is a measurement rig
+ first, RAM fast path, translation TLB, decode cache, profiling/dispatch,
+-then hardening and closure. Each phase below is scoped, not pre-approved for
+-implementation: measure its actual hotspot before writing the optimization.
++then hardening and closure. Future phases are scoped, not pre-approved for
++implementation: measure an actual hotspot before writing an optimization.
+ 
+ | Phase | Deliverable | Gate | Status |
+ |---|---|---|---|
+ | P0 | Work counter + opt-in `--stats`; seven-tape wall-time rig; cap/idle negative control | `make test-perf`, `make bench`, `make test`, `make test-sanitize`, `make fuzz FUZZ_PROGRAMS=256` | ✅ 0051 |
+-| P1 | RAM contiguous fast path for proven hot cases; all MMIO/A20/ROM cases use slow path | state-by-state differential fuzz + all P0 tapes measured before/after | 📋 |
++| P1 | Measured-hot 8-byte full-span RAM read fast path; ROM/MMIO/A20/boundary remain on old path | six bus vectors + LE-swap NC, differential fuzz, seven P0 tapes paired pre/post | ✅ 0052 |
+ | P2 | Guest-translation TLB with measured invalidation (CR3, INVLPG, paging-mode/permissions) | page-fault/Ring3/SMEP/SMAP vector suite + differential fuzz + P0 tapes | 📋 |
+ | P3 | Decode cache, with explicit invalidation for writes to code, A20 and mode transitions | self-modifying code + mode-transition vectors + differential fuzz + P0 tapes | 📋 |
+ | P4 | Profile-guided dispatch optimization only if the profile justifies it | `-pg`/gprof before/after + `make fuzz` + P0 tape ratios | 📋 |
+@@ -67,13 +68,14 @@ implementation: measure its actual hotspot before writing the optimization.
+ 
+ ## 2. Defect ledger
+ 
+-| ID | Symptom, repro and source | P0 remedy / later work |
++| ID | Symptom, repro and source | Remedy / later work |
+ |---|---|---|
+ | D0 | 20M cap / 0.685 s → false 28.69 MIPS though `instr=4837677` / 0.685 s → ~7.06. No bench existed. | P0 `make bench`: parse actual `executed=`, reject `cap_reached=1`, print ratio; NC uses cap as numerator and fails (RC 1). |
+ | D1 | `STI;HLT` + two idle slots: `instr_count=vtime=1026` while only 2 instructions were attempted; K3 `+512` is intentional. | P0 separate `executed_steps=2`, `idle_quantum=1024`, K6 identity unchanged; deterministic unit vector. |
+ | D2 | `m->n_vcpus=0` for a normal UP run; naive summation counted zero work. | P0 `machine_executed_total` counts BSP for 0/1 contexts; vector tests 0,1,2. |
+ | D3 | Every gate in `Makefile` compared state; a slowdown could pass all of them. | P0 wall-time median from five runs of each tape; report only. Later P1–P5 compare paired builds on same host, not absolute machine-external thresholds. |
+ | D4 | Appending `--no-fb` to all tapes made `gfx-fb` identical to `text-no-fb`. | P0 per-tape argv verbatim; printed labels correspond to distinct CLI paths. |
++| D5 | Five `-O2 -pg` firmware runs: `mem_read` **313,666,250** calls, **45.66%** of profile samples, **235,535,030** calls from `translate`'s 8-byte page-table walk. The old RAM case loops `size` times, bounds-checking every byte. | P1 one 8-byte `memcpy` (no alignment/aliasing UB) after ROM checks, only if A20 open and all 8 RAM bytes in bounds; big-endian hosts use the old LE loop. Post profile: same 313,666,250 calls, 14.37% of samples. |
+ 
+ ## 3. P0 — one patch, measured gates
+ 
+@@ -178,16 +180,117 @@ Do not bake a patch size, tree hash or host timing into this document:
+ the patch itself must not contain itself, and quoting its own sha/size
+ creates an amend loop. Historical tapes do not move with `--stats` absent.
+ 
+-## 4. Planned phases — gate before optimization
++## 4. P1 — measured 8-byte RAM read, one patch
+ 
+-**P1 (RAM fast path).** First profile `mem.c` per-byte loops under `-pg`/
+-gprof or targeted step counters. Only contiguous RAM spans with measured
+-hot frequency may bypass byte walking; accesses crossing RAM/ROM/MMIO
+-boundaries, A20 masking, open bus and I/O hooks must retain their old
+-observable order. Differential fuzz and edge-crossing vectors are in the
+-*same* patch. NC forces the fast path across a boundary; the new vector
+-must redden. Report paired before/after ratios from `make bench`, not an
+-absolute MIPS goal.
++### 4.1 Profile that authorized the change
++
++The P0 O2 build was compiled with `-pg -g` and run five times on the same
++firmware-boot tape (`--platform=haswell --max-instr=50000000`). `gprof -b`
++aggregated five `gmon.out` files: `mem_read` **313,666,250** calls,
++**45.66%** of 0.01-second flat-profile samples (1.21 of 2.65 sampled
++seconds); **235,535,030** calls from `translate`, which walks four levels
++of page tables via *8-byte* reads. `mem_write` saw only **2,514,365** calls,
++**0.00%** of samples; optimizing writes on a hunch would not follow the
++measured hotspot. `translate` itself consumed 14.72% of the remaining
++sampled time. This justifies the narrow 8-byte RAM *read* fast path, not
++a general rewrite of the physical bus or a translation-cache claim.
++
++`src/mem.c`: after existing A20 mask and **both ROM alias checks**, an
++unaligned-safe `memcpy` loads exactly 8 bytes if `a20` is open,
++`size == 8`, and `phys <= RAM_SIZE - 8`; the `#if` restricts it to a
++little-endian host. This condition is subtraction-based (no overflow from
++`phys+8`). Disabled A20, ROM at 0xE0000 (inside RAM!), top-of-4GB ROM,
++partial reads at RAM end, all non-8 widths, and MMIO retain the original
++path. Writes are untouched. `memcpy` avoids a misaligned `uint64_t *` load
++and C strict-aliasing UB. It does not change the guest clock or instruction
++work count.
++
++### 4.2 Regression vector and negative control (same patch)
++
++`make test-perf-mem` builds `tests/test_perf_mem.c` against production
++`mem.c`: six groups cover (1) unaligned 8-byte LE values, (2) last 8/7/1
++RAM bytes with 0xFF partial fill and clipped writes, (3) both ROM aliases,
++ROM wrap and the existing *start-address* decode across the low ROM
++boundary, (4) closed A20 and start-only bit-20 mask, (5) widths 1/2/4,
++(6) BAR read callback versus the existing RAM-priority decode. All groups
++passed RC=0, with `test-perf-mem: all vectors passed`. The P1 unit target
++is in both `make test` and `make test-sanitize`.
++
++A test-harness correction happened before shipping: the first A20 vector
++used `0x1FFFFE`, which after the bit-20 mask becomes `0x0FFFFE` inside
++the low ROM alias. Its RAM expectation was wrong (RC=134); the shipped
++vector uses `0x3FFFFE` → `0x2FFFFE`, crossing 3 MiB in ordinary RAM.
++That correction is an input-fixture fix, **not** an emulator defect.
++
++**Exactly one NC for P1:** `tests/integration/p1_mem_nc.sh` copies `mem.c`
++to a temporary directory, changes only the fast-path return to
++`__builtin_bswap64(v)`, compiles the **same** P1 vector and requires the
++first assertion text `mem_read(&g_m, 0x123, 8) ==
++0x1716151413121110ULL` to fail. It does: inner binary **RC=134**, NC
++script **RC=1**, `make test-perf-mem-nc` **RC=2** (`make` reports recipe
++Error 1), receipt `P1 NC: FAILED AS DESIGNED (swapped-endian RAM fast path
++is detected)`. The checkout is not mutated. The same vector also guards
++RAM/ROM/A20 boundaries; the NC deliberately targets endian fidelity,
++which a generic memcpy on the wrong host could silently violate.
++
++### 4.3 Performance and guest identity (measured, not a CI threshold)
++
++Five post-change `-O2 -pg` runs on the same firmware workload: `mem_read`
++**313,666,250 calls** (unchanged), **14.37%** of sampled time (0.26 of
++1.81 sampled seconds). gprof sampling is noisy; do not treat its
++percentages as a portable speedup. `make bench` was run as alternating
++**pre1 → post1 → pre2 → post2**, each seven tapes ×3 repeats, same O2
++compiler and firmware/disk inputs. Every one of the seven work counts was
++identical across all four passes; no run reached its cap. The paired
++wall-time ratios pre/post were:
++
++| Tape | Attempts | Pair 1 (ms; ratio) | Pair 2 (ms; ratio) |
++|---|---:|---:|---:|
++| boot-haswell | 4,837,677 | 691→514; 1.34× | 783→427; 1.83× |
++| boot-broadwell | 4,807,694 | 680→507; 1.34× | 701→433; 1.62× |
++| boot-baytrail | 4,807,650 | 679→470; 1.44× | 670→419; 1.60× |
++| text-no-fb | 4,837,677 | 674→570; 1.18× | 687→421; 1.63× |
++| gfx-fb | 4,837,677 | 676→486; 1.39× | 680→420; 1.62× |
++| vbe-800x600x32 | 4,837,677 | 690→467; 1.48× | 688→427; 1.61× |
++| smp2 | 4,837,677 | 1116→747; 1.49× | 1004→710; 1.41× |
++
++The two pre1/pre2 haswell medians alone differ 13%, and post1/post2
++medians differ 17%; host load/frequency clearly moved. The limited
++local evidence supports a real reduction of `mem_read` cost and faster
++*sampled* tapes, **not** a universal fixed 1.5× speedup. There is no
++absolute wall-clock gate, and a regression claim must compare builds on
++one host with the same input and compile flags.
++
++Four historical 600k-cap lanes with identical paths for `--log` and
++`--dump-fb`: firmware boot, `--vbe=800x600x32`, `--vbe=off`, `--no-fb`.
++Pre/post stdout, ring log, PPM byte-identical, each RC=0/0; PPM SHA256
++prefixes `15c96625cfec5acc` (first three) and `c3b3d73f6bbb08ab`
++(no-fb). `make test` **RC=0** (P1 vector + boot + N2/N3 PASS),
++`make test-sanitize` **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0**
++(256 programs / 6,144 instructions, states match, 0 host crashes).
++Frozen guest lanes remain SKIP because its toolchain/build are absent;
++this is not a claim of fresh guest end-to-end performance.
++
++### 4.4 Fresh-clone patch gate (measured)
++
++From parent `2a10cf4` (`PERF P0`), `git am
++"$REPO/patches/0052-PERF-P1-profiled-ram-read.patch"` applied cleanly;
++the resulting `HEAD^{tree}` was identical to the development tree. The
++three ignored nasm artifacts (firmware.bin, test_kernel.bin, disk.img)
++were seeded as in `NET_PLAN.md` §3.9; `make -n` said both build targets
++up to date. In that fresh clone: `make test` **RC=0** (`test-perf-mem:
++all vectors passed`, boot integration ok, N2/N3 ALL PASS), `make
++test-sanitize` **RC=0**, `make fuzz FUZZ_PROGRAMS=256` **RC=0**
++(6,144 differential instructions, all states match, 0 host crashes),
++`make bench BENCH_REPS=3` **RC=0** (seven tapes with stable work, none
++capped), and the one P1 NC `make test-perf-mem-nc` **RC=2** (inner binary
++RC=134, wrapper RC=1, exact LE assertion in §4.2). Frozen-guest lanes
++SKIP; no claim is made about a new guest build.
++
++Do not put a checksum or size of this patch into itself: those numbers
++change when its documentation changes, causing an amend loop.
++
++## 5. Planned phases — gate before optimization
+ 
+ **P2 (translation TLB).** Only if the P1 follow-up profile shows address
+ translation is hot. State a key containing all permission/mode bits
+@@ -218,7 +321,7 @@ close the defect ledger with per-defect vectors, include the one NC for
+ P5, re-run all guest-visible historical receipts, and verify `git am` in
+ a fresh clone.
+ 
+-## 5. Standing constraints
++## 6. Standing constraints
+ 
+ 1. Do not change `instr_count`/`vtime_instr` semantics: they are the K6
+    guest clock and include K3 idle quanta. An optimization that returns
+diff --git a/src/mem.c b/src/mem.c
+index 2d1a4da..932f43f 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -85,6 +85,21 @@ uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
+         for (int i = 0; i < size; i++) v |= ((uint64_t)m->rom[(off + i) % ROM_SIZE]) << (8*i);
+         return v;
+     }
++    /* PERF P1: profile-guided 8-byte RAM read.  Five firmware runs under
++     * gprof found 235535030 mem_read calls from translate() -- its PTE/PDE/
++     * PDPTE/PML4E walks all use size=8.  A single unaligned-safe memcpy
++     * replaces eight byte-at-a-time checks only when the ENTIRE read stays
++     * in RAM, ROM aliasing above has already been handled, and the A20
++     * gate is open.  Keep the old byte loop for every boundary, disabled
++     * A20, ROM window, and non-8-byte read.  memcpy avoids type-punning/
++     * alignment UB; host big-endian builds use the original LE byte loop. */
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++    if (m->chipset.a20 && size == 8 && phys <= (uint64_t)RAM_SIZE - 8) {
++        uint64_t v;
++        memcpy(&v, m->ram + phys, sizeof v);
++        return v;  /* PERF P1: fast path, exactly 8 in-range RAM bytes */
++    }
++#endif
+     if (phys < RAM_SIZE) {
+         uint64_t v = 0;
+         for (int i = 0; i < size; i++) {
+diff --git a/tests/integration/p1_mem_nc.sh b/tests/integration/p1_mem_nc.sh
+new file mode 100755
+index 0000000..ddde342
+--- /dev/null
++++ b/tests/integration/p1_mem_nc.sh
+@@ -0,0 +1,48 @@
++#!/bin/sh
++# PERF P1 -- one negative control for the 8-byte RAM fast path.
++#
++# Create a throwaway copy of mem.c with the optimized read's return byte-
++# swapped.  It is still an 8-byte load, and the code still runs, but it is
++# now WRONG for the guest's little-endian contract.  Compile the very same
++# test_perf_mem.c shipped in the phase and demand that its first LE assertion
++# fail.  This mutation touches neither the checkout nor the passing gates.
++# The script exits 1 intentionally when it has proved the NC is red.
++# `make test-perf-mem-nc` wraps the recipe error and exits 2.
++set -eu
++
++root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
++cd "$root"
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++cp src/mem.c "$tmp/mem.c"
++python3 - "$tmp/mem.c" <<'PY'
++from pathlib import Path
++import sys
++p = Path(sys.argv[1]); s = p.read_text()
++a = 'return v;  /* PERF P1: fast path, exactly 8 in-range RAM bytes */'
++b = 'return __builtin_bswap64(v);  /* PERF P1 NC: wrong endian */'
++assert s.count(a) == 1, 'NC mutation anchor must be exactly one fast path'
++p.write_text(s.replace(a, b, 1))
++PY
++
++${CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -Isrc -Itests \
++    tests/test_perf_mem.c "$tmp/mem.c" src/cpu.c src/io.c src/platform.c \
++    src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c \
++    src/ioapic.c -o "$tmp/test-perf-mem-nc" -lm
++ulimit -c 0 || true
++set +e
++"$tmp/test-perf-mem-nc" >"$tmp/out" 2>"$tmp/err"
++rc=$?
++set -e
++if [ "$rc" -eq 0 ]; then
++    echo 'NC BROKEN: swapped-endian fast path passed the P1 vector' >&2
++    exit 2
++fi
++if ! grep -F -q -e 'mem_read(&g_m, 0x123, 8) == 0x1716151413121110ULL' "$tmp/err"; then
++    echo "NC BROKEN: failed for another reason (inner rc=$rc):" >&2
++    cat "$tmp/err" >&2
++    exit 2
++fi
++printf 'P1 NC: inner rc=%s; assert mem_read(&g_m, 0x123, 8) == 0x1716151413121110ULL failed as designed\n' "$rc"
++echo 'P1 NC: FAILED AS DESIGNED (swapped-endian RAM fast path is detected)'
++exit 1
+diff --git a/tests/test_perf_mem.c b/tests/test_perf_mem.c
+new file mode 100644
+index 0000000..94e3747
+--- /dev/null
++++ b/tests/test_perf_mem.c
+@@ -0,0 +1,128 @@
++/* tests/test_perf_mem.c -- PERF P1: narrow, profile-guided RAM read fast path.
++ *
++ * Five O2 -pg boot runs: 313666250 mem_read calls, 235535030 from translate's
++ * 8-byte PTE/PDE/PDPTE/PML4E walks; mem_read 45.66% of samples (before).
++ * Only an 8-byte read ENTIRELY inside RAM with A20 open may take memcpy;
++ * everything else must produce exactly the old byte-loop/bus result.
++ * No wall-clock threshold here: these are architectural/bus invariants.
++ *
++ * The one P1 negative control changes the 8-byte fast-path return to
++ * __builtin_bswap64(v) in a scratch copy of mem.c.  The first vector below
++ * asserts the exact LE value and fails (NC script verifies the assertion).
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "platform.h"
++#include "harness.h"
++
++static machine_t g_m;
++static unsigned mmio_reads;
++
++static uint64_t mmio_test_read(void *ctx, uint64_t addr, int size) {
++    (void)ctx;
++    assert(addr == 0xFEBC0000ULL);
++    assert(size == 8);
++    ++mmio_reads;
++    return 0x1020304050607080ULL;
++}
++static void mmio_test_write(void *ctx, uint64_t addr, int size, uint64_t val) {
++    (void)ctx; (void)addr; (void)size; (void)val;
++    assert(!"MMIO write not part of this vector");
++}
++
++int main(void) {
++    setup_machine(&g_m);
++    assert(g_m.chipset.a20);
++
++    /* 1. Unaligned 8-byte little-endian load.  memcpy's host byte order
++     * must be the same as the byte loop's LE assembly, and alignment must
++     * not produce UB.  The NC deliberately swaps the 8 bytes so it fails
++     * THIS assertion (not a later timing threshold). */
++    for (int i = 0; i < 16; i++) g_m.ram[0x123 + i] = (uint8_t)(0x10 + i);
++    assert(mem_read(&g_m, 0x123, 8) == 0x1716151413121110ULL);
++    assert(mem_read(&g_m, 0x124, 8) == 0x1817161514131211ULL);
++    puts("ok p1 unaligned LE RAM 8-byte load");
++
++    /* 2. Last eight in RAM are in-range, last seven aren't.  Old mem_read
++     * reads bytes inside RAM and fills out-of-range positions with 0xFF,
++     * NOT by consulting the unmapped/open-bus handler for the whole read.
++     * Using only phys<RAM_SIZE as the fast-path guard would read past the
++     * allocation and break this contract. */
++    for (int i = 0; i < 8; i++) g_m.ram[RAM_SIZE - 8 + i] = (uint8_t)(0xA0 + i);
++    assert(mem_read(&g_m, RAM_SIZE - 8, 8) == 0xA7A6A5A4A3A2A1A0ULL);
++    assert(mem_read(&g_m, RAM_SIZE - 7, 8) == 0xFFA7A6A5A4A3A2A1ULL);
++    assert(mem_read(&g_m, RAM_SIZE - 1, 8) == 0xFFFFFFFFFFFFFFA7ULL);
++    assert(mem_read(&g_m, RAM_SIZE, 8) == 0xFFFFFFFFFFFFFFFFULL);
++    mem_write(&g_m, RAM_SIZE - 2, 8, 0x1122334455667788ULL);
++    assert(mem_read(&g_m, RAM_SIZE - 2, 8) == 0xFFFFFFFFFFFF7788ULL);
++    puts("ok p1 RAM limit: last 8 in range, partial reads fill FF; writes clipped");
++
++    /* 3. ROM alias lives INSIDE RAM.  It must win before the fast path.
++     * Crossing the top of the alias wraps (old off+i modulo ROM_SIZE),
++     * but an 8-byte read that STARTS below it still reads RAM across the
++     * boundary.  That starting-address decode is a historical contract,
++     * not an invitation to fix mixed-bus reads during PERF. */
++    for (int i = 0; i < 8; i++) g_m.rom[i] = (uint8_t)(0x20 + i);
++    for (int i = 0; i < 4; i++) g_m.rom[ROM_SIZE - 4 + i] = (uint8_t)(0x30 + i);
++    for (int i = -4; i < 4; i++)
++        g_m.ram[ROM_ALIAS_LOW_BASE + i] = (uint8_t)(0x40 + i + 4);
++    assert(mem_read(&g_m, ROM_ALIAS_LOW_BASE, 8) == 0x2726252423222120ULL);
++    assert(mem_read(&g_m, ROM_TOPOF4G_BASE, 8) == 0x2726252423222120ULL);
++    assert(mem_read(&g_m, ROM_ALIAS_LOW_BASE + ROM_SIZE - 4, 8) ==
++           0x2322212033323130ULL);
++    assert(mem_read(&g_m, ROM_ALIAS_LOW_BASE - 4, 8) ==
++           0x4746454443424140ULL);
++    mem_write(&g_m, ROM_ALIAS_LOW_BASE, 8, 0xFFFFFFFFFFFFFFFFULL);
++    assert(mem_read(&g_m, ROM_ALIAS_LOW_BASE, 8) == 0x2726252423222120ULL);
++    puts("ok p1 ROM aliases precede RAM; wrap and start-address decode unchanged");
++
++    /* 4. A20 closed: bus masks bit 20 of the START address only.  This
++     * case stays on the old byte loop (even if the masked address is RAM);
++     * both modes must agree on the low bytes.  Also exercise the old
++     * start-only mask on an 8-byte read straddling the 3-MiB boundary.
++     * A 1-MiB straddle would START inside the 0xE0000..0xFFFFF ROM alias
++     * after masking A20; it would test ROM wrap rather than RAM. */
++    for (int i = 0; i < 8; i++) {
++        g_m.ram[0x100 + i] = (uint8_t)(0x50 + i);
++        g_m.ram[0x100100 + i] = (uint8_t)(0x60 + i);
++    }
++    assert(mem_read(&g_m, 0x100100, 8) == 0x6766656463626160ULL);
++    g_m.chipset.a20 = 0;
++    assert(mem_read(&g_m, 0x100100, 8) == 0x5756555453525150ULL);
++    for (int i = 0; i < 8; i++) g_m.ram[0x2FFFFE + i] = (uint8_t)(0x70 + i);
++    assert(mem_read(&g_m, 0x3FFFFE, 8) == 0x7776757473727170ULL);
++    g_m.chipset.a20 = 1;
++    puts("ok p1 disabled A20 retains start-only mask and slow path");
++
++    /* 5. Other widths are untouched, including unaligned reads. */
++    assert(mem_read(&g_m, 0x123, 1) == 0x10);
++    assert(mem_read(&g_m, 0x123, 2) == 0x1110);
++    assert(mem_read(&g_m, 0x123, 4) == 0x13121110);
++    puts("ok p1 1/2/4-byte reads unchanged");
++
++    /* 6. MMIO is decoded only after RAM and ROM.  Above-RAM BAR dispatches
++     * its read callback; below-RAM registered region still reads RAM (the
++     * existing RAM-priority contract).  This vector also guarantees no
++     * BAR or firmware-facing MMIO contract was widened by the fast path. */
++    mmio_reads = 0;
++    mem_register_mmio(&g_m, 0xFEBC0000ULL, 8, mmio_test_read,
++                      mmio_test_write, NULL, "P1 test high BAR");
++    assert(mem_read(&g_m, 0xFEBC0000ULL, 8) == 0x1020304050607080ULL);
++    assert(mmio_reads == 1);
++    mem_register_mmio(&g_m, 0x123, 8, mmio_test_read,
++                      mmio_test_write, NULL, "P1 test RAM-priority");
++    assert(mem_read(&g_m, 0x123, 8) == 0x1716151413121110ULL);
++    assert(mmio_reads == 1);
++    while (g_m.mmio_list) {
++        mmio_region_t *r = g_m.mmio_list;
++        g_m.mmio_list = r->next;
++        free(r);
++    }
++    puts("ok p1 MMIO BAR and RAM priority unchanged");
++
++    puts("test-perf-mem: all vectors passed");
++    return 0;
++}
+-- 
+2.47.3
+

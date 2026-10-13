@@ -77,6 +77,10 @@ static void fx64(uint64_t user_pt_flags) {
 /* Run one instruction from phys `pa` (already written), return step rc. */
 static int load1(uint64_t pa, const uint8_t *bytes, size_t n) {
     memcpy(g_m.ram + pa, bytes, n);
+    /* This test injects new instructions into the same phys/RIP AFTER
+     * execution.  Unlike guest/DMA mem_write, a direct host RAM pointer
+     * cannot automatically invalidate P2/P3; flush once after injection. */
+    perf_tlb_flush(&g_m);
     g_m.cpu.rip = pa;
     return cpu_step(&g_m.cpu);
 }

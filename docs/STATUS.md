@@ -547,6 +547,114 @@
   negative-control lane is byte-identical on re-run and prints the
   unattached receipt verbatim, `make test` + `make test-sanitize` green.
 
+- PERF P0 delivered (`patches/0051-PERF-P0-honest-benchmark.patch`): a
+  separate `cpu.executed_steps` counter increments only on the cpu_step
+  `done:` path, never on the K3 +512 all-idle clock quantum; the K6
+  guest-visible `instr_count`/`vtime_instr` semantics stay unchanged.
+  `--stats` opts into per-vCPU attempts, machine-wide executed total,
+  idle delta, virtual clock and cap flag; without it, the four firmware/
+  video tapes are byte-identical pre/post in stdout, log and framebuffer.
+  `tests/test_perf.c` pins STI;HLT + two idle slots as 2 executed steps
+  versus `instr_count=vtime=1026`, the K6 identity, faulting attempt,
+  single/multi-context summation, and cap-independent completed work.
+  `make bench` uses a separately rebuilt O2 binary (the ASan lane replaces
+  `x86emu` with O1 ASan), seven firmware tapes ×5 median host wall-time,
+  stable work-count gates and no timing threshold. On this runner boot-
+  haswell did 4,837,677 attempts in 678 ms (7.14 Msteps/s) and halted
+  well below the 50M cap; the NC divides that SAME wall time by the
+  cap instead, prints 10.34× inflation, and fails by design: script
+  RC=1, `make bench-nc` RC=2 (`make` reports the recipe's Error 1).
+  `make test` RC=0, `make test-sanitize` RC=0, `make fuzz
+  FUZZ_PROGRAMS=256` RC=0 (6,144 instructions compared, no host crash).
+  In a fresh clone at `a3f76b5`, `git am` applied cleanly and yielded the
+  same tree; after seeding prebuilt nasm artifacts, `make test` and `make
+  test-sanitize` passed RC=0, `make bench BENCH_REPS=3` RC=0, and the
+  NC `make bench-nc BENCH_REPS=3` failed RC=2 as designed. Frozen
+  AuraLite-OS guest lanes SKIP without its missing build tools. P1–P5
+  are planned, not delivered.
+
+- PERF P1 delivered (`patches/0052-PERF-P1-profiled-ram-read.patch`):
+  after five O2 gprof firmware runs measured 313,666,250 `mem_read`
+  calls (45.66% of samples; 235,535,030 from 8-byte page-table walks),
+  `mem_read` has a narrowly guarded 8-byte RAM `memcpy` path. It runs
+  only on little-endian hosts with A20 open, entirely inside RAM and
+  *after* both ROM alias checks; no write path, MMIO, disabled A20,
+  partial boundary or non-8 width changes. Five post-change gprof runs:
+  the same 313,666,250 calls, 14.37% of samples. Six deterministic
+  bus vectors pass, including the low BIOS ROM alias at `0xE0000` (which
+  lives inside RAM), RAM-end FF fills, A20, MMIO and unaligned LE loads.
+  The phase NC byte-swaps only a scratch fast-path return, causing the
+  first LE assertion to fail (inner RC=134, wrapper RC=1, make RC=2).
+  Seven tapes × two paired pre/post triples kept *identical* executed
+  work counts and no capped run, with local wall-time ratios 1.18–1.83×
+  and obvious host-frequency variation: not a CI wall-time threshold.
+  Four historical firmware/video stdout+log+PPM triples remain
+  byte-identical pre/post. `make test`, `make test-sanitize` and
+  `make fuzz FUZZ_PROGRAMS=256` all RC=0. In a fresh clone at the
+  P0 parent, `git am` produced an identical tree; after seeding the
+  ignored nasm binaries, `make test`, `make test-sanitize`, `make fuzz
+  FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` all passed RC=0;
+  `make test-perf-mem-nc` failed RC=2 by design. Frozen AuraLite-OS
+  lanes still SKIP without its guest build toolchain. P2–P5 remain planned.
+
+- PERF P2 delivered (`patches/0053-PERF-P2-coherent-success-tlb.patch`):
+  after P1, five O2 gprof firmware boots measured `translate` 79,798,615
+  calls, 22.10% of samples. A 256-entry shared success-only TLB caches
+  4KiB subpage translations after the existing permission checks; full
+  CR3/CR0/CR4/EFER, AC, CPL, descriptor override and access mode key
+  the result. Only ordinary RAM-backed page-table reads with A20 open
+  may be cached. Global generation flushes on every guest/DMA RAM store,
+  CR0/CR3/CR4/LMSW/EFER/INVLPG/reset and K1 loader boot; faulting,
+  ROM/MMIO-backed and A20-closed walks remain uncached. Fresh `--stats`
+  on the boot tape: 15,863,692 hits, 4,668 misses, 4,669 flushes,
+  4,837,677 actual instruction attempts; `mem_read` in five profiled
+  boots fell 313,666,250→78,188,375 calls. P2 vectors include live
+  PTE remap, all four #PF CR2/error/RIP verdicts, large PS pages,
+  dynamic MMIO root and SMP keying; the single NC removes the RAM-write
+  flush in a scratch copy and reddens `assert(c->gpr[RAX] == NEW_VALUE)`
+  (binary RC=134, wrapper RC=1, make RC=2). Seven alternating pre/post
+  tapes kept work counts identical; local paired time ratios 1.15–1.35×
+  with no absolute timing gate. Four historical video/firmware stdout,
+  log and PPM receipts byte-identical. `make test`, `make test-sanitize`,
+  `make fuzz FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` all RC=0;
+  in a fresh clone from `f7c3bd7`, `git am` gave the identical tree;
+  after nasm-artifact seeding, `make test`, `make test-sanitize`, `make
+  fuzz FUZZ_PROGRAMS=256`, `make bench BENCH_REPS=3` each passed RC=0;
+  P2 NC failed RC=2 by design. Frozen AuraLite-OS lanes SKIP without
+  the missing guest toolchain. P3–P5 remain planned.
+
+- PERF P3 (`patches/0054-PERF-P3-ram-prefix-predecode.patch`): after P2,
+  `decode_modrm` sampled 8% and `fetch8` 6%; `group1` redundantly
+  re-fetched 970,913 times per boot. A shared 512-slot cache stores only
+  RAM-backed, one-page prefixes/opcode after successful P2 EXEC; dynamic
+  ModRM/SIB/imm always re-read, the P2 RAM-write epoch coheres SMC/PTE/DMA,
+  and MMIO/ROM/NX, A20-off, cross-page and debug stay live. New vectors
+  cover SMC/PTE remap, mode/trace, NX #PF err/CR2/RIP, SIB/imm and MMIO;
+  the one epoch-check NC fails deliberately (inner RC=134, make RC=2).
+  Two alternating seven-tape series show UP 1.17–1.35×, SMP ~1.02×,
+  identical instruction work; four historical stdout/stderr/log/PPM lanes
+  byte-identical. The ring3 harness now flushes after post-start raw RAM
+  instruction injection. Full gates/fresh-clone receipt in PERF_PLAN §6.4.
+  Frozen AuraLite-OS toolchain absent: guest lanes SKIP. P4–P5 planned.
+
+- PERF P4 measured NO-GO: gprof on P3 did not isolate opcode-switch
+  cost, and a scratch-only direct-group1 dispatch experiment gave mixed
+  paired results (including two Haswell/Broadwell slowdowns). No CPU
+  dispatcher or bogus phase patch was shipped. Reproduction:
+  `docs/research/PERF_P4_GATE.md`.
+- PERF P5 (`patches/0055-PERF-P5-paired-confidence-closeout.patch`): the
+  seven-tape comparator now measures alternating before/after O2 pairs,
+  rejects unequal guest steps/idle/BSP clock/vtime/vCPU count and capped or
+  nondeterministic runs, then reports seeded 95% *local* bootstrap intervals
+  without timing CI thresholds. Nine-pair P2→P3 UP estimates 1.237–1.279×;
+  SMP 1.002× [0.977,1.026] has no speed claim. P3→P5 binaries are
+  bit-identical; nine available historical stdout/stderr/log/PPM lanes are
+  byte-identical; N2/N3 wire gates remain x2. Five P5 comparator vectors
+  pass, and its single NC removes the work-equality guard and fails
+  `AssertionError: ValueError not raised` (inner 1, make 2). D0–D8 map
+  to concrete vectors in PERF_PLAN. Full gates/fresh-clone verdict in §8.4.
+  Frozen guest lanes SKIP without its absent toolchain.
+
 ## Current limits
 
 This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.

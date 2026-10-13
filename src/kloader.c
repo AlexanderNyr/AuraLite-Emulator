@@ -439,6 +439,10 @@ int kload_boot(machine_t *m, const char *elf_path, const char *initrd_path) {
     uint32_t mmap_n = kfill_boot_info(m, map_hi, initrd_phys, initrd_size);
     free(initrd_img);
 
+    /* PERF P2: this loader built tables via direct pre-execution RAM
+     * memcpy/pt_entries writes rather than guest mem_write; discard any
+     * earlier mapping before starting CPU execution. */
+    perf_tlb_flush(m);
     /* ---- CPU state: exactly the boot.asm contract ---- */
     cpu_reset(&m->cpu);
     m->cpu.cr0 = 0x80000023ULL;                  /* PE|MP|NE|PG */
