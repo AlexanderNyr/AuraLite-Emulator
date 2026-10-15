@@ -6,7 +6,7 @@
 > `make test` and `make test-sanitize` stay green at every phase boundary.
 > Every claim below is measured against the tree, not assumed.
 
-**Status: T0 ✅ (`patches/0056-TOOLING-T0-tooling-plan.patch`); T1 ✅ (`patches/0057-TOOLING-T1-trace-disassembly.patch`); T2 ✅ (`patches/0058-TOOLING-T2-debugger-repl.patch`); T3 ✅ (`patches/0059-TOOLING-T3-gdbstub.patch`); T4 ✅ (`patches/0060-TOOLING-T4-snapshots.patch`); T5 📋 planned.**
+**Status: T0 ✅ (`patches/0056-TOOLING-T0-tooling-plan.patch`); T1 ✅ (`patches/0057-TOOLING-T1-trace-disassembly.patch`); T2 ✅ (`patches/0058-TOOLING-T2-debugger-repl.patch`); T3 ✅ (`patches/0059-TOOLING-T3-gdbstub.patch`); T4 ✅ (`patches/0060-TOOLING-T4-snapshots.patch`); T5 ✅ (`patches/0061-TOOLING-T5-live-web-monitor.patch`).**
 
 | Phase | Deliverable | Gate | Status |
 |---|---|---|---|
@@ -15,7 +15,7 @@
 | T2 | Run-control core + built-in REPL: `--debug`, `--debug-script=`, `--symbols=`; breakpoints, watchpoints, step/next, side-effect-free memory/page-walk inspection | unit vectors; scripted transcript lane; **non-perturbation** byte identity (UP + SMP); NC | ✅ 0058 |
 | T3 | gdbstub `--gdb=[host:]port` (GDB Remote Serial Protocol over TCP; vCPUs as threads; `monitor` = REPL) | Python RSP client lanes; real `gdb -batch` lane (SKIP without gdb); non-perturbation; NC | ✅ 0059 |
 | T4 | Snapshots `--snapshot-save=` / `--snapshot-load=` and REPL `savevm`/`loadvm` | split-run identity lanes (straight run ≡ save + fresh-process load); round-trip identity; config-mismatch refusal; NC | ✅ 0060 |
-| T5 | Live monitor `--monitor=[host:]port`: HTTP + WebSocket server, `web/monitor.html` live mode (registers, framebuffer, log, disassembly, run control, keyboard); plan close-out | codec vectors (RFC 6455 accept key, SHA-1, framing); HTTP/WS client lanes; non-perturbation; NC | 📋 |
+| T5 | Live monitor `--monitor=[host:]port`: HTTP + WebSocket server, `web/monitor.html` live mode (registers, framebuffer, log, disassembly, run control, keyboard); plan close-out | codec vectors (RFC 6455 accept key, SHA-1, framing); HTTP/WS client lanes; non-perturbation; NC | ✅ 0061 |
 
 Ordering is dependency-driven: the disassembler (T1) is consumed by the
 REPL's `x/i` (T2), by gdb's `monitor` output (T3) and by the monitor's
@@ -501,20 +501,66 @@ at step 1,000, before any framebuffer write, stays green; make RC=2.
 
 ## 8. T5 — live monitor + close-out
 
-**Deliverable.** `src/monitor.c`: a single-threaded HTTP/1.1 + RFC 6455
-WebSocket server polled from the run loop (never blocks the guest while
-running), serving `web/monitor.html`; JSON state frames (mode, vtime,
-executed, registers, vCPUs, new log lines, stop reason, disassembly at
-RIP) and binary row-delta framebuffer frames; commands
-`pause/continue/step/break/exec/keys/type`. Run control obeys rule 4;
-while gdb is attached the monitor is read-only for run control.
-`web/monitor.html` gains a live mode and keeps its offline file mode.
+**Deliverable.** `src/ws.c`/`ws.h` provide dependency-free SHA-1,
+RFC 6455 accept-key and frame helpers. `src/monitor.c`/`monitor.h` attach a
+single-threaded HTTP/1.1 + WebSocket frontend to the T2 debugger poll loop;
+network I/O is non-blocking while the guest runs, and all state inspection
+uses the T2 side-effect-free APIs. `--monitor=[IPv4:]port` defaults to
+127.0.0.1 and stops at the reset vector. JSON state frames carry platform,
+mode, vtime, executed attempts, registers, vCPU state, logs, stop reason,
+and disassembly. Binary framebuffer messages carry `FB`, version, keyframe
+flag, little-endian dimensions/row count, then changed rows as y + RGB.
+Commands: `pause/continue/step/break/exec/keys/type/quit`. When GDB is
+attached, monitor run control is read-only. `web/monitor.html` adds the live
+view and retains offline PPM/log loading. The endpoint has no authentication;
+non-loopback binding is an explicit user choice.
 
-**Gate.** codec vectors (RFC 6455 §1.3 key → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`,
-FIPS 180 SHA-1 vectors, masked/unmasked 7/16/64-bit lengths);
-`tests/test_monitor.py` (HTTP GET, handshake, state frames, pause/step/
-break/exec, framebuffer marker pixel, quit); non-perturbation. **NC:** a
-wrong accept GUID → the client handshake check reddens.
+**Gate.** `make test-monitor-codec`: RFC 6455 sample accept key, FIPS 180
+SHA-1 vectors, masked and unmasked short/16-bit/64-bit payloads, and
+malformed-header/control-frame rejection. `make test-monitor`: HTTP GET,
+101 handshake, initial state and 800×600 framebuffer keyframe, 16-/64-bit
+server payload lengths, run control, read-only REPL, framebuffer marker,
+Set-1 and ASCII keyboard injection, GDB ownership, async pause/step/quit,
+masked short/16-/64-bit client frames, unmasked-frame rejection, and
+non-perturbation (stdout incl. `--stats`, PPM and log byte-identical).
+Both targets are part of `make test` and `make test-sanitize`. **NC:** a
+scratch `ws.c` with the wrong accept GUID; HTTP and 101 stay green while the
+client's sample-key assertion alone fails.
+
+### 8.1 Delivered (measured)
+
+**Code and wire.** `--monitor=8080` serves `web/monitor.html` at
+`http://127.0.0.1:8080/`, then upgrades `/ws`. The frontend is polled by the
+T2 stop/running loop; it never creates a CPU thread. Running polls occur at
+the T2 cadence (one callback per 1024 instruction attempts) and publish
+state/framebuffer every 64 callbacks. The first 800×600 RGB keyframe is
+1,441,210 payload bytes, so the output limits include legal RFC 64-bit
+frame lengths. Later frames carry only changed rows. State JSON includes the
+selected CPU's GPR/control-register dump, platform/mode, stop and execution
+counters, per-vCPU RIP/state, `dbg_disas_at()` output, framebuffer size and
+new log-ring entries. Commands share the T2 run-control and inspection
+paths; keyboard input uses the KBC's Set-1 queue and `type` translates US
+ASCII make/break codes. The monitor refuses run-control commands while a
+GDB frontend is registered.
+
+**Measured gates.** `make test-monitor-codec` passes all 19 checks.
+`make test-monitor` passes 54 checks across five lanes: HTTP/handshake,
+firmware control + marker, async pause/step/quit, GDB read-only ownership,
+and frame lengths/protocol hygiene. The full 800×600 keyframe uses a 64-bit
+WebSocket payload length; the monitor state and control replies are parsed
+at short/16-bit lengths. The firmware lane sets a breakpoint at the guest
+entry, single-steps `cli`, continues to the 600,000-attempt limit, sees the
+`0x00200000` marker pixel, injects keyboard input, and compares stdout
+(incl. `--stats`), the complete log ring and PPM to a plain run byte for byte.
+`make test` passes (355 s) and `make test-sanitize` passes (138 s); existing
+frozen-guest lanes skip because KERNEL/INITRD are not supplied in this
+workspace. `make test-monitor-nc` fails as designed: after corrupting only
+the RFC GUID, HTTP and 101 pass, and the client accept-key check is the only
+red assertion. Historical suite lanes remain green.
+
+**NC** (`make test-monitor-nc`): wrong RFC 6455 accept GUID in a scratch
+copy of `ws.c`; inner client RC=1 on the exact sample accept-key assertion,
+HTTP GET and 101 upgrade pass, wrapper RC=1 as designed.
 
 ## 9. Non-goals
 

@@ -16,6 +16,7 @@
 #include "dbg.h"     /* TOOLING */
 #include "gdbstub.h" /* TOOLING T3 */
 #include "snapshot.h" /* TOOLING T4 */
+#include "monitor.h" /* TOOLING T5 */
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -170,6 +171,7 @@ int main(int argc, char **argv) {
     const char *gdb_spec = NULL;    /* --gdb=[host:]port: TOOLING T3 gdbstub */
     const char *snap_save_path = NULL; /* --snapshot-save=path: TOOLING T4, at run end */
     const char *snap_load_path = NULL; /* --snapshot-load=path: TOOLING T4, before the run */
+    const char *monitor_spec = NULL;   /* --monitor=[host:]port: TOOLING T5 */
     uint64_t trace_from = 0;        /* --trace-from=VTIME: first traced instruction */
     uint64_t trace_count = 0;       /* --trace-count=N: stop after N lines (0 = all) */
 
@@ -231,6 +233,7 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--gdb=", 6)) gdb_spec = argv[i]+6;                   /* TOOLING T3 */
         else if (!strncmp(argv[i], "--snapshot-save=", 16)) snap_save_path = argv[i]+16;  /* TOOLING T4 */
         else if (!strncmp(argv[i], "--snapshot-load=", 16)) snap_load_path = argv[i]+16;
+        else if (!strncmp(argv[i], "--monitor=", 10)) monitor_spec = argv[i]+10;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
                    "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--dump-text=out.txt] [--log=out.txt]\n"
@@ -257,6 +260,8 @@ int main(int argc, char **argv) {
                   "          [--symbols=elf] debugger symbols (default: the --kernel ELF)\n"
                   "          [--gdb=[host:]port] wait for gdb (`target remote host:port`; TOOLING T3);\n"
                   "                      host defaults to 127.0.0.1; vCPUs are threads; `monitor help`\n"
+                  "          [--monitor=[IPv4:]port] live HTTP/WebSocket monitor (default 127.0.0.1; T5)\n"
+                  "                      starts stopped; open http://host:port/ (no authentication)\n"
                   "          [--snapshot-save=path] save the machine when the run loop ends (TOOLING T4)\n"
                   "          [--snapshot-load=path] start from a saved machine; same build and machine\n"
                   "                      shape required; --max-instr stays a total budget\n"
@@ -434,7 +439,7 @@ int main(int argc, char **argv) {
 
     /* TOOLING T2: debugger front end. Stops are wall-clock pauses only;
      * nothing on this path changes guest state unless the user does. */
-    int debugging = debug_repl || debug_in || gdb_spec;
+    int debugging = debug_repl || debug_in || gdb_spec || monitor_spec;
     if (debugging) {
         dbg_attach(m);
         const char *symp = symbols_path ? symbols_path : kernel_path;
@@ -449,6 +454,11 @@ int main(int argc, char **argv) {
         }
         if (gdb_spec && gdb_attach(m, gdb_spec) != 0)
             fprintf(stderr, "[gdb] not attached; the run continues without gdb\n");
+        if (monitor_spec && monitor_attach(m, monitor_spec) != 0) {
+            rc = EXIT_INPUT_ERROR;
+            if (debug_in) fclose(debug_in);
+            goto teardown;
+        }
         dbg_run_start(m, 1);
     }
     if (debug_in) fclose(debug_in);

@@ -1,21 +1,100 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Universal x86 Emulator Monitor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AuraLite x86 Emulator Monitor</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--line:#263451;--muted:#8fa2c2;--accent:#58d6ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e7efff;font:14px ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:22px 28px;border-bottom:1px solid var(--line);background:linear-gradient(110deg,#15243d,#10182b)}h1{margin:0 0 6px;font-size:20px;color:var(--accent)}.sub{color:var(--muted)}main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:18px;max-width:1300px;margin:auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.panel h2{margin:0;padding:12px 14px;font-size:13px;color:#b8d7ff;border-bottom:1px solid var(--line)}.body{padding:14px}.kv{display:grid;grid-template-columns:120px 1fr;gap:8px 12px}.key{color:var(--muted)}.value{color:#c8f4ff}.ok{color:#62e6a6}.warn{color:#ffd36a}.wide{grid-column:1/-1}canvas{width:100%;background:#030611;border:1px solid var(--line);image-rendering:pixelated;aspect-ratio:4/3}.drop{border:1px dashed #486187;border-radius:7px;padding:12px;color:var(--muted);margin-top:10px}input{max-width:100%}pre{margin:0;max-height:260px;overflow:auto;white-space:pre-wrap;color:#b9cbe8}.pill{display:inline-block;border:1px solid #34758a;border-radius:99px;padding:4px 9px;color:var(--accent)}
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--line:#263451;--muted:#8fa2c2;--accent:#58d6ff;--green:#62e6a6;--warn:#ffd36a;--red:#ff8585}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e7efff;font:14px ui-monospace,SFMono-Regular,Consolas,monospace}
+header{padding:20px 26px;border-bottom:1px solid var(--line);background:linear-gradient(110deg,#15243d,#10182b)}h1{margin:0 0 6px;font-size:20px;color:var(--accent)}.sub{color:var(--muted)}
+main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1fr);gap:14px;padding:16px;max-width:1400px;margin:auto}
+.panel{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.panel h2{margin:0;padding:11px 14px;font-size:13px;color:#b8d7ff;border-bottom:1px solid var(--line)}.body{padding:13px}.wide{grid-column:1/-1}
+.kv{display:grid;grid-template-columns:125px minmax(0,1fr);gap:8px 12px}.key{color:var(--muted)}.value{color:#c8f4ff;overflow-wrap:anywhere}.ok{color:var(--green)}.warn{color:var(--warn)}.bad{color:var(--red)}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}.controls label{display:flex;gap:6px;align-items:center;color:var(--muted)}input{min-width:0;max-width:100%;padding:7px 8px;border:1px solid var(--line);border-radius:5px;background:#0b1324;color:#e7efff;font:inherit}input[type=text]{flex:1}button{padding:7px 10px;border:1px solid #34758a;border-radius:6px;background:#14273b;color:var(--accent);font:inherit;cursor:pointer}button:hover{background:#1d3850}button.danger{border-color:#774454;color:#ffb0b0}.hint{color:var(--muted);font-size:12px;line-height:1.45}
+pre{margin:0;max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:#b9cbe8}.screen{width:100%;background:#030611;border:1px solid var(--line);image-rendering:pixelated;aspect-ratio:4/3}.drop{border:1px dashed #486187;border-radius:7px;padding:10px;color:var(--muted);margin-top:9px}.small{font-size:12px;color:var(--muted)}
+@media(max-width:760px){main{grid-template-columns:1fr}.wide{grid-column:auto}header{padding:16px}}
 </style>
-<header><h1>Universal x86 Emulator Monitor</h1><div class="sub">from-scratch x86 firmware emulator · CPU, PCI, MMIO, USB and framebuffer</div></header>
+</head>
+<body>
+<header><h1>AuraLite x86 Emulator Monitor</h1><div class="sub">Live HTTP/WebSocket view · CPU, vCPUs, logs, disassembly and framebuffer · offline PPM/log loading remains available</div></header>
 <main>
-<section class="panel"><h2>Machine</h2><div class="body kv"><div class="key">Platform</div><div class="value">Haswell / Intel profile</div><div class="key">Execution</div><div class="value ok">CPU interpreter active</div><div class="key">Mode</div><div class="value" id="mode">long64</div><div class="key">Firmware</div><div class="value">firmware.bin · 128 KiB</div><div class="key">RAM</div><div class="value">128 MiB</div><div class="key">USB</div><div class="value ok">EHCI / MSC model</div></div></section>
-<section class="panel"><h2>Registers</h2><div class="body kv"><div class="key">RIP</div><div class="value">0x00000000000e38d5</div><div class="key">RAX</div><div class="value">0x0000000000000000</div><div class="key">RSP</div><div class="value">0x00000000fef0fffc</div><div class="key">CR0</div><div class="value">0x00000000e0000011</div><div class="key">CR3</div><div class="value">0x0000000000010000</div><div class="key">EFER</div><div class="value">0x0000000000000500</div></div></section>
-<section class="panel wide"><h2>Framebuffer preview · 800×600</h2><div class="body"><canvas id="screen" width="800" height="600"></canvas><div class="drop">Load a PPM produced by <code>./x86emu --dump-fb=framebuffer.ppm</code>: <input id="ppm" type="file" accept=".ppm,image/x-portable-pixmap"></div></div></section>
-<section class="panel wide"><h2>Event log</h2><div class="body"><pre id="log">[boot] platform=Haswell
-[pci] MMCONFIG window enabled at 0xe0000000
-[usb-msc] READ(10) LBA=0 blocks=512
-</pre><div class="drop">Load a text log: <input id="logfile" type="file" accept=".txt,.log"></div></div></section>
+<section class="panel wide"><h2>Live connection and run control</h2><div class="body">
+  <div class="controls"><label>WebSocket <input id="wsurl" type="text" value="ws://127.0.0.1:8080/ws" aria-label="WebSocket URL"></label><button id="connect">Connect</button><span id="connection" class="warn">Offline</span></div>
+  <div class="controls"><button data-command="pause">Pause</button><button data-command="continue">Continue</button><button data-command="step">Step</button><button id="quit" class="danger">Quit emulator</button></div>
+  <div class="controls"><label>Breakpoint <input id="breakaddr" type="text" value="0x100000"></label><button id="breakbtn">Set break</button><label>REPL <input id="execLine" type="text" value="info regs"></label><button id="execbtn">Execute</button></div>
+  <div class="controls"><label>Set-1 scancodes <input id="keycodes" type="text" value="1E,9E"></label><button id="keysbtn">Send keys</button><label>Type ASCII <input id="typed" type="text" value="hello\n"></label><button id="typebtn">Type</button></div>
+  <div class="hint">The monitor starts the machine stopped at the reset vector. Use Continue to run. Run-control commands are refused while GDB owns the session. The server has no authentication; it binds to 127.0.0.1 unless you explicitly choose another IPv4 address.</div>
+</div></section>
+
+<section class="panel"><h2>Machine / stop state</h2><div class="body kv">
+  <div class="key">Platform</div><div class="value" id="platform">—</div>
+  <div class="key">CPU mode</div><div class="value" id="mode">—</div>
+  <div class="key">Stop reason</div><div class="value" id="stop">—</div>
+  <div class="key">vTime</div><div class="value" id="vtime">—</div>
+  <div class="key">Executed</div><div class="value" id="executed">—</div>
+  <div class="key">Disassembly</div><div class="value" id="disasm">—</div>
+  <div class="key">vCPUs</div><div class="value" id="vcpus">—</div>
+</div></section>
+<section class="panel"><h2>Registers</h2><div class="body"><pre id="registers">Connect to a running emulator to view registers.</pre></div></section>
+
+<section class="panel wide"><h2>Framebuffer preview · live row deltas</h2><div class="body"><canvas id="screen" class="screen" width="800" height="600"></canvas><div class="drop">Offline image: load a PPM produced by <code>./x86emu --dump-fb=framebuffer.ppm</code> <input id="ppm" type="file" accept=".ppm,image/x-portable-pixmap"></div></div></section>
+<section class="panel wide"><h2>Event log · new lines from the live machine</h2><div class="body"><pre id="log">Connect to stream new log lines.</pre><div class="drop">Offline log: <input id="logfile" type="file" accept=".txt,.log"></div></div></section>
+<section class="panel wide"><h2>Command output</h2><div class="body"><pre id="command-output">Debugger REPL replies will appear here.</pre></div></section>
 </main>
 <script>
-const c=document.querySelector('#screen'),x=c.getContext('2d');let g=x.createLinearGradient(0,0,800,600);g.addColorStop(0,'#162b4d');g.addColorStop(.5,'#163f55');g.addColorStop(1,'#08121e');x.fillStyle=g;x.fillRect(0,0,800,600);x.fillStyle='#58d6ff';x.font='24px monospace';x.fillText('x86 PC emulator',28,48);x.font='14px monospace';x.fillText('Framebuffer is ready for a guest payload',28,76);
-function ppm(buf){let s=new TextDecoder().decode(buf.slice(0,1000)),m=s.match(/^P6\s+(\d+)\s+(\d+)\s+255\s/);if(!m)return;let h=m[0].length,w=+m[1],ht=+m[2],im=new ImageData(w,ht),a=new Uint8Array(buf);for(let i=0;i<w*ht;i++){im.data[i*4]=a[h+i*3+0];im.data[i*4+1]=a[h+i*3+1];im.data[i*4+2]=a[h+i*3+2];im.data[i*4+3]=255}c.width=w;c.height=ht;x.putImageData(im,0,0)}
-document.querySelector('#ppm').onchange=e=>{let f=e.target.files[0];if(f)f.arrayBuffer().then(ppm)};document.querySelector('#logfile').onchange=e=>{let f=e.target.files[0];if(f)f.text().then(t=>document.querySelector('#log').textContent=t)};
+'use strict';
+const $=s=>document.querySelector(s), canvas=$('#screen'), ctx=canvas.getContext('2d');
+let ws=null, lastLogLines=0;
+function status(text,cls){const e=$('#connection');e.textContent=text;e.className=cls||'warn'}
+function sendCommand(cmd,extra={}){if(!ws||ws.readyState!==WebSocket.OPEN){status('Not connected','bad');return}ws.send(JSON.stringify({cmd,...extra}))}
+function connect(){
+  const url=$('#wsurl').value.trim();
+  if(ws)try{ws.close()}catch(_e){}
+  try{ws=new WebSocket(url)}catch(e){status('Bad URL: '+e.message,'bad');return}
+  ws.binaryType='arraybuffer';status('Connecting…','warn');
+  ws.onopen=()=>status('Connected','ok');
+  ws.onclose=()=>status('Disconnected','bad');
+  ws.onerror=()=>status('WebSocket error','bad');
+  ws.onmessage=e=>{if(typeof e.data==='string'){try{const msg=JSON.parse(e.data);if(msg.kind==='state')renderState(msg);else if(msg.kind==='reply')renderReply(msg)}catch(err){$('#command-output').textContent='Invalid monitor JSON: '+err}}else renderFramebuffer(e.data)};
+}
+function renderState(s){
+  $('#mode').textContent=s.mode||'—';$('#platform').textContent=(s.platform||'AuraLite x86')+' · '+(s.selected_vcpu===undefined?'':('vCPU '+s.selected_vcpu));
+  $('#stop').textContent=(s.stop_reason||'—')+(s.stop_vcpu===undefined?'':(' · vCPU '+s.stop_vcpu))+(s.stop_lin?' · '+s.stop_lin:'');
+  $('#vtime').textContent=s.vtime||'—';$('#executed').textContent=s.executed||'—';$('#disasm').textContent=s.disassembly||'—';
+  const regs=s.registers||{};$('#registers').textContent=Object.entries(regs).map(([k,v])=>k.padEnd(9)+' '+v).join('\n')||'—';
+  $('#vcpus').textContent=(s.vcpus||[]).map(v=>`vcpu${v.id} ${v.state} ${v.mode} RIP=${v.rip} steps=${v.executed_steps}${v.halted?' halted':''}`).join('\n')||'—';
+  const log=$('#log');if(Array.isArray(s.logs)&&s.logs.length){if(!lastLogLines)log.textContent='';for(const line of s.logs){log.textContent+=(log.textContent?'\n':'')+line;lastLogLines++}const lines=log.textContent.split('\n');if(lines.length>600)log.textContent=lines.slice(-600).join('\n');log.scrollTop=log.scrollHeight}
+  if(s.framebuffer){$('#screen').title=`${s.framebuffer.width}×${s.framebuffer.height}`}
+}
+function renderReply(r){const prefix=r.ok?'OK':'ERROR';let text=`${prefix} ${r.cmd||''}: ${r.message||''}`;if(r.output)text+='\n'+r.output;$('#command-output').textContent=text}
+function renderFramebuffer(buffer){
+  const b=new Uint8Array(buffer);if(b.length<10||b[0]!==70||b[1]!==66||b[2]!==1)return;
+  const d=new DataView(buffer), flags=b[3], w=d.getUint16(4,true), h=d.getUint16(6,true), rows=d.getUint16(8,true);
+  if(!w||!h||w>4096||h>4096)return;
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}
+  if(flags&1)ctx.clearRect(0,0,w,h);
+  let off=10;const rowImage=ctx.createImageData(w,1);
+  for(let n=0;n<rows;n++){
+    if(off+2>b.length)return;
+    const y=d.getUint16(off,true);off+=2;if(y>=h||off+w*3>b.length)return;
+    for(let x=0;x<w;x++){const q=x*4,p=off+x*3;rowImage.data[q]=b[p];rowImage.data[q+1]=b[p+1];rowImage.data[q+2]=b[p+2];rowImage.data[q+3]=255}
+    ctx.putImageData(rowImage,0,y);off+=w*3;
+  }
+}
+$('#connect').onclick=connect;
+$('[data-command="pause"]').onclick=()=>sendCommand('pause');
+$('[data-command="continue"]').onclick=()=>sendCommand('continue');
+$('[data-command="step"]').onclick=()=>sendCommand('step');
+$('#quit').onclick=()=>sendCommand('quit');
+$('#breakbtn').onclick=()=>sendCommand('break',{addr:$('#breakaddr').value.trim()});
+$('#execbtn').onclick=()=>sendCommand('exec',{line:$('#execLine').value});
+$('#keysbtn').onclick=()=>sendCommand('keys',{codes:$('#keycodes').value});
+$('#typebtn').onclick=()=>sendCommand('type',{text:$('#typed').value.replace(/\\n/g,'\n')});
+function ppm(buf){const bytes=new Uint8Array(buf);let head=new TextDecoder().decode(bytes.slice(0,1000)),m=head.match(/^P6\s+(\d+)\s+(\d+)\s+255\s/);if(!m)return;let off=m[0].length,w=+m[1],h=+m[2];if(!w||!h||off+w*h*3>bytes.length)return;canvas.width=w;canvas.height=h;const image=ctx.createImageData(w,h);for(let i=0;i<w*h;i++){image.data[i*4]=bytes[off+i*3];image.data[i*4+1]=bytes[off+i*3+1];image.data[i*4+2]=bytes[off+i*3+2];image.data[i*4+3]=255}ctx.putImageData(image,0,0)}
+$('#ppm').onchange=e=>{const f=e.target.files[0];if(f)f.arrayBuffer().then(ppm)};
+$('#logfile').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(t=>{$('#log').textContent=t;lastLogLines=t.split('\n').length})};
+if(location.protocol==='http:'||location.protocol==='https:'){$('#wsurl').value=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';connect()}
 </script>
+</body>
+</html>

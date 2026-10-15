@@ -7,6 +7,23 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0061 (TOOLING T5, live WebSocket monitor)
+
+- `src/ws.c`/`ws.h`: dependency-free SHA-1, RFC 6455 accept-key and
+  frame codec; `src/monitor.c`/`monitor.h`: non-blocking HTTP/1.1 + WebSocket
+  frontend on the T2 debugger loop. `--monitor=[IPv4:]port` defaults to
+  loopback and starts stopped; the server has no authentication.
+- `web/monitor.html`: live CPU/vCPU state, registers, disassembly, new log
+  lines and RGB framebuffer row deltas, plus pause/continue/step/break/REPL,
+  Set-1 keyboard and ASCII typing controls. Existing offline PPM/log loading
+  remains. Run control is read-only while GDB owns the session.
+- Gates: `make test-monitor-codec` (SHA-1/RFC sample key; masked/unmasked
+  7/16/64-bit length forms and malformed headers), `make test-monitor`
+  (54 HTTP/WebSocket/control checks), and both are in `make test` and
+  `make test-sanitize`. Firmware marker pixel, `--stats` stdout, PPM and log
+  are byte-identical to an unmonitored run. NC: `make test-monitor-nc`
+  (wrong accept GUID → only the sample-key handshake assertion fails).
+
 ### Added — patch 0060 (TOOLING T4, snapshots)
 
 - `src/snapshot.c`/`snapshot.h`: `AURASNP1` files of tagged, length-checked

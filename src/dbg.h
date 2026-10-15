@@ -86,6 +86,8 @@ typedef struct dbg_frontend {
     /* wait for work while stopped: return an fd to poll (or -1 for a
      * frontend that reads synchronously, e.g. a script file) */
     int  (*stop_fd)(machine_t *m, struct dbg_frontend *fe);
+    /* Optional poll(2) events for stop_fd; defaults to POLLIN. */
+    int  (*stop_events)(machine_t *m, struct dbg_frontend *fe);
     /* service input while stopped; may set a resume action via dbg_resume */
     void (*service)(machine_t *m, struct dbg_frontend *fe);
     /* periodic poll while running (async stop requests, monitor I/O) */
@@ -98,6 +100,7 @@ typedef struct dbg_frontend {
 int  dbg_add_frontend(machine_t *m, dbg_frontend_t *fe);
 void dbg_remove_frontend(machine_t *m, dbg_frontend_t *fe);
 int  dbg_frontends(machine_t *m);
+int  dbg_has_frontend(machine_t *m, const char *name);
 
 /* Called by main()'s run loop. */
 void dbg_run_start(machine_t *m, int stop_at_start);

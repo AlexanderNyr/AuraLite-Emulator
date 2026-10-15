@@ -734,7 +734,25 @@
   `--sata-writethrough` are refused with a reason. NC: forgetting the RAM
   windows fails nine lanes while a split before any framebuffer write
   stays green.
+- TOOLING T5 (`patches/0061-TOOLING-T5-live-web-monitor.patch`):
+  `--monitor=[IPv4:]port` serves `web/monitor.html` over HTTP and RFC 6455
+  WebSocket. Live JSON includes machine/vCPU/register/disassembly/log state;
+  binary `FB` frames publish keyframe and changed RGB rows. Pause, continue,
+  step, break, REPL inspection, keyboard scancodes/ASCII and quit share the
+  T2 core; monitor run control is read-only with GDB attached. The default
+  bind is 127.0.0.1 and there is no authentication. Measured: codec suite
+  passes 19 vectors, live suite 54 checks; the 800×600 keyframe is sent
+  using the RFC 64-bit length, the firmware marker is observed, and stdout
+  incl. `--stats`, the PPM and log ring are byte-identical to a plain run.
+  `make test` and `make test-sanitize` pass. The single NC corrupts the
+  accept GUID: HTTP/101 pass and the client's sample-key assertion alone
+  fails.
 
 ## Current limits
 
-This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.
+This remains a firmware-focused x86 emulator, not a drop-in replacement for
+QEMU. The CPU ISA is expanded from execution traces and tests; some chipset
+blocks are behavioral models rather than cycle-accurate implementations.
+The live monitor is unauthenticated and defaults to loopback; non-loopback
+binding is an explicit operator choice. Existing frozen-guest integration
+lanes still require the separate AuraLite-OS KERNEL/INITRD artifacts.

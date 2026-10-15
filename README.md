@@ -65,6 +65,27 @@ gdb kernel.elf -ex 'target remote :1234' -ex 'break kmain' -ex continue
 vCPUs appear as threads, hardware watchpoints work, and `monitor help` lists the
 built-in debugger commands. Addresses are linear (in real mode, `$pc` is IP).
 
+### Live monitor
+
+The live monitor serves the browser UI and a WebSocket connection from the
+emulator process. It starts the guest stopped at the reset vector:
+
+```sh
+./x86emu --platform=haswell --monitor=8080
+# Open http://127.0.0.1:8080/ and press Continue
+```
+
+`--monitor=[IPv4:]port` binds to `127.0.0.1` by default. The page shows CPU and
+vCPU state, registers, disassembly, new log lines and the live framebuffer; its
+controls provide pause/continue/step, breakpoints, debugger inspection, keyboard
+scancodes, ASCII typing and quit. Offline PPM/log loading is still available.
+When GDB is attached, monitor run control is read-only and GDB remains the owner.
+
+There is **no authentication**. Keep the default loopback binding unless remote
+access is intentional; an explicit bind such as `--monitor=0.0.0.0:8080` exposes
+the emulator controls to anyone who can reach that port. Use appropriate network
+isolation/firewall rules. The monitor currently accepts IPv4 bind addresses.
+
 Snapshots save the whole machine when the run loop ends and resume it later in
 a fresh process; `--max-instr` stays the total budget:
 

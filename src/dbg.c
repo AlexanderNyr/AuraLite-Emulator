@@ -377,7 +377,13 @@ static void stop_loop(machine_t *m) {
         for (int i = 0; i < nf && s->pending == DBG_ACT_NONE; i++) {
             int fd = fes[i]->stop_fd ? fes[i]->stop_fd(m, fes[i]) : -1;
             if (fd < 0) { if (fes[i]->service) fes[i]->service(m, fes[i]); }
-            else { pfd[np].fd = fd; pfd[np].events = POLLIN; pfd[np].revents = 0; pfe[np++] = fes[i]; }
+            else {
+                pfd[np].fd = fd;
+                pfd[np].events = fes[i]->stop_events ? (short)fes[i]->stop_events(m, fes[i]) : POLLIN;
+                if (!pfd[np].events) pfd[np].events = POLLIN;
+                pfd[np].revents = 0;
+                pfe[np++] = fes[i];
+            }
         }
         if (s->pending != DBG_ACT_NONE || np == 0) continue;
         int r = poll(pfd, (nfds_t)np, 200);
@@ -605,6 +611,13 @@ void dbg_remove_frontend(machine_t *m, dbg_frontend_t *fe) {
 }
 
 int dbg_frontends(machine_t *m) { return m->dbg ? m->dbg->nfe : 0; }
+
+int dbg_has_frontend(machine_t *m, const char *name) {
+    if (!m->dbg || !name) return 0;
+    for (int i = 0; i < m->dbg->nfe; i++)
+        if (m->dbg->fe[i]->name && !strcmp(m->dbg->fe[i]->name, name)) return 1;
+    return 0;
+}
 
 /* ----------------------------------------------- breakpoints/watch ---- */
 int dbg_break_add(machine_t *m, uint64_t lin, int temp) {
