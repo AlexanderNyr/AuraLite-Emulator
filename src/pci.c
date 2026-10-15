@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "pci.h"
+#include "snapshot.h"   /* TOOLING T4 */
 
 static uint32_t cfg_addr_io_read(void *ctx, uint16_t port, int size) {
     machine_t *m = ctx; (void)port;
@@ -96,6 +97,25 @@ static void hostbridge_write(pci_dev_t *d, int reg, int size, uint64_t val) {
             mlog(&m->log, "[pci] host bridge: MMCONFIG (ECAM) window enabled at 0x%08llx", (unsigned long long)m->mmconfig_base);
             mem_register_mmio(m, m->mmconfig_base, 0x10000000ULL, mmconfig_read, mmconfig_write, m, "MMCONFIG/ECAM");
         }
+    }
+}
+
+/* TOOLING T4: re-create a run-time ECAM window while loading a snapshot
+ * (the same registration hostbridge_write performs, without the log). */
+void pci_ecam_map(machine_t *m, uint64_t base) {
+    mem_register_mmio(m, base, 0x10000000ULL, mmconfig_read, mmconfig_write, m, "MMCONFIG/ECAM");
+}
+
+/* TOOLING T4: every function's 256-byte config space, in list order; the
+ * record tag carries bus/dev/func so a different device list is refused. */
+void pci_snap(machine_t *m, snap_t *s) {
+    for (pci_dev_t *d = m->pci_devices; d; d = d->next) {
+        char tag[16];
+        snprintf(tag, sizeof tag, "pci.%02x.%02x.%x", d->bus & 0xFF, d->dev & 0xFF, d->func & 7);
+        uint8_t cfg[256];
+        memcpy(cfg, d->cfg, sizeof cfg);
+        snap_bytes(s, tag, cfg, sizeof cfg);
+        if (snap_loading(s)) memcpy(d->cfg, cfg, sizeof cfg);
     }
 }
 

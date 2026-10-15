@@ -35,6 +35,47 @@ The unmodified firmware is useful for observing its actual behaviour and faults:
 ./x86emu --platform=haswell --max-instr=200000 --trace
 ```
 
+`--trace` logs mode/RIP/opcode into the log ring. For a full disassembled
+trace (one line per instruction, with a CPU-vs-disassembler self-check and a
+summary on stderr) use `--trace-file=trace.txt`, optionally windowed with
+`--trace-from=VTIME --trace-count=N`. `make x86dis` builds an
+ndisasm-style disassembler for raw binaries (`./x86dis -b64 file.bin`).
+
+A built-in debugger stops before the first instruction with `--debug`
+(commands on stdin; `help` lists them; Ctrl-C pauses a running guest):
+
+```sh
+./x86emu --platform=haswell --debug
+(x86dbg) break 0x100000
+(x86dbg) continue
+(x86dbg) x/8i $rip
+(x86dbg) watch w 0xd0000000 4
+```
+
+`--debug-script=file` runs the same commands from a file, and `--symbols=elf`
+(default: the `--kernel` ELF) enables `break kmain`, symbolized `x/i` and `bt`.
+
+For gdb, start the emulator with `--gdb=1234` and connect:
+
+```sh
+./x86emu --kernel=kernel.elf --initrd=initrd.tar --gdb=1234 &
+gdb kernel.elf -ex 'target remote :1234' -ex 'break kmain' -ex continue
+```
+
+vCPUs appear as threads, hardware watchpoints work, and `monitor help` lists the
+built-in debugger commands. Addresses are linear (in real mode, `$pc` is IP).
+
+Snapshots save the whole machine when the run loop ends and resume it later in
+a fresh process; `--max-instr` stays the total budget:
+
+```sh
+./x86emu --kernel=kernel.elf --initrd=initrd.tar --max-instr=900000000 --snapshot-save=boot.snap
+./x86emu --kernel=kernel.elf --initrd=initrd.tar --max-instr=1200000000 --snapshot-load=boot.snap
+```
+
+The second run must use the same machine shape (platform, ROM, kernel, vCPUs,
+disks); the debugger adds `savevm FILE` / `loadvm FILE`.
+
 Run any compatible ROM directly; the emulator does not rewrite the guest image. For the bundled sample:
 
 ```sh

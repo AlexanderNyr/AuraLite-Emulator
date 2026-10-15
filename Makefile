@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history
+.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -20,7 +20,7 @@ BENCH_PAIR_REPS ?= 9
 FUZZ_PROGRAMS ?= 512
 FUZZ_INSTR    ?= 24
 
-x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h
+x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h src/disasm.h src/dbg.h src/gdbstub.h src/snapshot.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SRC) -o $@ -lm
 
 firmware/firmware.bin: firmware/sample_firmware.nas
@@ -134,6 +134,77 @@ test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c sr
 test-decode-nc: tests/test_decode.c tests/integration/p3_decode_nc.sh src/cpu.c
 	sh tests/integration/p3_decode_nc.sh
 
+# TOOLING T1: disassembler. x86dis is the ndisasm-style listing tool the
+# differential drives; test-disasm is self-contained (frozen ndisasm vectors,
+# inspection and trace-hook vectors) so it also runs in the sanitizer lane.
+x86dis: tools/x86dis.c src/disasm.c src/disasm.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) tools/x86dis.c src/disasm.c -o $@
+
+test-disasm: tests/test_disasm.c tests/harness.h src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_disasm.c src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-disasm -lm
+	./test-disasm
+	rm -f test-disasm
+
+# Live differential against ndisasm (ships with nasm): 226,884 generated
+# encodings, 16/32/64-bit. SKIPs (exit 0) when ndisasm is absent.
+test-disasm-diff: x86dis tests/disasm_diff.py
+	@if command -v ndisasm >/dev/null 2>&1; then python3 tests/disasm_diff.py --x86dis ./x86dis --show 10; \
+	 else echo "SKIP test-disasm-diff: ndisasm not found"; fi
+
+# Trace self-check lanes (5 platforms + K1 fixture; frozen guest when
+# KERNEL/INITRD are set): 0 mismatches, 0 undecodable, stdout identical.
+test-trace: x86emu firmware/firmware.bin disk/disk.img tests/integration/t1_trace_check.sh
+	sh tests/integration/t1_trace_check.sh
+
+# Exactly one T1 NC: one wrong immediate size; never in `make test`.
+test-disasm-nc: tests/integration/t1_disasm_nc.sh tests/test_disasm.c src/disasm.c
+	sh tests/integration/t1_disasm_nc.sh
+
+# TOOLING T2: run-control core (exact stop RIPs/step counts, skip-once,
+# between-instruction steps, watchpoints, quit/pause, expressions) and the
+# REPL lanes (transcripts + non-perturbation on five platforms; the frozen
+# guest lane SKIPs unless KERNEL/INITRD are set).
+test-dbg: tests/test_dbg.c tests/harness.h src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dbg.c src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-dbg -lm
+	./test-dbg
+	rm -f test-dbg
+
+test-debug: x86emu firmware/firmware.bin disk/disk.img tests/integration/t2_debug_lanes.sh
+	sh tests/integration/t2_debug_lanes.sh
+
+# Exactly one T2 NC (skip-once removed); never in `make test`.
+test-dbg-nc: tests/integration/t2_dbg_nc.sh tests/test_dbg.c src/dbg.c
+	sh tests/integration/t2_dbg_nc.sh
+
+# TOOLING T3: gdbstub. test-gdbstub is the pure-socket RSP client (30
+# checks: session, Ctrl-C, protocol hygiene); test-gdb adds real `gdb -batch`
+# lanes (SKIP without gdb; the frozen-guest lane SKIPs without KERNEL/INITRD).
+test-gdbstub: x86emu firmware/firmware.bin disk/disk.img tests/test_gdbstub.py
+	X86EMU=./x86emu python3 tests/test_gdbstub.py
+
+test-gdb: x86emu firmware/firmware.bin disk/disk.img tests/test_gdbstub.py tests/integration/t3_gdb_lanes.sh
+	sh tests/integration/t3_gdb_lanes.sh
+
+# Exactly one T3 NC (no 0x03 poll while running); never in `make test`.
+test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gdbstub.c
+	sh tests/integration/t3_gdbstub_nc.sh
+
+# TOOLING T4: snapshots. test-snap: format vectors on a harness machine
+# (split identity, determinism, sparse RAM, refusals; sanitizer lane too).
+# test-snapshot: split-run identity lanes on real workloads (the frozen
+# guest lanes SKIP unless KERNEL/INITRD are set).
+test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+	./test-snap
+	rm -f test-snap
+
+test-snapshot: x86emu firmware/firmware.bin disk/disk.img tests/kload_fixture.elf tests/integration/t4_snapshot_lanes.sh
+	sh tests/integration/t4_snapshot_lanes.sh
+
+# Exactly one T4 NC (RAM windows not carried); never in `make test`.
+test-snapshot-nc: tests/integration/t4_snapshot_nc.sh src/devices.c
+	sh tests/integration/t4_snapshot_nc.sh
+
 test-boot: x86emu firmware/firmware.bin disk/disk.img
 	@set -e; ./x86emu --platform=haswell --max-instr=600000 >/tmp/x86emu-boot.out 2>/tmp/x86emu-boot.err; cat /tmp/x86emu-boot.err; grep -q '\[usb-msc\] READ(10) LBA=0 blocks=1' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] bulk-IN 512 bytes -> guest 0x00100000' /tmp/x86emu-boot.out; grep -q '\[usb-msc\] synthesized CSW (status=OK)' /tmp/x86emu-boot.out; grep -q '\[guest\] conventional entry reached at 0x00100000' /tmp/x86emu-boot.out; grep -q '\[guest\] framebuffer marker OK: pixel\[0\]=0x00200000' /tmp/x86emu-boot.out; grep -q '\[serial\] GUEST_OK' /tmp/x86emu-boot.out; echo "boot integration test: ok"
 
@@ -183,7 +254,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e
+test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -193,7 +264,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
@@ -242,4 +313,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu x86emu-bench test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
+	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-cpu test-usb test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf

@@ -101,6 +101,11 @@ typedef struct cpu {
      * --stats; no guest-visible state and no historical tape depends on
      * it. */
     uint64_t executed_steps;
+    /* TOOLING T1: exception/interrupt deliveries on this context (every
+     * raise_exception call). Tooling-only bookkeeping: no instruction reads
+     * it, so it is not guest-visible. The trace self-check uses it to tell
+     * "the next RIP came from an event" from "the next RIP is wrong". */
+    uint64_t event_count;
     int trace;               /* if non-zero, print each instruction */
 
     machine_t *mach;         /* back-reference to owning machine (memory/io) */
@@ -120,5 +125,21 @@ int cpu_op_size_default(cpu_t *c);
 /* USB U3: device-cadence hook installed by devices_init.  Narrow unit
  * harnesses link cpu.c without devices.c and leave it NULL. */
 extern void (*cpu_devices_tick)(machine_t *m);
+/* TOOLING T1/T2: instruction-boundary hook, called by cpu_step after
+ * interrupt delivery and before the fetch, only while m->dbg is set.
+ * A non-zero return makes cpu_step return 0 WITHOUT executing (used by the
+ * debugger to abandon a step for quit/loadvm). Installed by src/dbg.c;
+ * narrow harnesses link cpu.c without it and leave it NULL. */
+extern int (*cpu_dbg_boundary)(machine_t *m);
+/* TOOLING T2: linear data-access hook for watchpoints, called by the
+ * CPU's linear read/write helpers after a successful translation. Set by
+ * src/dbg.c only while at least one watchpoint exists; NULL otherwise. */
+extern void (*cpu_dbg_access)(machine_t *m, uint64_t lin, int size, int write);
+/* TOOLING T4: the machine-wide device-cadence phase (s_devtick) is machine
+ * state -- a snapshot must carry it or EHCI timing shifts after a load. */
+uint32_t cpu_devtick_get(void);
+void     cpu_devtick_set(uint32_t v);
+int      cpu_dbg_knob_resolved(void);   /* lazy EMU_DBG_U lookup done?   */
+void     cpu_dbg_knob_resolve(void);
 
 #endif

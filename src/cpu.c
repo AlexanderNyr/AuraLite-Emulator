@@ -14,9 +14,15 @@
 /* USB U3: device-cadence hook (devices_tick) -- installed by devices_init.
  * Narrow unit harnesses link cpu.c without devices.c and leave it NULL. */
 void (*cpu_devices_tick)(machine_t *m);
+/* TOOLING T1/T2: instruction-boundary hook (src/dbg.c); see cpu.h. */
+int (*cpu_dbg_boundary)(machine_t *m);
+/* TOOLING T2: watchpoint access hook (src/dbg.c); see cpu.h. */
+void (*cpu_dbg_access)(machine_t *m, uint64_t lin, int size, int write);
 
 /* USB U3: instruction-cadence divider for devices_tick (deterministic). */
 static uint32_t s_devtick;
+uint32_t cpu_devtick_get(void) { return s_devtick; }       /* TOOLING T4 */
+void     cpu_devtick_set(uint32_t v) { s_devtick = v; }
 
 /* RFLAGS bits a guest may control via POPF/IRET (IOPL/NT/RF/AC/ID included;
  * VM/VIF/VIP and reserved bits excluded; bit 1 is architecturally 1). */
@@ -67,6 +73,13 @@ void cpu_set_msr(cpu_t *c, uint32_t idx, uint64_t val) {
 static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err);
 static int cpl_now(const cpu_t *c) { return c->seg[SEG_CS].sel & 3; }
 static int dbg_u_on = -1;  /* K4: EMU_DBG_U=1 knob, resolved lazily (fetch8) */
+/* TOOLING T4: whether that lazy lookup has run is internal path state --
+ * while it is -1 the P3 predecode is bypassed -- so a snapshot carries it
+ * (measured: without this, a restored run lost one decode hit). */
+int  cpu_dbg_knob_resolved(void) { return dbg_u_on >= 0; }
+void cpu_dbg_knob_resolve(void) {
+    if (dbg_u_on < 0) { const char *e = getenv("EMU_DBG_U"); dbg_u_on = (e && e[0] == '1'); }
+}
 static int dbg_u_events;
 static int dbg_read_probe = 0;      /* K4: first-N read/write syscall probe */
 static int syscall_ret_probe = -1;  /* id of the in-flight probed syscall */
@@ -217,10 +230,29 @@ check:
 
 static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err);
 
-static uint64_t read_mem_v(machine_t *m, uint64_t vaddr, int size) {
+/* TOOLING T2: the watchpoint call sits out of line (cold), and read_mem_v
+ * carries an `inline` hint. Measured: the hook's extra bytes pushed
+ * read_mem_v over GCC's -O2 auto-inline threshold, rm_read/do_pop/
+ * read_descriptor/raise_exception started calling it, and the paired
+ * bench showed ~3% on six of seven tapes. With the hint the inlining map
+ * is the pre-T2 one again (always_inline over-inlined into cpu_step and
+ * was slower) and every paired CI contains 1.0. */
+__attribute__((noinline, cold))
+static int dbg_boundary_cold(machine_t *m) {
+    return (cpu_dbg_boundary && !m->cpu.fault) ? cpu_dbg_boundary(m) : 0;
+}
+__attribute__((noinline, cold))
+static void dbg_access_cold(machine_t *m, uint64_t vaddr, int size, int write) {
+    if (cpu_dbg_access) cpu_dbg_access(m, vaddr, size, write);
+}
+#define DBG_ACCESS(m, va, sz, w) \
+    do { if (__builtin_expect(cpu_dbg_access != NULL, 0)) dbg_access_cold((m), (va), (sz), (w)); } while (0)
+
+static inline uint64_t read_mem_v(machine_t *m, uint64_t vaddr, int size) {
     uint64_t phys;
     if (!translate(m, vaddr, &phys, T_READ))  /* fault already raised (K4) */
         return 0;
+    DBG_ACCESS(m, vaddr, size, 0);   /* TOOLING T2 watch */
     return mem_read(m, phys, size);
 }
 static void write_mem_v(machine_t *m, uint64_t vaddr, int size, uint64_t val) {
@@ -239,6 +271,7 @@ static void write_mem_v(machine_t *m, uint64_t vaddr, int size, uint64_t val) {
         mlog(&m->log, "[dbg-u] cpulocal W va=GS+%llx val=%llx rip=%llx",
              (unsigned long long)(vaddr - m->cpu.seg[SEG_GS].base),
              (unsigned long long)val, (unsigned long long)m->cpu.rip);
+    DBG_ACCESS(m, vaddr, size, 1);   /* TOOLING T2 watch */
     mem_write(m, phys, size, val);
 }
 
@@ -323,6 +356,7 @@ static uint64_t tss_base_from_gdt(machine_t *m, cpu_t *c) {
 
 static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err) {
     cpu_t *c = &m->cpu;
+    c->event_count++;   /* TOOLING T1: tooling-only, see cpu.h */
     /* K4: the whole delivery window -- gate fetch, TSS read, frame pushes --
      * happens at supervisor privilege on real hardware, even when the event
      * struck in ring 3. Suspend the RPL for the duration so the U/S
@@ -959,6 +993,15 @@ int cpu_step(cpu_t *c) {
             int pvec = pic_intack(m);
             if (pvec >= 0) raise_exception(m, pvec, 0, 0);
         }
+    }
+
+    /* TOOLING T1/T2: the instruction boundary as tools see it -- any
+     * hardware interrupt has been delivered, nothing of the next
+     * instruction has been fetched. One pointer test when no tool is
+     * attached (m->dbg == NULL); the call itself lives out of line so it
+     * does not cost the untooled path register spills (measured). */
+    if (__builtin_expect(m->dbg != NULL, 0)) {
+        if (dbg_boundary_cold(m)) return 0;
     }
 
     c->exception_taken = 0;

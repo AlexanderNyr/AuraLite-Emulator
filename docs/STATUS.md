@@ -655,6 +655,86 @@
   to concrete vectors in PERF_PLAN. Full gates/fresh-clone verdict in §8.4.
   Frozen guest lanes SKIP without its absent toolchain.
 
+- TOOLING T0 (`patches/0056-TOOLING-T0-tooling-plan.patch`): measured
+  baseline + `docs/plans/TOOLING_PLAN.md`. `--trace` is a log-ring
+  writer: a 4,837,677-step haswell boot leaves 4,095 trace lines in the
+  4096-line ring and drops the five `test-boot` receipts from stdout
+  (5 → 0); the full trace exists only on stderr (164,481,549 bytes) with
+  mode/RIP/first-opcode-byte per line. Tracing costs ≈8× (stderr to
+  /dev/null) to ≈24× (to a file) and turns P3 predecode off
+  (`decode_hits` 4,802,386 → 0). No breakpoint, watchpoint, gdbstub or
+  snapshot exists; `web/monitor.html` hard-codes its register values
+  (`RIP=0xe38d5` vs the real `0x10005a`) and has no network code. Gap
+  ledger D0–D8; T1–T5 planned (disassembly trace, REPL, gdbstub,
+  snapshots, live monitor), all opt-in and gated on non-perturbation.
+
+- TOOLING T1 (`patches/0057-TOOLING-T1-trace-disassembly.patch`):
+  `src/disasm.c` (16/32/64-bit, NASM syntax as `ndisasm` prints it),
+  `tools/x86dis`, and `--trace-file=PATH` (`--trace-from=VTIME`,
+  `--trace-count=N`): one line per executed instruction (vcpu, vtime,
+  mode, CS:RIP, linear, bytes, disassembly) written by an instruction-
+  boundary hook that reads code side-effect-free, never the log ring.
+  Each line self-checks the previous one: the successor RIP must be the
+  fall-through or the decoded direct-branch target unless an exception/
+  interrupt/reset intervened. Measured: 0 mismatches / 0 undecodable over
+  the five full firmware boots (4.8M lines each), the K1 fixture, 40M
+  guest steps UP and with `--smp=2`, a 12M-line window around the shell
+  prompt with a typed `ls` (ring 3, syscall/sysret) and a 200M-line idle
+  window; stdout incl. `--stats` is byte-identical with and without the
+  trace. ndisasm differential: 226,884 encodings, 153,538 exact, 0 diff,
+  8,428 under 13 written CPU/SDM-vs-ndisasm reasons, 4,278 out of scope.
+  Hook cost untraced: paired ratios 0.976×–1.013×, all CIs contain 1.0.
+  NC: a wrong group-83 immediate size reddens the unit vectors, the
+  differential (`diff=388`) and the trace (`mismatches=490035`).
+
+- TOOLING T2 (`patches/0058-TOOLING-T2-debugger-repl.patch`): a built-in
+  debugger. `--debug` stops before the first instruction with a REPL on
+  stdin (Ctrl-C pauses a running guest), `--debug-script=FILE` drives it
+  from a file, `--symbols=ELF` (default: the `--kernel` ELF) feeds symbols.
+  Commands: break/tbreak/delete/enable/disable, watch [r|w|a] (linear),
+  continue, stepi/nexti N, until VTIME|+N, regs, info sregs/cr/xmm/vcpu/
+  break/mmio, x/FMT and x/Ni, print, set $reg, poke, xlate (page walk),
+  bt (frame pointers), log, vcpu N, detach, quit. Measured: exact stops
+  (guest entry at vtime 35,254; `stepi 3` → 35,257; a framebuffer
+  watchpoint after the marker store at 35,283 with new=0x200000; `break
+  kmain` on the frozen guest at vtime 18 with 2,388 ELF symbols) and
+  byte-identical stdout incl. `--stats` versus the plain run on five
+  platforms and on the guest with `--smp=2`. Breakpoints never patch
+  memory; inspection never reads a device register. Cost without a tool,
+  counted with cachegrind on the haswell boot: 3,467,211,197 host
+  instructions vs 3,476,309,458 at `f3470e1` (−0.26 %; T1 as shipped was
+  +1.78 % from register spills around its inline hook, fixed here with
+  cold out-of-line calls and a specialised UP loop). NC: without
+  skip-once a "break here; continue" from a between-instruction stop
+  re-stops at vtime 0 (unit RC=1, lanes RC=1).
+
+- TOOLING T3 (`patches/0059-TOOLING-T3-gdbstub.patch`): `--gdb=[host:]port`
+  waits for gdb (`target remote`) and speaks the GDB Remote Serial
+  Protocol as a T2 front end: target.xml (amd64 core, SSE, fs/gs_base,
+  CR0/2/3/4/EFER), registers, side-effect-free memory, virtual software/
+  hardware breakpoints, Z2/Z3/Z4 watchpoints, vCPUs as threads, Ctrl-C,
+  `monitor` = the T2 commands, k/D. Measured with GNU gdb 16.3: breakpoint
+  at the guest entry, gdb's own disassembly, a hardware watchpoint that
+  reports the framebuffer marker (New value = 2097152), and on the frozen
+  guest `kmain (boot_info=0x20000) at kernel/kernel.c:196` with a source
+  backtrace and two vCPU threads; a detached run's stdout equals the plain
+  run. NC: without the running-state poll, Ctrl-C gets no stop reply.
+
+- TOOLING T4 (`patches/0060-TOOLING-T4-snapshots.patch`): machine
+  snapshots. `--snapshot-save=FILE` saves when the run loop ends,
+  `--snapshot-load=FILE` starts from it (`--max-instr` stays a total
+  budget); the REPL and gdb's `monitor` add `savevm`/`loadvm` (one vCPU).
+  The file carries RAM (sparse), `machine_t` without host pointers, every
+  device model, PCI config spaces, runtime ECAM windows, RAM windows,
+  disk/SATA images, the log ring and the P2/P3 caches. Measured: fourteen
+  split lanes (five platforms, VBE, text mode, `--smp=2`, the K1 fixture,
+  the frozen guest UP and SMP) are byte-identical to straight runs in
+  stdout incl. `--stats`, PPM, text dump and full log; two processes write
+  identical files; mismatched shape, foreign/truncated files, `--tap` and
+  `--sata-writethrough` are refused with a reason. NC: forgetting the RAM
+  windows fails nine lanes while a split before any framebuffer write
+  stays green.
+
 ## Current limits
 
 This is a general firmware-focused x86 emulator, not yet a drop-in replacement for QEMU. The CPU ISA is expanded from execution traces and tests. Some chipset blocks are behavioural models rather than cycle-accurate implementations. The descriptor/CBW/CSW path and live web monitor are still being expanded.

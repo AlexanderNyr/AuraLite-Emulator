@@ -16,6 +16,7 @@
 #include "serial.h"
 #include "ahci.h"
 #include "vga_font.h"
+#include "snapshot.h"   /* TOOLING T4 */
 
 /* ============================ generic RAM window ========================== */
 typedef struct { uint8_t *buf; uint64_t base, size; uint32_t clear_bits_on_read; const char *name; } rw2_t;
@@ -37,6 +38,7 @@ static rw2_t *make_ramwindow(machine_t *m, uint64_t base, uint64_t size, uint32_
     rw2_t *w = calloc(1, sizeof *w);
     w->buf = calloc(1, size); w->base = base; w->size = size; w->clear_bits_on_read = clear_bits_on_read; w->name = name;
     mem_register_mmio_owned(m, base, size, rw2_read, rw2_write, w, name);
+    m->mmio_list->dbg_readable = 1;   /* TOOLING T2: byte reads are pure (no clear-on-read below dword) */
     return w;
 }
 
@@ -1362,6 +1364,31 @@ void devices_init_platform(machine_t *m) {
 
 /* C10: teardown keeps the ASan/UBSan CI lane leak-clean -- every device
  * window allocated by devices_init_* is an rw2_t hanging off the mmio list. */
+/* TOOLING T4: every device-model global of this file, host pointers kept
+ * live, plus the contents of the RAM-backed MMIO windows (framebuffer,
+ * CAR, DDR registers/SPD, EHCI BAR) in MMIO-list order. */
+void devices_snap(machine_t *m, snap_t *s) {
+    /* host pointers are zeroed in the file and kept live on load */
+    { ehci_t t = g_ehci; if (!snap_loading(s)) { t.regs = NULL; t.m = NULL; } snap_bytes(s, "dev.ehci", &t, sizeof t);
+      if (snap_loading(s)) { t.regs = g_ehci.regs; t.m = g_ehci.m; g_ehci = t; } }
+    snap_bytes(s, "dev.usb.bot", &g_st, sizeof g_st);
+    { uhci_t t = g_uhci; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.uhci", &t, sizeof t);
+      if (snap_loading(s)) { t.m = g_uhci.m; g_uhci = t; } }
+    { vga_t t = g_vga; if (!snap_loading(s)) { t.m = NULL; t.text = NULL; } snap_bytes(s, "dev.vga", &t, sizeof t);
+      if (snap_loading(s)) { t.m = g_vga.m; t.text = g_vga.text; g_vga = t; } }
+    { dispi_t t = g_dispi; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.dispi", &t, sizeof t);
+      if (snap_loading(s)) { t.m = g_dispi.m; g_dispi = t; } }
+    if (g_com1) serial_snap(g_com1, s);
+    unsigned k = 0;
+    for (mmio_region_t *r = m->mmio_list; r; r = r->next) {
+        if (!r->owned_ctx) continue;
+        rw2_t *w = r->ctx;
+        char tag[16];
+        snprintf(tag, sizeof tag, "dev.win%u", (k++) & 0xFFu);
+        snap_sparse(s, tag, w->buf, (size_t)w->size);
+    }
+}
+
 void devices_done(machine_t *m) {
     mmio_region_t *r = m->mmio_list;
     while (r) {

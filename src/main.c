@@ -13,6 +13,9 @@
 #include "platform.h"
 #include "kloader.h"
 #include "ahci.h"
+#include "dbg.h"     /* TOOLING */
+#include "gdbstub.h" /* TOOLING T3 */
+#include "snapshot.h" /* TOOLING T4 */
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -69,6 +72,14 @@ enum {
  * externally (timeout kills, stop signals) took the entire boot history with
  * it. Stash the flush context and flush on SIGTERM/SIGINT too. */
 static machine_t *sig_m;
+/* TOOLING T4: REPL/gdb `savevm`/`loadvm` reach the snapshot module through
+ * dbg_snap_hook with the shape this process was started with. */
+static snap_cfg_t g_snapcfg;
+static int repl_snapshot(machine_t *m, const char *path, int load) {
+    return load ? snap_load(m, path, &g_snapcfg) : snap_save(m, path, &g_snapcfg);
+}
+/* TOOLING T2: Ctrl-C under --debug pauses the guest instead of exiting. */
+static void debug_on_sigint(int sig) { (void)sig; if (sig_m) dbg_request_pause(sig_m); }
 static const char *sig_log;
 static void flush_on_signal(int sig) {
     if (sig_m && sig_log) {
@@ -82,6 +93,38 @@ static void flush_on_signal(int sig) {
         }
     }
     _exit(128 + sig);
+}
+
+/* TOOLING T2: one UP iteration of the run loop (formerly inline in main).
+ * Inlined at two call sites with `tooled` constant, so the copy without a
+ * tool attached carries no tool test at all. Returns 1 to end the run. */
+typedef struct { const char *keys_list; uint64_t keys_at; int keys_at_prompt; } keys_trigger_t;
+static inline __attribute__((always_inline))
+int run_up_step(machine_t *m, uint64_t *n, int *step_result, keys_trigger_t *k, const int tooled) {
+    if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
+        m->guest_entry_seen = 1;
+        mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
+    }
+    *step_result = cpu_step(&m->cpu);
+    if (*step_result != 0)
+        return 1;
+    (*n)++;
+    if (tooled) { m->run_steps = *n; dbg_post_step(m); *n = m->run_steps; }   /* stops; loadvm resyncs */
+    if (!m->kmain_seen && m->kmain_va && m->cpu.rip == m->kmain_va) {
+        m->kmain_seen = 1;
+        mlog(&m->log, "[kernel] kmain reached -- AuraLite-OS C entry "
+             "(%llu instructions in)", (unsigned long long)*n);
+    }
+    if (k->keys_list && ((k->keys_at && m->vtime_instr >= k->keys_at) ||
+                         (k->keys_at_prompt && m->shell_prompt_seen))) {
+        if (kbc_queue_keys(m, k->keys_list) < 0)
+            mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
+        else
+            mlog(&m->log, "[kbc] --keys-at fired (instr=%llu, prompt=%d)",
+                 (unsigned long long)m->vtime_instr, k->keys_at_prompt);
+        k->keys_at = 0; k->keys_at_prompt = 0;
+    }
+    return m->stop_requested ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
@@ -120,6 +163,15 @@ int main(int argc, char **argv) {
     uint64_t watch_phys = 0;        /* --watch-phys=addr: store probe */
     uint64_t max_instr = 50ull*1000*1000;
     int trace = 0;
+    const char *trace_file = NULL;  /* --trace-file=path: TOOLING T1 disassembly trace */
+    int debug_repl = 0;             /* --debug: TOOLING T2 REPL on stdin, stop at start */
+    const char *debug_script = NULL;/* --debug-script=path: REPL commands from a file */
+    const char *symbols_path = NULL;/* --symbols=elf: debugger symbols (default: --kernel) */
+    const char *gdb_spec = NULL;    /* --gdb=[host:]port: TOOLING T3 gdbstub */
+    const char *snap_save_path = NULL; /* --snapshot-save=path: TOOLING T4, at run end */
+    const char *snap_load_path = NULL; /* --snapshot-load=path: TOOLING T4, before the run */
+    uint64_t trace_from = 0;        /* --trace-from=VTIME: first traced instruction */
+    uint64_t trace_count = 0;       /* --trace-count=N: stop after N lines (0 = all) */
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--rom=", 6)) rom_path = argv[i]+6;
@@ -170,6 +222,15 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--watch-phys=", 13))
             watch_phys = strtoull(argv[i]+13, NULL, 0);
         else if (!strcmp(argv[i], "--trace")) trace = 1;
+        else if (!strncmp(argv[i], "--trace-file=", 13)) trace_file = argv[i]+13;   /* TOOLING T1 */
+        else if (!strncmp(argv[i], "--trace-from=", 13)) trace_from = strtoull(argv[i]+13, NULL, 0);
+        else if (!strncmp(argv[i], "--trace-count=", 14)) trace_count = strtoull(argv[i]+14, NULL, 0);
+        else if (!strcmp(argv[i], "--debug")) debug_repl = 1;                         /* TOOLING T2 */
+        else if (!strncmp(argv[i], "--debug-script=", 15)) debug_script = argv[i]+15;
+        else if (!strncmp(argv[i], "--symbols=", 10)) symbols_path = argv[i]+10;
+        else if (!strncmp(argv[i], "--gdb=", 6)) gdb_spec = argv[i]+6;                   /* TOOLING T3 */
+        else if (!strncmp(argv[i], "--snapshot-save=", 16)) snap_save_path = argv[i]+16;  /* TOOLING T4 */
+        else if (!strncmp(argv[i], "--snapshot-load=", 16)) snap_load_path = argv[i]+16;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
                    "          [--max-instr=N] [--trace] [--dump-fb=out.ppm] [--dump-text=out.txt] [--log=out.txt]\n"
@@ -187,11 +248,34 @@ int main(int argc, char **argv) {
                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
                    "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n"
+                  "          [--trace-file=path] disassembled trace, one line per instruction, with a\n"
+                  "                      CPU-vs-disassembler self-check (TOOLING T1); never touches\n"
+                  "                      the log ring.  [--trace-from=VTIME] [--trace-count=N]\n"
+                  "          [--debug] stop before the first instruction and read debugger commands\n"
+                  "                      from stdin (TOOLING T2; `help` lists them; Ctrl-C pauses)\n"
+                  "          [--debug-script=path] the same commands from a file; EOF detaches\n"
+                  "          [--symbols=elf] debugger symbols (default: the --kernel ELF)\n"
+                  "          [--gdb=[host:]port] wait for gdb (`target remote host:port`; TOOLING T3);\n"
+                  "                      host defaults to 127.0.0.1; vCPUs are threads; `monitor help`\n"
+                  "          [--snapshot-save=path] save the machine when the run loop ends (TOOLING T4)\n"
+                  "          [--snapshot-load=path] start from a saved machine; same build and machine\n"
+                  "                      shape required; --max-instr stays a total budget\n"
                   "          [--stats] print the PERF P0 measurement block: executed_steps / instr_count /\n"
                   "                      vtime / cap.  Executed attempts, not idle clock\n"
                   "                      quanta, are the throughput numerator (faults count)\n", argv[0]);
             return 0;
         }
+    }
+
+    FILE *debug_in = NULL;
+    if (debug_script) {   /* TOOLING T2: fail before any machine state exists */
+        debug_in = fopen(debug_script, "r");
+        if (!debug_in) { fprintf(stderr, "cannot open --debug-script=%s\n", debug_script); return EXIT_INPUT_ERROR; }
+    }
+    if (trace_file) {   /* TOOLING T1: fail before any machine state exists */
+        FILE *tf = fopen(trace_file, "w");
+        if (!tf) { fprintf(stderr, "cannot open --trace-file=%s\n", trace_file); return EXIT_INPUT_ERROR; }
+        fclose(tf);
     }
 
     size_t rom_len = 0;
@@ -201,6 +285,7 @@ int main(int argc, char **argv) {
         if (!rom) return 1;
     }
 
+    int rc = EXIT_OK;
     machine_t *m = calloc(1, sizeof *m);
     m->cpu.mach = m;
     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
@@ -331,35 +416,54 @@ int main(int argc, char **argv) {
              "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
     }
 
-    uint64_t n = 0;
+    /* TOOLING T4: restore a saved machine before any tool attaches, so the
+     * debugger, the trace and the run loop all start from it. */
+    snap_cfg_t snapcfg = { platform_by_name(platform_name)->name, tap_arg != NULL, sata_wt };
+    g_snapcfg = snapcfg;
+    dbg_snap_hook = repl_snapshot;
+    if (snap_load_path && snap_load(m, snap_load_path, &snapcfg) != 0) {
+        rc = EXIT_INPUT_ERROR;
+        if (debug_in) fclose(debug_in);
+        goto teardown;
+    }
+
+    /* TOOLING T1: the trace hook reads code side-effect-free at every
+     * instruction boundary; the CPU's own fetch/predecode path is untouched. */
+    if (trace_file && dbg_trace_open(m, trace_file, trace_from, trace_count) != 0)
+        fprintf(stderr, "cannot open --trace-file=%s\n", trace_file);
+
+    /* TOOLING T2: debugger front end. Stops are wall-clock pauses only;
+     * nothing on this path changes guest state unless the user does. */
+    int debugging = debug_repl || debug_in || gdb_spec;
+    if (debugging) {
+        dbg_attach(m);
+        const char *symp = symbols_path ? symbols_path : kernel_path;
+        if (symp) {
+            int ns = dbg_symbols_load(m, symp);
+            fprintf(stderr, "[dbg] symbols: %d from %s\n", ns < 0 ? 0 : ns, symp);
+        }
+        if ((debug_repl || debug_in) &&
+            dbg_repl_attach(m, debug_in ? debug_in : stdin, !debug_in, stderr) == 0) {
+            debug_in = NULL;   /* owned by the REPL front end now */
+            if (!debug_script) signal(SIGINT, debug_on_sigint);
+        }
+        if (gdb_spec && gdb_attach(m, gdb_spec) != 0)
+            fprintf(stderr, "[gdb] not attached; the run continues without gdb\n");
+        dbg_run_start(m, 1);
+    }
+    if (debug_in) fclose(debug_in);
+
+    /* TOOLING T2: the step counter is published as m->run_steps for tools.
+     * The UP loop exists twice -- `tooled` is a constant in each copy -- so
+     * the untooled loop is the pre-T2 body (measured: a per-step tool test
+     * cost ~3 host instructions per step). */
+    keys_trigger_t keys = { keys_list, keys_at, keys_at_prompt };
+    uint64_t n = m->run_steps;
     int step_result = 0;
-    while (n < max_instr) {
-        if (m->n_vcpus <= 1) {
-        if (!m->guest_entry_seen && m->cpu.rip == 0x00100000ULL) {
-            m->guest_entry_seen = 1;
-            mlog(&m->log, "[guest] conventional entry reached at 0x00100000");
-        }
-        step_result = cpu_step(&m->cpu);
-        if (step_result != 0)
-            break;
-        n++;
-        if (!m->kmain_seen && m->kmain_va && m->cpu.rip == m->kmain_va) {
-            m->kmain_seen = 1;
-            mlog(&m->log, "[kernel] kmain reached -- AuraLite-OS C entry "
-                 "(%llu instructions in)", (unsigned long long)n);
-        }
-        if (keys_list && ((keys_at && m->vtime_instr >= keys_at) ||
-                          (keys_at_prompt && m->shell_prompt_seen))) {
-            if (kbc_queue_keys(m, keys_list) < 0)
-                mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
-            else
-                mlog(&m->log, "[kbc] --keys-at fired (instr=%llu, prompt=%d)",
-                     (unsigned long long)m->vtime_instr, keys_at_prompt);
-            keys_at = 0; keys_at_prompt = 0;
-        }
-        if (m->stop_requested)
-            break;
-        } else {
+    if (m->n_vcpus <= 1) {
+        if (m->dbg) { while (n < max_instr) if (run_up_step(m, &n, &step_result, &keys, 1)) break; }
+        else        { while (n < max_instr) if (run_up_step(m, &n, &step_result, &keys, 0)) break; }
+    } else while (n < max_instr) {
         /* K6 dual-context: strict 1:1 round-robin.  A vcpu that hard-
          * stops (hlt+cli or a cpu fault) is parked off the rotation; the
          * run ends only when EVERY active context has stopped -- the same
@@ -401,6 +505,7 @@ int main(int argc, char **argv) {
             if (m->vcpu[i].state != VCPU_RUN) continue;
             vcpu_load(m, i);
             step_result = cpu_step(&m->cpu);
+            if (m->dbg && step_result == 0) { m->run_steps = n + 1; dbg_post_step(m); }   /* TOOLING T2 */
             vcpu_store(m, i);
             n++;
             ran = 1;
@@ -410,14 +515,14 @@ int main(int argc, char **argv) {
                      m->vcpu[1-i].state == VCPU_RUN ? 1 : 0);
                 m->vcpu[i].state = VCPU_OFF;
             }
-            if (keys_list && ((keys_at && m->vtime_instr >= keys_at) ||
-                              (keys_at_prompt && m->shell_prompt_seen))) {
-                if (kbc_queue_keys(m, keys_list) < 0)
+            if (keys.keys_list && ((keys.keys_at && m->vtime_instr >= keys.keys_at) ||
+                              (keys.keys_at_prompt && m->shell_prompt_seen))) {
+                if (kbc_queue_keys(m, keys.keys_list) < 0)
                     mlog(&m->log, "[kbc] --keys-at parse error (want hex bytes like 1E,9E,39)");
                 else
                     mlog(&m->log, "[kbc] --keys-at fired (instr=%llu, prompt=%d)",
-                         (unsigned long long)m->vtime_instr, keys_at_prompt);
-                keys_at = 0; keys_at_prompt = 0;
+                         (unsigned long long)m->vtime_instr, keys.keys_at_prompt);
+                keys.keys_at = 0; keys.keys_at_prompt = 0;
             }
             if (m->stop_requested)
                 break;
@@ -428,12 +533,17 @@ int main(int argc, char **argv) {
         }
         if (m->stop_requested)
             break;
-        }
     }
 
     /* K6: bring the BSP context back into the live pair for the final
      * register dump / fault verdict (its slot copy is authoritative). */
+    m->run_steps = n;
+    /* TOOLING T4: the loop boundary is the snapshot point (before the BSP
+     * is reloaded for the final dump, so SMP slots are exactly as left). */
+    int snap_save_failed = snap_save_path && snap_save(m, snap_save_path, &snapcfg) != 0;
     if (m->n_vcpus > 1) vcpu_load(m, 0);
+    if (m->dbg) dbg_run_end(m, step_result);   /* TOOLING T2: post-mortem stop */
+    if (trace_file) dbg_trace_close(m, 1);   /* TOOLING T1: summary to stderr */
     if (m->guest_entry_seen && m->fb && m->fb[0] == 0x00200000u)
         mlog(&m->log, "[guest] framebuffer marker OK: pixel[0]=0x%08x", m->fb[0]);
     dump_regs(&m->cpu);
@@ -506,13 +616,16 @@ int main(int argc, char **argv) {
             fclose(f);
         }
     }
-    int rc = EXIT_OK;
     if (m->cpu.fault)
         rc = EXIT_CPU_FAULT;
     else if (step_result != 0 && !m->cpu.halted)
         rc = EXIT_CPU_FAULT;
+    if (snap_save_failed && rc == EXIT_OK) rc = EXIT_INPUT_ERROR;
+
+teardown:
 
     /* C10: orderly teardown keeps the ASan/UBSan lane leak-clean. */
+    dbg_detach(m);                                  /* TOOLING */
     devices_done(m);
     pci_done(m);
     mem_done(m);

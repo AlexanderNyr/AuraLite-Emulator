@@ -32,7 +32,7 @@ maps to exactly one plan below.
 | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
 | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
 | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
-| `docs/plans/TOOLING_PLAN.md` | 📋 planned | built-in debugger REPL, **gdbstub**, live WebSocket monitor for `web/monitor.html`, snapshots, trace disassembly | T0–T5 |
+| [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | 🚧 T0–T4 ✅ (0056–0060); T5 📋 | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
 | `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
@@ -52,6 +52,28 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
    plan + `docs/STATUS.md` evidence, same patch.
 
 ## Immediate queue (next patches)
+
+- ~~`0056` — TOOLING T0: measured baseline + `docs/plans/TOOLING_PLAN.md`
+  (`--trace` floods the 4096-line ring: 4,095 of 4,837,677 lines kept and
+  the five boot receipts 5 → 0; trace costs ≈8–24× and switches off P3
+  predecode; no breakpoint/gdbstub/snapshot; `web/monitor.html` is a
+  static mock with fabricated values; run state lives in `main()` locals)~~
+  shipped.
+- ~~`0057` — TOOLING T1: disassembler + `--trace-file=` with CPU-vs-
+  disassembler self-check (0 mismatches / 0 undecodable over five firmware
+  boots and 40M guest steps UP+SMP), ndisasm differential (226,884
+  encodings, 0 unexplained), `tools/x86dis`~~ shipped.
+- ~~`0058` — TOOLING T2: run-control core + REPL (`--debug`,
+  `--debug-script=`, `--symbols=`); exact stops and byte-identical stdout
+  versus the plain run on five platforms and the guest with `--smp=2`~~
+  shipped.
+- ~~`0059` — TOOLING T3: gdbstub (`--gdb=`); real gdb debugs the frozen
+  guest at source level (`kmain` at kernel/kernel.c:196, two vCPU
+  threads)~~ shipped.
+- ~~`0060` — TOOLING T4: snapshots (`--snapshot-save=`/`--snapshot-load=`,
+  `savevm`/`loadvm`); fourteen split lanes incl. the frozen guest SMP are
+  byte-identical to straight runs~~ shipped.
+- `0061` — TOOLING T5: live WebSocket monitor (`--monitor=`) + close-out.
 
 - ~~`0051` — PERF P0: honest instruction-attempt counter and opt-in `--stats`,
   seven-tape O2 benchmark on a separate binary, cap-based MIPS negative

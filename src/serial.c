@@ -16,6 +16,7 @@
  *   semantics detach while DLAB is set, like real silicon.
  */
 #include "serial.h"
+#include "snapshot.h"   /* TOOLING T4 */
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +42,14 @@ struct serial_state {
     char    line[256];
     size_t  len;
 };
+
+/* TOOLING T4: the UART register file and the partial line buffer. */
+void serial_snap(struct serial_state *ser, snap_t *s) {
+    struct serial_state t = *ser;
+    if (!snap_loading(s)) t.m = NULL;
+    snap_bytes(s, "dev.com1", &t, sizeof t);
+    if (snap_loading(s)) { t.m = ser->m; *ser = t; }
+}
 
 serial_t *serial_alloc(machine_t *m) {
     serial_t *s = calloc(1, sizeof *s);

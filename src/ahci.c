@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ahci.h"
+#include "snapshot.h"   /* TOOLING T4 */
 
 /* ---- register state ---- */
 
@@ -71,6 +72,20 @@ static ahci_t g_ahci[AHCI_CTRLS];
 
 /* S5: --sata-writethrough host files, one per attach slot (see ahci.h). */
 static FILE *g_wt[AHCI_CTRLS][AHCI_MAX_ATTACH];
+
+/* TOOLING T4: HBA + port register state of both controllers (host
+ * pointers stay live; --sata-writethrough is refused by snapshot.c). */
+void ahci_snap(machine_t *m, snap_t *s) {
+    (void)m;
+    for (int c = 0; c < AHCI_CTRLS; c++) {
+        char tag[16];
+        snprintf(tag, sizeof tag, "dev.ahci%u", (unsigned)c & 7u);
+        ahci_t t = g_ahci[c];
+        if (!snap_loading(s)) t.m = NULL;
+        snap_bytes(s, tag, &t, sizeof t);
+        if (snap_loading(s)) { t.m = g_ahci[c].m; t.ctrl = g_ahci[c].ctrl; g_ahci[c] = t; }
+    }
+}
 
 int ahci_wt_attach(machine_t *m, int ctrl, int port, const char *path) {
     (void)m;

@@ -30,6 +30,8 @@ typedef struct mmio_region {
     const char *name;
     int enabled;
     int owned_ctx;              /* C10: devices_done() frees ctx (rw2_t) only when set */
+    int dbg_readable;           /* TOOLING T2: read() is a pure RAM-window read with no
+                                 * side effect, so debuggers may call it */
     struct mmio_region *next;
 } mmio_region_t;
 
@@ -88,6 +90,8 @@ typedef struct perf_decode_entry {
 } perf_decode_entry_t;
 
 /* ---- Event log for the GUI / debugging ---- */
+struct dbg_state;   /* TOOLING: src/dbg.c, opaque to everything else */
+
 #define LOG_RING 4096
 typedef struct {
     char lines[LOG_RING][160];
@@ -199,6 +203,12 @@ struct machine {
     uint64_t vtime_instr;
     uint64_t watch_phys;      /* --watch-phys=addr: DW store probe, 0=off */
     vcpu_slot_t vcpu[EM_MAX_VCPU];
+    /* TOOLING: the attached tooling core (trace, debugger, gdbstub,
+     * monitor). NULL unless a T flag asked for it; never guest state. */
+    struct dbg_state *dbg;
+    /* TOOLING T2: the run loop's step counter (what --max-instr budgets),
+     * formerly a main() local; one loop iteration per vCPU step. */
+    uint64_t run_steps;
 };
 typedef struct machine machine_t;
 

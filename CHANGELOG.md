@@ -7,6 +7,94 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0060 (TOOLING T4, snapshots)
+
+- `src/snapshot.c`/`snapshot.h`: `AURASNP1` files of tagged, length-checked
+  records walked by one visitor in both directions; shape and build
+  fingerprints; sparse RAM/disk/SATA/RAM-window pages; host pointers zeroed
+  (deterministic files). Module visitors: `devices_snap` (EHCI, USB/BOT,
+  UHCI, VGA, dispi, COM1, RAM windows), `serial_snap`, `ahci_snap`,
+  `pci_snap` + `pci_ecam_map` (runtime ECAM replay); cpu.c exports the
+  device-cadence phase and the lazy `EMU_DBG_U` flag.
+- `--snapshot-save=FILE` (run end), `--snapshot-load=FILE` (before the run;
+  refusals exit 1); REPL/`monitor` `savevm`/`loadvm` (one vCPU; deferred
+  past the current instruction from a boundary stop).
+- Gates: `make test-snap` (format vectors; sanitizer lane too), `make
+  test-snapshot` (14 split lanes byte-identical, determinism, round trip,
+  6 refusals, REPL replay). NC: `make test-snapshot-nc` (RAM windows
+  forgotten → 9 lanes fail, the pre-framebuffer control passes; make RC=2).
+
+### Added — patch 0059 (TOOLING T3, gdbstub)
+
+- `src/gdbstub.c`/`gdbstub.h`, `--gdb=[host:]port` (host defaults to
+  127.0.0.1): RSP over TCP as a T2 front end. qSupported/NoAck,
+  target.xml (`i386:x86-64` core + SSE + segments + an
+  `org.auralite.x86emu.sys` CR/EFER feature), g/G/p/P, m/M/X, c/s/vCont,
+  Z0-Z4, threads = vCPUs, qThreadExtraInfo, qRcmd = T2 commands, Ctrl-C,
+  k/vKill/D, W/X at run end.
+- Gates: `make test-gdbstub` (30 pure-socket checks), `make test-gdb`
+  (adds real `gdb -batch` lanes on the firmware and, with KERNEL/INITRD,
+  the guest with ELF symbols and two vCPU threads; SKIPs without gdb).
+  NC: `make test-gdbstub-nc` (no running-state poll → Ctrl-C times out;
+  make RC=2). Untooled cost unchanged; historical lanes byte-identical.
+
+### Added — patch 0058 (TOOLING T2, debugger REPL)
+
+- Run-control core in `src/dbg.c`: virtual breakpoints on the linear PC,
+  linear watchpoints (r/w/a) through a new `cpu_dbg_access` hook installed
+  only while one exists, stepi/nexti/until, async pause, two stop sites
+  (boundary and between-instruction) with skip-once and step accounting,
+  front-end registry with a `poll()`-driven stop loop (T3/T5 plug in).
+- REPL front end: `--debug` (stdin, Ctrl-C pauses), `--debug-script=FILE`
+  (EOF detaches), `--symbols=ELF` (default `--kernel`); regs/sregs/cr/xmm/
+  vcpu/break/mmio, x/FMT, x/Ni with symbols, print/set/poke, xlate, bt,
+  log, vcpu N, detach, quit. Transcript on stderr.
+- `machine_t.run_steps` replaces `main()`'s local step counter;
+  `mmio_region_t.dbg_readable` marks pure RAM windows (framebuffer, CAR,
+  DDR scratch) that inspection may read.
+- Gates: `make test-dbg` (10 exact stops, breakpoint-everywhere identity,
+  quit/pause/eval; sanitizer lane too), `make test-debug` (25 checks incl.
+  five-platform and guest-SMP non-perturbation). NC: `make test-dbg-nc`
+  (unit RC=1, lanes RC=1; make RC=2). Historical lanes byte-identical.
+- Performance: tool calls in `cpu_step`/`read_mem_v`/`write_mem_v` are
+  `cold` out-of-line helpers behind one predicted test, `read_mem_v` keeps
+  its inlining via an `inline` hint, and the UP run loop is specialised on
+  "tool attached". Cachegrind, haswell boot: −0.26 % host instructions vs
+  `f3470e1` (T1 alone had been +1.78 %; the paired wall bench could not
+  resolve either).
+
+### Added — patch 0057 (TOOLING T1, trace disassembly)
+
+- `src/disasm.c`/`disasm.h`: table-driven x86 disassembler (one-byte map,
+  x87, 0F with 66/F2/F3 SSE..SSE4.2 forms, MMX, common 0F38/0F3A), NASM
+  syntax as printed by ndisasm; `tools/x86dis.c` (`make x86dis`) prints an
+  ndisasm-style listing (`--stride=N` for corpora).
+- `src/dbg.c`/`dbg.h`: the tooling core. Side-effect-free inspection
+  (`dbg_translate` mirrors `translate()` without faults/TLB fills;
+  `dbg_read_phys` never calls MMIO callbacks) and the `--trace-file=`
+  writer with a CPU-vs-disassembler successor self-check
+  (`--trace-from=`, `--trace-count=`, stderr summary).
+- CPU contact: `cpu_dbg_boundary` hook (called only while `m->dbg` is set)
+  and a tooling-only `cpu_t.event_count`. Legacy `--trace` unchanged.
+- Gates: `make test-disasm` (frozen ndisasm/CPU/flow/reject/inspection/
+  hook vectors; sanitizer lane too), `make test-disasm-diff` (226,884
+  encodings vs ndisasm, 0 unexplained divergences), `make test-trace`
+  (8 lanes, 0 mismatches, 0 undecodable, stdout identical with/without
+  trace). NC: `make test-disasm-nc` (unit RC=1, diff RC=1, trace
+  mismatches=490035; make RC=2). All historical lanes byte-identical.
+
+### Added — patch 0056 (TOOLING T0, measured baseline + plan)
+
+- New `docs/plans/TOOLING_PLAN.md`: T0–T5 with one gate and one NC per
+  phase. Baseline measured on `f3470e1`: `--trace` writes every step into
+  the 4096-line log ring, so a 4,837,677-step boot keeps 4,095 trace lines
+  and the five `test-boot` receipts vanish from stdout (5 → 0); trace
+  lines carry only mode/RIP/first opcode byte; tracing costs ≈8–24× and
+  disables P3 predecode (`decode_hits` 4,802,386 → 0). No stop/inspect
+  facility, no remote protocol, no persistence; `web/monitor.html` is a
+  static mock (hard-coded `RIP=0xe38d5`; 0 network calls). Docs only —
+  no source change, all historical receipts untouched.
+
 ### Changed — patch 0055 (PERF P5, paired confidence + close-out)
 
 - P4's required profile gate was **NO-GO**, not a delivered dispatch
