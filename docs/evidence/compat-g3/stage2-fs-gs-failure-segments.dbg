@@ -1,0 +1,5 @@
+b 0x8b6d
+continue
+info regs
+info sregs
+q

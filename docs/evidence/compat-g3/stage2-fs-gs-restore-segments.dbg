@@ -1,0 +1,16 @@
+b 0x8b40
+continue
+info regs
+info sregs
+tbreak 0x8b64
+continue
+info regs
+info sregs
+continue
+info regs
+info sregs
+tbreak 0x8b64
+continue
+info regs
+info sregs
+q

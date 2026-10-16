@@ -1,0 +1,77 @@
+---- CPU state (mode=real16, instr=1188468411) ----
+RAX=0000000000000000 RBX=000000000000aa55 RCX=0000000000000000 RDX=0000000000000080
+RSI=000000000000832c RDI=0000000000003000 RBP=0000000000000000 RSP=0000000000007bfe
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=0000000000000a0b RFLAGS=0000000000000246 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=0800 base=0000000000008000 L=0 D=0   SS=0000 base=0000000000000000
+STATE: FAULT -- #UD unsupported opcode 0x60 at rip=00000a0b (mode real16) (at rip=0xa0b)
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=11404475 instr_count=1188468411 halted=0 fault=1
+[stats] executed=11404475 idle_quantum=1177063936 instr_count_bsp=1188468411 vtime=1188468411
+[stats] cap=50000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=2274015
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 25 (#??) -> f000:e6f2 via IVT
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=1188460415
+[ahci-probe] port=0 cmd=0xc8 wr=0 vt=1188460415
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=1188460458
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=1188467285
+[ahci-probe] port=0 cmd=0xc8 wr=0 vt=1188467285
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=1188467328
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[serial] 
+[serial] [BL3] AuraLite stage2 alive
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] FAULT: #UD unsupported opcode 0x60 at rip=00000a0b (mode real16)

@@ -76,6 +76,22 @@ static void test_cmos_content_and_ports(void) {
     assert(cmos(&f, 0x0B) == 0x02);                            /* reg B pin: 24h/BCD */
 }
 
+static void test_cmos_extended_memory_above_16m(void) {
+    fx_t f; fx_init(&f);
+    uint64_t reported = ((uint64_t)cmos(&f, 0x34) << 16) |
+                        ((uint64_t)cmos(&f, 0x35) << 24);
+    uint64_t expected = RAM_SIZE > 16u * 1024u * 1024u
+                      ? (uint64_t)RAM_SIZE - 16u * 1024u * 1024u : 0;
+    expected &= ~0xFFFFULL;  /* CMOS extension is in 64-KiB units */
+    assert(reported == expected);
+    if (RAM_SIZE >= 16u * 1024u * 1024u)
+        assert(reported + 16u * 1024u * 1024u == RAM_SIZE);
+    /* At the pinned 128-MiB machine size, SeaBIOS reads 0x07000000 bytes
+     * above 16 MiB and therefore reconstructs exactly 128 MiB. */
+    assert(cmos(&f, 0x34) == 0x00 && cmos(&f, 0x35) == 0x07);
+    printf("ok: cmos_extended_memory_above_16m\n");
+}
+
 static void test_time_advances_bcd_exact(void) {
     fx_t f; fx_init(&f);
     fx_steps(&f, SEC_INSTR + 8000 * IPT);          /* 1 s + margin past UIP */
@@ -144,6 +160,7 @@ static void test_irq8_update_ended(void) {
 
 int main(void) {
     test_cmos_content_and_ports();
+    test_cmos_extended_memory_above_16m();
     test_time_advances_bcd_exact();
     test_uip_freeze_then_commit();
     test_regc_flags_no_uie();

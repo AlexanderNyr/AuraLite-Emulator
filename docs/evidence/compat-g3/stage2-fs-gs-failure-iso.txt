@@ -1,0 +1,5 @@
+input_sha256=b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+partition_lba=256 fat_lba=288 fats=2 fatsz=1281
+kernel_first_cluster=5 old_next=[6, 6] bad_next=0xffffff7
+changed_offsets=['0x24014', '0xc4214']
+output_bytes=84934656 output_sha256=cbfb4698e6e9af2878febe5adf81cfb7c92957fb4a3ebc056d22098d648a9611

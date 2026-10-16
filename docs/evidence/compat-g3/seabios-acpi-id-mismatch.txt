@@ -1,0 +1,19 @@
+SeaBIOS ACPI publication gate — source and diagnostic A/B
+
+Baseline source: SeaBIOS rel-1.16.3, commit
+ a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8; .config has CONFIG_ACPI=y.
+
+In src/fw/acpi.c, both fadt_init_tbl and acpi_find_tbl list Intel
+PIIX4 PM 8086:7113 and ICH9 LPC 8086:2918, but not 8086:1e55. acpi_setup()
+returns when pci_find_init_device(acpi_find_tbl, NULL) finds no match, before
+building/copying the RSDP/RSDT/MADT set. x86emu's LPC is 8086:1e55
+(src/devices.c near line 1251); the runtime PCI probe reports
+`PCI: init bdf=00:1f.0 id=8086:1e55`.
+
+The diagnostic patch adds 8086:1e55 to both lists and uses the ICH9 FADT
+setup routine. On the unchanged pinned ISO and unmodified Stage 2, SeaBIOS
+then logs `Copying ACPI RSDP from 0x00006dfc to 0x000f6210`; Stage 2 reports
+`[BL9] ACPI RSDP found` and `[BL9] ACPI MADT parsed`. The same run still
+reports `[BL4] ELF parse FAILED`. This isolates the missing-RSDP gate in this
+recreated test setup, but does not validate the FADT/PM register model or the
+contents of `boot_info_t`; the loader's MADT receipt is not an ABI check.

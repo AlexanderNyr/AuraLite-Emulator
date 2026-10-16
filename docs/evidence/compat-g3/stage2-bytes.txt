@@ -1,0 +1,10 @@
+Pinned Stage-2 stop byte derivation
+
+Historical stop: CS=0x0800, IP=0x0A0B.
+Linear address = (0x0800 << 4) + 0x0A0B = 0x08A0B.
+Stage 2 is loaded at physical 0x8000 from ISO LBA 34 (raw offset 0x4400).
+Byte offset within Stage 2 = 0x0A0B; raw ISO byte = 0x4400 + 0x0A0B = 0x4E0B.
+Pinned ISO SHA-256: d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+Byte at raw offset 0x4E0B: 0x60 (real-mode PUSHA).
+
+This maps the historical #UD to the pinned ISO byte; it is not boot evidence.

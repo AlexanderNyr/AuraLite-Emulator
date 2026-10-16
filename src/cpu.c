@@ -680,10 +680,12 @@ static int64_t fetch_imm_signed_z(dctx_t *d, int size) {
 }
 
 /* is_mem: 0 = register operand (reg=index), 1 = memory (addr/seg valid),
- * 2 = memory pending RIP-relative fixup. reg_field is the ModRM.reg bits
- * (5:3), ALWAYS valid regardless of is_mem -- it is either a second
+ * 2 = memory pending RIP-relative fixup. rsp_base marks an effective address
+ * based on RSP/ESP, needed by POP r/m because that form computes its memory
+ * destination after incrementing the stack pointer. reg_field is the ModRM.reg
+ * bits (5:3), ALWAYS valid regardless of is_mem -- it is either a second
  * register operand or an opcode-extension, depending on the instruction. */
-typedef struct { int is_mem; int reg; uint64_t addr; int seg; int reg_field; } rm_t;
+typedef struct { int is_mem; int reg; uint64_t addr; int seg; int reg_field; int rsp_base; } rm_t;
 static uint64_t rm_ea(dctx_t *d, rm_t *rm);  /* lazy RIP-relative EA (K2) */
 
 static const int tbl16_base[8] = {RBX,RBX,RBP,RBP,RSI,RDI,RBP,RBX};
@@ -740,6 +742,7 @@ static rm_t decode_modrm(dctx_t *d, uint8_t modrm) {
     uint64_t eff = base_val + (uint64_t)disp;
     if (d->addrsize == 32) eff &= 0xFFFFFFFFull;
     out.addr = eff;
+    out.rsp_base = have_base && basereg == RSP;
     if (out.seg < 0) out.seg = (have_base && ((basereg&7)==RSP || (basereg&7)==RBP)) ? SEG_SS : SEG_DS;
     return out;
 }
@@ -1171,6 +1174,21 @@ really_slow:
     case 0x89: { rm_t rm=MODRM(); FIXUP(rm); rm_write(&d,&rm,osz,get_reg(c,rm.reg_field,osz,d.has_rex)); break; }
     case 0x8A: { rm_t rm=MODRM(); FIXUP(rm); set_reg(c,rm.reg_field,1,d.has_rex, rm_read(&d,&rm,1)); break; }
     case 0x8B: { rm_t rm=MODRM(); FIXUP(rm); set_reg(c,rm.reg_field,osz,d.has_rex, rm_read(&d,&rm,osz)); break; }
+    case 0x8F: { /* POP r/m: only group /0 is defined */
+        rm_t rm = MODRM(); FIXUP(rm);
+        int ext = rm.reg_field & 7;
+        if (ext != 0) { faultf(c, "#UD POP r/m group ext=%d", ext); break; }
+        int sz = stack_unit(&d);
+        uint64_t value = do_pop(&d, sz);
+        if (rm.is_mem && rm.rsp_base) {
+            /* POP computes an ESP/RSP-based destination after the pop. The
+             * ModRM decoder cached the old base, so advance that EA using
+             * the active address width before storing the value. */
+            rm.addr += (uint64_t)sz;
+            if (d.addrsize == 32) rm.addr &= 0xFFFFFFFFull;
+        }
+        rm_write(&d, &rm, sz, value);
+        break; }
     /* ---- XCHG r/m,r (C8) ---- */
     case 0x86: case 0x87: {
         int size = (op==0x86)?1:osz; rm_t rm=MODRM(); FIXUP(rm);
@@ -2003,6 +2021,51 @@ really_slow:
             break; }
         case 0xB6: { rm_t rm=MODRM(); FIXUP(rm); uint64_t v=rm_read(&d,&rm,1); set_reg(c,rm.reg_field,osz,d.has_rex,v); break; }
         case 0xB7: { rm_t rm=MODRM(); FIXUP(rm); uint64_t v=rm_read(&d,&rm,2); set_reg(c,rm.reg_field,osz,d.has_rex,v); break; }
+        /* ---- SHLD/SHRD r/m,r,imm8 or CL ---- */
+        case 0xA4: case 0xA5: case 0xAC: case 0xAD: {
+            int size = osz;
+            int bits = size * 8;
+            int is_right = op2 == 0xAC || op2 == 0xAD;
+            rm_t rm = MODRM();
+            uint8_t raw_count = (op2 == 0xA4 || op2 == 0xAC)
+                              ? fetch8(&d) : (uint8_t)get_reg(c, RCX, 1, d.has_rex);
+            FIXUP(rm);  /* immediate is part of a RIP-relative instruction */
+            if (c->fault || c->exception_taken) goto done;
+            uint8_t count = raw_count & (size == 8 ? 63 : 31);
+            uint64_t mask = reg_mask(size);
+            uint64_t dst = rm_read(&d, &rm, size) & mask;
+            if (c->fault || c->exception_taken) goto done;
+            if (!count) break;  /* zero count preserves destination and flags */
+            uint64_t src = get_reg(c, rm.reg_field, size, d.has_rex) & mask;
+
+            /* Treat the operands as a 2*width concatenation. This avoids
+             * undefined C shifts and also gives deterministic silicon-like
+             * behavior for the architecturally undefined 16-bit count>15
+             * range (the architectural count mask is still applied above). */
+            __uint128_t pair = is_right
+                ? (((__uint128_t)src << bits) | dst)
+                : (((__uint128_t)dst << bits) | src);
+            uint64_t result = is_right
+                ? (uint64_t)(pair >> count) & mask
+                : (uint64_t)((pair << count) >> bits) & mask;
+            uint64_t cf;
+            if (is_right) {
+                cf = count <= bits ? (dst >> (count - 1)) & 1
+                                   : (src >> (count - bits - 1)) & 1;
+            } else {
+                cf = count <= bits ? (dst >> (bits - count)) & 1
+                                   : (src >> (2 * bits - count)) & 1;
+            }
+            set_flags_logic(c, result, size);  /* SF/ZF/PF, AF undefined */
+            if (cf) c->rflags |= FLAG_CF;
+            if (count == 1) {
+                uint64_t msb = 1ULL << (bits - 1);
+                int overflow = is_right ? (((dst ^ result) & msb) != 0)
+                                        : ((((result & msb) != 0) ^ (cf != 0)) != 0);
+                if (overflow) c->rflags |= FLAG_OF;
+            }
+            rm_write(&d, &rm, size, result);
+            break; }
         /* ---- MOVSX (sign-extended counterpart of MOVZX) ---- */
         case 0xBE: case 0xBF: {
             int from = (op2==0xBE)?1:2; rm_t rm=MODRM(); FIXUP(rm);
@@ -2130,6 +2193,13 @@ really_slow:
             if (ext==6) elem &= ~(1ULL << ib);
             if (ext==7) elem ^=  (1ULL << ib);
             if (ext!=4) rm_write(&d,&rm,osz,elem);
+            break; }
+        case 0x09: { /* WBINVD: no data-cache model, so coherent no-op. */
+            if ((c->cr0 & 1) && cpl_now(c) != 0) {
+                raise_exception(m, 13, 1, 0); /* #GP(0): privileged instruction */
+                break;
+            }
+            /* Guest writes are immediately visible; there is no cache to flush. */
             break; }
         case 0x31: { /* RDTSC: virtual time = executed instruction attempts x per-platform
                         ratio (platform_t::tsc_per_instr) — deterministic */
@@ -2302,8 +2372,14 @@ really_slow:
                          uint16_t lim = (ext==0) ? c->gdtr_limit : c->idtr_limit;
                          uint64_t gb  = (ext==0) ? c->gdtr_base  : c->idtr_base;
                          write_mem_v(m, addr, 2, lim);
+                         /* SGDT/SIDT write a 10-byte pseudo-descriptor only
+                          * in 64-bit mode. In real/protected 16- or 32-bit
+                          * mode the 16-bit limit plus 32-bit base is exactly
+                          * six bytes; padding a write through addr+7 can
+                          * corrupt the next stack slot (SeaBIOS call32_prep
+                          * places a local SGDT object directly before EBX). */
                          if (cpu_addr_size(c)==64) write_mem_v(m, addr+2, 8, gb);
-                         else { write_mem_v(m, addr+2, 4, gb); write_mem_v(m, addr+6, 2, 0); }
+                         else write_mem_v(m, addr+2, 4, gb);
                          break;
                      }
                      uint16_t lim = (uint16_t)read_mem_v(m, addr, 2);
@@ -2357,6 +2433,25 @@ really_slow:
     case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
         int r=(op-0x58)|(d.has_rex?(d.rex_b<<3):0); int sz = stack_unit(&d);
         set_reg(c,r,sz,d.has_rex, do_pop(&d, sz)); break; }
+    case 0x60: { /* PUSHA/PUSHAD: legacy only; saved SP/ESP is pre-decrement */
+        if (cpu_addr_size(c)==64) { faultf(c, "#UD PUSHA in 64-bit mode"); break; }
+        int sz = stack_unit(&d);
+        static const int regs[] = { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };
+        uint64_t original_sp = get_reg(c, RSP, sz, 0);
+        for (size_t i=0; i<sizeof(regs)/sizeof(regs[0]); i++) {
+            uint64_t value = regs[i]==RSP ? original_sp : get_reg(c, regs[i], sz, 0);
+            do_push(&d, sz, value);
+        }
+        break; }
+    case 0x61: { /* POPA/POPAD discards the saved SP/ESP slot */
+        if (cpu_addr_size(c)==64) { faultf(c, "#UD POPA in 64-bit mode"); break; }
+        int sz = stack_unit(&d);
+        static const int regs[] = { RDI, RSI, RBP, RSP, RBX, RDX, RCX, RAX };
+        for (size_t i=0; i<sizeof(regs)/sizeof(regs[0]); i++) {
+            uint64_t value = do_pop(&d, sz);
+            if (regs[i] != RSP) set_reg(c, regs[i], sz, 0, value);
+        }
+        break; }
     /* PUSH imm: the immediate width follows the operand size (imm16 when
      * osz==2 — the baseline always fetched imm32 and decoded 2 bytes past
      * the instruction, C0 ledger #8), then sign-extends into the stack unit. */

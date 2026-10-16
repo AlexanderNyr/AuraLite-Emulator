@@ -1,0 +1,77 @@
+---- CPU state (mode=real16, instr=19557354482) ----
+RAX=0000000000000000 RBX=000000000000c800 RCX=000000000000c8e7 RDX=0000000000000000
+RSI=000000000000c8e7 RDI=0000000000000000 RBP=0000000000000000 RSP=0000000000006fa0
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=000000000000c903 RFLAGS=0000000000000246 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=f000 base=00000000000f0000 L=0 D=0   SS=0000 base=0000000000000000
+STATE: HALTED (HLT executed)
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=11825138 instr_count=19557354482 halted=1 fault=0
+[stats] executed=11825138 idle_quantum=19545529344 instr_count_bsp=19557354482 vtime=19557354482
+[stats] cap=50000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=2307705
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT

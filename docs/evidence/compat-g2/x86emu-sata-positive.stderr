@@ -1,0 +1,703 @@
+[ahci] ABAR registered at 0xfeb10000 (6 ports, S1: registers+presence)
+
+[ahci] port 0: attached /home/user/AuraLite-OS-compat/release/auralite.iso (84934656 bytes)
+[boot] platform=Haswell (LGA1150, model 0x3C) rom=/tmp/seabios-src/out/bios.bin (131072 bytes) disk=/tmp/g2-no-usb-media.img (1048576 bytes)
+SeaBIOS (version ?-20261015_193553-e2b.local)
+BUILD: gcc: (Debian 14.2.0-19) 14.2.0 binutils: (GNU Binutils for Debian) 2.44
+No Xen hypervisor found.
+Running on QEMU (q35)
+physbits: signature="GenuineIntel", pae=no, lm=yes, phys-bits=32, valid=yes
+cpuid 0x40000000: eax 40000000, signature 'AuraLite HV '
+RamSize: 0x08000000 [cmos]
+Relocating init from 0x000e4fc0 to 0x06ff1000 (size 61280)
+=== PCI bus & bridge init ===
+PCI: pci_bios_init_bus_rec bus = 0x0
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=134887
+[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=6ff1198 vt=134918
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=6ff11d5 vt=134948
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=135003
+[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=6ff1198 vt=135034
+PCI: pci_bios_init_bus_rec bdf = 0x8
+PCI: primary bus = 0x0
+PCI: secondary bus = 0xff -> 0x1
+PCI: pci_bios_init_bus_rec bus = 0x1
+PCI: subordinate bus = 0x0 -> 0x1
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=142159
+[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=6ff1198 vt=142189
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=6ff11d5 vt=142219
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=142274
+[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=6ff1198 vt=142304
+=== PCI device probing ===
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=152008
+[pci-probe] io-read fn=0 reg=0x00 size=4 val=0x1e558086 rip=6ff115b vt=152763
+[pci-probe] io-read fn=0 reg=0x08 size=4 val=0x06010000 rip=6ff115b vt=152780
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=6ff11d5 vt=152804
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=6ff11d5 vt=152837
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=6ff1198 vt=152892
+[pci-probe] io-read fn=2 reg=0x00 size=4 val=0x1e038086 rip=6ff115b vt=153695
+[pci-probe] io-read fn=2 reg=0x08 size=4 val=0x01060100 rip=6ff115b vt=153712
+[pci-probe] io-read fn=2 reg=0x0e size=1 val=0x00000000 rip=6ff11d5 vt=153736
+Found 6 PCI devices (max PCI bus is 00)
+[pci] host bridge: MMCONFIG (ECAM) window enabled at 0xb0000000
+PCIe: using q35 mmconfig at 0xb0000000
+=== PCI new allocation pass #1 ===
+PCI: check devices
+[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0x00000000 rip=6ff113d vt=203409
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xffffffff rip=6ff10bf vt=203445
+[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0xffffffff rip=6ff113d vt=203460
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0x00000000 rip=6ff10bf vt=203479
+[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0x00000000 rip=6ff113d vt=206152
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xffffffff rip=6ff10bf vt=206188
+[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0xffffffff rip=6ff113d vt=206203
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0x00000000 rip=6ff10bf vt=206222
+[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0x00000000 rip=6ff113d vt=208965
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xffffffff rip=6ff10bf vt=209001
+[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0xffffffff rip=6ff113d vt=209016
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0x00000000 rip=6ff10bf vt=209035
+[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0x00000000 rip=6ff113d vt=211848
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xffffffff rip=6ff10bf vt=211884
+[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0xffffffff rip=6ff113d vt=211899
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0x00000000 rip=6ff10bf vt=211918
+[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0x00000000 rip=6ff113d vt=214801
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xffffffff rip=6ff10bf vt=214837
+[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0xffffffff rip=6ff113d vt=214852
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0x00000000 rip=6ff10bf vt=214871
+[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0x00000000 rip=6ff113d vt=217824
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xffffffff rip=6ff10bf vt=217860
+[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0xffffffff rip=6ff113d vt=217875
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0x00000000 rip=6ff10bf vt=217894
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0x00000000 rip=6ff113d vt=220920
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfffff800 rip=6ff10bf vt=220939
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0xfffff800 rip=6ff113d vt=220961
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0x00000000 rip=6ff10bf vt=220980
+[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=6ff113d vt=224089
+[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0xffffffff rip=6ff10bf vt=224125
+[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=6ff113d vt=224140
+[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0x00000000 rip=6ff10bf vt=224159
+[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=6ff113d vt=224194
+[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0xffffffff rip=6ff10bf vt=224230
+[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=6ff113d vt=224245
+[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0x00000000 rip=6ff10bf vt=224264
+[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=6ff113d vt=224299
+[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0xffffffff rip=6ff10bf vt=224335
+[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=6ff113d vt=224350
+[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0x00000000 rip=6ff10bf vt=224369
+[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=6ff113d vt=224404
+[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0xffffffff rip=6ff10bf vt=224440
+[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=6ff113d vt=224455
+[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0x00000000 rip=6ff10bf vt=224474
+[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=6ff113d vt=224509
+[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0xffffffff rip=6ff10bf vt=224545
+[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=6ff113d vt=224560
+[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0x00000000 rip=6ff10bf vt=224579
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfeb10000 rip=6ff113d vt=224614
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xffffffff rip=6ff10bf vt=224650
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfffff000 rip=6ff113d vt=224665
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfeb10000 rip=6ff10bf vt=224684
+[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=6ff113d vt=227846
+[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0xfffff800 rip=6ff10bf vt=227865
+[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=6ff113d vt=227887
+[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0x00000000 rip=6ff10bf vt=227906
+=== PCI new allocation pass #2 ===
+PCI: IO: c000 - bfff
+PCI: 32: 00000000c0000000 - 00000000fec00000
+PCI: map device bdf=00:00.0  bar 0, addr febe0000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 1, addr febe1000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 2, addr febe2000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 3, addr febe3000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 4, addr febe4000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 5, addr febe5000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 6, addr febe6000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 0, addr febe7000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 1, addr febe8000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 6, addr febe9000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 0, addr febea000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 1, addr febeb000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 2, addr febec000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 3, addr febed000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 4, addr febee000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 5, addr febef000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 6, addr febf0000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 0, addr febf1000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 1, addr febf2000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 2, addr febf3000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 3, addr febf4000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 4, addr febf5000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 5, addr febf6000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 6, addr febf7000, size 00001000 [mem]
+PCI: map device bdf=00:1f.0  bar 0, addr febf8000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xfebf8000 rip=6ff10bf vt=284282
+PCI: map device bdf=00:1f.0  bar 1, addr febf9000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xfebf9000 rip=6ff10bf vt=286425
+PCI: map device bdf=00:1f.0  bar 2, addr febfa000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xfebfa000 rip=6ff10bf vt=288571
+PCI: map device bdf=00:1f.0  bar 3, addr febfb000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xfebfb000 rip=6ff10bf vt=290717
+PCI: map device bdf=00:1f.0  bar 4, addr febfc000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xfebfc000 rip=6ff10bf vt=292863
+PCI: map device bdf=00:1f.0  bar 5, addr febfd000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xfebfd000 rip=6ff10bf vt=295009
+PCI: map device bdf=00:1f.0  bar 6, addr febfe000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfebfe000 rip=6ff10bf vt=297158
+PCI: map device bdf=00:1f.2  bar 5, addr febff000, size 00001000 [mem]
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfebff000 rip=6ff10bf vt=299304
+PCI: init bdf=00:00.0 id=8086:29c0
+PCI: init bdf=00:01.0 id=8086:0101
+PCI: init bdf=00:02.0 id=8086:0412
+PCI: init bdf=00:03.0 id=8086:1e26
+PCI: init bdf=00:1f.0 id=8086:1e55
+[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=6ff11b1 vt=306101
+[pci-probe] ecam-read fn=0 reg=0x004 size=2 val=0x00000000 rip=6ff1173 vt=306326
+[pci-probe] ecam-write fn=0 reg=0x004 size=2 val=0x00000103 rip=6ff10fe vt=306346
+PCI: init bdf=00:1f.2 id=8086:1e03
+[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=6ff11b1 vt=307421
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000000 rip=6ff1173 vt=307646
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=6ff10fe vt=307666
+PCI: Using 00:02.0 for primary VGA
+[lapic] software ENABLED (spurious vector 0xff)
+[lapic] IPI INIT-assert: vec=0x00 shorthand=3 (broadcast form not modeled for INIT/SIPI)
+[lapic] IPI SIPI: vec=0x10 shorthand=3 (broadcast form not modeled for INIT/SIPI)
+Found 1 cpu(s) max supported 1 cpu(s)
+Copying PIR from 0x06fffc80 to 0x000f3ea0
+[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=6ff11b1 vt=314407
+[pci-probe] ecam-read fn=0 reg=0x03c size=1 val=0x00000000 rip=6ff11b1 vt=314423
+[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=6ff11b1 vt=314454
+[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=6ff11b1 vt=314470
+Copying MPTABLE from 0x00006d88/6fe8d60 to 0x000f3dc0
+Copying SMBIOS from 0x00006d88 to 0x000f3c90
+CPU Mhz=458
+Scan for VGA option rom
+Turning on vga text mode console
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+SeaBIOS (version ?-20261015_193553-e2b.local)
+[kbd-probe] status=0x00 rip=6ff3f51 vt=2446807
+[kbd-probe] status=0x00 rip=f49cb vt=2446829
+[kbd-probe] status=0x18 rip=f49cb vt=2446867
+[kbd-probe] status=0x18 rip=6ff3f51 vt=2446894
+[kbd-probe] status=0x18 rip=f49cb vt=2446918
+[kbd-probe] status=0x1d rip=6ff3f17 vt=2446935
+[kbd-probe] read=0x55 status=0x1d rip=6ff3f3b vt=2446938
+[kbd-probe] status=0x1c rip=f49cb vt=2446966
+[kbd-probe] status=0x1d rip=6ff3f17 vt=2446983
+[kbd-probe] read=0x00 status=0x1d rip=6ff3f3b vt=2446986
+[kbd-probe] status=0x1c rip=f49cb vt=2447188
+[kbd-probe] status=0x1c rip=f49cb vt=2447204
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfebff000 rip=6ff113d vt=2448251
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=6ff1173 vt=2448283
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=6ff10fe vt=2448303
+[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=6ff11b1 vt=2448790
+AHCI controller at 00:1f.2, iobase 0xfebff000, irq 0
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=6ff1173 vt=2450059
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000107 rip=6ff10fe vt=2450079
+[ahci-mmio-probe] read off=0x4 size=4 rip=6ffaa2a vt=2450086
+[ahci-mmio-probe] write off=0x4 size=4 val=0x80000000 rip=6ffaa35 vt=2450089
+[ahci-mmio-probe] read off=0x0 size=4 rip=6ffaa3b vt=2450091
+[ahci-mmio-probe] read off=0xc size=4 rip=6ffaa43 vt=2450094
+[ahci-mmio-probe] write off=0x100 size=4 val=0x6ff0800 rip=f4296 vt=2461378
+[ahci-mmio-probe] write off=0x108 size=4 val=0x6ff0700 rip=f4296 vt=2461389
+[ahci-mmio-probe] write off=0x104 size=4 val=0x0 rip=f4296 vt=2461404
+[ahci-mmio-probe] write off=0x10c size=4 val=0x0 rip=f4296 vt=2461415
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2462394
+[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=f4296 vt=2462408
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2462417
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2462445
+[ahci-mmio-probe] write off=0x118 size=4 val=0x10 rip=f4296 vt=2462458
+[ahci-mmio-probe] write off=0x118 size=4 val=0x12 rip=f4296 vt=2462470
+[ahci-mmio-probe] read off=0x128 size=4 rip=f42a5 vt=2462501
+[ahci-mmio-probe] read off=0x130 size=4 rip=f42a5 vt=2462514
+[ahci-mmio-probe] read off=0x120 size=4 rip=f42a5 vt=2462546
+[ahci-mmio-probe] write off=0x118 size=4 val=0x13 rip=f4296 vt=2462561
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2462939
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=2462952
+[ahci-probe] port=0 cmd=0xa1 wr=0 vt=2462952
+[ahci] port 0: unsupported ATA cmd 0xa1 (S3 scope)
+
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2462982
+[ahci-mmio-probe] write off=0x110 size=4 val=0x40000000 rip=f4296 vt=2462995
+[ahci-mmio-probe] read off=0x120 size=4 rip=f42a5 vt=2463007
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2463024
+[ahci-mmio-probe] write off=0x118 size=4 val=0xc010 rip=f4296 vt=2463036
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2463046
+[ahci-mmio-probe] read off=0x130 size=4 rip=f42a5 vt=2463057
+[ahci-mmio-probe] write off=0x130 size=4 val=0x0 rip=f4296 vt=2463068
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2463077
+[ahci-mmio-probe] write off=0x110 size=4 val=0x0 rip=f4296 vt=2463088
+[ahci-mmio-probe] read off=0x120 size=4 rip=f42a5 vt=2463097
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2463110
+[ahci-mmio-probe] write off=0x118 size=4 val=0x4011 rip=f4296 vt=2463122
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2463513
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=2463526
+[ahci-probe] port=0 cmd=0xec wr=0 vt=2463526
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2463556
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=2463569
+Searching bootorder for: /pci@i0cf8/*@1f,2/drive@0/disk@0
+AHCI/0: Set transfer mode to default PIO
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2469699
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=2469712
+[ahci-probe] port=0 cmd=0xef wr=1 vt=2469712
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2469742
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=2469755
+Searching bios-geometry for: /pci@i0cf8/*@1f,2/drive@0/disk@0
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2473084
+[ahci-mmio-probe] write off=0x118 size=4 val=0xc000 rip=f4296 vt=2473098
+[kbd-probe] status=0x1c rip=f49cb vt=2473173
+[kbd-probe] status=0x1c rip=f49cb vt=2473189
+[kbd-probe] status=0x0c rip=f49cb vt=2473221
+[kbd-probe] write=0xff pending=0x00 status=0x04 rip=6ff5f44 vt=2473230
+[kbd-probe] reply=0xfa status=0x04 rip=6ff5f44 vt=2473230
+[kbd-probe] reply=0xaa status=0x04 rip=6ff5f44 vt=2473230
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2473257
+[kbd-probe] read=0xfa status=0x05 rip=6ff5ec6 vt=2473261
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2473308
+[kbd-probe] read=0xaa status=0x05 rip=6ff5ec6 vt=2473312
+[kbd-probe] status=0x04 rip=f49cb vt=2473341
+[kbd-probe] status=0x0c rip=f49cb vt=2473357
+[kbd-probe] status=0x1c rip=f49cb vt=2473419
+[kbd-probe] status=0x1c rip=f49cb vt=2473435
+[ahci-mmio-probe] write off=0x180 size=4 val=0x6ff0000 rip=f4296 vt=2485683
+[ahci-mmio-probe] write off=0x188 size=4 val=0x6fedf00 rip=f4296 vt=2485694
+[ahci-mmio-probe] write off=0x184 size=4 val=0x0 rip=f4296 vt=2485709
+[ahci-mmio-probe] write off=0x18c size=4 val=0x0 rip=f4296 vt=2485720
+[ahci-mmio-probe] read off=0x198 size=4 rip=f42a5 vt=2486987
+[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=f4296 vt=2487001
+[ahci-mmio-probe] read off=0x190 size=4 rip=f42a5 vt=2487010
+[ahci-mmio-probe] read off=0x198 size=4 rip=f42a5 vt=2487038
+[ahci-mmio-probe] write off=0x198 size=4 val=0x10 rip=f4296 vt=2487051
+[ahci-mmio-probe] write off=0x198 size=4 val=0x12 rip=f4296 vt=2487063
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2487094
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2487162
+[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=f4296 vt=2487176
+[ahci-mmio-probe] read off=0x110 size=4 rip=f42a5 vt=2487185
+[ahci-mmio-probe] write off=0x100 size=4 val=0x7fffc00 rip=f4296 vt=2489459
+[ahci-mmio-probe] write off=0x108 size=4 val=0x7fffb00 rip=f4296 vt=2489471
+[ahci-mmio-probe] read off=0x118 size=4 rip=f42a5 vt=2489481
+[ahci-mmio-probe] write off=0x118 size=4 val=0x11 rip=f4296 vt=2489495
+AHCI/0: registering: "AHCI/0: uAariLetE umiDksH AB ATA-0 Hard-Disk (81 MiBytes)"
+[kbd-probe] status=0x1c rip=f49cb vt=2492202
+[kbd-probe] status=0x1c rip=f49cb vt=2492218
+[kbd-probe] status=0x0c rip=f49cb vt=2492250
+[kbd-probe] write=0xf5 pending=0x00 status=0x04 rip=6ff5f44 vt=2492259
+[kbd-probe] reply=0xfa status=0x04 rip=6ff5f44 vt=2492259
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2492286
+[kbd-probe] read=0xfa status=0x05 rip=6ff5ec6 vt=2492290
+[kbd-probe] status=0x04 rip=f49cb vt=2492334
+[kbd-probe] status=0x0c rip=f49cb vt=2492350
+[kbd-probe] status=0x1c rip=f49cb vt=2492410
+[kbd-probe] status=0x1c rip=f49cb vt=2492426
+[ahci-mmio-probe] write off=0x200 size=4 val=0x6feec00 rip=f4296 vt=2504650
+[ahci-mmio-probe] write off=0x208 size=4 val=0x6ff0900 rip=f4296 vt=2504661
+[ahci-mmio-probe] write off=0x204 size=4 val=0x0 rip=f4296 vt=2504676
+[ahci-mmio-probe] write off=0x20c size=4 val=0x0 rip=f4296 vt=2504687
+[ahci-mmio-probe] read off=0x218 size=4 rip=f42a5 vt=2505942
+[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=f4296 vt=2505956
+[ahci-mmio-probe] read off=0x210 size=4 rip=f42a5 vt=2505965
+[ahci-mmio-probe] read off=0x218 size=4 rip=f42a5 vt=2505993
+[ahci-mmio-probe] write off=0x218 size=4 val=0x10 rip=f4296 vt=2506006
+[ahci-mmio-probe] write off=0x218 size=4 val=0x12 rip=f4296 vt=2506018
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2506049
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2506117
+[kbd-probe] status=0x1c rip=f49cb vt=2506195
+[kbd-probe] status=0x1c rip=f49cb vt=2506211
+[kbd-probe] status=0x0c rip=f49cb vt=2506243
+[kbd-probe] write=0xf0 pending=0x00 status=0x04 rip=6ff5f44 vt=2506252
+[kbd-probe] reply=0xfa status=0x04 rip=6ff5f44 vt=2506252
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2506279
+[kbd-probe] read=0xfa status=0x05 rip=6ff5ec6 vt=2506283
+[kbd-probe] status=0x04 rip=f49cb vt=2506318
+[kbd-probe] write=0x02 pending=0xf0 status=0x04 rip=6ff5f44 vt=2506327
+[kbd-probe] reply=0xfa status=0x04 rip=6ff5f44 vt=2506327
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2506354
+[kbd-probe] read=0xfa status=0x05 rip=6ff5ec6 vt=2506358
+[kbd-probe] status=0x04 rip=f49cb vt=2506396
+[kbd-probe] status=0x0c rip=f49cb vt=2506412
+[kbd-probe] status=0x1c rip=f49cb vt=2506472
+[kbd-probe] status=0x1c rip=f49cb vt=2506488
+[ahci-mmio-probe] write off=0x280 size=4 val=0x6fee800 rip=f4296 vt=2519588
+[ahci-mmio-probe] write off=0x288 size=4 val=0x6ff0500 rip=f4296 vt=2519599
+[ahci-mmio-probe] write off=0x284 size=4 val=0x0 rip=f4296 vt=2519614
+[ahci-mmio-probe] write off=0x28c size=4 val=0x0 rip=f4296 vt=2519625
+[ahci-mmio-probe] read off=0x298 size=4 rip=f42a5 vt=2521096
+[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=f4296 vt=2521110
+[ahci-mmio-probe] read off=0x290 size=4 rip=f42a5 vt=2521119
+[ahci-mmio-probe] read off=0x298 size=4 rip=f42a5 vt=2521147
+[ahci-mmio-probe] write off=0x298 size=4 val=0x10 rip=f4296 vt=2521160
+[ahci-mmio-probe] write off=0x298 size=4 val=0x12 rip=f4296 vt=2521172
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2521203
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2521271
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2521339
+[kbd-probe] status=0x1c rip=f49cb vt=2521417
+[kbd-probe] status=0x1c rip=f49cb vt=2521433
+[kbd-probe] status=0x0c rip=f49cb vt=2521465
+[kbd-probe] write=0xf4 pending=0x00 status=0x04 rip=6ff5f44 vt=2521474
+[kbd-probe] reply=0xfa status=0x04 rip=6ff5f44 vt=2521474
+[kbd-probe] status=0x05 rip=6ff5ebc vt=2521501
+[kbd-probe] read=0xfa status=0x05 rip=6ff5ec6 vt=2521505
+[kbd-probe] status=0x04 rip=f49cb vt=2521549
+[kbd-probe] status=0x0c rip=f49cb vt=2521565
+PS2 keyboard initialized
+[ahci-mmio-probe] write off=0x300 size=4 val=0x6fefc00 rip=f4296 vt=2536118
+[ahci-mmio-probe] write off=0x308 size=4 val=0x6fefb00 rip=f4296 vt=2536129
+[ahci-mmio-probe] write off=0x304 size=4 val=0x0 rip=f4296 vt=2536144
+[ahci-mmio-probe] write off=0x30c size=4 val=0x0 rip=f4296 vt=2536155
+[ahci-mmio-probe] read off=0x318 size=4 rip=f42a5 vt=2537902
+[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=f4296 vt=2537916
+[ahci-mmio-probe] read off=0x310 size=4 rip=f42a5 vt=2537925
+[ahci-mmio-probe] read off=0x318 size=4 rip=f42a5 vt=2537953
+[ahci-mmio-probe] write off=0x318 size=4 val=0x10 rip=f4296 vt=2537966
+[ahci-mmio-probe] write off=0x318 size=4 val=0x12 rip=f4296 vt=2537978
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2538009
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2538077
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2538145
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2538213
+[ahci-mmio-probe] write off=0x380 size=4 val=0x6fef400 rip=f4296 vt=2553243
+[ahci-mmio-probe] write off=0x388 size=4 val=0x6fef300 rip=f4296 vt=2553254
+[ahci-mmio-probe] write off=0x384 size=4 val=0x0 rip=f4296 vt=2553269
+[ahci-mmio-probe] write off=0x38c size=4 val=0x0 rip=f4296 vt=2553280
+[ahci-mmio-probe] read off=0x398 size=4 rip=f42a5 vt=2555267
+[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=f4296 vt=2555281
+[ahci-mmio-probe] read off=0x390 size=4 rip=f42a5 vt=2555290
+[ahci-mmio-probe] read off=0x398 size=4 rip=f42a5 vt=2555318
+[ahci-mmio-probe] write off=0x398 size=4 val=0x10 rip=f4296 vt=2555331
+[ahci-mmio-probe] write off=0x398 size=4 val=0x12 rip=f4296 vt=2555343
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2555374
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2555442
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2555510
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2555578
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2555646
+Searching bootorder for: HALT
+Found 0 serial ports
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2557370
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2557438
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2557506
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2557574
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2557642
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2557937
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2558005
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2558073
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2558141
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2558209
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2558504
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2558572
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2558640
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2558708
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2558776
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2559071
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2559139
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2559207
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2559275
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2559343
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2559638
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2559706
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2559774
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2559842
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2559910
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2560205
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2560273
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2560341
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2560409
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2560477
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2560772
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2560840
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2560908
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2560976
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2561044
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2561339
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2561407
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2561475
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2561543
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2561611
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2561906
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2561974
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2562042
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2562110
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2562178
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2562473
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2562541
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2562609
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2562677
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2562745
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2563040
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2563108
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2563176
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2563244
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2563312
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2563607
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2563675
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2563743
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2563811
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2563879
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2564174
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2564242
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2564310
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2564378
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2564446
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2564741
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2564809
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2564877
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2564945
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2565013
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2565308
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2565376
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2565444
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2565512
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2565580
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2565875
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2565943
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2566011
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2566079
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2566147
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2566442
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2566510
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2566578
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2566646
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2566714
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2567009
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2567077
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2567145
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2567213
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2567281
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2567576
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2567644
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2567712
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2567780
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2567848
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2568143
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2568211
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2568279
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2568347
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=f42a5 vt=2568415
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=f42a5 vt=2568710
+[ahci-mmio-probe] read off=0x328 size=4 rip=f42a5 vt=2568778
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=f42a5 vt=2568846
+[ahci-mmio-probe] read off=0x228 size=4 rip=f42a5 vt=2568914
+[ahci-mmio-probe] write off=0x198 size=4 val=0x4000 rip=f4296 vt=7069925
+[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=f4296 vt=7070503
+[ahci-mmio-probe] write off=0x218 size=4 val=0x4000 rip=f4296 vt=7088671
+[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=f4296 vt=7089181
+[ahci-mmio-probe] write off=0x298 size=4 val=0x4000 rip=f4296 vt=7103981
+[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=f4296 vt=7104423
+[ahci-mmio-probe] write off=0x318 size=4 val=0x4000 rip=f4296 vt=7120838
+[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=f4296 vt=7121212
+[ahci-mmio-probe] write off=0x398 size=4 val=0x4000 rip=f4296 vt=7137887
+[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=f4296 vt=7138193
+All threads complete.
+Scan for option roms
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0xfebfe000 rip=6ff113d vt=7148096
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfffffffe rip=6ff10bf vt=7148113
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0xfffffffe rip=6ff113d vt=7148128
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfebfe001 rip=6ff10bf vt=7148155
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfebfe000 rip=6ff10bf vt=7148177
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+
+Press ESC for boot menu.
+
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 22 (#??) -> f000:e82e via IVT
+Searching bootorder for: HALT
+drive 0x000f3c20: PCHS=0/0/0 translation=lba LCHS=164/16/63 s=165888
+Space available for UMB: c0000-ee800, f0000-f3c20
+Returned 16773120 bytes of ZoneHigh
+e820 map has 7 items:
+  0: 0000000000000000 - 000000000009fc00 = 1 RAM
+  1: 000000000009fc00 - 00000000000a0000 = 2 RESERVED
+  2: 00000000000f0000 - 0000000000100000 = 2 RESERVED
+  3: 0000000000100000 - 0000000007fff000 = 1 RAM
+  4: 0000000007fff000 - 0000000008000000 = 2 RESERVED
+  5: 00000000b0000000 - 00000000c0000000 = 2 RESERVED
+  6: 00000000fffc0000 - 0000000100000000 = 2 RESERVED
+[cpu] real-mode vector 25 (#??) -> f000:e6f2 via IVT
+enter handle_19:
+  NULL
+Booting from Hard Disk...
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+G2 handle_13 ah=2 al=1 dl=80
+G2 basic CHS=0/0/1 LCHS=164/16/63 DL=80
+G2 p32 op=000eff88 drive=000f3c20 type=50 cmd=2 count=1 lba=0 buf=00007c00
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=1188460415
+[ahci-probe] port=0 cmd=0xc8 wr=0 vt=1188460415
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=1188460458
+G2 basic status=0 count=1
+Booting from 0000:7c00
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+G2 handle_13 ah=41 al=0 dl=80
+[cpu] real-mode vector 19 (#??) -> f000:e3fe via IVT
+G2 handle_13 ah=42 al=0 dl=80
+G2 p32 op=000eff88 drive=000f3c20 type=50 cmd=2 count=126 lba=34 buf=00008000
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=1188467285
+[ahci-probe] port=0 cmd=0xc8 wr=0 vt=1188467285
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=1188467328
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[serial] 
+[serial] [BL3] AuraLite stage2 alive
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] FAULT: #UD unsupported opcode 0x60 at rip=00000a0b (mode real16)

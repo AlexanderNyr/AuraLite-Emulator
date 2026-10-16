@@ -1,0 +1,22 @@
+PCI: init bdf=00:1f.0 id=8086:1e55
+Copying ACPI RSDP from 0x00006dfc to 0x000f6210
+[serial] [BL3] AuraLite stage2 alive
+[serial] [BL3] E820 done
+[serial] [BL3] A20 gate on
+[serial] [BL3] disk read OK
+[serial] [BL3] unreal mode OK
+[serial] [BL9] ACPI RSDP found
+[serial] [BL9] ACPI MADT parsed
+[serial] [BL4] FAT32 BPB parsed
+[serial] [BL4] kernel.elf located
+[serial] [BL4] kernel.elf loaded to 0x00200000
+[serial] [BL4] ELF parse FAILED
+[serial] [BL4] KERNEL.ELF unloadable -- falling back to KERNEL.OLD
+[serial] [BL4] KERNEL.OLD missing or unloadable; halting
+[serial] [BL3] real-mode services complete; halting
+
+[stats] vcpu=0 executed_steps=173979379 instr_count=576696537331 halted=1 fault=0
+[stats] executed=173979379 idle_quantum=576522557952 instr_count_bsp=576696537331 vtime=576696537331
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=35957861
+[stats] decode_hits=0 decode_misses=0

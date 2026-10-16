@@ -1,0 +1,77 @@
+---- CPU state (mode=real16, instr=1188468411) ----
+RAX=0000000000000000 RBX=000000000000aa55 RCX=0000000000000000 RDX=0000000000000080
+RSI=000000000000832c RDI=0000000000003000 RBP=0000000000000000 RSP=0000000000007bfe
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=0000000000000a0b RFLAGS=0000000000000246 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=0800 base=0000000000008000 L=0 D=0   SS=0000 base=0000000000000000
+STATE: FAULT -- #UD unsupported opcode 0x60 at rip=00000a0b (mode real16) (at rip=0xa0b)
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=11404475 instr_count=1188468411 halted=0 fault=1
+[stats] executed=11404475 idle_quantum=1177063936 instr_count_bsp=1188468411 vtime=1188468411
+[stats] cap=50000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=2274015
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[g2-call32-step] left=22 mode=real16 cs=f000 rip=0000a9f2 eax=00000001 ebx=00000001 ecx=00000001 edx=00000001 esp=0000ff48
+[g2-call32-step] left=21 mode=real16 cs=f000 rip=0000a9f4 eax=0000e000 ebx=00000001 ecx=00000001 edx=00000001 esp=0000ff48
+[g2-call32-step] left=20 mode=real16 cs=f000 rip=0000a9f8 eax=0000e000 ebx=00000001 ecx=00000001 edx=00000001 esp=0000ff48
+[g2-call32-step] left=19 mode=real16 cs=f000 rip=0000a9fa eax=0000e000 ebx=00000001 ecx=00000001 edx=00000001 esp=0000ff48
+[g2-call32-step] left=18 mode=real16 cs=f000 rip=0000a9fc eax=0000e000 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=17 mode=real16 cs=f000 rip=0000a9fe eax=0000e000 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=16 mode=real16 cs=f000 rip=0000aa00 eax=0000e000 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=15 mode=real16 cs=f000 rip=0000aa04 eax=ffffff80 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=14 mode=real16 cs=f000 rip=0000aa06 eax=ffffff80 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=13 mode=real16 cs=f000 rip=0000aa08 eax=ffffff02 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=12 mode=real16 cs=f000 rip=0000aa0a eax=ffffff02 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=11 mode=real16 cs=f000 rip=0000aa0f eax=ffffff02 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=10 mode=real16 cs=f000 rip=0000aa14 eax=ffffff02 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=9 mode=real16 cs=f000 rip=0000aa17 eax=00000000 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff48
+[g2-call32-step] left=8 mode=real16 cs=f000 rip=0000aa1b eax=00000000 ebx=00000001 ecx=00000001 edx=00000000 esp=0000ff50
+[g2-call32-step] left=7 mode=real16 cs=f000 rip=0000aa1d eax=00000000 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff54
+[g2-call32-step] left=6 mode=real16 cs=f000 rip=0000aa1f eax=00000000 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff58
+[g2-call32-step] left=5 mode=real16 cs=f000 rip=0000b5d5 eax=00000000 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff5c
+[g2-call32-step] left=4 mode=real16 cs=f000 rip=0000b5d8 eax=00000000 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff5c
+[g2-call32-step] left=3 mode=real16 cs=f000 rip=0000b5da eax=00000000 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff5c
+[g2-call32-step] left=2 mode=real16 cs=f000 rip=0000b5dd eax=000eff88 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff5c
+[g2-call32-step] left=1 mode=real16 cs=f000 rip=0000b5e0 eax=000eff88 ebx=000eff88 ecx=00000001 edx=00000000 esp=0000ff5c
+[ahci-mmio-probe] write off=0x138 size=4 val=0x1 rip=f4296 vt=1188467285
+[ahci-probe] port=0 cmd=0xc8 wr=0 vt=1188467285
+[ahci-mmio-probe] write off=0x110 size=4 val=0x1 rip=f4296 vt=1188467328
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[serial] 
+[serial] [BL3] AuraLite stage2 alive
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] FAULT: #UD unsupported opcode 0x60 at rip=00000a0b (mode real16)

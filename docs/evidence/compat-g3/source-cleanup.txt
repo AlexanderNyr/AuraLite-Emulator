@@ -1,0 +1,44 @@
+Source/build state — COMPAT G3, 2026-10-16
+
+After the initial diagnostic-only experiments, the compatibility source tree
+was intentionally updated with a candidate FS/GS restoration fix:
+- boot/bios/stage2/disk.inc calls go_unreal after INT 13h success and exhausted
+  retries, before popad restores the caller's full GPR frame.
+- boot/bios/stage2/unreal.inc uses pushad/popad so its full-register
+  preservation comment matches behavior.
+- boot/bios/stage2/stage2_start.asm documents that INT 13h can reload the
+  hidden FS/GS caches.
+The exact diff is stage2-fs-gs-restore.patch. The updated Stage 2 was built and
+copied to stage2-fs-gs-restore.bin. It has not been embedded in the authoritative
+release ISO. Do not interpret the temporary diagnostic ISO/run as acceptance.
+
+The authoritative release ISO and kernel remain unchanged:
+  ISO SHA-256 d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+  kernel.elf SHA-256 a1c5264bcf6fbed66a75e0a4a54f3deb6d713842fa64a812cb1a0a05cb647bb3
+The earlier temporary patch source was reversed before the candidate source fix
+was applied. The historical earlier diagnostic binary/patch remain in the
+bundle and are explicitly marked superseded.
+
+Before the candidate fix, the OS build/ directory was absent. `make stage2`
+was run with NASM 2.16.03; the generated binary and build log are in the bundle.
+The generated OS build/ directory was removed afterward. The temporary ISO and
+error-injection image stayed under /tmp and were not copied into release/.
+
+Pre-existing compatibility-checkout edits to other integration scripts and
+tools were left untouched:
+  tests/integration/bl2_mbr_smoke.sh
+  tests/integration/bl3_stage2_smoke.sh
+  tests/integration/bl4_boot_smoke.sh
+  tests/integration/bl4_elf_smoke.sh
+  tests/integration/bl4_fat_smoke.sh
+  tests/integration/bl5_iso_smoke.sh
+  tests/integration/bl6_uefi_smoke.sh
+  tests/integration/bl7_dual_smoke.sh
+  tests/integration/cases/test_usb_hid_input.sh
+  tools/mkisoimage_bios.sh
+  tools/mkisoimage_dual.sh
+
+The error-injection ISO and all run outputs stayed under /tmp; only their
+hashes, source helper, and compressed diagnostic receipts are in the bundle.
+No `--sata-writethrough` run was used. The candidate source change is not a
+claim of a pinned-image handoff or ABI validation.

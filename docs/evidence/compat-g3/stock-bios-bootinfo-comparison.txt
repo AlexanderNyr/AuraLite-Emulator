@@ -1,0 +1,15 @@
+QEMU q35 / stock 128-KiB SeaBIOS / AHCI + blank USB: qemu-samebios-ahci-candidate-bootinfo.bin sha256=a78dd3a651638b395144d4df3cac9d8ecca9855f58bb556d202feadbd8c42e42
+xemu Haswell / same stock BIOS / AHCI + blank USB: stock-bios-candidate-bootinfo.bin sha256=49e0c14b98b8f381d951419c3a7efe7c85b810a010f277897446313da041f2c3
+Raw block: different; differing_bytes=19
+Selected stable fields: MATCH
+  magic=0x4155524142544c44 / 0x4155524142544c44
+  fb=(0, 0, 0, 0, 0, 0, 0, 0) / (0, 0, 0, 0, 0, 0, 0, 0)
+  HHDM=0xffff800000000000 / 0xffff800000000000
+  initrd=0x1800000+0xb22000 / 0x1800000+0xb22000
+  CPUs/BSP/entries=1/0/[(0, 0, 0, 0)] / 1/0/[(0, 0, 0, 0)]
+  boot_from_uefi=0 / 0
+RSDP: 0xf67b0 / 0x0
+E820 count: 8 / 7
+QEMU q35 / stock 128-KiB SeaBIOS / AHCI + blank USB E820:  0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7edf000:t1; 0x7fdf000+0x21000:t2; 0xb0000000+0x10000000:t2; 0xfed1c000+0x4000:t2; 0xfffc0000+0x40000:t2
+xemu Haswell / same stock BIOS / AHCI + blank USB E820: 0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7efe000:t1; 0x7ffe000+0x2000:t2; 0xb0000000+0x10000000:t2; 0xfffc0000+0x40000:t2
+Scope: selected boot_info_t fields only. Do not infer firmware equivalence, allocator-zone cause, or boot acceptance from this comparison.

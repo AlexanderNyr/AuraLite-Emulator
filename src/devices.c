@@ -18,6 +18,16 @@
 #include "vga_font.h"
 #include "snapshot.h"   /* TOOLING T4 */
 
+/* TEMP G2 probe: expose SeaBIOS's QEMU debug port in an instrumented run. */
+static uint32_t debugcon_read(void *ctx, uint16_t port, int size) {
+    (void)ctx; (void)port; (void)size;
+    return 0xE9;
+}
+static void debugcon_write(void *ctx, uint16_t port, int size, uint32_t value) {
+    (void)ctx; (void)port; (void)size;
+    fputc((int)(value & 0xFF), stderr);
+}
+
 /* ============================ generic RAM window ========================== */
 typedef struct { uint8_t *buf; uint64_t base, size; uint32_t clear_bits_on_read; const char *name; } rw2_t;
 
@@ -1189,6 +1199,7 @@ static void gpu_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
 /* =========================== public init entry points ====================== */
 void devices_init_common(machine_t *m) {
     pci_init(m);
+    io_register(m, 0x402, 1, debugcon_read, debugcon_write, m, "SeaBIOS debugcon (G2 probe)");
 
     /* CHIPSET H0: the 8259A pair exists identically on all five platforms */
     pic_init(m);
@@ -1222,14 +1233,23 @@ void devices_init_common(machine_t *m) {
     g_com1 = serial_alloc(m);
     serial_io_register(m, g_com1);
 
-    /* Host bridge: bus0 dev0 func0 */
-    pci_add_device(m, 0,0,0, "host-bridge", 0x8086, 0x0100, 0x06, 0x00, 0);
+    /* Host bridge: bus0 dev0 func0. SeaBIOS recognizes this Q35 ID and
+     * programs its PAM0..6 window through PCI config space. TEMP G2 probe:
+     * QEMU subsystem IDs enable the instrumented BIOS debugcon. */
+    pci_dev_t *host_bridge = pci_add_device(m, 0,0,0, "host-bridge", 0x8086, PCI_DEVICE_ID_INTEL_Q35_MCH,
+                   0x06, 0x00, 0);
+    host_bridge->cfg[0x2C] = 0xF4; host_bridge->cfg[0x2D] = 0x1A;
+    host_bridge->cfg[0x2E] = 0x00; host_bridge->cfg[0x2F] = 0x11;
 
     /* "PCI bridge / misc" at dev1 (poked directly by the Haswell path) */
     pci_add_device(m, 0,1,0, "pci-bridge-misc", 0x8086, 0x0101, 0x06, 0x04, 0);
 
-    /* LPC bridge: real Intel convention dev31/func0 */
-    pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086, 0x1E55, 0x06, 0x01, 0);
+    /* LPC bridge: real Intel convention dev31/func0. This chipset device
+     * shares device 31 with the AHCI function at 0:31.2, so advertise the
+     * multifunction header bit or PCI enumerators (including SeaBIOS) stop
+     * after function 0 and never discover the SATA controller. */
+    pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086, 0x1E55, 0x06, 0x01, 0);
+    lpc_pci->cfg[0x0E] = 0x80;                    /* multifunction, type 0 */
 
     /* SATA/AHCI: real Intel convention dev31/func2.  STORE S1: BAR5 is a
      * real MMIO window now (was an empty stub -- the guest's own boot
@@ -1239,6 +1259,8 @@ void devices_init_common(machine_t *m) {
     sata_pci->cfg[0x25] = (uint8_t)(AHCI_ABAR >> 8);
     sata_pci->cfg[0x26] = (uint8_t)(AHCI_ABAR >> 16);
     sata_pci->cfg[0x27] = (uint8_t)(AHCI_ABAR >> 24);
+    sata_pci->cfg_read = ahci_pci_cfg_read;
+    sata_pci->cfg_write = ahci_pci_cfg_write;
     ahci_register(m);
 
     /* GPU: dev2/func0 (real Intel iGPU convention) */
@@ -1334,6 +1356,8 @@ void devices_add_ahci2(machine_t *m) {
     p->cfg[0x25] = (uint8_t)(AHCI_ABAR2 >> 8);
     p->cfg[0x26] = (uint8_t)(AHCI_ABAR2 >> 16);
     p->cfg[0x27] = (uint8_t)(AHCI_ABAR2 >> 24);
+    p->cfg_read = ahci_pci_cfg_read;
+    p->cfg_write = ahci_pci_cfg_write;
     ahci_register_ctrl(m, 1);
 }
 

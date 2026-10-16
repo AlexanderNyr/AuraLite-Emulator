@@ -6,9 +6,10 @@
 //
 // Inspection is side-effect-free by construction (TOOLING_PLAN rule 3):
 // dbg_translate() mirrors cpu.c translate() -- 4-level walk, PS leaves,
-// the same masks -- but raises no #PF, fills no P2 TLB entry and reads
-// page tables only from RAM/ROM; dbg_read_phys() never calls an MMIO
-// callback. Debugger and trace reads therefore cannot perturb a run.
+// the same masks -- but raises no #PF, fills no P2 TLB entry and uses the
+// side-effect-free physical decoder (including Q35 PAM shadow selection).
+// dbg_read_phys() never calls a device MMIO callback. Debugger and trace
+// reads therefore cannot perturb a run.
 //
 // Run control (T2) is the only stop/resume machinery (TOOLING_PLAN rule
 // 4): the REPL, the gdbstub (T3) and the monitor (T5) are front ends that

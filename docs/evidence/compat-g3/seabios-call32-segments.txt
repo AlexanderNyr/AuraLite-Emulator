@@ -1,0 +1,32 @@
+SeaBIOS AHCI call32 FS/GS cache analysis
+
+SeaBIOS rel-1.16.3's AHCI 32-bit call32 path preserves FS/GS selector values;
+call32_post reloads those selectors. In real mode selector 0x0010 gives base
+0x100 and limit 0xffff, not the guest's prior unreal-mode hidden cache. The
+runtime trace is AH=42, AHCI type 0x50, LBA 128, buffer 0x11000. Stage 2's
+baseline disk_read_lba saves GPRs, DS and ES, but not FS/GS; fat_load assumes
+the flat caches survived. Thus the baseline trace indicates a BIOS/guest
+interaction, not an x86emu segment-semantics defect.
+
+The unmodified-image first-copy watch saw ELF magic at 0x11400, zeroes at
+0x11500, and the first write at 0x200100. This aligns with the saved
+stage4-snapshot-analysis.txt findings: the staging range is not byte-identical
+to the pinned kernel. The pinned kernel's ELF header/program-header values are
+otherwise compatible with elf_load.
+
+Candidate source fix validation (diagnostic image only):
+- disk_read_lba now calls go_unreal before its final popad on both success and
+  exhausted-retry exits. go_unreal now uses pushad/popad.
+- The post-patch trace at LBA 128 observes FS/GS base=0x100, limit=0xffff at
+  the BIOS return. At the helper return both are base=0, limit=0xffffffff;
+  EAX is restored to 0x80 (the original LBA). The trace uses the fixed
+  Stage-2 binary SHA-256 51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+  and is preserved in stage2-fs-gs-restore-segments.*.
+- A hash-guarded temporary ISO contains that Stage-2 binary only in the
+  reserved LBA 34–159 slot. The ACPI-ID probe ROM plus this modified image
+  emits ELF PT_LOAD/initrd/long-mode and Ring-3 shell-active receipts with
+  fault=0. It is diagnostic-only; the pinned release ISO was not modified.
+- A separate bad-FAT-link image forces an invalid-LBA BIOS read. At the final
+  `stc` return breakpoint, FS/GS are flat and EAX is restored to `0x10000b17`;
+  Stage 2 reports the kernel load failure and follows its bounded fallback
+  path with `fault=0`. This temporary error-injection image is diagnostic-only.

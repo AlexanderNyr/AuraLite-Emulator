@@ -1,0 +1,51 @@
+# G2 capture commands (2026-10-15)
+# Working directory: /home/user/AuraLite-Emulator
+# The SeaBIOS ROM is the instrumented local build listed in README.md.
+# No diagnostic always-writable-ROM bypass is applied.
+
+# Build the emulator and run unit tests (both exit 0).
+make -j4
+make test-unit
+
+# Positive SATA-only media lane: blank USB image + ISO on SATA.
+./x86emu \
+  --rom=/tmp/seabios-src/out/bios.bin \
+  --platform=haswell \
+  --disk=/tmp/g2-no-usb-media.img \
+  --sata=/home/user/AuraLite-OS-compat/release/auralite.iso \
+  --max-instr=50000000 --stats \
+  --log=/tmp/g2-final-positive.log \
+  >/tmp/g2-final-positive.stdout \
+  2>/tmp/g2-final-positive.stderr
+# Observed x86emu status: 2, later #UD at CS=0800:IP=0A0B after [BL3].
+
+# Negative media control: same blank USB image, no SATA ISO attached.
+./x86emu \
+  --rom=/tmp/seabios-src/out/bios.bin \
+  --platform=haswell \
+  --disk=/tmp/g2-no-usb-media.img \
+  --max-instr=50000000 --stats \
+  --log=/tmp/g2-final-negative.log \
+  >/tmp/g2-final-negative.stdout \
+  2>/tmp/g2-final-negative.stderr
+# Observed x86emu status: 0, HALTED after no-bootable-device path; no [BL3].
+
+# Input identity checks at capture time:
+sha256sum /tmp/seabios-src/out/bios.bin
+sha256sum /tmp/g2-no-usb-media.img
+sha256sum /home/user/AuraLite-OS-compat/release/auralite.iso
+
+# Earlier one-address watch that isolated the bug (pre-fix build):
+# ./x86emu --rom=/tmp/seabios-src/out/bios.bin --platform=haswell \
+#   --disk=/tmp/g2-no-usb-media.img \
+#   --sata=/home/user/AuraLite-OS-compat/release/auralite.iso \
+#   --max-instr=50000000 --watch-phys=0xeff38 \
+#   --log=/tmp/g2-call32-watch.log \
+#   >/tmp/g2-call32-watch.stdout 2>/tmp/g2-call32-watch.stderr
+# Key evidence: push at RIP A996 stored eff88 to EFF38; SGDT at A9C5
+# wrongly stored size=2 val=0 to EFF38; POP EBX then yielded e0000.
+
+# Post-fix diagnostic replay (before removing the temporary cpu.c trace):
+# The same positive command was rerun with --watch-phys=0xeff38. Its outputs
+# are x86emu-sata-positive-traced.stdout/.stderr; POP EBX restored eff88 and
+# SeaBIOS read the boot sector and entered Stage 2.

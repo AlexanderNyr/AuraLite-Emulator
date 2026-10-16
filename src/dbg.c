@@ -77,44 +77,11 @@ int dbg_code_bits(const cpu_t *c) {
     return 16;
 }
 
-/* The MMIO region mem_read would pick for `phys` (mem.c find_mmio's
- * smallest-match rule), or NULL. */
-static mmio_region_t *mmio_at(machine_t *m, uint64_t phys) {
-    mmio_region_t *best = NULL;
-    for (mmio_region_t *r = m->mmio_list; r; r = r->next) {
-        if (!r->enabled || phys < r->base || phys >= r->base + r->size) continue;
-        if (!best || r->size < best->size) best = r;
-    }
-    return best;
-}
-
-/* One physical byte exactly as mem_read would return it, but only where
- * that read has no side effect: RAM, the two ROM windows, open bus. */
-static int phys_byte(machine_t *m, uint64_t phys, uint8_t *out) {
-    if (!m->chipset.a20) phys &= ~0x100000ULL;
-    if (phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE) {
-        *out = m->rom[(phys - ROM_ALIAS_LOW_BASE) % ROM_SIZE]; return 1;
-    }
-    if (phys >= ROM_TOPOF4G_BASE && phys <= 0xFFFFFFFFULL) {
-        *out = m->rom[(phys - ROM_TOPOF4G_BASE) % ROM_SIZE]; return 1;
-    }
-    if (phys < RAM_SIZE) { *out = m->ram[phys]; return 1; }
-    mmio_region_t *r = mmio_at(m, phys);
-    if (r) {
-        /* only plain RAM windows (framebuffer, CAR, DDR scratch) are read;
-         * a device register read could change device state */
-        if (!r->dbg_readable) return 0;
-        *out = (uint8_t)r->read(r->ctx, phys, 1);
-        return 1;
-    }
-    *out = 0xFF;   /* open bus, like mem_read */
-    return 1;
-}
-
 size_t dbg_read_phys(machine_t *m, uint64_t phys, void *buf, size_t n) {
     uint8_t *b = buf;
     size_t i = 0;
-    for (; i < n; i++) if (!phys_byte(m, phys + i, &b[i])) break;
+    for (; i < n; i++)
+        if (!mem_debug_peek_byte(m, phys + i, &b[i])) break;
     return i;
 }
 
@@ -158,7 +125,7 @@ size_t dbg_read_lin(machine_t *m, const cpu_t *c, uint64_t lin, void *buf, size_
             if (!dbg_translate(m, c, a & ~0xFFFULL, &p)) break;
             page = a >> 12; pbase = p & ~0xFFFULL;
         }
-        if (!phys_byte(m, pbase | (a & 0xFFF), &b[i])) break;
+        if (!mem_debug_peek_byte(m, pbase | (a & 0xFFF), &b[i])) break;
     }
     return i;
 }

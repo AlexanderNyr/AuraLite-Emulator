@@ -1,0 +1,18 @@
+snapshot version=2; RAM=134217728 bytes; boot_info phys=0x10000 size=7776
+Generated C-header offsets/size: bootinfo-layout.inc MATCH
+magic=0x4155524142544c44 OK; boot_from_uefi=0; reserved padding=zero
+fb phys=0x0 0x0 pitch=0 bpp=0 rgb-shift=0,0,0
+mmap_count=7 (max 256); hhdm_offset=0xffff800000000000
+  mmap[0] base=0x00000000 length=0x0009fc00 type=1
+  mmap[1] base=0x0009fc00 length=0x00000400 type=2
+  mmap[2] base=0x000f0000 length=0x00010000 type=2
+  mmap[3] base=0x00100000 length=0x07efe000 type=1
+  mmap[4] base=0x07ffe000 length=0x00002000 type=2
+  mmap[5] base=0xb0000000 length=0x10000000 type=2
+  mmap[6] base=0xfffc0000 length=0x00040000 type=2
+initrd phys=0x1800000 size=0xb22000 (11673600 bytes)
+cpu_count=1 (max 64); bsp_lapic_id=0
+  cpu[0] processor_id=0 lapic_id=0 goto=0x0 extra=0x0
+rsdp_phys=0x0 (absent)
+Checks: generated C-header offsets/size, magic, array counts, sorted non-overlapping E820 entries, field padding, HHDM, CPU/BSP agreement, and RSDP.
+Scope: temporary candidate Stage-2 + unmodified stock Debian SeaBIOS snapshot; structural handoff evidence only, not pinned-image acceptance or QEMU equivalence

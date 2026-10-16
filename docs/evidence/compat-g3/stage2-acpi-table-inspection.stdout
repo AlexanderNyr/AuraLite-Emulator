@@ -1,0 +1,76 @@
+---- CPU state (mode=real16, instr=1289014568) ----
+RAX=0000000000000004 RBX=0000000000001000 RCX=0000000007fff69e RDX=0000000000000006
+RSI=0000000007ff85bd RDI=0000000000000001 RBP=0000000000000000 RSP=0000000000007c00
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=000000000000015b RFLAGS=0000000000000246 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=0800 base=0000000000008000 L=0 D=0   SS=0000 base=0000000000000000
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=121109288 instr_count=1289014568 halted=0 fault=0
+[stats] executed=121109288 idle_quantum=1167905280 instr_count_bsp=1289014568 vtime=1289014568
+[stats] cap=1300000000 cap_reached=0 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=24063622
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[serial] [BL9] ACPI RSDP found
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[serial] [BL9] ACPI MADT parsed
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT

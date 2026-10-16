@@ -24,7 +24,8 @@
  *   0x14 equipment byte            = 0x10 (80x25 color video, no FDD/FPU/mouse)
  *   0x15/0x16 base memory KB       = 640 (0x0280 LE)
  *   0x17/0x18 extended memory KB   = min(RAM_KB-1024, 65535) -- classic cap
- *   0x30/0x31 extended memory KB   = same value (POST mirror)
+ *   0x30/0x31 extended memory KB   = same classic saturated value (POST mirror)
+ *   0x34/0x35 memory above 16 MiB   = 32-bit byte count bits 16..31 (64-KiB units)
  *   0x32 century (BCD)             = computed (0x20 for 2026-epoch)
  *   0x2E/0x2F checksum             = 0x0000, intentionally never computed
  *   all other non-dynamic bytes    = 0x00 at rtc_init, guest-writable

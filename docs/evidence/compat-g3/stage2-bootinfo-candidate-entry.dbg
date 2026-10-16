@@ -1,0 +1,13 @@
+tb 0xffffffff80191640
+continue
+info regs
+x/1xg 0x10000
+x/8xw 0x10008
+x/8xg 0x10028
+x/4xw 0x11828
+x/4xg 0x11830
+x/2xw 0x11848
+x/3xg 0x11850
+x/2xg 0x11e50
+x/2xw 0x11e58
+detach

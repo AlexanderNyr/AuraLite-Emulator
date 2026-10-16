@@ -1,0 +1,53 @@
+Candidate BIOS Stage-2 boot_info_t handoff — diagnostic only
+
+Run identity
+- Temporary ISO `/tmp/g3-stage2-fs-gs-restore-v2.iso`, SHA-256
+  b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905.
+  It contains the candidate Stage 2 in LBA 34–159, not the pinned ISO's Stage 2.
+- Candidate Stage 2 SHA-256
+  51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963.
+- ACPI-ID diagnostic SeaBIOS ROM SHA-256
+  012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5.
+- O2 x86emu SHA-256
+  2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9.
+- USB input: 1 MiB zero-filled image, SHA-256
+  30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58.
+
+At the temporary breakpoint on kernel entry `_start` (`0xffffffff80191640`),
+`RDI=0x10000`, which matches `BOOT_INFO_PHYS`; RIP is the expected entry and
+mode is long64. The breakpoint was before executing the kernel's first `cli`.
+The selected register and structure dump is in the archived debugger stderr.
+The full run exits RC 0 at the 1.3-billion-step cap with `halted=1`,
+`fault=0`, `cap_reached=1`, 720,494,088 executed steps and
+297,427,521,032 guest instructions.
+
+The raw sparse RAM snapshot was intentionally left in /tmp:
+- `/tmp/g3-stage2-bootinfo-candidate.snap`
+- 30,080,378 bytes; SHA-256
+  784ca493b84daa8371722ebb86d87c13b5de717caf898717b45d6481bc509925
+- AURASNP1 format v2; 128 MiB RAM.
+`inspect_bootinfo_snapshot.py` parsed the 7,776-byte structure at physical
+0x10000. Its receipt is `stage2-bootinfo-candidate-parser.txt`; the host C
+layout check and generated offsets are in `bootinfo-layout.txt` and
+`bootinfo-layout.inc`.
+
+Measured candidate contents
+- Magic `0x4155524142544c44`; framebuffer all zero (BIOS text mode).
+- Seven sorted, non-overlapping E820 entries; types 1/2, zero pads.
+- HHDM `0xffff800000000000`.
+- Initrd `0x01800000`, size `0x00b22000` (11,673,600 bytes).
+- `cpu_count=1`, `bsp_lapic_id=0`, CPU[0] processor/APIC ID 0, zero parked-AP
+  fields.
+- `rsdp_phys=0x000f6210`; RSDP signature and revision-0 checksum valid.
+- `boot_from_uefi=0`; reserved padding zero.
+
+The kernel then logged the matching handoff magic and BIOS path, parsed the
+initrd (206 files), and reached the shell-active marker. Together, the
+entry-register capture, candidate memory block, generated C offsets and
+kernel receipts provide a bounded structural/field check of this candidate
+handoff. It is not evidence for the authoritative x86emu ISO or a pinned-image
+BIOS-to-kernel acceptance result. This capture alone is not the separate
+limited QEMU reference comparison; it also does not validate allocator policy,
+ACPI device behavior, or SMP.
+
+Reproduction script: `stage2-bootinfo-candidate-entry.dbg`; see `commands.txt`.

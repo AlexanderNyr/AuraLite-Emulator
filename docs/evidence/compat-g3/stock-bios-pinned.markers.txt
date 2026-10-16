@@ -1,0 +1,14 @@
+[BL3] AuraLite stage2 alive
+[BL3] E820 done
+[BL3] A20 gate on
+[BL3] disk read OK
+[BL3] unreal mode OK
+[BL10] CPU supports long mode
+[BL9] ACPI RSDP not found; BSP-only
+[BL4] FAT32 BPB parsed
+[BL4] kernel.elf located
+[BL4] kernel.elf loaded to 0x00200000
+[BL4] ELF parse FAILED
+[BL4] KERNEL.ELF unloadable -- falling back to KERNEL.OLD
+[BL4] KERNEL.OLD missing or unloadable; halting
+[BL3] real-mode services complete; halting

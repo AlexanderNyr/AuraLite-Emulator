@@ -1,0 +1,77 @@
+Limited QEMU BIOS reference run — COMPAT G3, 2026-10-16
+
+QEMU was absent from PATH/system packages during the initial G3 test-suite run.
+For this follow-up, Debian 13's `qemu-system-x86` 10.0.13 package was downloaded
+and extracted to `/tmp/g3-qemu-root` without root/system installation.
+- qemu-system-x86 package SHA-256:
+  5e841d0723a657fd8bc2e9e1a085d24f47fcb3e4a0f94762e6c38b429f22fbb1
+- `qemu-system-x86_64 --version`: QEMU 10.0.13, Debian
+  `1:10.0.13+ds-0+deb13u1`.
+- Debian SeaBIOS `bios-256k.bin` SHA-256:
+  fc6d2ea888862e6b26d53fb877ab712324726eb8f44eb6baf076c64a31f1c3fb
+  (same measured 256-KiB BIOS hash listed in the G0 toolchain evidence).
+- The qemu-system-data tree was extracted under `/tmp`; the standard VGA BIOS
+  lookup was satisfied by a symlink to the extracted SeaBIOS VGA ROM.
+- QEMU dependencies were extracted into the same temporary root; nothing was
+  installed into the system. Package Debian version is the pinned host version.
+
+Both QEMU invocations used the same environment and firmware:
+  -machine q35,accel=tcg -cpu Haswell -m 128M -display none
+  -bios /tmp/g3-qemu-root/usr/share/seabios/bios-256k.bin
+  -drive if=ide,format=raw,file=<ISO> -snapshot -no-reboot
+  -serial stdio; QMP over a temporary UNIX socket.
+The `-snapshot` option kept both ISO inputs unchanged. TCG warned that it does
+not implement PCID, TSC deadline, HLE, INVPCID, or RTM from the requested Haswell
+CPU model; both runs nevertheless reached the serial shell-active marker.
+
+Runs and receipts
+1. Authoritative pinned release ISO
+   SHA-256 d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7.
+   QEMU booted the original Stage 2 through ACPI RSDP/MADT, kernel/initrd,
+   long mode and `[kernel] shell active; kmain idling.`
+2. Temporary candidate ISO
+   SHA-256 b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905.
+   Only its reserved Stage-2 slot LBA 34-159 is changed to the candidate binary.
+   QEMU reached the same Stage 4/kernel/initrd and shell-active receipts.
+Both ISO files remain unchanged after QEMU; QEMU does not write the pinned file.
+
+After each run reached the shell, QMP `human-monitor-command` issued
+`pmemsave 0x10000 7776 <output>`. The resulting pinned and candidate blocks are
+byte-identical, each SHA-256
+9119c44956fae7044f125c52c42aaea7d76e8347333516fe74747ee447cbdd42.
+The x86emu candidate block was extracted from its temporary v2 snapshot; its
+SHA-256 is f4bd25acb5b82fd0c7ba942e7ec2f121acedd76187c182476e7aebf13efb30e6.
+`qemu-bootinfo-comparison.txt` records the decoded comparison. Selected stable
+fields match; the QEMU/x86emu E820 maps and RSDP addresses differ as listed
+there. No allocator-zone or cause is inferred from those differences.
+
+The QEMU process was stopped after each memory dump to avoid leaving a VM
+running; stderr records the deliberate SIGTERM after the serial shell marker.
+That initial 256 KiB BIOS run is a limited QEMU reference, not a same-ROM/
+transport comparison with xemu and not an acceptance result for the modified
+image.
+
+A follow-up used the exact unmodified 128 KiB SeaBIOS `bios.bin` used by xemu
+(SHA-256 4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca),
+with q35/TCG, Haswell, 128 MiB and one vCPU. Under both the QEMU `if=ide` mode
+and explicit AHCI + blank-USB mode, the unchanged pinned ISO reaches
+`ELF parse FAILED`, while the temporary candidate reaches shell-active. QEMU
+reports RSDP/MADT in both; the selected map and RSDP agree within each pinned/
+candidate pair, while initrd is absent on the failed pinned path and present on
+the candidate path. The raw blocks are not identical; full receipts and exact
+field comparisons are in `qemu-samebios-ab.txt` and the `qemu-samebios-*` files.
+The QEMU candidate block compared with the xemu candidate captured under the
+same BIOS file and AHCI + blank-USB setup matches selected stable fields; the
+remaining RSDP/E820 differences are documented without a zone/cause claim.
+This follow-up is also diagnostic, not acceptance; the 128 KiB `bios.bin` is a
+different file from the earlier 256 KiB `bios-256k.bin`.
+
+The `run_qemu_g3_reference.sh`, `run_qemu_g3_samebios.sh`, and
+`capture_qemu_bootinfo.py` helpers were independently smoke-tested on candidate
+runs. The captured blocks matched the archived QEMU candidate blocks for their
+respective configurations. This verifies the helpers; it is not an additional
+acceptance result.
+
+Full serial captures, stderr, raw 7,776-byte boot_info blocks, and comparison
+script/output are in this evidence bundle; raw VM snapshots and QEMU package
+files remain in /tmp / Debian repositories and are not bundled.

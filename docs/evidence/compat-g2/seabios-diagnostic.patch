@@ -1,0 +1,51 @@
+--- a/src/block.c
++++ b/src/block.c
+@@ -572,6 +572,9 @@
+ process_op_32(struct disk_op_s *op)
+ {
+     ASSERT32FLAT();
++    dprintf(1, "G2 p32 op=%08x drive=%08x type=%02x cmd=%u count=%u lba=%u buf=%08x\n",
++            (u32)op, (u32)op->drive_fl, op->drive_fl->type, op->command,
++            op->count, (u32)op->lba, (u32)op->buf_fl);
+     switch (op->drive_fl->type) {
+     case DTYPE_VIRTIO_BLK:
+         return virtio_blk_process_op(op);
+--- a/src/disk.c
++++ b/src/disk.c
+@@ -137,6 +137,8 @@
+ 
+     struct chs_s chs = getLCHS(drive_fl);
+     u16 nlc=chs.cylinder, nlh=chs.head, nls=chs.sector;
++    dprintf(1, "G2 basic CHS=%u/%u/%u LCHS=%u/%u/%u DL=%x\n",
++            cylinder, head, sector, nlc, nlh, nls, regs->dl);
+ 
+     // sanity check on cyl heads, sec
+     if (cylinder >= nlc || head >= nlh || sector > nls) {
+@@ -152,6 +154,7 @@
+     dop.buf_fl = MAKE_FLATPTR(regs->es, regs->bx);
+ 
+     int status = send_disk_op(&dop);
++    dprintf(1, "G2 basic status=%x count=%u\n", status, dop.count);
+ 
+     regs->al = dop.count;
+ 
+@@ -742,6 +745,7 @@
+ {
+     debug_enter(regs, DEBUG_HDL_13);
+     u8 extdrive = regs->dl;
++    dprintf(1, "G2 handle_13 ah=%x al=%x dl=%x\n", regs->ah, regs->al, regs->dl);
+ 
+     if (CONFIG_CDROM_EMU) {
+         if (regs->ah == 0x4b) {
+--- a/src/stacks.c
++++ b/src/stacks.c
+@@ -259,7 +259,8 @@
+         "  movl $(" __stringify(BUILD_BIOS_ADDR) " + 1f), %%edx\n"
+         "  jmp transition32_nmi_off\n"
+         ASM16_SWITCH32
+-        "1:calll *%3\n"
++        "1:movl %%ebx, %%eax\n"
++        "  calll *%3\n"
+         "  movl $2f, %%edx\n"
+         "  jmp transition16big\n"
+ 

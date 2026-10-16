@@ -25,16 +25,25 @@ void rtc_init(machine_t *m) {
     /* pinned power-on CMOS content (rtc.h table) */
     m->rtc.ram[0x0A] = 0x26;                 /* reg A: DV=010, RS=0110 */
     m->rtc.ram[0x0B] = 0x02;                 /* reg B: 24h, BCD */
-    unsigned ram_kb = (unsigned)(RAM_SIZE / 1024);
-    unsigned ext_kb = ram_kb > 1024 ? ram_kb - 1024 : 0;
+    uint64_t ram_kb = RAM_SIZE / 1024u;
+    uint64_t ext_kb = ram_kb > 1024 ? ram_kb - 1024 : 0;
     if (ext_kb > 65535) ext_kb = 65535;      /* classic 16-bit field cap */
+    /* SeaBIOS's CMOS fallback treats 0x34/0x35 as bits 16..31 of the
+     * byte count above 16 MiB (64-KiB granularity). The classic 0x17/18
+     * and 0x30/31 fields saturate below that ceiling, so populate both. */
+    uint64_t ext2_bytes = RAM_SIZE > 16u * 1024u * 1024u
+                        ? (uint64_t)RAM_SIZE - 16u * 1024u * 1024u : 0;
+    ext2_bytes &= ~0xFFFFULL;
+    if (ext2_bytes > 0xFFFF0000ULL) ext2_bytes = 0xFFFF0000ULL;
     m->rtc.ram[0x14] = 0x10;
     m->rtc.ram[0x15] = 640 & 0xFF;
     m->rtc.ram[0x16] = 640 >> 8;
-    m->rtc.ram[0x17] = ext_kb & 0xFF;
-    m->rtc.ram[0x18] = ext_kb >> 8;
-    m->rtc.ram[0x30] = ext_kb & 0xFF;
-    m->rtc.ram[0x31] = ext_kb >> 8;
+    m->rtc.ram[0x17] = (uint8_t)ext_kb;
+    m->rtc.ram[0x18] = (uint8_t)(ext_kb >> 8);
+    m->rtc.ram[0x30] = (uint8_t)ext_kb;
+    m->rtc.ram[0x31] = (uint8_t)(ext_kb >> 8);
+    m->rtc.ram[0x34] = (uint8_t)(ext2_bytes >> 16);
+    m->rtc.ram[0x35] = (uint8_t)(ext2_bytes >> 24);
 }
 
 void rtc_tick(machine_t *m) {

@@ -1,0 +1,10 @@
+QEMU pinned vs QEMU candidate: exact_block_match=True
+  bytes=7776; pinned_sha256=9119c44956fae7044f125c52c42aaea7d76e8347333516fe74747ee447cbdd42
+QEMU candidate vs x86emu candidate stable fields: MATCH
+  magic=0x4155524142544c44; HHDM=0xffff800000000000; initrd=0x1800000+0xb22000
+  cpu_count=1 bsp_lapic=0 cpus=[(0, 0, 0, 0)]; boot_from_uefi=0
+  RSDP differs (firmware-specific): QEMU=0xf52c0, x86emu=0xf6210
+  mmap_count differs: QEMU=8, x86emu=7
+  QEMU E820:   0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7edf000:t1; 0x7fdf000+0x21000:t2; 0xb0000000+0x10000000:t2; 0xfed1c000+0x4000:t2; 0xfffc0000+0x40000:t2
+  x86emu E820: 0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7efc000:t1; 0x7ffc000+0x4000:t2; 0xb0000000+0x10000000:t2; 0xfffc0000+0x40000:t2
+Scope: selected boot_info_t fields from the pinned ISO and the candidate ISO in QEMU, compared with the candidate ISO in x86emu. QEMU/x86emu used different firmware IDs and disk transports; map/RSDP differences are not interpreted here as an allocator-zone result or acceptance pass.

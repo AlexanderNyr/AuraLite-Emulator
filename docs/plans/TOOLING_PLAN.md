@@ -435,11 +435,11 @@ that a single visitor walks for both directions: the machine shape
 `machine_t` minus the 2 MiB I/O dispatch table (CPU, vCPU slots, LAPICs,
 PIC/PIT/RTC/KBC/chipset/IOAPIC, the P2/P3 caches with their epoch, the log
 ring, vtime, `run_steps`), the cpu.c statics, RAM (4 KiB page bitmap +
-non-zero pages), the MMIO list (runtime ECAM windows replayed oldest first
-via `pci_ecam_map`, then an exact match and the `enabled` flags), PCI
-config spaces (tags carry bus:dev.fn), every device global of devices.c
-(EHCI, USB/BOT, UHCI, VGA, dispi, COM1, the RAM-window buffers),
-ahci.c's HBAs, the USB stick and SATA images. Modules reach the visitor
+non-zero pages), PCI config spaces (tags carry bus:dev.fn), AHCI HBA state
+(including the live BAR5 base), the MMIO list (runtime ECAM windows replayed
+oldest first via `pci_ecam_map`, then an exact match and the `enabled`
+flags), every device global of devices.c (EHCI, USB/BOT, UHCI, VGA, dispi,
+COM1, the RAM-window buffers), the USB stick and SATA images. Modules reach the visitor
 through function pointers in `snap_t`, so the narrow unit harnesses link
 nothing new (the first draft broke `make test-unit`'s link — caught,
 fixed). Host pointers are zeroed in the file and kept live on load, so
@@ -458,6 +458,17 @@ took the slow path once. That one-time flag is internal path state and is
 now carried (`cpu.statics`). And `s_devtick` (the device-cadence phase) is
 process-global — carried too, which the unit suite needs explicitly
 because several machines share one process.
+
+**Version 2 restore-order correction (2026-10-16).** The full emulator suite
+initially exposed an AHCI snapshot-load refusal: the guest had relocated BAR5
+to `0xfe044000`, but `mmio_rec` compared it against the fresh-machine window
+at `0xfeb10000` before PCI config and AHCI state had been restored. Snapshot
+format version 2 now loads PCI config, then `ahci_snap` rebinds the live BAR,
+then validates the MMIO map. Older v1 files are refused rather than parsed
+with the new record order. `make test-snapshot` now passes all 12 available
+split lanes, determinism and save/load/save identity; frozen-guest lanes skip
+when their separate KERNEL/INITRD fixtures are absent. Full `make test` and
+`make test-sanitize` pass. This repair is separate from COMPAT G3.
 
 **REPL.** `savevm FILE`/`loadvm FILE` (one vCPU): at a between-instruction
 stop they run at once; at a boundary stop — inside `cpu_step`, interrupt
@@ -548,8 +559,13 @@ GDB frontend is registered.
 firmware control + marker, async pause/step/quit, GDB read-only ownership,
 and frame lengths/protocol hygiene. The full 800×600 keyframe uses a 64-bit
 WebSocket payload length; the monitor state and control replies are parsed
-at short/16-bit lengths. The firmware lane sets a breakpoint at the guest
-entry, single-steps `cli`, continues to the 600,000-attempt limit, sees the
+at short/16-bit lengths. A 2026-10-16 regression run passes the corrected
+boot lane (26 checks) and framing lane (8 checks): the short case pads a valid
+JSON command below 126 bytes and asserts the short-encoding marker `0`; the
+boot lane compares monitored stdout, log and framebuffer bytes with the plain
+run, using the same framebuffer path and preserving the plain PPM before
+monitor overwrite. The firmware lane sets a breakpoint at the guest entry,
+single-steps `cli`, continues to the 600,000-attempt limit, sees the
 `0x00200000` marker pixel, injects keyboard input, and compares stdout
 (incl. `--stats`), the complete log ring and PPM to a plain run byte for byte.
 `make test` passes (355 s) and `make test-sanitize` passes (138 s); existing

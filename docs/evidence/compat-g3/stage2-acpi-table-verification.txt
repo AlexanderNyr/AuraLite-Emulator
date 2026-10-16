@@ -1,0 +1,10 @@
+Snapshot/parser receipt — current AURASNP1 format version 2
+Raw snapshot (intentionally not bundled): 19,148,154 bytes
+Snapshot SHA-256: c802a8236633280f8cae3469b730df475bb55ea7d9015994dd8419bbcc70ee3c
+
+RSDP phys=0xf6210 signature=RSD PTR  revision=0 checksum20=OK
+RSDT phys=0x7ffe4c0 length=48 checksum=OK entries=3
+MADT phys=0x7fff630 length=110 checksum=OK lapic=0xfee00000 flags=0x1
+MADT structures=[(0, 8), (1, 12), (2, 10), (2, 10), (2, 10), (2, 10), (4, 6)]
+enabled/local APIC candidates (processor, APIC ID, flags): [(0, 0, 1)]
+Scope: structural/checksum inspection only; not FADT/PM validation, IOAPIC/SMP operation, or boot_info ABI acceptance.

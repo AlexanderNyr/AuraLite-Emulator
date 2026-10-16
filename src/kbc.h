@@ -16,6 +16,9 @@
  *    port read/write, 0xFE CPU-reset pulse (counted in reset_pulses
  *    AND, since H5, requests the real machine reset through
  *    chipset_request_reset -- port 0x92/0xCF9 are the other sources);
+ *  - keyboard-device replies: reset ACK/BAT (0xFA, 0xAA), identify, scan-set,
+ *    typematic, LED, scanning, echo, and resend commands. Host writes are
+ *    consumed synchronously; replies use the same FIFO as injected keys.
  *  - IRQ1 is a LEVEL of (output-buffer-full AND command-byte bit0):
  *    scan codes obviously, command responses too when the guest left
  *    the interrupt enabled (POST clears it, so self-test stays quiet).
@@ -47,6 +50,9 @@ typedef struct kbc {
     uint8_t  ob;          /* output buffer */
     uint8_t  outport;     /* P20-P27 latch: bit0 SRST#, bit1 A20GATE (H5) */
     uint8_t  expect_data; /* 0 none, 1 payload for 0x60, 2 payload for 0xD1 */
+    uint8_t  kbd_expect_param; /* keyboard command awaiting one data byte */
+    uint8_t  kbd_scan_set;     /* PS/2 set number (power-on default 2) */
+    uint8_t  kbd_last_reply;   /* byte repeated for keyboard command 0xFE */
     uint8_t  queue[KBC_QUEUE];
     unsigned q_head, q_tail;      /* ring: head=next out, tail=next in */
     unsigned reset_pulses;        /* 0xFE pulse count (observability) */

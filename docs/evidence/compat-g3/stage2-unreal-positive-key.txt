@@ -1,0 +1,28 @@
+[serial] [BL3] AuraLite stage2 alive
+[serial] [BL3] E820 done
+[serial] [BL3] A20 gate on
+[serial] [BL3] disk read OK
+[serial] [BL3] unreal mode OK
+[serial] [BL9] ACPI RSDP not found; BSP-only
+[serial] [BL4] FAT32 BPB parsed
+[serial] [BL4] kernel.elf located
+[serial] [BL4] kernel.elf loaded to 0x00200000
+[serial] [BL4] ELF PT_LOAD segments copied to phys
+[serial] [BL4] initrd.tar loaded to 0x01800000
+[serial] [BL4] page tables built at 0x01000000
+[serial] [BL4] entering long mode; jumping to kernel _start
+[serial]  Hello from AuraLite OS kernel!                     
+[serial]   x86_64 long mode, booted via BIOS               
+[serial] [boot]  handoff magic=0x4155524142544c44 path=BIOS
+[serial] [boot] starting init shell (Ring 3)...
+[serial] [user] starting init shell in Ring 3...
+[serial] [user] shell in isolated address space (CR3=0x38c6000)
+[serial]    AuraLite OS v0.0.1 — Interactive Shell     
+[serial] [perf] boot-to-shell: 208 ticks (~2101 ms @ 99 Hz)
+[serial] [kernel] shell active; kmain idling.
+
+[stats] vcpu=0 executed_steps=720438607 instr_count=297455871823 halted=1 fault=0
+[stats] executed=720438607 idle_quantum=296735433216 instr_count_bsp=297455871823 vtime=297455871823
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=809331787 tlb_misses=183840375 tlb_flushes=166190915
+[stats] decode_hits=175198149 decode_misses=208663047

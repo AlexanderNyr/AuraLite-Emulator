@@ -174,6 +174,73 @@ static void test_shift_count_mask(void) {
     assert((m.cpu.rflags & FLAG_CF) != 0);
 }
 
+/* SHRD/SHLD: immediate and CL counts, operand-size override, flags, and
+ * the zero-count no-op. The first case is the exact 32-bit form from the
+ * G1 diagnostic's next fault (shrd eax,edx,cl). */
+static void test_shld_shrd(void) {
+    machine_t m;
+    setup_machine(&m);
+    const uint8_t shrd_cl[] = {
+        0x66,0xB8,0x67,0x45,0x23,0x81,       /* mov eax,0x81234567 */
+        0x66,0xBA,0xEF,0xCD,0xAB,0x89,       /* mov edx,0x89ABCDEF */
+        0xB1,0x21,                            /* mov cl,33 -> masked to 1 */
+        0x66,0x0F,0xAD,0xD0,                  /* shrd eax,edx,cl */
+        0xF4
+    };
+    run_program(&m, shrd_cl, sizeof shrd_cl, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RAX] == 0xC091A2B3u);
+    assert((m.cpu.rflags & (FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF)) ==
+           (FLAG_CF|FLAG_SF));
+
+    setup_machine(&m);
+    const uint8_t shld_imm[] = {
+        0x66,0xB8,0x67,0x45,0x23,0x81,
+        0x66,0xBA,0xEF,0xCD,0xAB,0x89,
+        0x66,0x0F,0xA4,0xD0,0x01,              /* shld eax,edx,1 */
+        0xF4
+    };
+    run_program(&m, shld_imm, sizeof shld_imm, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RAX] == 0x02468ACFu);
+    assert((m.cpu.rflags & (FLAG_CF|FLAG_OF|FLAG_SF|FLAG_ZF|FLAG_PF)) ==
+           (FLAG_CF|FLAG_OF|FLAG_PF));
+
+    setup_machine(&m);
+    const uint8_t shrd16[] = {
+        0xB8,0x34,0x12,                       /* mov ax,0x1234 */
+        0xBA,0xCD,0xAB,                       /* mov dx,0xABCD */
+        0x0F,0xAC,0xD0,0x04,                  /* shrd ax,dx,4 */
+        0xF4
+    };
+    run_program(&m, shrd16, sizeof shrd16, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert((m.cpu.gpr[RAX] & 0xFFFF) == 0xD123);
+
+    setup_machine(&m);
+    m.cpu.gpr[RDX] = 0x89ABCDEFu;
+    mem_write(&m, 0x2000, 4, 0x81234567u);
+    const uint8_t shrd_mem[] = {
+        0x66,0x0F,0xAC,0x16,0x00,0x20,0x01, /* shrd dword [0x2000],edx,1 */
+        0xF4
+    };
+    run_program(&m, shrd_mem, sizeof shrd_mem, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(mem_read(&m, 0x2000, 4) == 0xC091A2B3u);
+
+    setup_machine(&m);
+    m.cpu.gpr[RAX] = 0x81234567u;
+    m.cpu.gpr[RDX] = 0x89ABCDEFu;
+    m.cpu.gpr[RCX] = 0;
+    const uint64_t original_flags = 0x202u | FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_OF;
+    m.cpu.rflags = original_flags;
+    const uint8_t shrd_zero[] = { 0x0F,0xAD,0xD0,0xF4 };
+    run_program(&m, shrd_zero, sizeof shrd_zero, 0, 4);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RAX] == 0x81234567u);
+    assert(m.cpu.rflags == original_flags);
+}
+
 /* ---- C3 vectors: MUL/IMUL/DIV/IDIV --------------------------------------- */
 
 static void test_mul_imul(void) {
@@ -237,6 +304,168 @@ static void test_push_imm16_stream_sync(void) {
     assert((m.cpu.gpr[RSP] & 0xFFFF) == 0x7FFE);
 }
 
+/* The pinned SeaBIOS ROM reaches POP r/m with both address-size and
+ * operand-size overrides while running in real mode. Include that encoding,
+ * plus the special POP [ESP] post-increment destination rule. */
+static void test_pop_rm(void) {
+    machine_t m;
+    setup_machine(&m);
+    m.cpu.gpr[RAX] = 0x2000;          /* EAX base for [EAX+0x1c] */
+    m.cpu.gpr[RSP] = 0x7000;
+    mem_write(&m, 0x7000, 4, 0x89ABCDEFu);
+    const uint8_t seabios_form[] = { 0x67,0x66,0x8F,0x40,0x1C,0xF4 };
+    run_program(&m, seabios_form, sizeof seabios_form, 0, 8);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7004);
+    assert(mem_read(&m, 0x201C, 4) == 0x89ABCDEFu);
+
+    setup_machine(&m);
+    m.cpu.gpr[RSP] = 0x7000;
+    mem_write(&m, 0x7000, 4, 0xDEADBEEFu);
+    const uint8_t pop_esp_memory[] = { 0x67,0x66,0x8F,0x04,0x24,0xF4 };
+    run_program(&m, pop_esp_memory, sizeof pop_esp_memory, 0, 8);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7004);
+    assert(mem_read(&m, 0x7000, 4) == 0xDEADBEEFu);
+    assert(mem_read(&m, 0x7004, 4) == 0xDEADBEEFu);
+
+    setup_machine(&m);
+    m.cpu.gpr[RSP] = 0x7000;
+    mem_write(&m, 0x7000, 2, 0xBEEFu);
+    const uint8_t pop_word_esp_memory[] = { 0x67,0x8F,0x04,0x24,0xF4 };
+    run_program(&m, pop_word_esp_memory, sizeof pop_word_esp_memory, 0, 8);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7002);
+    assert(mem_read(&m, 0x7002, 2) == 0xBEEFu);
+
+    setup_machine(&m);
+    const uint8_t invalid_group[] = { 0x8F,0xC8 };
+    memcpy(m.ram, invalid_group, sizeof invalid_group);
+    assert(cpu_step(&m.cpu) != 0);
+    assert(m.cpu.fault);
+}
+
+static void setup_long_mode_stack_test(machine_t *m, uint8_t opcode) {
+    setup_machine(m);
+    /* Identity-map the first 2 MiB with one large page so the illegal
+     * PUSHA/POPA encoding can be fetched in a valid long-mode state. */
+    mem_write(m, 0x1000, 8, 0x2003);
+    mem_write(m, 0x2000, 8, 0x3003);
+    mem_write(m, 0x3000, 8, 0x0083);  /* present, writable, 2-MiB page at 0 */
+    m->cpu.cr3 = 0x1000;
+    m->cpu.cr4 = 0x20;               /* PAE */
+    m->cpu.efer = 0x500;             /* LME | LMA */
+    m->cpu.cr0 = 0x80000011u;        /* PG | ET | PE */
+    m->cpu.seg[SEG_CS].sel = 0x08;
+    m->cpu.seg[SEG_CS].base = 0;
+    m->cpu.seg[SEG_CS].limit = 0xFFFFFFFFu;
+    m->cpu.seg[SEG_CS].l = 1;
+    m->cpu.seg[SEG_CS].d_b = 0;
+    m->cpu.seg[SEG_SS].base = 0;
+    m->cpu.seg[SEG_SS].limit = 0xFFFFFFFFu;
+    m->cpu.rip = 0;
+    m->ram[0] = opcode;
+    perf_tlb_flush(m);
+}
+
+static void test_pusha_popa(void) {
+    machine_t m;
+    setup_machine(&m);
+    m.cpu.gpr[RAX] = 0x1111;
+    m.cpu.gpr[RCX] = 0x2222;
+    m.cpu.gpr[RDX] = 0x3333;
+    m.cpu.gpr[RBX] = 0x4444;
+    m.cpu.gpr[RBP] = 0x5555;
+    m.cpu.gpr[RSI] = 0x6666;
+    m.cpu.gpr[RDI] = 0x7777;
+    m.cpu.gpr[RSP] = 0x8000;
+    uint64_t flags = m.cpu.rflags;
+    const uint8_t pusha16[] = { 0x60, 0xF4 };
+    run_program(&m, pusha16, sizeof pusha16, 0, 4);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7FF0);
+    const uint16_t expected16[] = {
+        0x7777, 0x6666, 0x5555, 0x8000, 0x4444, 0x3333, 0x2222, 0x1111
+    };
+    for (size_t i=0; i<sizeof(expected16)/sizeof(expected16[0]); i++)
+        assert(mem_read(&m, 0x7FF0 + i*2, 2) == expected16[i]);
+    assert(m.cpu.rflags == flags);  /* PUSHA does not change flags */
+
+    setup_machine(&m);
+    m.cpu.gpr[RAX] = 0xAABBCCDDEEFF0001ull;
+    m.cpu.gpr[RBX] = 0x1122334455660002ull;
+    m.cpu.gpr[RCX] = 0x2233445566770003ull;
+    m.cpu.gpr[RDX] = 0x3344556677880004ull;
+    m.cpu.gpr[RBP] = 0x4455667788990005ull;
+    m.cpu.gpr[RSI] = 0x5566778899AA0006ull;
+    m.cpu.gpr[RDI] = 0x66778899AABB0007ull;
+    m.cpu.gpr[RSP] = 0x7000;
+    const uint64_t old_ax = m.cpu.gpr[RAX], old_bx = m.cpu.gpr[RBX];
+    const uint64_t old_cx = m.cpu.gpr[RCX], old_dx = m.cpu.gpr[RDX];
+    const uint64_t old_bp = m.cpu.gpr[RBP], old_si = m.cpu.gpr[RSI];
+    const uint64_t old_di = m.cpu.gpr[RDI];
+    const uint16_t popa16_data[] = {
+        0x7777, 0x6666, 0x5555, 0xDEAD, 0x4444, 0x3333, 0x2222, 0x1111
+    };
+    for (size_t i=0; i<sizeof(popa16_data)/sizeof(popa16_data[0]); i++)
+        mem_write(&m, 0x7000 + i*2, 2, popa16_data[i]);
+    flags = m.cpu.rflags;
+    const uint8_t popa16[] = { 0x61, 0xF4 };
+    run_program(&m, popa16, sizeof popa16, 0, 4);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7010); /* saved SP slot was discarded */
+    assert((m.cpu.gpr[RDI] & 0xFFFF) == 0x7777 && (m.cpu.gpr[RDI] >> 16) == (old_di >> 16));
+    assert((m.cpu.gpr[RSI] & 0xFFFF) == 0x6666 && (m.cpu.gpr[RSI] >> 16) == (old_si >> 16));
+    assert((m.cpu.gpr[RBP] & 0xFFFF) == 0x5555 && (m.cpu.gpr[RBP] >> 16) == (old_bp >> 16));
+    assert((m.cpu.gpr[RBX] & 0xFFFF) == 0x4444 && (m.cpu.gpr[RBX] >> 16) == (old_bx >> 16));
+    assert((m.cpu.gpr[RDX] & 0xFFFF) == 0x3333 && (m.cpu.gpr[RDX] >> 16) == (old_dx >> 16));
+    assert((m.cpu.gpr[RCX] & 0xFFFF) == 0x2222 && (m.cpu.gpr[RCX] >> 16) == (old_cx >> 16));
+    assert((m.cpu.gpr[RAX] & 0xFFFF) == 0x1111 && (m.cpu.gpr[RAX] >> 16) == (old_ax >> 16));
+    assert(m.cpu.rflags == flags);  /* POPA does not change flags */
+
+    setup_machine(&m);
+    m.cpu.gpr[RAX] = 0x11111111;
+    m.cpu.gpr[RCX] = 0x22222222;
+    m.cpu.gpr[RDX] = 0x33333333;
+    m.cpu.gpr[RBX] = 0x44444444;
+    m.cpu.gpr[RBP] = 0x55555555;
+    m.cpu.gpr[RSI] = 0x66666666;
+    m.cpu.gpr[RDI] = 0x77777777;
+    m.cpu.gpr[RSP] = 0x9000;
+    const uint8_t pushad32[] = { 0x66, 0x60, 0xF4 };
+    run_program(&m, pushad32, sizeof pushad32, 0, 4);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x8FE0);
+    const uint32_t expected32[] = {
+        0x77777777, 0x66666666, 0x55555555, 0x00009000,
+        0x44444444, 0x33333333, 0x22222222, 0x11111111
+    };
+    for (size_t i=0; i<sizeof(expected32)/sizeof(expected32[0]); i++)
+        assert(mem_read(&m, 0x8FE0 + i*4, 4) == expected32[i]);
+
+    setup_machine(&m);
+    m.cpu.gpr[RSP] = 0x7000;
+    const uint32_t popad32_data[] = {
+        0x77777777, 0x66666666, 0x55555555, 0xDEADBEEF,
+        0x44444444, 0x33333333, 0x22222222, 0x11111111
+    };
+    for (size_t i=0; i<sizeof(popad32_data)/sizeof(popad32_data[0]); i++)
+        mem_write(&m, 0x7000 + i*4, 4, popad32_data[i]);
+    const uint8_t popad32[] = { 0x66, 0x61, 0xF4 };
+    run_program(&m, popad32, sizeof popad32, 0, 4);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(m.cpu.gpr[RSP] == 0x7020);
+    assert(m.cpu.gpr[RDI] == 0x77777777 && m.cpu.gpr[RSI] == 0x66666666);
+    assert(m.cpu.gpr[RBP] == 0x55555555 && m.cpu.gpr[RBX] == 0x44444444);
+    assert(m.cpu.gpr[RDX] == 0x33333333 && m.cpu.gpr[RCX] == 0x22222222);
+    assert(m.cpu.gpr[RAX] == 0x11111111);
+
+    setup_long_mode_stack_test(&m, 0x60);
+    assert(cpu_step(&m.cpu) != 0 && m.cpu.fault);
+    setup_long_mode_stack_test(&m, 0x61);
+    assert(cpu_step(&m.cpu) != 0 && m.cpu.fault);
+}
+
 static void test_smsw_sgdt(void) {
     machine_t m;
     setup_machine(&m);
@@ -252,10 +481,27 @@ static void test_smsw_sgdt(void) {
     /* lgdt [0x300]; sgdt [0x2000]; hlt */
     const uint8_t prog_sgdt[] = { 0x0F, 0x01, 0x16, 0x00, 0x03,
                                   0x0F, 0x01, 0x06, 0x00, 0x20, 0xF4 };
+    mem_write(&m, 0x2006, 2, 0xA55A);  /* the six-byte pseudo-descriptor ends here */
     run_program(&m, prog_sgdt, sizeof prog_sgdt, 0, 16);
     assert(!m.cpu.fault);
     assert(mem_read(&m, 0x2000, 2) == 0x000F);
     assert(mem_read(&m, 0x2002, 4) == 0x500);
+    assert(mem_read(&m, 0x2006, 2) == 0xA55A);
+
+    setup_machine(&m);
+    m.cpu.gdtr_limit = 0x1234;
+    m.cpu.gdtr_base = 0x89ABCDEFu;
+    m.cpu.gpr[RSP] = 0x7000;
+    mem_write(&m, 0x7008, 2, 0xA55A);
+    /* SeaBIOS call32_prep: data32 SGDT [esp+2] in real mode. */
+    const uint8_t seabios_sgdt[] = {
+        0x67,0x66,0x0F,0x01,0x44,0x24,0x02,0xF4
+    };
+    run_program(&m, seabios_sgdt, sizeof seabios_sgdt, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert(mem_read(&m, 0x7002, 2) == 0x1234);
+    assert(mem_read(&m, 0x7004, 4) == 0x89ABCDEFu);
+    assert(mem_read(&m, 0x7008, 2) == 0xA55A);
 }
 
 /* ---- C5 vectors: PUSHF/POPF, INT/IRET round trip, #DE through the IVT ---- */
@@ -630,6 +876,28 @@ static void test_cpuid_leaves(void) {
     assert(strchr(brand, '\0') == brand + 48);
 }
 
+/* SeaBIOS executes WBINVD before setting the PAM shadow read-only. With no
+ * modeled data cache, it must be a coherent no-op that still advances RIP. */
+static void test_wbinvd_no_cache(void) {
+    machine_t m;
+    setup_machine(&m);
+    m.cpu.cr0 |= 1;                    /* protected mode */
+    m.cpu.seg[SEG_CS].sel = 0x08;
+    m.cpu.seg[SEG_CS].base = 0;
+    m.cpu.seg[SEG_CS].limit = 0xFFFFFFFFu;
+    m.cpu.seg[SEG_CS].d_b = 1;         /* 32-bit code, CPL0 */
+    const uint8_t prog[] = {
+        0xC7,0x05,0x00,0x20,0x00,0x00,0x78,0x56,0x34,0x12, /* mov dword [2000],12345678 */
+        0x0F,0x09,                                             /* wbinvd */
+        0xA1,0x00,0x20,0x00,0x00,                           /* mov eax,[2000] */
+        0xF4
+    };
+    run_program(&m, prog, sizeof prog, 0, 16);
+    assert(!m.cpu.fault && m.cpu.halted);
+    assert((uint32_t)m.cpu.gpr[RAX] == 0x12345678u);
+    assert(mem_read(&m, 0x2000, 4) == 0x12345678u);
+}
+
 static void test_rdtsc_pause_fences(void) {
     machine_t m;
     setup_machine(&m);
@@ -670,9 +938,12 @@ int main(void) {
     test_near_jcc_not_taken_pf_family();
     test_rotates_8bit();
     test_shift_count_mask();
+    test_shld_shrd();
     test_mul_imul();
     test_div_idiv();
     test_push_imm16_stream_sync();
+    test_pop_rm();
+    test_pusha_popa();
     test_smsw_sgdt();
     test_pushf_popf();
     test_int_iret_roundtrip();
@@ -692,6 +963,7 @@ int main(void) {
     test_bswap_xadd_cmpxchg();
 
     test_cpuid_leaves();
+    test_wbinvd_no_cache();
     test_rdtsc_pause_fences();
 
     puts("unit tests: ok");

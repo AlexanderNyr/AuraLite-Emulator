@@ -96,8 +96,8 @@ class WSClient:
     def send_raw_frame(self, payload, opcode=1, masked=True):
         n = len(payload)
         if n < 126:
-            marker = n
-            head = bytes((0x80 | opcode, (0x80 if masked else 0) | marker))
+            marker = 0  # short-length encoding; n itself occupies the wire byte
+            head = bytes((0x80 | opcode, (0x80 if masked else 0) | n))
         elif n <= 0xFFFF:
             marker = 126
             head = bytes((0x80 | opcode, (0x80 if masked else 0) | marker)) + struct.pack("!H", n)
@@ -445,7 +445,9 @@ def lane_framing():
         if not c: return
         c.recv_event(5); c.recv_event(5)
         base = b'{"cmd":"exec","line":"info regs"}'
-        for n, marker in ((len(base), len(base)), (126, 126), (65536, 127)):
+        short_n = len(base) + 8  # JSON whitespace preserves validity; stay in the short-frame range.
+        check(short_n < 126, "short framing case uses a payload below the 126-byte threshold")
+        for n, marker in ((short_n, 0), (126, 126), (65536, 127)):
             payload = base + b" " * (n - len(base))
             c.send_raw_frame(payload, masked=True)
             observed = c.sent_frame_lengths[-1]
@@ -458,7 +460,7 @@ def lane_framing():
                 reply = c.wait_reply("", 10)
                 ok = not reply.get("ok") and reply.get("message") == "text command is too long"
             check(ok and observed[1] == marker and observed[2] == n and observed[3],
-                  "codec masked client frame length=%d parsed" % n)
+                  "codec masked client frame length=%d marker=%d parsed" % (n, marker))
         # Client frames are required to be masked; the server closes a bad peer.
         c.send_raw_frame(b"x", masked=False)
         try:

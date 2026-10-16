@@ -1,0 +1,43 @@
+G2 call32 / SGDT stack-slot diagnosis
+Captured 2026-10-15
+
+The failing pointer is not computed incorrectly. At __call32 entry, EDX is
+000eff88 and SeaBIOS saves that value in EBX. The corruption occurs in
+call32_prep while it saves the GDTR:
+
+  0000a994  66 56                         push esi
+  0000a996  66 53                         push ebx
+  0000a998  66 83 ec 08                   sub esp,8
+  0000a9c5  67 66 0f 01 44 24 02          sgdt [esp+2]
+  0000aa17  66 83 c4 08                   add esp,8
+  0000aa1b  66 5b                         pop ebx
+  0000aa1d  66 5e                         pop esi
+
+With SS=e000 and ESP=ff30 after the local allocation, the six-byte SGDT
+pseudo-descriptor starts at physical EFF32. The saved EBX is at EFF38:
+
+  1. push ebx at RIP A996 writes 4 bytes, value 000eff88, to EFF38.
+  2. SGDT at RIP A9C5 should write 6 bytes at EFF32..EFF37.
+  3. x86emu incorrectly appended a 2-byte zero write at EFF38..EFF39 for
+     non-long mode. The watchpoint logged that exact store at RIP A9C5.
+  4. The saved dword consequently became 000e0000, and pop ebx at F000:AA1B
+     restored the corrupt pointer. SeaBIOS then logged op=000e0000.
+
+The ISA pseudo-descriptor is 6 bytes outside 64-bit mode (16-bit limit plus
+32-bit base); only 64-bit mode uses 10 bytes. The fix in src/cpu.c removes
+the spurious non-long-mode word store. tests/test_cpu.c now runs the exact
+real-mode data32/address32 encoding (67 66 0F 01 44 24 02) against a sentinel
+at the next stack word, verifying that SGDT leaves it untouched.
+
+The post-fix targeted replay showed EBX=000eff88 after call32_prep and
+SeaBIOS logged:
+
+  G2 p32 op=000eff88 drive=000f3c20 type=50 cmd=2 count=1 lba=0 buf=00007c00
+  G2 basic status=0 count=1
+  G2 p32 op=000eff88 drive=000f3c20 type=50 cmd=2 count=126 lba=34 buf=00008000
+
+This is an emulator SGDT over-store, not a MAKE_FLATPTR, memory-shadow, or
+SeaBIOS dispatch-pointer calculation error. The separate temporary
+SeaBIOS `movl %ebx,%eax` experiment is preserved in seabios-diagnostic.patch
+for context; it did not fix the original failure by itself and is not the
+root-cause fix. The diagnostic always-writable-ROM bypass was not used.

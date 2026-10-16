@@ -1,0 +1,60 @@
+G3 same-stock-BIOS xemu A/B — diagnostic only
+Captured: 2026-10-16
+
+Purpose
+  Re-run the unmodified authoritative ISO and the temporary Stage-2 candidate
+  under the same unmodified Debian SeaBIOS binary, current O2 x86emu build,
+  machine profile, device attachments and instruction cap. This is a controlled
+  mechanism diagnostic for the FS/GS restoration. It is not pinned-image
+  acceptance: only the candidate image differs, and that image is modified.
+
+Exact inputs
+  x86emu SHA-256
+  2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9
+  Debian seabios 1.16.3-2 `bios.bin` SHA-256 (128 KiB file)
+  4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca
+  Blank USB image: `blank-usb-1m.img` (hash is in SHA256SUMS)
+  Platform: `haswell`; blank USB on `--disk`; ISO on `--sata`;
+  `--max-instr=1300000000 --stats`; one vCPU.
+
+Image identities
+  Authoritative pinned ISO, unchanged before and after both runs:
+  SHA-256 d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+  Temporary candidate ISO, only LBA 34–159 replaced with the candidate Stage 2:
+  SHA-256 b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+  The candidate contains the FS/GS cache restore on successful and final-error
+  disk-read exits; it does not contain the ACPI-ID diagnostic ROM patch. The
+  image can be reconstructed with `make_diagnostic_iso.py` and the documented
+  candidate Stage-2 build.
+
+Result — pinned ISO
+  BIOS/Stage 2 reach the same Stage-4 boundary: ACPI RSDP is not found
+  (BSP-only), the kernel file is loaded, then `[BL4] ELF parse FAILED`; the
+  KERNEL.OLD fallback is also unavailable and the guest halts.
+  x86emu: executed_steps=155247564, halted=1, fault=0, cap_reached=1.
+
+Result — candidate ISO
+  Same BIOS and machine setup reach ELF PT_LOAD copying, initrd load, page-table
+  setup, long-mode entry and `[kernel] shell active; kmain idling.` ACPI RSDP is
+  still not found (BSP-only); this A/B does not test the ACPI-ID change.
+  x86emu: executed_steps=653526713, halted=1, fault=0, cap_reached=1.
+
+Interpretation and limits
+  This same-ROM/same-device xemu A/B supports the guest-side FS/GS cache repair
+  as the mechanism behind the ELF-parse boundary. It is stronger than the
+  earlier recreated-ROM replay, but still uses a modified ISO for the passing
+  run. The authoritative pinned ISO continues to fail ELF parsing in xemu; do
+  not call this acceptance, pinned-image handoff validation, a full BIOS-to-
+  kernel acceptance pass, an SMP comparison, or a PERF P4 result. The original two shell/failure runs did not capture the entry handoff; a
+  separate candidate run with the same ROM/device setup now does. Its kernel-
+  entry RDI and structural block check are recorded in
+  `stock-bios-candidate-entry.txt`. This still does not validate the pinned
+  image's handoff. The 128 KiB `bios.bin` here is not QEMU's separate 256 KiB
+  `bios-256k.bin` used in the initial reference captures (both are from the
+  Debian package set; hashes are recorded separately).
+
+Reproduction commands are in `commands.txt`. Captures:
+  `stock-bios-pinned.markers.txt`, `stock-bios-pinned.stdout.txt`,
+  `stock-bios-pinned.stderr.gz`, `stock-bios-pinned.log.gz`;
+  corresponding `stock-bios-candidate.*` files. The compressed stderr retains
+  raw xemu serial/debug output; the small marker extracts isolate the boot path.

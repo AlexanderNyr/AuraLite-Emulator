@@ -1,0 +1,308 @@
+# COMPAT G3 controlled diagnostics — 2026-10-16
+# Pinned ISO/kernel are authoritative. All modified guest/ROM runs below
+# are diagnostic only; they are not acceptance evidence.
+
+# Verify authoritative inputs and the source-state boundaries.
+sha256sum /home/user/AuraLite-OS-compat/release/auralite.iso
+sha256sum /home/user/AuraLite-OS-compat/release/kernel.elf
+# Expected ISO/kernel: d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+#                    a1c5264bcf6fbed66a75e0a4a54f3deb6d713842fa64a812cb1a0a05cb647bb3
+sha256sum /home/user/AuraLite-OS-compat/boot/bios/stage2/disk.inc
+sha256sum /home/user/AuraLite-OS-compat/boot/bios/stage2/unreal.inc
+# The compatibility source contains the candidate fix; see
+# stage2-fs-gs-restore.patch and pinned-inputs.txt for exact source hashes.
+
+# Recreated diagnostic ROM recipes (the supplied ROM binaries are exact run inputs).
+# Fetch SeaBIOS rel-1.16.3 at commit a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8;
+# copy seabios.config to the source root, apply seabios-diagnostic.patch,
+# then build to produce seabios-diagnostic-128k.bin. For the ACPI probe,
+# clone/copy that same source tree, apply seabios-acpi-id-probe.patch and
+# rebuild. Its only source delta is adding LPC 8086:1e55 to ACPI/FADT matches.
+# SeaBIOS embeds a build timestamp, so local rebuild hashes can differ.
+
+# Build the candidate Stage 2 (not the authoritative ISO Stage 2).
+cd /home/user/AuraLite-OS-compat
+PATH=/tmp/g3-nasm/usr/bin:$PATH make -B stage2
+sha256sum build/boot/stage2.bin
+# Expected 6,656-byte Stage 2 SHA-256:
+# 51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+# A source checkout not already carrying the change can apply
+# /home/user/AuraLite-Emulator/docs/evidence/compat-g3/stage2-fs-gs-restore.patch
+# with git apply, then run the build above. The earlier
+# stage2-unreal-restore.patch is a historical experiment and is superseded.
+
+# Build a temporary diagnostic image. The helper hash-checks the input ISO,
+# verifies its reserved Stage-2 slot tail, and changes only LBA 34–159.
+cd /home/user/AuraLite-Emulator
+python3 docs/evidence/compat-g3/make_diagnostic_iso.py \
+  /home/user/AuraLite-OS-compat/release/auralite.iso \
+  docs/evidence/compat-g3/stage2-fs-gs-restore.bin \
+  /tmp/g3-stage2-fs-gs-restore-v2.iso
+# Expected temporary ISO SHA-256:
+# b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+# The authoritative release ISO is never written by this command.
+
+# FS/GS return trace: two Stage-2 reads, including AHCI LBA 128.
+./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso --max-instr=1300000000 \
+  --debug-script=docs/evidence/compat-g3/stage2-fs-gs-restore-segments.dbg \
+  --log=/tmp/g3-stage2-fs-gs-restore-v2-segments.log \
+  >/tmp/g3-stage2-fs-gs-restore-v2-segments.stdout \
+  2>/tmp/g3-stage2-fs-gs-restore-v2-segments.stderr
+# At the LBA-128 post-BIOS breakpoint FS/GS are base=0x100, limit=0xffff;
+# at the helper return they are base=0, limit=0xffffffff and EAX=0x80.
+
+# First isolate the FS/GS candidate from the ACPI-ID ROM patch: use the base
+# recreated diagnostic SeaBIOS ROM (without the ACPI-ID addition) with the
+# temporary Stage-2 image. It still reports no RSDP/BSP-only, but reaches
+# ELF PT_LOAD, long mode and Ring-3 shell-active markers. This is diagnostic,
+# not pinned-image acceptance.
+./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  --max-instr=1300000000 --stats \
+  --log=/tmp/g3-stage2-fs-gs-stock-acpi-rom.log \
+  >/tmp/g3-stage2-fs-gs-stock-acpi-rom.stdout \
+  2>/tmp/g3-stage2-fs-gs-stock-acpi-rom.stderr
+# Expected: [BL9] ACPI RSDP not found; BSP-only, followed by ELF PT_LOAD,
+# long-mode and shell-active markers; halted=1, fault=0, cap_reached=1.
+# See stage2-fs-gs-restore-stock-acpi-key.txt and captures.
+
+# End-to-end mechanism diagnostic, using the ACPI-ID probe ROM and the
+# temporary Stage-2 image above. It emits ACPI, ELF PT_LOAD, initrd,
+# long-mode, and Ring-3 shell-active markers, but is not an acceptance run.
+./x86emu --rom=docs/evidence/compat-g3/seabios-acpi-id-probe-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  --max-instr=1300000000 --stats \
+  --log=/tmp/g3-stage2-fs-gs-restore-v2-acpi.log \
+  >/tmp/g3-stage2-fs-gs-restore-v2-acpi.stdout \
+  2>/tmp/g3-stage2-fs-gs-restore-v2-acpi.stderr
+# Recorded receipts include [BL9] RSDP/MADT, [BL4] ELF PT_LOAD copied,
+# initrd/page tables/long mode, and Ring-3 init-shell/shell-active markers.
+# It ends at the cap with fault=0. This run alone does not capture the
+# boot_info_t entry handoff or establish pinned-image acceptance.
+
+# Capture the candidate boot_info_t at the real kernel entry. The breakpoint
+# is before _start's first instruction; RDI should equal BOOT_INFO_PHYS=0x10000.
+# The snapshot is temporary and deliberately not copied into the bundle.
+./x86emu --rom=docs/evidence/compat-g3/seabios-acpi-id-probe-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  --max-instr=1300000000 --stats \
+  --debug-script=docs/evidence/compat-g3/stage2-bootinfo-candidate-entry.dbg \
+  --snapshot-save=/tmp/g3-stage2-bootinfo-candidate.snap \
+  --log=/tmp/g3-stage2-bootinfo-candidate.log \
+  >/tmp/g3-stage2-bootinfo-candidate.stdout \
+  2>/tmp/g3-stage2-bootinfo-candidate.stderr
+python3 docs/evidence/compat-g3/inspect_bootinfo_snapshot.py \
+  /tmp/g3-stage2-bootinfo-candidate.snap
+# Candidate-only receipt: kernel-entry RDI=0x10000; 7,776-byte block at that
+# address matches the pinned header layout, magic, HHDM, E820/initrd/CPU/RSDP
+# fields and BIOS flag. Snapshot SHA-256:
+# 784ca493b84daa8371722ebb86d87c13b5de717caf898717b45d6481bc509925.
+# No pinned-image acceptance is implied; the separate QEMU reference comparison
+# and its firmware/transport caveats are recorded in qemu-reference-g3.txt.
+
+# Reproduce the host-side header layout / generated offsets:
+cc -I /home/user/AuraLite-OS-compat \
+  docs/evidence/compat-g3/bootinfo-layout-probe.c \
+  -o /tmp/g3-bootinfo-layout-probe
+/tmp/g3-bootinfo-layout-probe
+cc -I /home/user/AuraLite-OS-compat \
+  /home/user/AuraLite-OS-compat/tools/gen_boot_offsets.c \
+  -o /tmp/g3-gen-boot-offsets
+/tmp/g3-gen-boot-offsets --asm
+
+# Exercise the INT 13h exhausted-retry/error return in a separate temporary
+# copy. This changes only the KERNEL.ELF first-cluster FAT link in both FATs
+# of the already temporary Stage-2 image; it does not modify the pinned ISO.
+python3 docs/evidence/compat-g3/make_fat_failure_iso.py \
+  /tmp/g3-stage2-fs-gs-restore-v2.iso /tmp/g3-stage2-fs-gs-failure.iso
+# Expected error-injection ISO SHA-256:
+# cbfb4698e6e9af2878febe5adf81cfb7c92957fb4a3ebc056d22098d648a9611
+./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-failure.iso --max-instr=1300000000 \
+  --debug-script=docs/evidence/compat-g3/stage2-fs-gs-failure-segments.dbg \
+  --log=/tmp/g3-stage2-fs-gs-failure-segments.log \
+  >/tmp/g3-stage2-fs-gs-failure-segments.stdout \
+  2>/tmp/g3-stage2-fs-gs-failure-segments.stderr
+# At the final-error stc breakpoint FS/GS are flat and EAX is restored to
+# 0x10000b17 (the injected invalid LBA).
+./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-failure.iso --max-instr=1300000000 --stats \
+  --log=/tmp/g3-stage2-fs-gs-failure.log \
+  >/tmp/g3-stage2-fs-gs-failure.stdout \
+  2>/tmp/g3-stage2-fs-gs-failure.stderr
+# Expected: kernel.elf load FAILED, KERNEL.OLD fallback/missing receipts,
+# halted=1, fault=0. This is a negative diagnostic, not a boot acceptance run.
+
+# Reproduce the pinned-image ELF failure with the ACPI-ID ROM and unchanged
+# original Stage 2; take a v2 snapshot at the instruction cap and inspect it.
+./x86emu --rom=docs/evidence/compat-g3/seabios-acpi-id-probe-128k.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/home/user/AuraLite-OS-compat/release/auralite.iso \
+  --max-instr=1300000000 --stats \
+  --debug-script=docs/evidence/compat-g3/stage2-acpi-madt-body.dbg \
+  --snapshot-save=/tmp/g3-acpi-table-inspection-v2.snap \
+  --log=/tmp/g3-acpi-table-inspection-v2.log \
+  >/tmp/g3-acpi-table-inspection-v2.stdout \
+  2>/tmp/g3-acpi-table-inspection-v2.stderr
+python3 docs/evidence/compat-g3/inspect_acpi_snapshot.py \
+  /tmp/g3-acpi-table-inspection-v2.snap
+sha256sum /tmp/g3-acpi-table-inspection-v2.snap
+# Snapshot SHA-256 c802a8236633280f8cae3469b730df475bb55ea7d9015994dd8419bbcc70ee3c.
+# It confirms table bytes/checksums and that the original Stage 2 still fails
+# at ELF parse; it is a diagnostic snapshot and is intentionally not bundled.
+
+# Run emulator test gates. NASM was available at /tmp/g3-nasm/usr/bin/nasm.
+cd /home/user/AuraLite-Emulator
+PATH=/tmp/g3-nasm/usr/bin:$PATH make test
+make test-sanitize
+# Both gates passed (RC 0). The regular suite skips frozen KERNEL/INITRD lanes
+# and gdb lanes when those external artifacts/tools are absent. The first
+# make test exposed an AHCI-ABAR snapshot v1 restore-order failure; snapshot
+# v2 restores PCI/AHCI before MMIO validation and test-snapshot now passes.
+# Finish with the normal O2 binary, because test-sanitize leaves an O1
+# ASan+UBSan binary behind:
+make clean && make -j4
+# Current O2 x86emu SHA-256:
+# 2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9
+
+# Limited QEMU 10.0.13 BIOS reference (rootless package extraction).
+# On the original run, these Debian 13 packages were downloaded to /tmp and
+# extracted without installation; qemu-system-x86_64 reports Debian 10.0.13.
+mkdir -p /tmp/g3-qemu-debs /tmp/g3-qemu-root
+cd /tmp/g3-qemu-debs
+apt-get download 'qemu-system-x86=1:10.0.13+ds-0+deb13u1' \
+  'qemu-system-common=1:10.0.13+ds-0+deb13u1' \
+  'qemu-system-data=1:10.0.13+ds-0+deb13u1' 'seabios=1.16.3-2' \
+  'ipxe-qemu=1.21.1+git20250501.dad20602+dfsg-1' \
+  libcapstone5 libpmem1 libfdt1 libnuma1 librdmacm1t64 libibverbs1 libslirp0 \
+  libvdeplug2t64 libaio1t64 liburing2 libndctl6 libdaxctl1 libnl-3-200 \
+  libnl-route-3-200 libkmod2
+for f in ./*.deb; do dpkg-deb -x "$f" /tmp/g3-qemu-root; done
+ln -sf ../seabios/vgabios-stdvga.bin /tmp/g3-qemu-root/usr/share/qemu/vgabios-stdvga.bin
+sha256sum /tmp/g3-qemu-root/usr/share/seabios/bios-256k.bin
+# Expected BIOS SHA-256 fc6d2ea888862e6b26d53fb877ab712324726eb8f44eb6baf076c64a31f1c3fb.
+
+# Controlled xemu A/B using the same unmodified package SeaBIOS binary. This
+# is the 128 KiB bios.bin, not QEMU's 256 KiB file above. The pinned ISO is
+# unchanged; the candidate ISO modifies only Stage-2 sectors 34–159.
+sha256sum /tmp/g3-qemu-root/usr/share/seabios/bios.bin
+# Expected SHA-256 4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca.
+cd /home/user/AuraLite-Emulator
+sha256sum /home/user/AuraLite-OS-compat/release/auralite.iso
+./x86emu --rom=/tmp/g3-qemu-root/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/home/user/AuraLite-OS-compat/release/auralite.iso \
+  --max-instr=1300000000 --stats \
+  --log=/tmp/g3-stage2-stock-bios-pinned.log \
+  >/tmp/g3-stage2-stock-bios-pinned.stdout \
+  2>/tmp/g3-stage2-stock-bios-pinned.stderr
+./x86emu --rom=/tmp/g3-qemu-root/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  --max-instr=1300000000 --stats \
+  --log=/tmp/g3-stage2-stock-bios-candidate.log \
+  >/tmp/g3-stage2-stock-bios-candidate.stdout \
+  2>/tmp/g3-stage2-stock-bios-candidate.stderr
+sha256sum /home/user/AuraLite-OS-compat/release/auralite.iso
+# The pinned ISO hash is unchanged; both runs report ACPI RSDP not found. The
+# pinned ISO reports ELF parse FAILED; the modified candidate reaches shell
+# active. Both have fault=0 and cap_reached=1. This is a mechanism diagnostic.
+
+# Candidate-only stock-ROM handoff capture: breakpoint before the first
+# kernel instruction, then save a v2 snapshot at the normal cap. The raw RAM
+# snapshot stays in /tmp; write only the validated 7,776-byte boot_info block.
+./x86emu --rom=/tmp/g3-qemu-root/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  --max-instr=1300000000 --stats \
+  --debug-script=docs/evidence/compat-g3/stage2-bootinfo-candidate-entry.dbg \
+  --snapshot-save=/tmp/g3-stage2-stock-bios-candidate.snap \
+  --log=/tmp/g3-stage2-stock-bios-candidate-entry.log \
+  >/tmp/g3-stage2-stock-bios-candidate-entry.stdout \
+  2>/tmp/g3-stage2-stock-bios-candidate-entry.stderr
+python3 docs/evidence/compat-g3/inspect_bootinfo_snapshot.py \
+  /tmp/g3-stage2-stock-bios-candidate.snap \
+  --scope 'temporary candidate Stage-2 + stock Debian SeaBIOS snapshot; candidate-only structural handoff check' \
+  --write-raw docs/evidence/compat-g3/stock-bios-candidate-bootinfo.bin \
+  | tee docs/evidence/compat-g3/stock-bios-candidate-handoff-parser.txt
+# Expected kernel-entry RIP=0xffffffff80191640, RDI=0x10000; RSDP=0, mmap_count=7.
+# This does not validate the authoritative pinned image's handoff.
+
+# Same 128-KiB SeaBIOS binary in QEMU. In terminal A run each helper command;
+# in terminal B capture physical 0x10000 after the noted serial boundary, then
+# stop QEMU in terminal A. -snapshot protects both source images.
+# Pinned ISO with explicit AHCI + blank USB: wait for ELF parse FAILED.
+bash docs/evidence/compat-g3/run_qemu_g3_samebios.sh \
+  /home/user/AuraLite-OS-compat/release/auralite.iso \
+  /tmp/g3-qemu-samebios-ahci-pinned ahci-usb
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-samebios-ahci-pinned.qmp \
+  /tmp/g3-qemu-samebios-ahci-pinned-bootinfo.bin
+# Candidate ISO with the identical QEMU AHCI/USB config: wait for shell active.
+bash docs/evidence/compat-g3/run_qemu_g3_samebios.sh \
+  /tmp/g3-stage2-fs-gs-restore-v2.iso \
+  /tmp/g3-qemu-samebios-ahci-candidate ahci-usb
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-samebios-ahci-candidate.qmp \
+  /tmp/g3-qemu-samebios-ahci-candidate-bootinfo.bin
+# Optional same-stock-ROM QEMU if=ide control; pinned fails and candidate
+# reaches shell under this 128-KiB BIOS too.
+bash docs/evidence/compat-g3/run_qemu_g3_samebios.sh \
+  /home/user/AuraLite-OS-compat/release/auralite.iso \
+  /tmp/g3-qemu-samebios-ide-pinned ide
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-samebios-ide-pinned.qmp \
+  /tmp/g3-qemu-samebios-ide-pinned-bootinfo.bin
+# Stop QEMU in terminal A, then run the candidate in the same mode.
+bash docs/evidence/compat-g3/run_qemu_g3_samebios.sh \
+  /tmp/g3-stage2-fs-gs-restore-v2.iso \
+  /tmp/g3-qemu-samebios-ide-candidate ide
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-samebios-ide-candidate.qmp \
+  /tmp/g3-qemu-samebios-ide-candidate-bootinfo.bin
+# Stop QEMU in terminal A after each memory capture. The archived QEMU
+# pairs and decoded outputs are qemu-samebios-*.
+
+# Exact QEMU machine options used for the separate initial reference: q35+TCG, Haswell, 128 MiB,
+# Debian SeaBIOS 256K, IDE, -snapshot (no source ISO writes), -no-reboot.
+# The actual runs used -serial stdio | tee <prefix>.serial and a QMP UNIX socket.
+# For reproduction, run the following QEMU command in terminal A and leave it
+# running; after shell-active appears, run the capture helper from terminal B,
+# then stop QEMU in terminal A (Ctrl-C is fine; the disk uses -snapshot).
+export LD_LIBRARY_PATH=/tmp/g3-qemu-root/usr/lib/x86_64-linux-gnu
+QEMU=/tmp/g3-qemu-root/usr/bin/qemu-system-x86_64
+# TERMINAL A, pinned release ISO (unchanged): start this and leave it running.
+$QEMU -L /tmp/g3-qemu-root/usr/share/qemu \
+  -machine q35,accel=tcg -cpu Haswell -m 128M \
+  -bios /tmp/g3-qemu-root/usr/share/seabios/bios-256k.bin \
+  -display none -serial stdio -monitor none \
+  -qmp unix:/tmp/g3-qemu-pinned.qmp,server=on,wait=off \
+  -drive if=ide,format=raw,file=/home/user/AuraLite-OS-compat/release/auralite.iso \
+  -snapshot -no-reboot 2>/tmp/g3-qemu-pinned.stderr \
+  | tee /tmp/g3-qemu-pinned.serial
+# TERMINAL B, after shell-active appears in terminal A:
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-pinned.qmp /tmp/g3-qemu-pinned-bootinfo.bin
+# Stop the pinned-ISO QEMU process in terminal A, then start the candidate run.
+# TERMINAL A, candidate ISO (modified LBA 34–159, diagnostic only):
+$QEMU -L /tmp/g3-qemu-root/usr/share/qemu \
+  -machine q35,accel=tcg -cpu Haswell -m 128M \
+  -bios /tmp/g3-qemu-root/usr/share/seabios/bios-256k.bin \
+  -display none -serial stdio -monitor none \
+  -qmp unix:/tmp/g3-qemu-candidate.qmp,server=on,wait=off \
+  -drive if=ide,format=raw,file=/tmp/g3-stage2-fs-gs-restore-v2.iso \
+  -snapshot -no-reboot 2>/tmp/g3-qemu-candidate.stderr \
+  | tee /tmp/g3-qemu-candidate.serial
+# TERMINAL B, after shell-active appears in terminal A:
+python3 docs/evidence/compat-g3/capture_qemu_bootinfo.py \
+  /tmp/g3-qemu-candidate.qmp /tmp/g3-qemu-candidate-bootinfo.bin
+# Both logs reach shell-active. QEMU boot_info blocks are byte-identical
+# (SHA-256 9119c44956fae7044f125c52c42aaea7d76e8347333516fe74747ee447cbdd42).
+# The qemu-system binary and package files are not stored in the evidence bundle.

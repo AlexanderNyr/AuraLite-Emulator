@@ -14,6 +14,10 @@
 
 #include "machine.h"
 
+struct pci_dev;
+uint64_t ahci_pci_cfg_read(struct pci_dev *d, int reg, int size);
+void ahci_pci_cfg_write(struct pci_dev *d, int reg, int size, uint64_t val);
+
 #define AHCI_ABAR        0xFEB10000u
 #define AHCI_ABAR2       0xFEB12000u   /* S4: --ahci2 controller; the guest maps
                                         * 8 KiB per BAR5 (measured ahci.c), so

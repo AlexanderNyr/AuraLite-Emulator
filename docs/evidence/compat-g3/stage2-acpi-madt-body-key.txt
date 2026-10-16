@@ -1,0 +1,19 @@
+Probe ROM SHA-256: 012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5
+Pinned ISO SHA-256: d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+Emulator SHA-256 (PAM-aware debugger build): e86bd0bd1cdc97cb2e78f22b336971c13978964d0df11c494a500d7dd84701df
+RAM snapshot SHA-256 (stored under /tmp, not in compact bundle): 10af7c70d1f1ae74295d13de1d89744fb81d6ec440a40ece194cce5b2df28626
+[serial] [BL9] ACPI RSDP found
+[dbg] stopped: breakpoint 1 vcpu=0 vtime=1289013740 steps=121108460
+=> 0800:0000000000000d0b  push ebp
+rax 0x0000000007fff630  rcx 0x000000000000000c  rdx 0x0000000043495041  rbx 0x0000000000000004
+r8  0x0000000000000000  r9  0x0000000000000000  r10 0x0000000000000000  r11 0x0000000000000000
+rip 0x0000000000000d0b  rflags 0x0000000000000246 [ PF ZF IF ]
+cs 0800 ss 0000 ds 0000 es 0000 fs 0010 gs 0010  mode real16 cpl 0 vcpu 0
+[serial] [BL9] ACPI MADT parsed
+[serial] [BL4] ELF parse FAILED
+[snapshot] saved /tmp/g3-acpi-table-inspection.snap: 19148154 bytes at vtime 576696537331 (step 1300000000)
+[stats] vcpu=0 executed_steps=173979379 instr_count=576696537331 halted=1 fault=0
+[stats] executed=173979379 idle_quantum=576522557952 instr_count_bsp=576696537331 vtime=576696537331
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=35957861
+[stats] decode_hits=0 decode_misses=0

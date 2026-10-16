@@ -1,0 +1,77 @@
+---- CPU state (mode=long64, instr=297427521032) ----
+RAX=ffffffff88018310 RBX=0000000000000000 RCX=00000000c0000102 RDX=0000000000000000
+RSI=ffffffff88018310 RDI=0000000000000000 RBP=ffffffff8c008fd8 RSP=ffffffff8c008fd8
+R8 =ffffffff8801a5f0 R9 =0000000000000000 R10=0000000000000001 R11=00000000fffff801
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=ffffffff80153792 RFLAGS=0000000000000286 CR0=0000000080010033 CR3=0000000001000000 CR4=0000000000000620 EFER=0000000000000d01
+CS=0008 base=0000000000000000 L=1 D=0   SS=0010 base=0000000000000000
+STATE: HALTED (HLT executed)
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=720494088 instr_count=297427521032 halted=1 fault=0
+[stats] executed=720494088 idle_quantum=296707026944 instr_count_bsp=297427521032 vtime=297427521032
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=809354806 tlb_misses=183830468 tlb_flushes=166193210
+[stats] decode_hits=175228918 decode_misses=208651558
+
+---- last log lines ----
+[serial] [bc] writeback stores=1897 flushed=1474 coalesced=423
+[serial] [bc] writeback stores=1899 flushed=1476 coalesced=423
+[serial] [bc] writeback stores=1901 flushed=1478 coalesced=423
+[serial] [bc] writeback stores=1903 flushed=1480 coalesced=423
+[serial] [bc] writeback stores=1905 flushed=1482 coalesced=423
+[serial] [bc] writeback stores=1907 flushed=1484 coalesced=423
+[serial] [bc] writeback stores=1909 flushed=1486 coalesced=423
+[serial] [bc] writeback stores=1911 flushed=1488 coalesced=423
+[serial] [bc] writeback stores=1920 flushed=1494 coalesced=426
+[serial] [bc] writeback stores=1922 flushed=1496 coalesced=426
+[serial] [bc] writeback stores=1924 flushed=1498 coalesced=426
+[serial] [bc] writeback stores=1926 flushed=1500 coalesced=426
+[serial] [bc] writeback stores=1928 flushed=1502 coalesced=426
+[serial] [bc] writeback stores=1930 flushed=1504 coalesced=426
+[serial] [bc] writeback stores=1932 flushed=1506 coalesced=426
+[serial] [bc] writeback stores=1934 flushed=1508 coalesced=426
+[serial] [bc] writeback stores=1936 flushed=1510 coalesced=426
+[serial] [bc] writeback stores=1945 flushed=1516 coalesced=429
+[serial] [bc] writeback stores=1947 flushed=1518 coalesced=429
+[serial] [bc] writeback stores=1949 flushed=1520 coalesced=429
+[serial] [bc] writeback stores=1951 flushed=1522 coalesced=429
+[serial] [bc] writeback stores=1953 flushed=1524 coalesced=429
+[serial] [bc] writeback stores=1955 flushed=1526 coalesced=429
+[serial] [bc] writeback stores=1957 flushed=1528 coalesced=429
+[serial] [bc] writeback stores=1959 flushed=1530 coalesced=429
+[serial] [bc] writeback stores=1961 flushed=1532 coalesced=429
+[serial] [bc] writeback stores=1963 flushed=1534 coalesced=429
+[serial] [bc] writeback stores=1972 flushed=1540 coalesced=432
+[serial] [bc] writeback stores=1974 flushed=1542 coalesced=432
+[serial] [bc] writeback stores=1976 flushed=1544 coalesced=432
+[serial] [bc] writeback stores=1978 flushed=1546 coalesced=432
+[serial] [bc] writeback stores=1980 flushed=1548 coalesced=432
+[serial] [bc] writeback stores=1982 flushed=1550 coalesced=432
+[serial] [bc] writeback stores=1984 flushed=1552 coalesced=432
+[serial] [bc] writeback stores=1986 flushed=1554 coalesced=432
+[serial] [bc] writeback stores=1988 flushed=1556 coalesced=432
+[serial] [bc] writeback stores=1997 flushed=1562 coalesced=435
+[serial] [bc] writeback stores=1999 flushed=1564 coalesced=435
+[serial] [bc] writeback stores=2001 flushed=1566 coalesced=435
+[serial] [bc] writeback stores=2003 flushed=1568 coalesced=435
+[serial] [bc] writeback stores=2005 flushed=1570 coalesced=435
+[serial] [bc] writeback stores=2007 flushed=1572 coalesced=435
+[serial] [bc] writeback stores=2009 flushed=1574 coalesced=435
+[serial] [bc] writeback stores=2011 flushed=1576 coalesced=435
+[serial] [bc] writeback stores=2013 flushed=1578 coalesced=435
+[serial] [bc] writeback stores=2015 flushed=1580 coalesced=435
+[serial] [bc] writeback stores=2024 flushed=1586 coalesced=438
+[serial] [bc] writeback stores=2026 flushed=1588 coalesced=438
+[serial] [bc] writeback stores=2028 flushed=1590 coalesced=438
+[serial] [bc] writeback stores=2030 flushed=1592 coalesced=438
+[serial] [bc] writeback stores=2032 flushed=1594 coalesced=438
+[serial] [bc] writeback stores=2034 flushed=1596 coalesced=438
+[serial] [bc] writeback stores=2036 flushed=1598 coalesced=438
+[serial] [bc] writeback stores=2038 flushed=1600 coalesced=438
+[serial] [bc] writeback stores=2040 flushed=1602 coalesced=438
+[serial] [bc] writeback stores=2049 flushed=1608 coalesced=441
+[serial] [bc] writeback stores=2051 flushed=1610 coalesced=441
+[serial] [bc] writeback stores=2053 flushed=1612 coalesced=441
+[serial] [bc] writeback stores=2055 flushed=1614 coalesced=441
+[serial] [bc] writeback stores=2057 flushed=1616 coalesced=441

@@ -1,0 +1,20 @@
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #1 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #2 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #3 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #4 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #5 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #6 (port 0xCF9) -> F000:FFF0
+No bootable device.  Retrying in 60 seconds.
+[chipset] system reset #7 (port 0xCF9) -> F000:FFF0
+
+[stats] vcpu=0 executed_steps=55734700 instr_count=55734700 halted=0 fault=0
+[stats] executed=55734700 idle_quantum=0 instr_count_bsp=55734700 vtime=201769400257
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=180115788
+[stats] decode_hits=0 decode_misses=0

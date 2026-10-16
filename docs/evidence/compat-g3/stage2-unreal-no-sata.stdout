@@ -1,0 +1,76 @@
+---- CPU state (mode=real16, instr=55734700) ----
+RAX=0000000000000000 RBX=0000000000000001 RCX=000000000000930c RDX=0000000000000000
+RSI=000000000000df00 RDI=0000000000000000 RBP=0000000000000107 RSP=0000000000006e48
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=000000000000eeee RFLAGS=0000000000000056 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=f000 base=00000000000f0000 L=0 D=0   SS=0000 base=0000000000000000
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=55734700 instr_count=55734700 halted=0 fault=0
+[stats] executed=55734700 idle_quantum=0 instr_count_bsp=55734700 vtime=201769400257
+[stats] cap=1300000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=180115788
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cf9-probe] write=0x02 old=0x00 CS:IP=0008:f23df vt=201713665554
+[cf9-probe] write=0x06 old=0x02 CS:IP=0008:f23e2 vt=201713665556
+[chipset] system reset #7 (port 0xCF9) -> F000:FFF0
+[pci] host bridge: MMCONFIG (ECAM) window enabled at 0xb0000000
+[lapic] software ENABLED (spurious vector 0xff)
+[lapic] IPI INIT-assert: vec=0x00 shorthand=3 (broadcast form not modeled for INIT/SIPI)
+[lapic] IPI SIPI: vec=0x10 shorthand=3 (broadcast form not modeled for INIT/SIPI)
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+[kbd-probe] read=0x55 status=0x1d rip=6ff48d0 vt=201715985465
+[kbd-probe] read=0x00 status=0x1d rip=6ff48d0 vt=201715985513
+[kbd-probe] write=0xff pending=0x00 status=0x04 rip=6ff729e vt=201716002136
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=201716002136
+[kbd-probe] reply=0xaa status=0x04 rip=6ff729e vt=201716002136
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=201716002167
+[kbd-probe] read=0xaa status=0x05 rip=6ff7220 vt=201716002218
+[kbd-probe] write=0xf5 pending=0x00 status=0x04 rip=6ff729e vt=201716017151
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=201716017151
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=201716017182
+[kbd-probe] write=0xf0 pending=0x00 status=0x04 rip=6ff729e vt=201716033528
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=201716033528
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=201716033559
+[kbd-probe] write=0x02 pending=0xf0 status=0x04 rip=6ff729e vt=201716033603
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=201716033603
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=201716033634
+[kbd-probe] write=0xf4 pending=0x00 status=0x04 rip=6ff729e vt=201716051134
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=201716051134
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=201716051165
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT
+[cpu] real-mode vector 8 (#DF) -> f000:fea5 via IVT
+[cpu] real-mode vector 28 (#??) -> f000:ff53 via IVT

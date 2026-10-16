@@ -748,6 +748,39 @@
   accept GUID: HTTP/101 pass and the client's sample-key assertion alone
   fails.
 
+## BIOS compatibility diagnostics (G2–G3, 2026-10-16)
+
+- G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
+  SGDT/SIDT store width: the emulator now writes the six-byte pseudo-descriptor
+  outside long mode. PUSHA/PUSHAD and POPA/POPAD support was subsequently added
+  for the Stage-2 instruction path. The captured commands and receipts are in
+  `docs/evidence/compat-g2/`.
+- G3's Stage-4 `ELF parse FAILED` boundary is traced to BIOS INT 13h return
+  resetting Stage 2's unreal-mode FS/GS caches before the FAT copy. A candidate
+  Stage-2 source change restores unreal mode after successful and final-error
+  disk-read returns while preserving caller registers. This is a diagnostic
+  candidate; the pinned ISO was not changed.
+- Same-stock 128-KiB Debian SeaBIOS A/Bs in xemu and QEMU reproduce the split:
+  the pinned ISO fails ELF parsing, while the modified candidate reaches
+  shell-active. QEMU reproduces it with AHCI + blank USB and with `if=ide`.
+  The separate xemu candidate-entry capture records RDI=`0x10000`, seven E820
+  entries and no RSDP; it does not validate the pinned image's handoff.
+- QEMU and xemu candidate blocks match selected stable fields but differ in
+  RSDP (QEMU `0xf67b0`, xemu absent) and E820 count (8 vs. 7). The SeaBIOS
+  LPC-ID allowlist establishes the RSDP-presence mismatch; the remaining E820
+  differences have no established cause. Each 128-KiB QEMU pinned/candidate
+  pair has 362 differing raw bytes: 358 beyond the declared eight E820 entries
+  and four in initrd fields. The separate 256-KiB QEMU reference, where both
+  images reached shell and blocks matched, is a different firmware setup.
+- Snapshot restore-order testing also led to format v2: PCI config and the AHCI
+  BAR are restored before MMIO validation; v1 snapshots are refused. Recorded
+  tests and full evidence are in `docs/evidence/compat-g3/` and
+  `docs/plans/TOOLING_PLAN.md`.
+
+G3 remains open. These modified-image runs are diagnostic only; no pinned-image
+BIOS-to-kernel acceptance, allocator-zone measurement, CF9-causality claim or
+PERF P4 pass is established.
+
 ## Current limits
 
 This remains a firmware-focused x86 emulator, not a drop-in replacement for

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include "machine.h"
+#include "pci.h"
 
 void mlog(logring_t *lr, const char *fmt, ...) {
     char buf[160];
@@ -29,6 +30,11 @@ void mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len) {
          * decoded (reset vector always at top). */
         memcpy(m->rom + (ROM_SIZE - n), rom_image, n);
     }
+    /* The low decode is ROM until PAM enables reads from this RAM-backed
+     * shadow. Seed it from the right-aligned flash image so enabling PAM
+     * does not expose uninitialized data before SeaBIOS copies its writable
+     * code/data sections. The flash buffer itself remains immutable. */
+    memcpy(m->ram + ROM_ALIAS_LOW_BASE, m->rom, ROM_SIZE);
     m->mmio_list = NULL;
 }
 
@@ -65,11 +71,113 @@ void mem_register_mmio_owned(machine_t *m, uint64_t base, uint64_t size,
     m->mmio_list->owned_ctx = 1;
 }
 
+#define PAM_WINDOW_BASE 0x000C0000ULL
+#define PAM_WINDOW_END  0x00100000ULL
+
+/* The advertised host bridge is Q35. Its seven PAM bytes are also the
+ * source of truth for the memory decoder; there is no shadow-enable state
+ * that can get out of sync with PCI config space or snapshots. */
+static pci_dev_t *q35_host_bridge(machine_t *m) {
+    for (pci_dev_t *d = m->pci_devices; d; d = d->next) {
+        uint16_t vendor = (uint16_t)d->cfg[0] | ((uint16_t)d->cfg[1] << 8);
+        uint16_t device = (uint16_t)d->cfg[2] | ((uint16_t)d->cfg[3] << 8);
+        if (d->bus == 0 && d->dev == 0 && d->func == 0 &&
+            vendor == 0x8086 && device == PCI_DEVICE_ID_INTEL_Q35_MCH)
+            return d;
+    }
+    return NULL;
+}
+
+/* Return the PAM field value (bit 0: read RAM, bit 1: write RAM) for a
+ * physical byte in C0000-FFFFF. PAM0's bits 5:4 select the entire 64-KiB
+ * F0000-FFFFF BIOS window; PAM1..6 each select two 16-KiB halves. */
+static uint8_t q35_pam_mode(const pci_dev_t *hb, uint64_t phys) {
+    unsigned reg, shift;
+    if (phys >= 0x000F0000ULL) {
+        reg = PCI_Q35_PAM0;
+        shift = 4;
+    } else {
+        uint64_t off = phys - PAM_WINDOW_BASE;
+        reg = PCI_Q35_PAM0 + 1 + (unsigned)(off >> 15);
+        shift = (off & 0x7FFFu) >= 0x4000u ? 4 : 0;
+    }
+    return (uint8_t)((hb->cfg[reg] >> shift) & 0x03);
+}
+
+static uint8_t q35_pam_read_byte(machine_t *m, const pci_dev_t *hb,
+                                 uint64_t phys) {
+    if (q35_pam_mode(hb, phys) & 0x01)
+        return m->ram[phys];
+    if (phys >= ROM_ALIAS_LOW_BASE)
+        return m->rom[(phys - ROM_ALIAS_LOW_BASE) % ROM_SIZE];
+    /* C0000-DFFFF is an option-ROM window; no expansion-ROM image is
+     * currently installed, so reads with PAM closed are open bus. */
+    return 0xFF;
+}
+
+/* Debugger/trace reads must see the same side-effect-free byte as a CPU
+ * physical read, including Q35 PAM's RAM-shadow selection. Do not call a
+ * device MMIO handler merely to inspect memory. */
+int mem_debug_peek_byte(machine_t *m, uint64_t phys, uint8_t *out) {
+    if (!out) return 0;
+    if (!m->chipset.a20) phys &= ~0x100000ULL;
+    if (phys >= PAM_WINDOW_BASE && phys < PAM_WINDOW_END) {
+        pci_dev_t *hb = q35_host_bridge(m);
+        if (hb) {
+            *out = q35_pam_read_byte(m, hb, phys);
+            return 1;
+        }
+    }
+    if (phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE) {
+        *out = m->rom[(phys - ROM_ALIAS_LOW_BASE) % ROM_SIZE];
+        return 1;
+    }
+    if (phys >= ROM_TOPOF4G_BASE && phys <= 0xFFFFFFFFULL) {
+        *out = m->rom[(phys - ROM_TOPOF4G_BASE) % ROM_SIZE];
+        return 1;
+    }
+    if (phys < RAM_SIZE) {
+        *out = m->ram[phys];
+        return 1;
+    }
+    mmio_region_t *r = find_mmio(m, phys);
+    if (r) {
+        if (!r->dbg_readable || !r->read) return 0;
+        *out = (uint8_t)r->read(r->ctx, phys, 1);
+        return 1;
+    }
+    *out = 0xFF;                   /* unmapped open bus */
+    return 1;
+}
+
 uint64_t mem_read(machine_t *m, uint64_t phys, int size) {
     /* CHIPSET H5: with the A20 gate closed the bus forces address bit 20
      * to zero -- odd megabytes alias onto the even ones below (the real
      * 1MB wrap). Applies to fetches too; the CPU path funnels here. */
     if (!m->chipset.a20) phys &= ~0x100000ULL;
+    /* Q35 PAM controls reads from RAM throughout C0000-FFFFF. The E0000-
+     * FFFFF half additionally falls back to the immutable 128-KiB firmware
+     * image; absent C0000-DFFFF option ROMs read as open bus. */
+    if (phys < PAM_WINDOW_END && phys + (uint64_t)size > PAM_WINDOW_BASE) {
+        pci_dev_t *hb = q35_host_bridge(m);
+        if (hb) {
+            uint64_t v = 0;
+            for (int i = 0; i < size; i++) {
+                uint64_t a = phys + (uint64_t)i;
+                uint8_t b;
+                if (a >= PAM_WINDOW_BASE && a < PAM_WINDOW_END)
+                    b = q35_pam_read_byte(m, hb, a);
+                else if (a >= ROM_ALIAS_LOW_BASE && a < ROM_ALIAS_LOW_BASE + ROM_SIZE)
+                    b = m->rom[(a - ROM_ALIAS_LOW_BASE) % ROM_SIZE];
+                else if (a < RAM_SIZE)
+                    b = m->ram[a];
+                else
+                    b = 0xFF;
+                v |= (uint64_t)b << (8*i);
+            }
+            return v;
+        }
+    }
     /* ROM aliasing: legacy shadow window and top-of-4GB reset window both map
      * to the same 128KB firmware image (this mirrors real PCH/ICH firmware hub
      * decoding and is how the firmware's own reset vector -> 0xE000:0000 trick works). */
@@ -130,6 +238,29 @@ void mem_write(machine_t *m, uint64_t phys, int size, uint64_t val) {
     }
     /* CHIPSET H5: A20 mask, same bus rule as mem_read. */
     if (!m->chipset.a20) phys &= ~0x100000ULL;
+    /* PAM writes are routed per byte: a single store may straddle PAM
+     * subregions or the 1-MiB boundary. Write-disabled bytes are discarded;
+     * enabled writes update the RAM shadow, never the flash buffer. */
+    if (phys < PAM_WINDOW_END && phys + (uint64_t)size > PAM_WINDOW_BASE) {
+        pci_dev_t *hb = q35_host_bridge(m);
+        if (hb) {
+            int changed_ram = 0;
+            for (int i = 0; i < size; i++) {
+                uint64_t a = phys + (uint64_t)i;
+                if (a >= PAM_WINDOW_BASE && a < PAM_WINDOW_END) {
+                    if (q35_pam_mode(hb, a) & 0x02) {
+                        m->ram[a] = (uint8_t)(val >> (8*i));
+                        changed_ram = 1;
+                    }
+                } else if (a < RAM_SIZE) {
+                    m->ram[a] = (uint8_t)(val >> (8*i));
+                    changed_ram = 1;
+                }
+            }
+            if (changed_ram) perf_tlb_flush(m);
+            return;
+        }
+    }
     if (phys >= ROM_ALIAS_LOW_BASE && phys < ROM_ALIAS_LOW_BASE + ROM_SIZE) return; /* ROM: read-only */
     if (phys >= ROM_TOPOF4G_BASE && phys <= 0xFFFFFFFFULL) return;                   /* ROM: read-only */
     if (phys < RAM_SIZE) {

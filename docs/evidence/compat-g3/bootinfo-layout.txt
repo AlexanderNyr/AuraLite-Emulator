@@ -1,0 +1,38 @@
+Host ABI layout check — candidate Stage-2 handoff follow-up
+
+The probe was compiled against the compatibility checkout's pinned
+boot/shared/boot_info.h using:
+  cc -I /home/user/AuraLite-OS-compat \
+    docs/evidence/compat-g3/bootinfo-layout-probe.c -o /tmp/g3-bootinfo-layout-probe
+  /tmp/g3-bootinfo-layout-probe
+The generated NASM offsets were independently emitted by the checkout's
+`tools/gen_boot_offsets.c --asm`; the receipt is `bootinfo-layout.inc`.
+
+Input source hashes
+  boot/shared/boot_info.h:
+    22cb52dc9740f122a645a4c0d2f5c2cc6acfd388dba2e37f1ee598b7a0280013
+  tools/gen_boot_offsets.c:
+    a6a3f4ab797a7f1cf1c2fc904e41acf6d8a2fa004c36df523b81b013fc2dccaa
+
+Measured C layout
+  sizeof(boot_fb_t)            32
+  sizeof(boot_mmap_entry_t)    24
+  sizeof(boot_cpu_t)           24
+  sizeof(boot_info_t)          7776
+  offsetof(magic)              0
+  offsetof(fb)                 8
+  offsetof(mmap)                40
+  offsetof(mmap_count)          6184
+  offsetof(hhdm_offset)         6192
+  offsetof(initrd_phys)         6200
+  offsetof(initrd_size)         6208
+  offsetof(cpu_count)           6216
+  offsetof(bsp_lapic_id)        6220
+  offsetof(cpus)                6224
+  offsetof(rsdp_phys)           7760
+  offsetof(boot_from_uefi)      7768
+
+These offsets/sizes match the documented C structure and the generated Stage-2
+field-offset contract. This host-side layout measurement alone does not prove
+that the BIOS Stage-2 handoff is correct; the candidate-only runtime capture
+is documented in `stage2-bootinfo-candidate-key.txt` and the parser receipt.

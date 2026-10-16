@@ -1,0 +1,36 @@
+Candidate Stage-2 run with the base recreated diagnostic SeaBIOS
+
+Run identity
+- Candidate ISO: /tmp/g3-stage2-fs-gs-restore-v2.iso
+  SHA-256 b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+- Stage 2 in the ISO: candidate FS/GS restoration build, SHA-256
+  51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+- ROM: base recreated diagnostic SeaBIOS, without the ACPI-ID patch;
+  SHA-256 69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d
+- Emulator: O2 x86emu, SHA-256
+  2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9
+- USB: 1 MiB zero-filled control, SHA-256
+  30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58
+- Platform Haswell; one vCPU; max-instr 1,300,000,000.
+
+Selected receipts
+- SeaBIOS / Stage 2 reports `[BL9] ACPI RSDP not found; BSP-only`.
+- Stage 2 nevertheless reports `kernel.elf located`, `kernel.elf loaded to
+  0x00200000`, and `ELF PT_LOAD segments copied to phys`.
+- The kernel reaches long mode, starts the Ring-3 init shell, and reports
+  `[kernel] shell active; kmain idling.`
+- Exit code 0; halted=1, fault=0, cap_reached=1; executed_steps=720438607,
+  instr_count=297455871823.
+
+This isolates the candidate INT 13h FS/GS repair from the separate
+ACPI-ID ROM change: the candidate succeeds through the shell-active marker
+without that ROM patch, although ACPI remains unavailable and Stage 2 uses its
+BSP-only fallback. The ISO still contains modified Stage 2 and the ROM is a
+recreated diagnostic build; this is not pinned-image acceptance or a full
+BIOS-to-kernel acceptance result. This run itself did not capture the
+boot_info_t entry handoff; see the separate candidate-only handoff receipt.
+
+Capture identities (uncompressed inputs to the archived captures)
+- stdout SHA-256 7f80c53c28d237e7daa0176898080ea5593507d069d34dd8a4fe08edcd555f1b
+- stderr SHA-256 9cf9aba3d25e68d972c036ea36e7f02a8fb5e844eb84e3d1317bdb7322f48a57
+- emulator log SHA-256 bb18abe1ec861343463eecb66f86a385221efd7ba9e70af7155455baf4fc01b6

@@ -31,6 +31,8 @@ void kbc_init(machine_t *m) {
     /* H5: the output port powers up with SRST# deasserted, otherwise the
      * board would hold itself in reset. A20 contribution starts low. */
     m->kbc.outport = 0x01;
+    m->kbc.kbd_scan_set = 2;
+    m->kbc.kbd_last_reply = 0xFA;
 }
 
 /* ------------------------------------------------------------- queue */
@@ -54,14 +56,104 @@ static void kbc_update_irq(machine_t *m) {
     pic_set_irq(m, 1, ((m->kbc.status & ST_OBF) && (m->kbc.cmd & CMD_IRQ)) ? 1 : 0);
 }
 
-/* Move the next queued scancode into the output buffer when allowed.
- * Command-response writes set OB directly (no strobe -- see commands). */
+/* Move the next queued keyboard byte into the output buffer when allowed.
+ * Device replies and injected scancodes share FIFO order. */
 static void try_fill(machine_t *m) {
     kbc_t *k = &m->kbc;
     if ((k->status & (ST_OBF | ST_INH)) || q_empty(k)) return;
     k->ob = q_pop(k);
     k->status |= ST_OBF;
     kbc_update_irq(m);
+}
+
+/* The 8042 routes keyboard-device replies through the same output FIFO as
+ * injected scan codes. Queue an entire response before exposing its first
+ * byte so ACK/BAT and multi-byte identify replies keep their wire order. */
+static void kbd_reply(machine_t *m, const uint8_t *bytes, unsigned count) {
+    kbc_t *k = &m->kbc;
+    static unsigned probe_replies;
+    for (unsigned i = 0; i < count; i++) {
+        if (q_push(k, bytes[i]) < 0) break;
+        k->kbd_last_reply = bytes[i];
+        if (probe_replies++ < 64)
+            mlog(&m->log, "[kbd-probe] reply=0x%02x status=0x%02x rip=%llx vt=%llu",
+                 bytes[i], k->status, (unsigned long long)m->cpu.rip,
+                 (unsigned long long)m->vtime_instr);
+    }
+    try_fill(m);
+}
+
+static void kbd_reply_byte(machine_t *m, uint8_t byte) {
+    kbd_reply(m, &byte, 1);
+}
+
+static void kbd_ack(machine_t *m) {
+    kbd_reply_byte(m, 0xFA);
+}
+
+/* Small PS/2 keyboard protocol model: SeaBIOS reset/BAT, scan-set setup,
+ * typematic/LED parameters, enable/disable scanning, and identify. The
+ * controller itself still consumes host writes synchronously (IBF=0). */
+static void kbd_data_write(machine_t *m, uint8_t byte) {
+    kbc_t *k = &m->kbc;
+    static unsigned probe_writes;
+    if (probe_writes++ < 64)
+        mlog(&m->log, "[kbd-probe] write=0x%02x pending=0x%02x status=0x%02x rip=%llx vt=%llu",
+             byte, k->kbd_expect_param, k->status,
+             (unsigned long long)m->cpu.rip, (unsigned long long)m->vtime_instr);
+
+    if (k->kbd_expect_param) {
+        uint8_t command = k->kbd_expect_param;
+        k->kbd_expect_param = 0;
+        if (command == 0xF0) {
+            if (byte == 0) {
+                const uint8_t reply[] = { 0xFA, k->kbd_scan_set };
+                kbd_reply(m, reply, sizeof reply);
+                return;
+            }
+            if (byte >= 1 && byte <= 3) k->kbd_scan_set = byte;
+        }
+        kbd_ack(m);
+        return;
+    }
+
+    switch (byte) {
+    case 0xFF: {                                  /* reset, ACK, then BAT */
+        static const uint8_t reply[] = { 0xFA, 0xAA };
+        k->kbd_expect_param = 0;
+        k->kbd_scan_set = 2;
+        kbd_reply(m, reply, sizeof reply);
+        return;
+    }
+    case 0xF2: {                                  /* identify: MF2 keyboard */
+        static const uint8_t reply[] = { 0xFA, 0xAB, 0x83 };
+        kbd_reply(m, reply, sizeof reply);
+        return;
+    }
+    case 0xF0: case 0xF3: case 0xED:              /* command + one parameter */
+        k->kbd_expect_param = byte;
+        kbd_ack(m);
+        return;
+    case 0xF4: case 0xF5:                         /* scanning on/off */
+    case 0xF6:                                    /* restore defaults */
+    case 0xF7: case 0xF8: case 0xF9: case 0xFA:  /* key-type modes */
+        if (byte == 0xF6) k->kbd_scan_set = 2;
+        kbd_ack(m);
+        return;
+    case 0xFB: case 0xFC: case 0xFD:              /* key mode + key byte */
+        k->kbd_expect_param = byte;
+        kbd_ack(m);
+        return;
+    case 0xFE:                                    /* resend last device byte */
+        kbd_reply_byte(m, k->kbd_last_reply);
+        return;
+    case 0xEE:                                    /* echo */
+        kbd_reply_byte(m, 0xEE);
+        return;
+    default:                                      /* unsupported command */
+        kbd_reply_byte(m, 0xFE);                  /* request host resend */
+        return;
+    }
 }
 
 int kbc_inject_scancode(machine_t *m, uint8_t code) {
@@ -89,6 +181,11 @@ int kbc_queue_keys(machine_t *m, const char *hexlist) {
 /* ---------------------------------------------------------------- ports */
 
 static uint32_t kbc_status_read(machine_t *m) {
+    static unsigned probe_status;
+    if (probe_status++ < 96)
+        mlog(&m->log, "[kbd-probe] status=0x%02x rip=%llx vt=%llu",
+             m->kbc.status, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
     return m->kbc.status;   /* IBF/TME/RCV/PERR always observed 0 */
 }
 
@@ -96,6 +193,11 @@ static uint32_t kbc_data_read(machine_t *m) {
     kbc_t *k = &m->kbc;
     if (!(k->status & ST_OBF)) return 0xFF;       /* nothing there (documented) */
     uint8_t v = k->ob;
+    static unsigned probe_reads;
+    if (probe_reads++ < 64)
+        mlog(&m->log, "[kbd-probe] read=0x%02x status=0x%02x rip=%llx vt=%llu",
+             v, k->status, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
     k->status &= (uint8_t)~ST_OBF;   /* A2 untouched: it tracks last WRITE */
     kbc_update_irq(m);                            /* level dips... */
     try_fill(m);                                  /* ...and re-arms per byte */
@@ -122,10 +224,10 @@ static void kbc_data_write(machine_t *m, uint8_t v) {
         chipset_set_a20_kbc(m, (v >> 1) & 1);
         return;
     }
-    /* byte "to the keyboard": no keyboard device model yet -- consumed
-     * synchronously, IBF therefore never observable (documented). The
-     * 0xE0/0xED LED/set-rate dance layer arrives with a keyboard device. */
+    /* Byte "to the keyboard": data-port write, so A2 clears. Device
+     * responses enter the normal output FIFO and appear synchronously. */
     k->status &= (uint8_t)~ST_A2;
+    kbd_data_write(m, v);
 }
 
 static void kbc_cmd_write(machine_t *m, uint8_t v) {

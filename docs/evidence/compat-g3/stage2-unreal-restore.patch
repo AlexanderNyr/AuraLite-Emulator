@@ -1,0 +1,17 @@
+--- a/boot/bios/stage2/disk.inc
++++ b/boot/bios/stage2/disk.inc
+@@ -68,12 +68,14 @@
+     pop  es
+     pop  ds
+     popad
++    call go_unreal                      ; INT 13h may reload FS/GS real-mode caches
+     clc
+     ret
+ .fail:
+     pop  es
+     pop  ds
+     popad
++    call go_unreal                      ; restore flat FS/GS before returning to caller
+     stc
+     ret
+ 

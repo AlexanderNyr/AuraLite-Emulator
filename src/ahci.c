@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ahci.h"
+#include "pci.h"
 #include "snapshot.h"   /* TOOLING T4 */
 
 /* ---- register state ---- */
@@ -62,6 +63,8 @@ typedef struct {
 typedef struct {
     machine_t   *m;
     int          ctrl;             /* S4: controller index (0..AHCI_CTRLS-1) */
+    uint32_t     abar;             /* live BAR5 decode base (PCI may relocate it) */
+    uint8_t      bar5_probe;       /* PCI all-ones BAR sizing read latch */
     uint32_t     ghc;
     uint32_t     is;               /* controller HBA IS (aggregates PxIS, S5) */
     int          intx;             /* S5: current board-line assertion state */
@@ -69,6 +72,21 @@ typedef struct {
 } ahci_t;
 
 static ahci_t g_ahci[AHCI_CTRLS];
+
+/* PCI may relocate BAR5 during firmware enumeration. Keep the bus decode
+ * region and register-relative address calculation on the same base. */
+static void ahci_set_abar(ahci_t *a, uint32_t base) {
+    base &= ~(AHCI_ABAR_SIZE - 1u);
+    a->abar = base;
+    if (!a->m) return;
+    for (mmio_region_t *r = a->m->mmio_list; r; r = r->next) {
+        if (r->ctx == a && r->size == AHCI_ABAR_SIZE) {
+            r->base = base;
+            r->enabled = base != 0;
+            return;
+        }
+    }
+}
 
 /* S5: --sata-writethrough host files, one per attach slot (see ahci.h). */
 static FILE *g_wt[AHCI_CTRLS][AHCI_MAX_ATTACH];
@@ -83,7 +101,10 @@ void ahci_snap(machine_t *m, snap_t *s) {
         ahci_t t = g_ahci[c];
         if (!snap_loading(s)) t.m = NULL;
         snap_bytes(s, tag, &t, sizeof t);
-        if (snap_loading(s)) { t.m = g_ahci[c].m; t.ctrl = g_ahci[c].ctrl; g_ahci[c] = t; }
+        if (snap_loading(s)) {
+            t.m = g_ahci[c].m; t.ctrl = g_ahci[c].ctrl; g_ahci[c] = t;
+            ahci_set_abar(&g_ahci[c], g_ahci[c].abar);
+        }
     }
 }
 
@@ -155,8 +176,11 @@ static const char *tagc(const ahci_t *a) { return a->ctrl ? "[ahci2]" : "[ahci]"
  * boot continues).
  */
 
+#define ATA_CMD_READ_DMA       0xC8
+#define ATA_CMD_WRITE_DMA      0xCA
 #define ATA_CMD_READ_DMA_EXT   0x25
 #define ATA_CMD_WRITE_DMA_EXT  0x35
+#define ATA_CMD_SET_FEATURES   0xEF
 #define ATA_CMD_IDENTIFY       0xEC
 
 static uint32_t gdr(machine_t *m, uint64_t pa)          { return (uint32_t)mem_read(m, pa, 4); }
@@ -233,6 +257,20 @@ static void ahci_identify(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
     }
 }
 
+/* SeaBIOS polls PxIS, then reads rfis[2] for a completed command. Mirror
+ * the D2H Register FIS into the guest's receive buffer as real AHCI does. */
+static void ahci_write_d2h_fis(ahci_t *a, int p, int failed) {
+    machine_t *m = a->m;
+    port_regs_t *r = &a->port[p];
+    uint64_t fb = (uint64_t)r->fb | ((uint64_t)r->fbu << 32);
+    if (!(r->cmd & PXCMD_FRE) || !fb) return;
+    uint64_t d2h = fb + 0x40;
+    mem_write(m, d2h + 0, 1, 0x34);                 /* Register D2H FIS */
+    mem_write(m, d2h + 1, 1, 0);
+    mem_write(m, d2h + 2, 1, TFD_ATTACHED | (failed ? 1u : 0u));
+    mem_write(m, d2h + 3, 1, failed ? 0x04u : 0u);  /* ABRT on command error */
+}
+
 /* Execute whatever the guest latched into PxCI for port p. */
 static void ahci_engine_port(ahci_t *a, int p) {
     machine_t *m = a->m;
@@ -253,20 +291,38 @@ static void ahci_engine_port(ahci_t *a, int p) {
         if (cfis[0] != 0x27 || !(cfis[1] & 0x80)) goto tfes;        /* H2D register FIS */
 
         uint8_t  cmd  = cfis[2];
-        /* H2D Register FIS: lba0..2 at [4..6], LBA48 high half at [8..10]. */
+        /* TEMP G2 probe: capture firmware-submitted AHCI commands. */
+        static unsigned probe_commands;
+        if (probe_commands++ < 64)
+            mlog(&m->log, "[ahci-probe] port=%d cmd=0x%02x wr=%d vt=%llu",
+                 p, cmd, wr, (unsigned long long)m->vtime_instr);
+        /* H2D Register FIS: low LBA bytes are at [4..6], with the
+         * 28-bit high nibble in device[3:0]; LBA48 adds [8..10]. */
+        int lba28 = cmd == ATA_CMD_READ_DMA || cmd == ATA_CMD_WRITE_DMA;
         uint64_t lba  = fis_u64(cfis, 0) | (fis_u64(cfis, 1) << 8) | (fis_u64(cfis, 2) << 16)
                       | (fis_u64(cfis, 4) << 24) | (fis_u64(cfis, 5) << 32) | (fis_u64(cfis, 6) << 40);
+        if (lba28) lba |= (uint64_t)(cfis[7] & 0x0Fu) << 24;
         uint32_t cnt  = ((uint32_t)cfis[12] | ((uint32_t)cfis[13] << 8));
-        if (cnt == 0) cnt = 65536;
+        if (cnt == 0) cnt = lba28 ? 256u : 65536u;
         int done = 0;
         switch (cmd) {
+        case ATA_CMD_READ_DMA:
         case ATA_CMD_READ_DMA_EXT:
-        case ATA_CMD_WRITE_DMA_EXT: {
-            /* S3: WRITE DMA EXT admitted; guest data travels PRDT -> image. */
-            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, wr);
+            if (wr) goto tfes;
+            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 0);
             if (done < 0) goto tfes;
             break;
-        }
+        case ATA_CMD_WRITE_DMA:
+        case ATA_CMD_WRITE_DMA_EXT:
+            if (!wr) goto tfes;
+            /* S3: writes travel guest PRDT -> attached image. */
+            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 1);
+            if (done < 0) goto tfes;
+            break;
+        case ATA_CMD_SET_FEATURES:
+            if (!wr) goto tfes;
+            done = 0;                              /* no data; transfer mode is advisory */
+            break;
         case ATA_CMD_IDENTIFY: {
             if (wr) goto tfes;
             ahci_identify(a, p, prdtl, ct);
@@ -279,12 +335,14 @@ static void ahci_engine_port(ahci_t *a, int p) {
         }
         gdw(m, hdr + 4, (uint32_t)done);       /* prdbc: bytes transferred */
         r->ci &= ~(1u << s);                    /* slot complete */
+        ahci_write_d2h_fis(a, p, 0);
         r->is |= 1u;                            /* DHRS: FIS D2H received */
         intx_update(a);                         /* S5: IS change -> line */
         continue;
     tfes:
         gdw(m, hdr + 4, 0);
         r->ci &= ~(1u << s);
+        ahci_write_d2h_fis(a, p, 1);
         r->is |= (1u << 30);                    /* TFES */
         r->tfd_err = 1;
         intx_update(a);                         /* S5 */
@@ -360,7 +418,12 @@ static void port_write(ahci_t *a, int p, uint32_t sub, uint32_t v) {
 
 static uint64_t abar_read(void *ctx, uint64_t addr, int size) {
     ahci_t *a = ctx;
-    uint64_t off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+    uint64_t off = addr - a->abar;
+    static unsigned probe_reads;
+    if (probe_reads++ < 160)
+        mlog(&a->m->log, "[ahci-mmio-probe] read off=0x%llx size=%d rip=%llx vt=%llu",
+             (unsigned long long)off, size, (unsigned long long)a->m->cpu.rip,
+             (unsigned long long)a->m->vtime_instr);
     if (size != 4) {
         /* The guest reads 32-bit only (dword array indexing).  Assemble
          * byte/other sizes from the containing dword for robustness. */
@@ -386,13 +449,18 @@ static uint64_t abar_read(void *ctx, uint64_t addr, int size) {
 
 static void abar_write(void *ctx, uint64_t addr, int size, uint64_t val) {
     ahci_t *a = ctx;
-    uint64_t off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+    uint64_t off = addr - a->abar;
+    static unsigned probe_writes;
+    if (probe_writes++ < 160)
+        mlog(&a->m->log, "[ahci-mmio-probe] write off=0x%llx size=%d val=0x%llx rip=%llx vt=%llu",
+             (unsigned long long)off, size, (unsigned long long)val,
+             (unsigned long long)a->m->cpu.rip, (unsigned long long)a->m->vtime_instr);
     if (size != 4) {
         uint32_t old = (uint32_t)abar_read(ctx, addr & ~3ull, 4);
         uint64_t in = addr & 3ull, mask = 0;
         for (int i = 0; i < size; i++) mask |= 0xFFull << (8 * (in + i));
         val = (old & ~mask) | ((val << (8 * in)) & mask);
-        addr &= ~3ull; off = addr - (a->ctrl ? AHCI_ABAR2 : AHCI_ABAR);
+        addr &= ~3ull; off = addr - a->abar;
     }
     if (off < 0x100) {
         switch (off) {
@@ -406,6 +474,62 @@ static void abar_write(void *ctx, uint64_t addr, int size, uint64_t val) {
     if (p >= 0) port_write(a, p, (uint32_t)(off & 0x7Fu), (uint32_t)val);
 }
 
+static ahci_t *ahci_pci_controller(pci_dev_t *d) {
+    if (!d || d->bus != 0 || d->dev != 31) return NULL;
+    if (d->func == 2) return &g_ahci[0];
+    if (d->func == 3) return &g_ahci[1];
+    return NULL;
+}
+
+uint64_t ahci_pci_cfg_read(struct pci_dev *dev, int reg, int size) {
+    pci_dev_t *d = dev;
+    ahci_t *a = ahci_pci_controller(d);
+    if (!a || size <= 0 || size > 8) return 0;
+    uint32_t bar5 = d->cfg[0x24] | ((uint32_t)d->cfg[0x25] << 8)
+                  | ((uint32_t)d->cfg[0x26] << 16) | ((uint32_t)d->cfg[0x27] << 24);
+    if (a->bar5_probe)
+        bar5 = ~(AHCI_ABAR_SIZE - 1u) & 0xFFFFFFF0u;
+    uint64_t value = 0;
+    for (int i = 0; i < size; i++) {
+        int off = reg + i;
+        uint8_t byte = 0;
+        if (off >= 0x24 && off < 0x28)
+            byte = (uint8_t)(bar5 >> (8 * (off - 0x24)));
+        else if (!((off >= 0x10 && off < 0x24) || (off >= 0x30 && off < 0x34))
+                 && off >= 0 && off < 256)
+            byte = d->cfg[off];
+        value |= (uint64_t)byte << (8 * i);
+    }
+    return value;
+}
+
+void ahci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
+    pci_dev_t *d = dev;
+    ahci_t *a = ahci_pci_controller(d);
+    if (!a || size <= 0 || size > 8) return;
+    if (reg == 0x24 && size == 4 && (uint32_t)val == 0xFFFFFFFFu) {
+        a->bar5_probe = 1;
+        return;
+    }
+
+    int touches_bar5 = reg < 0x28 && reg + size > 0x24;
+    if (touches_bar5) a->bar5_probe = 0;
+    pci_default_cfg_write(d, reg, size, val);
+    /* BAR0..4 and the expansion-ROM BAR are not implemented by this HBA. */
+    memset(d->cfg + 0x10, 0, 0x14);
+    memset(d->cfg + 0x30, 0, 4);
+    if (touches_bar5) {
+        uint32_t requested = d->cfg[0x24] | ((uint32_t)d->cfg[0x25] << 8)
+                           | ((uint32_t)d->cfg[0x26] << 16) | ((uint32_t)d->cfg[0x27] << 24);
+        uint32_t base = requested & ~(AHCI_ABAR_SIZE - 1u);
+        d->cfg[0x24] = (uint8_t)base;
+        d->cfg[0x25] = (uint8_t)(base >> 8);
+        d->cfg[0x26] = (uint8_t)(base >> 16);
+        d->cfg[0x27] = (uint8_t)(base >> 24);
+        ahci_set_abar(a, base);
+    }
+}
+
 void ahci_register_ctrl(machine_t *m, int ctrl) {
     if (ctrl < 0 || ctrl >= AHCI_CTRLS) return;
     ahci_t *a = &g_ahci[ctrl];
@@ -413,6 +537,7 @@ void ahci_register_ctrl(machine_t *m, int ctrl) {
     a->m = m;
     a->ctrl = ctrl;
     uint32_t base = ctrl ? AHCI_ABAR2 : AHCI_ABAR;
+    a->abar = base;
     mem_register_mmio(m, base, AHCI_ABAR_SIZE, abar_read, abar_write,
                       a, ctrl ? "AHCI ABAR2" : "AHCI ABAR");
     mlog(&m->log, "%s ABAR registered at 0x%x (%u ports, S1: registers+presence)\n",

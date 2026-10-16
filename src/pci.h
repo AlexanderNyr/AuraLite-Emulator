@@ -5,6 +5,13 @@
 #include <stdint.h>
 #include "machine.h"
 
+/* Q35 PAM layout: PAM0 bits 5:4 control the entire 0xF0000-0xFFFFF BIOS
+ * window; PAM1..6 control 0xC0000-0xEFFFF in two 16-KiB windows per byte.
+ * Each 2-bit field selects read-from-RAM and write-to-RAM independently. */
+#define PCI_DEVICE_ID_INTEL_Q35_MCH 0x29C0
+#define PCI_Q35_PAM0                 0x90
+#define PCI_Q35_PAM_COUNT            7
+
 typedef struct pci_dev {
     int bus, dev, func;
     uint8_t cfg[256];                 /* raw config space backing store */

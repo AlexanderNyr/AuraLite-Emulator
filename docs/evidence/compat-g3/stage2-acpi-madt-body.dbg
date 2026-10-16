@@ -1,0 +1,4 @@
+tb 0x8d0b
+continue
+info regs
+detach

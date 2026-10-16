@@ -1,0 +1,92 @@
+QEMU same-ROM Stage-4 A/B — COMPAT G3, diagnostic only
+Captured: 2026-10-16
+
+Purpose and scope
+  Extend the initial QEMU reference (Debian `bios-256k.bin`) with an A/B using
+  the exact 128 KiB Debian SeaBIOS `bios.bin` also used for the current xemu
+  stock-ROM A/B. The pinned ISO and temporary Stage-2 candidate were run under
+  identical QEMU settings for each storage mode. This independently reproduces
+  the ELF-parse boundary in QEMU and shows the candidate Stage 2 proceeds to
+  shell under the same 128 KiB firmware. The candidate ISO is modified; this is
+  mechanism evidence, not an acceptance result.
+
+Exact shared setup
+  QEMU: Debian 10.0.13 (`1:10.0.13+ds-0+deb13u1`), package/binary hashes in
+  `qemu-package-sha256.txt`.
+  BIOS: unmodified `seabios` 1.16.3-2 `bios.bin`, 131,072 bytes,
+  SHA-256 4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca.
+  Machine: q35 + TCG, Haswell, 128 MiB, one vCPU. Both ISOs use `-snapshot`.
+  Pinned ISO SHA-256 d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7.
+  Candidate ISO SHA-256 b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905;
+  only the reserved Stage-2 slot LBA 34–159 differs from the pinned ISO.
+
+Results in both QEMU storage modes
+  1. Explicit AHCI + blank USB storage:
+     `-machine q35,...,sata=off,usb=off -device ich9-ahci -device qemu-xhci`
+     with the ISO on `ahci.0` and the 1 MiB blank image on `xhci.0`.
+  2. QEMU `if=ide` ISO attachment, with the same 128 KiB BIOS, q35/TCG,
+     Haswell and memory size (no additional blank USB device in this lane).
+
+  In each mode the unmodified pinned ISO reaches Stage 4, prints
+  `[BL4] ELF parse FAILED`, and takes the missing/unloadable KERNEL.OLD fallback.
+  With the temporary candidate ISO, the same QEMU setup loads the ELF PT_LOAD
+  segments and initrd, enters long mode, and reaches `[kernel] shell active`.
+  Both logs report ACPI RSDP found/MADT parsed in QEMU. The candidate run is not
+  a pinned-image acceptance pass; the source ISO remains authoritative and was
+  not modified.
+
+Handoff capture results
+  QMP `pmemsave` captured 7,776 bytes at physical 0x10000 after the boundary.
+  The declared E820 tuples/count, RSDP, framebuffer, HHDM, CPU/BSP and BIOS flag
+  match between pinned and candidate within each QEMU mode. The pinned failure
+  has initrd phys/size 0/0; the candidate has 0x1800000/0xb22000, consistent
+  with only the candidate reaching initrd load. The raw blocks are NOT equal:
+  each pair differs in 362 bytes. Of those, 358 are beyond the declared eight
+  E820 entries in the fixed-capacity map array, and 4 are in the initrd fields.
+  Bytes beyond `mmap_count` are not treated as valid E820 entries or interpreted
+  here. Do not describe these 128 KiB BIOS pairs as byte-identical.
+
+  QEMU AHCI+USB blocks:
+    pinned    8f14046598ecd82a5d99b8e8ef3228c559418d4904f68ea159b9d7a0f30a8ea3
+    candidate a78dd3a651638b395144d4df3cac9d8ecca9855f58bb556d202feadbd8c42e42
+  QEMU `if=ide` blocks:
+    pinned    1767b8add243249fc330259750f710835454adfe508ab763650b30ed415f70b7
+    candidate 2c806e038bf459b6bab453082cfbcc478cdb682ce6f06da27de9176932155696
+  Exact decoded comparisons are `qemu-samebios-ahci-bootinfo-comparison.txt`
+  and `qemu-samebios-ide-bootinfo-comparison.txt`.
+
+Comparison with xemu under the same 128 KiB ROM
+  The candidate xemu handoff block is `stock-bios-candidate-bootinfo.bin`,
+  SHA-256 49e0c14b98b8f381d951419c3a7efe7c85b810a010f277897446313da041f2c3.
+  It was captured from the temporary candidate ISO with the exact same `bios.bin`,
+  Haswell profile, AHCI ISO and blank USB image. At the kernel-entry breakpoint,
+  RDI=0x10000; the parser confirms the 7,776-byte layout, HHDM, initrd, one CPU,
+  seven E820 entries and `rsdp_phys=0` (absent). The captured handoff block's
+  scope is candidate-only; it is not pinned-image validation.
+
+  Selected stable fields in QEMU AHCI+USB and xemu match (magic, zero FB,
+  HHDM, initrd, CPU/BSP and BIOS flag). They are not byte-identical: only 19
+  raw bytes differ. QEMU reports RSDP 0xf67b0 and eight E820 entries; xemu
+  reports no RSDP and seven entries. QEMU q35 uses LPC 8086:2918, which this
+  SeaBIOS ACPI allowlist recognizes; xemu advertises LPC 8086:1e55, which the
+  allowlist omits. The ROM-only ACPI-ID probe elsewhere in this bundle confirms
+  that specific RSDP gate. No cause is assigned to the remaining E820 tuple
+  differences, and they are not allocator-zone measurements.
+  Comparison output: `stock-bios-bootinfo-comparison.txt`.
+
+Configuration caveat
+  The earlier limited reference used the separate 256 KiB `bios-256k.bin` and
+  `-drive if=ide`; in that configuration both pinned and candidate ISOs reached
+  shell and their captured blocks were byte-identical. That is a distinct BIOS
+  image/configuration from these 128 KiB same-ROM tests; do not conflate the
+  outcomes or claim a single-variable firmware/transport explanation.
+
+Reproduction
+  `commands.txt` contains the exact QEMU commands. `run_qemu_g3_samebios.sh`
+  packages the 128 KiB BIOS and the `ide` / `ahci-usb` modes; after the serial
+  boundary, capture with `capture_qemu_bootinfo.py <prefix>.qmp <output.bin>`.
+  Both modes were smoke-tested on the candidate ISO; each helper capture
+  matched its archived candidate block exactly. Serial captures, compressed
+  stderr and all four
+  QEMU handoff blocks are included. QEMU binaries, package files and full VM
+  snapshots are not bundled.

@@ -1,0 +1,16 @@
+ACPI table contents and Stage-2 parser-path check — diagnostic only
+
+Run identity
+- ROM: SeaBIOS ACPI-ID probe `012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5`.
+- Guest: unchanged pinned ISO SHA-256 `d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7`; original Stage-2 slot SHA-256 `3018fcd50629ceccb45a256e199192ce140a45b5dbe5f8f806b5077ff91ecfac`.
+- Emulator build used for table inspection: `e86bd0bd1cdc97cb2e78f22b336971c13978964d0df11c494a500d7dd84701df` (debugger-only PAM-aware peek change described below).
+- RAM snapshot was written to `/tmp/g3-acpi-table-inspection-fixed.snap`, 19,148,154 bytes, SHA-256 `10af7c70d1f1ae74295d13de1d89744fb81d6ec440a40ece194cce5b2df28626`; intentionally not copied into this compact bundle. `inspect_acpi_snapshot.py` extracts the sparse RAM record and checks the tables.
+
+Observed parser path
+- A breakpoint at original Stage-2 `acpi_parse_madt_body` (linear `0x8d0b`) was hit. At entry EAX=`0x07fff630`, the MADT physical address; EDX=`0x43495041` (`APIC`). The run then printed the loader's `[BL9] ACPI MADT parsed` receipt.
+- Snapshot RAM at RSDP `0xF6210` contains `RSD PTR `, revision 0, OEM ID `BOCHS `, valid first-20-byte checksum, and an RSDT pointer to `0x07FFE4C0`.
+- RSDT at `0x07FFE4C0`: signature `RSDT`, length 48, 3 entries, checksum valid. It points to MADT `0x07FFF630`.
+- MADT at `0x07FFF630`: length 110, checksum valid, Local APIC base `0xFEE00000`, flags `1`. Its structures are `(type,length) = (0,8), (1,12), (2,10) x4, (4,6)`; the type-0 entry is processor ID 0, APIC ID 0, flags 1 (enabled).
+- The live debugger's PAM-aware `x` inspection now sees the RSDP bytes at `0xF6210`; its prior reader showed the immutable flash NOP pattern there because it bypassed Q35 PAM's RAM-shadow read selection.
+
+The snapshot also records `boot_info.rsdp_phys=0xF6210` and `cpu_count=1`, but the loader preinitializes `cpu_count` to 1 and the sole APIC ID is 0. This is **not** a `boot_info_t` ABI validation. The probe run still ends at Stage 4 with `ELF parse FAILED`; ROM and snapshot are diagnostic-only. This does not validate FADT/PM behavior, IOAPIC operation, SMP startup, or an accepted full handoff.

@@ -1,0 +1,24 @@
+Rootless QEMU package extraction input hashes (Debian 13, 2026-10-16)
+Packages were downloaded with apt-get download, extracted under /tmp/g3-qemu-root,
+and not installed. These .deb files themselves are not bundled.
+
+b3b799d90b87ef2d6defa925cd48cf1691a19806f08041733a4f884d4a218b17  ipxe-qemu_1.21.1+git20250501.dad20602+dfsg-1_all.deb
+490c8a2d116001a5f3b0a6d7a7aabf6a7b629366590dc5c3f75b078e931dd129  libaio1t64_0.3.113-8+b1_amd64.deb
+775187a7be26bb0b076d1979a02163b943dbc13eb4adb0efc503223a03c75422  libcapstone5_5.0.7-1~deb13u1_amd64.deb
+6296eb5c976743ba0defb7a061ef081238ca072cf569c6bb96fd3f9095c58a30  libdaxctl1_81-1_amd64.deb
+8e37034d7864807ae2063efcc82fc79aad59069546212e6e0908ed67f9f7e107  libfdt1_1.7.2-2+b1_amd64.deb
+4c3b889607586e6328964a5f98e01ef01daa415be24334d743d6654aab4c47a4  libibverbs1_56.1-1_amd64.deb
+ee6c50ebac79aa9795e8bf9aa01d94c99984d09d22598c66be0f8ba917b62179  libkmod2_34.2-2_amd64.deb
+fe60a05d42e61cb9f49a90b872aa5ca569363b13459ee0d405243c37a7de7c93  libndctl6_81-1_amd64.deb
+ce5c153953016be42def7b105f37d55eae07a9608d1dfe6bcb03cc017fc384cb  libnl-3-200_3.7.0-2_amd64.deb
+1c8c95542688996cff8e954583642b10a3bd78b69954f565fda62144c2bc3897  libnl-route-3-200_3.7.0-2_amd64.deb
+e578583f73f8208564e5035b18aa729c441fc7ecb389c666923552e123f4d655  libnuma1_2.0.19-1_amd64.deb
+7d972d6958e915ce602e4b90debc6b4b91a01dfea1fe003d0b013756e7d9d863  libpmem1_1.13.1-1.1+b1_amd64.deb
+5b56911725905b8e2a8389c99416ca078395c4ca8ce0d516bc758d5be0134687  librdmacm1t64_56.1-1_amd64.deb
+6125698173f8be0d0de01ff897a0df3c5e50fb09f70238b26dd6574aaa0934e1  libslirp0_4.8.0-1+deb13u1_amd64.deb
+4b589c00c7a51172aace2cb2fb3d3ff32daf86c644023126dcfcaa840cc941ea  liburing2_2.9-1_amd64.deb
+01291e2c8e28e91eac6b59c983a3a44e29ad0ddb8622699fbb84cbd5f26334a4  libvdeplug2t64_4.0.1-5.1+b1_amd64.deb
+3a99dc23c42c66bb7e96dc1f2ba12b1797d154a472fbdb1cfcd822d9fb69e85b  qemu-system-common_1%3a10.0.13+ds-0+deb13u1_amd64.deb
+a0e03c526cc09d4c2ab20aa19a8c12e916cdc49a170acb16a6563c28f70eafd3  qemu-system-data_1%3a10.0.13+ds-0+deb13u1_all.deb
+5e841d0723a657fd8bc2e9e1a085d24f47fcb3e4a0f94762e6c38b429f22fbb1  qemu-system-x86_1%3a10.0.13+ds-0+deb13u1_amd64.deb
+2b590534250b940f43222eeab9a8f57f337a9d9a73fc412a43ab8cd07a7e56f6  seabios_1.16.3-2_all.deb

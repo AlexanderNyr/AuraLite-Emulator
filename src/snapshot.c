@@ -17,7 +17,7 @@
 #include "platform.h"
 
 #define SNAP_MAGIC   "AURASNP1"
-#define SNAP_VERSION 1u
+#define SNAP_VERSION 2u
 
 typedef struct {
     snap_t pub;              /* first: the modules' view */
@@ -243,10 +243,12 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
     sio_bytes(&s->pub, "cpu.statics", cs, sizeof cs);
     if (s->loading && !s->failed) { cpu_devtick_set(cs[0]); if (cs[1]) cpu_dbg_knob_resolve(); }
     sio_sparse(&s->pub, "ram", m->ram, RAM_SIZE);
-    mmio_rec(m, s);
+    /* Restore device decode state before comparing the MMIO map: the guest
+     * can relocate AHCI BAR5, and ahci_snap rebinds that live window. */
     pci_snap(m, &s->pub);
-    devices_snap(m, &s->pub);
     ahci_snap(m, &s->pub);
+    mmio_rec(m, s);
+    devices_snap(m, &s->pub);
     if (m->disk) sio_sparse(&s->pub, "disk.usb", m->disk, m->disk_len);
     for (int c = 0; c < AHCI_CTRLS; c++)
         for (int i = 0; i < AHCI_MAX_ATTACH; i++)

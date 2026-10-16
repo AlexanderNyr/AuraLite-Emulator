@@ -15,7 +15,7 @@
 #define RAM_SIZE   (128u*1024*1024)   /* matches bochsrc "megs:128" */
 #define ROM_SIZE   (128u*1024)        /* 0x20000, matches firmware.bin size */
 
-#define ROM_ALIAS_LOW_BASE   0x000E0000ULL   /* legacy 128K BIOS shadow window */
+#define ROM_ALIAS_LOW_BASE   0x000E0000ULL   /* 128K firmware flash alias; PAM selects RAM shadow */
 #define ROM_TOPOF4G_BASE     0xFFFE0000ULL   /* top-of-4GB reset window */
 
 /* ---- MMIO callback device model ---- */
@@ -121,7 +121,7 @@ typedef struct vcpu_slot {
 struct machine {
     cpu_t cpu;
     uint8_t *ram;
-    uint8_t *rom;      /* 128KB firmware image, read-only to the guest */
+    uint8_t *rom;      /* immutable 128KB flash image; PAM shadow is backed by RAM */
     size_t   rom_len;
 
     mmio_region_t *mmio_list;
@@ -287,6 +287,9 @@ static inline lapic_t *vcpu_lapic(machine_t *m, int i) {
 void      mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len);
 void      mem_done(machine_t *m);                            /* C10: frees ram/rom */
 uint64_t  mem_read(machine_t *m, uint64_t phys, int size);
+/* Side-effect-free one-byte physical peek that follows RAM/ROM/PAM decoding
+ * and refuses device MMIO callbacks (used by debugger inspection). */
+int       mem_debug_peek_byte(machine_t *m, uint64_t phys, uint8_t *out);
 void      mem_write(machine_t *m, uint64_t phys, int size, uint64_t val);
 void      mem_register_mmio(machine_t *m, uint64_t base, uint64_t size,
                              mmio_read_fn r, mmio_write_fn w, void *ctx, const char *name);

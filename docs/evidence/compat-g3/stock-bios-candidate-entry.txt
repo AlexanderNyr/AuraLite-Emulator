@@ -1,0 +1,40 @@
+Candidate kernel-entry/handoff capture — stock Debian SeaBIOS, diagnostic ISO only
+Captured: 2026-10-16
+
+Run identity
+  x86emu O2 SHA-256 2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9
+  Stock unmodified Debian SeaBIOS 1.16.3-2 `bios.bin` SHA-256
+  4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca
+  Temporary candidate ISO SHA-256
+  b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+  Haswell profile, blank USB on `--disk`, candidate ISO on `--sata`, one vCPU.
+  The pinned release ISO was not used for this handoff capture.
+
+Entry breakpoint
+  Temporary breakpoint at kernel `_start`, RIP=0xffffffff80191640, before
+  the first kernel instruction. `RDI=0x10000`, matching BOOT_INFO_PHYS.
+  Physical 0x10000 begins with 0x4155524142544c44 (BOOT_MAGIC).
+  The raw debugger excerpt is preserved in
+  `stock-bios-candidate-handoff-parser.txt` and the execution capture in
+  `stock-bios-candidate-entry.stderr.gz` / `stock-bios-candidate-entry.stdout.txt`.
+
+Snapshot/parser result
+  Sparse RAM snapshot v2: 30,068,090 bytes, SHA-256
+  78d3bf51dbe7398b0f7941d7bffe2d2c479b2d9a0c8a3afe1d7aa7320dd0e545.
+  The 7,776-byte block was extracted to `stock-bios-candidate-bootinfo.bin`,
+  SHA-256 49e0c14b98b8f381d951419c3a7efe7c85b810a010f277897446313da041f2c3.
+  `inspect_bootinfo_snapshot.py` validates the pinned-header offsets/size,
+  magic, reserved padding, sorted/non-overlapping map entries, HHDM, CPU/BSP,
+  and the absent RSDP marker. Results are in
+  `stock-bios-candidate-handoff-parser.txt`.
+
+Observed fields
+  mmap_count=7; E820 entries are in the parser output.
+  HHDM=0xffff800000000000; initrd=0x1800000 / 0xb22000.
+  CPU count=1, BSP/APIC ID=0; boot_from_uefi=0; RSDP=0 (absent).
+
+Scope
+  This is structural handoff evidence for the **temporary candidate Stage 2**
+  under the unmodified stock ROM. It is not a pinned-image handoff check or
+  acceptance result. The pinned ISO still reaches ELF parse failure in xemu;
+  no claim is made about allocator zones, SMP, CF9 causality or PERF P4.

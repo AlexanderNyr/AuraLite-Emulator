@@ -52,7 +52,13 @@ static uint32_t cfg_data_io_read(void *ctx, uint16_t port, int size) {
     int bus=(a>>16)&0xFF, dev=(a>>11)&0x1F, func=(a>>8)&0x7, reg=(a&0xFC) + (port-0xCFC);
     pci_dev_t *d = pci_find(m, bus, dev, func);
     if (!d) return size==4?0xFFFFFFFF:(size==2?0xFFFF:0xFF);
-    return (uint32_t)(d->cfg_read ? d->cfg_read(d, reg, size) : default_cfg_read(d, reg, size));
+    uint32_t value = (uint32_t)(d->cfg_read ? d->cfg_read(d, reg, size) : default_cfg_read(d, reg, size));
+    static unsigned probe_reads;
+    if (bus == 0 && dev == 31 && probe_reads++ < 128)
+        mlog(&m->log, "[pci-probe] io-read fn=%d reg=0x%02x size=%d val=0x%08x rip=%llx vt=%llu",
+             func, reg, size, value, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
+    return value;
 }
 static void cfg_data_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
     machine_t *m = ctx;
@@ -61,6 +67,11 @@ static void cfg_data_io_write(void *ctx, uint16_t port, int size, uint32_t val) 
     int bus=(a>>16)&0xFF, dev=(a>>11)&0x1F, func=(a>>8)&0x7, reg=(a&0xFC) + (port-0xCFC);
     pci_dev_t *d = pci_find(m, bus, dev, func);
     if (!d) return;
+    static unsigned probe_writes;
+    if (bus == 0 && dev == 31 && probe_writes++ < 128)
+        mlog(&m->log, "[pci-probe] io-write fn=%d reg=0x%02x size=%d val=0x%08x rip=%llx vt=%llu",
+             func, reg, size, val, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
     if (d->cfg_write) d->cfg_write(d, reg, size, val); else default_cfg_write(d, reg, size, val);
 }
 
@@ -71,8 +82,15 @@ static uint64_t mmconfig_read(void *ctx, uint64_t addr, int size) {
     int bus=(int)((off>>20)&0xFF), dev=(int)((off>>15)&0x1F), func=(int)((off>>12)&0x7), reg=(int)(off&0xFFF);
     pci_dev_t *d = pci_find(m, bus, dev, func);
     if (!d) return size==8?~0ULL:(size==4?0xFFFFFFFF:(size==2?0xFFFF:0xFF));
-    if (reg < 256) return d->cfg_read ? d->cfg_read(d, reg, size) : default_cfg_read(d, reg, size);
-    return 0;
+    uint64_t value = reg < 256
+        ? (d->cfg_read ? d->cfg_read(d, reg, size) : default_cfg_read(d, reg, size))
+        : 0;
+    static unsigned probe_reads;
+    if (bus == 0 && dev == 31 && probe_reads++ < 128)
+        mlog(&m->log, "[pci-probe] ecam-read fn=%d reg=0x%03x size=%d val=0x%08llx rip=%llx vt=%llu",
+             func, reg, size, (unsigned long long)value, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
+    return value;
 }
 static void mmconfig_write(void *ctx, uint64_t addr, int size, uint64_t val) {
     machine_t *m = ctx;
@@ -80,13 +98,32 @@ static void mmconfig_write(void *ctx, uint64_t addr, int size, uint64_t val) {
     int bus=(int)((off>>20)&0xFF), dev=(int)((off>>15)&0x1F), func=(int)((off>>12)&0x7), reg=(int)(off&0xFFF);
     pci_dev_t *d = pci_find(m, bus, dev, func);
     if (!d || reg >= 256) return;
+    static unsigned probe_writes;
+    if (bus == 0 && dev == 31 && probe_writes++ < 128)
+        mlog(&m->log, "[pci-probe] ecam-write fn=%d reg=0x%03x size=%d val=0x%08llx rip=%llx vt=%llu",
+             func, reg, size, (unsigned long long)val, (unsigned long long)m->cpu.rip,
+             (unsigned long long)m->vtime_instr);
     if (d->cfg_write) d->cfg_write(d, reg, size, val); else default_cfg_write(d, reg, size, val);
 }
 
 /* host bridge dev0/fn0 reg 0x60: the firmware's "PCIEXBAR"-style enable register */
 static void hostbridge_write(pci_dev_t *d, int reg, int size, uint64_t val) {
     machine_t *m = d->ctx;
+    uint8_t old_pam[PCI_Q35_PAM_COUNT];
+    memcpy(old_pam, d->cfg + PCI_Q35_PAM0, sizeof old_pam);
     default_cfg_write(d, reg, size, val);
+    /* PAM0 defines only bits 5:4 for the whole F0000-FFFFF BIOS window;
+     * PAM1..6 use bits 1:0 and 5:4 for two 16-KiB windows each. In every
+     * field, bit 0 enables RAM reads and bit 1 enables RAM writes. */
+    for (int i = 0; i < size; i++) {
+        int off = reg + i;
+        if (off == PCI_Q35_PAM0)
+            d->cfg[off] &= 0x30;
+        else if (off > PCI_Q35_PAM0 && off < PCI_Q35_PAM0 + PCI_Q35_PAM_COUNT)
+            d->cfg[off] &= 0x33;
+    }
+    if (memcmp(old_pam, d->cfg + PCI_Q35_PAM0, sizeof old_pam) != 0)
+        perf_tlb_flush(m);  /* invalidate any decode of the old ROM/RAM view */
     if (reg <= 0x60 && reg+size > 0x60) {
         /* byte<<24 must be done in uint32_t: shifting 224<<24 in int is UB
          * (measured by the C10 UBSan lane). */

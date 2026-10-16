@@ -1,0 +1,53 @@
+Stage-4 ELF failure analysis (raw snapshots not included)
+
+Pinned kernel.elf:
+- 3,073,904 bytes; SHA-256 a1c5264bcf6fbed66a75e0a4a54f3deb6d713842fa64a812cb1a0a05cb647bb3.
+- ELF64, little-endian, entry 0xffffffff80191640, e_phoff=0x40,
+  e_phentsize=56, e_phnum=3. All three headers are PT_LOAD; the parser's
+  ELF_PHDR_MAX is 8 and its required phentsize is 56, so these header values
+  are accepted by elf_load.
+- PT_LOADs (offset, p_paddr, filesz, memsz):
+  (0x1000, 0xffffffff80100000, 0x918f1, 0x918f1)
+  (0x92900, 0xffffffff80192900, 0x2a12c, 0x2a12c)
+  (0xbca30, 0xffffffff801bda30, 0x230, 0x39da80)
+  The loader's low-32-bit subtraction of 0x80000000 maps these to
+  0x00100000, 0x00192900, and 0x001bda30 respectively.
+
+Unmodified Stage-2 failure:
+- Earlier first-copy debugging observed the BIOS return with FS/GS hidden
+  base 0x100 and limit 0xffff. The scratch sector at 0x11400 held ELF magic,
+  while GS:[ESI] read from 0x11500 and FS:[EDI] wrote at 0x200100 instead of
+  0x200000. The staged file therefore did not begin with its ELF header.
+- In the later ACPI-probe run with the pinned ISO and original Stage 2, a
+  19,148,154-byte AURASNP1 v2 snapshot was captured after the loader had
+  failed and tried the missing KERNEL.OLD fallback. RAM size is 128 MiB with
+  804 nonzero pages. The 3,073,904-byte region at 0x200000 has SHA-256
+  1c251fceb954e7e990c988c5e61112c9a9489d25025107d1796142d8a462f812,
+  not the kernel SHA; its first 0x300 bytes contain no ELF magic. The scratch
+  buffer has since been reused, so this end-of-run snapshot is distinct from
+  the earlier first-copy watch. Snapshot SHA-256:
+  c802a8236633280f8cae3469b730df475bb55ea7d9015994dd8419bbcc70ee3c.
+- The original image reports ELF parse FAILED; this is not evidence of an
+  invalid pinned kernel or kernel entry.
+
+Candidate source-fix diagnostic:
+- Stage 2 restores the flat FS/GS caches after INT 13h success/final failure
+  before popping the caller's saved GPR frame. go_unreal itself now uses
+  pushad/popad so it preserves all 32-bit GPRs as documented.
+- Debugger check on AHCI LBA 128 shows FS/GS base 0x100, limit 0xffff before
+  go_unreal and base 0, limit 0xffffffff after it; EAX returns as 0x80.
+- In a temporary ISO replacing only the Stage-2 slot, the loader reports ELF
+  PT_LOAD copy, initrd load, page tables and long-mode entry; the diagnostic
+  ACPI-ID ROM run reaches Ring-3 init-shell/shell-active markers at the cap
+  with fault=0. This remains a modified-image diagnostic, not acceptance.
+- The final-error path was also fault-injected by changing the KERNEL.ELF
+  first-cluster FAT link in both temporary-image FAT copies to 0x0ffffff7.
+  The invalid-LBA BIOS read returns through the exhausted-retry path; at the
+  `stc` breakpoint FS/GS are flat and EAX is restored to `0x10000b17`. The
+  full run reports `kernel.elf load FAILED`, the single KERNEL.OLD fallback
+  and its missing/unloadable halt, with `fault=0`. Neither temporary ISO is
+  acceptance evidence.
+
+The raw snapshots, original ISO, kernel and temporary ISO are not duplicated
+in the compact evidence bundle. The hash-guarded builder and all inputs/results
+are listed in README.md and commands.txt.

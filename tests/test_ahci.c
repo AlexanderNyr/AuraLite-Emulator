@@ -180,6 +180,7 @@ static void test_pxci_latches(void) {
 #define T_BUF1 0x30000u
 #define T_BUF2 0x31000u
 #define T_BUF3 0x32000u
+#define T_FB   0x24000u
 
 
 
@@ -192,9 +193,15 @@ static void t_hdr(machine_t *m, int prdtl, int wr) {
 static void t_fis(machine_t *m, uint8_t cmd, uint64_t lba, uint16_t count) {
     for (int i = 0; i < 64; i++) mem_write(m, T_CT + i, 1, 0);
     mem_write(m, T_CT + 0, 1, 0x27); mem_write(m, T_CT + 1, 1, 0x80);
-    mem_write(m, T_CT + 2, 1, cmd);  mem_write(m, T_CT + 7, 1, 0x40);
+    mem_write(m, T_CT + 2, 1, cmd);
+    mem_write(m, T_CT + 7, 1, 0x40 | ((lba >> 24) & 0x0F));
     mem_write(m, T_CT + 4, 1, lba & 0xFF);        mem_write(m, T_CT + 5, 1, (lba >> 8) & 0xFF);
-    mem_write(m, T_CT + 6, 1, (lba >> 16) & 0xFF); mem_write(m, T_CT + 8, 1, (lba >> 24) & 0xFF);
+    mem_write(m, T_CT + 6, 1, (lba >> 16) & 0xFF);
+    if (cmd != 0xC8 && cmd != 0xCA) {
+        mem_write(m, T_CT + 8, 1, (lba >> 24) & 0xFF);
+        mem_write(m, T_CT + 9, 1, (lba >> 32) & 0xFF);
+        mem_write(m, T_CT + 10, 1, (lba >> 40) & 0xFF);
+    }
     mem_write(m, T_CT + 12, 1, count & 0xFF);     mem_write(m, T_CT + 13, 1, count >> 8);
 }
 
@@ -227,6 +234,33 @@ static void test_engine_read_single(void) {
     printf("ok engine read single\n");
 }
 
+static void test_engine_read_dma_lba28(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 4 * 1024 * 1024);
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = (uint8_t)(i * 11 + 3);
+
+    mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0xC8, 7, 1);                         /* READ DMA (28-bit LBA) */
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
+    assert(mem_read(&f.m, T_CLB + 4, 4) == 512);
+    for (int i = 0; i < 512; i++)
+        assert(mem_read(&f.m, T_BUF1 + i, 1) == gx_disk[7 * 512 + i]);
+
+    /* LBA[27:24] comes from device[3:0], not the LBA48 high bytes. The
+     * deliberately out-of-range request must fail instead of aliasing LBA0. */
+    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+    t_hdr(&f.m, 1, 0);
+    t_fis(&f.m, 0xC8, 0x01000000u, 1);
+    t_prdt(&f.m, 0, T_BUF1, 512);
+    mem_write(&f.m, P(0, 0x38), 4, 1);
+    assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u);
+    fx_done(&f);
+    printf("ok engine read dma lba28\n");
+}
+
 static void test_engine_read_multi_prdt(void) {
     fx_t f; fx_init(&f);
     fx_attach_disk(&f, 0, 4 * 1024 * 1024);
@@ -253,6 +287,8 @@ static void test_engine_identify(void) {
     fx_t f; fx_init(&f);
     fx_attach_disk(&f, 0, 4 * 1024 * 1024);
     mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    mem_write(&f.m, P(0, 0x08), 4, T_FB);
+    mem_write(&f.m, P(0, 0x18), 4, 1u << 4);          /* FRE: enable FIS receive */
     t_hdr(&f.m, 1, 0);
     t_fis(&f.m, 0xEC, 0, 0);                            /* IDENTIFY: lba/count ignored */
     t_prdt(&f.m, 0, T_BUF3, 512);
@@ -264,6 +300,9 @@ static void test_engine_identify(void) {
     assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'u');
     uint32_t secs28 = (uint32_t)mem_read(&f.m, T_BUF3 + 60 * 2, 4);
     assert(secs28 == 4u * 1024 * 1024 / 512);           /* LBA28 capacity */
+    assert(mem_read(&f.m, T_FB + 0x40, 1) == 0x34);     /* D2H Register FIS */
+    assert(mem_read(&f.m, T_FB + 0x42, 1) == 0x40);     /* DRDY makes SeaBIOS accept */
+    assert(mem_read(&f.m, T_FB + 0x43, 1) == 0);        /* no ATA error */
     fx_done(&f);
     printf("ok engine identify\n");
 }
@@ -272,6 +311,8 @@ static void test_engine_read_oob_tfes(void) {
     fx_t f; fx_init(&f);
     fx_attach_disk(&f, 0, 4 * 1024 * 1024); /* 8192 sectors */
     mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+    mem_write(&f.m, P(0, 0x08), 4, T_FB);
+    mem_write(&f.m, P(0, 0x18), 4, 1u << 4);          /* FRE */
     t_hdr(&f.m, 1, 0);
     t_fis(&f.m, 0x25, 8192, 1);                         /* past end */
     t_prdt(&f.m, 0, T_BUF1, 512);
@@ -279,6 +320,9 @@ static void test_engine_read_oob_tfes(void) {
     assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u); /* cleared even on error */
     assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u); /* TFES */
     assert((mem_read(&f.m, P(0, 0x20), 4) & 1u) == 1u);         /* TFD.ERR */
+    assert(mem_read(&f.m, T_FB + 0x40, 1) == 0x34);
+    assert(mem_read(&f.m, T_FB + 0x42, 1) == 0x41);     /* DRDY | ERR */
+    assert(mem_read(&f.m, T_FB + 0x43, 1) == 0x04);     /* ABRT */
     mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);        /* guest W1C clears */
     assert(mem_read(&f.m, P(0, 0x10), 4) == 0u);
     /* next issue clears sticky ERR (guest's own exec does this) */
@@ -615,6 +659,7 @@ int main(void) {
     test_comreset_pulse();
     test_pxci_latches();
     test_engine_read_single();
+    test_engine_read_dma_lba28();
     test_engine_read_multi_prdt();
     test_engine_identify();
     test_engine_read_oob_tfes();

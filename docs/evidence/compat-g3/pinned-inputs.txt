@@ -1,0 +1,117 @@
+Pinned and diagnostic inputs — COMPAT G3, 2026-10-16
+
+Authoritative release inputs (unchanged)
+  ISO: /home/user/AuraLite-OS-compat/release/auralite.iso
+  84,934,656 bytes; SHA-256 d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7
+  Kernel: /home/user/AuraLite-OS-compat/release/kernel.elf
+  3,073,904 bytes; SHA-256 a1c5264bcf6fbed66a75e0a4a54f3deb6d713842fa64a812cb1a0a05cb647bb3
+  The ISO-extracted kernel copy was byte-identical to the release/kernel.elf.
+
+Stage 2 from the authoritative ISO
+  LBA 34 in the 512-byte BIOS-sector layout; original 6,656-byte binary SHA-256:
+  3018fcd50629ceccb45a256e199192ce140a45b5dbe5f8f806b5077ff91ecfac
+  This original Stage 2 remains in the authoritative release ISO.
+
+Candidate guest-source fix (not embedded in the authoritative ISO)
+  Source patch: stage2-fs-gs-restore.patch
+  disk.inc SHA-256 before the candidate fix:
+  2196d4359decdf9f4aee27f844581ec4e0c7340160ee3b452cebdc243c4e991c
+  Current candidate files:
+    boot/bios/stage2/disk.inc       7d0dc20e5275f861bf8595a8e9a06be9e3f45aaceb2c97c82990ebcbfeb1c0ae
+    boot/bios/stage2/unreal.inc     135ead928e870c20e12178f2708e744203451bc4ff5e12505179b3b5eb929686
+    boot/bios/stage2/stage2_start.asm
+      1a7ffdce9487018bc80e713490d43b570f9ca43d1420e0bd191f254a17151b80
+  NASM 2.16.03 output, 6,656 bytes, SHA-256:
+  51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+  Diagnostic ISO created by replacing only the reserved slot at LBA 34–159
+  (126 × 512-byte BIOS sectors, 64,512 bytes); SHA-256
+  b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+  It is diagnostic-only and is not stored. The pinned ISO hash above is unchanged.
+  An error-injection copy derived from this temporary image by
+  make_fat_failure_iso.py has SHA-256
+  cbfb4698e6e9af2878febe5adf81cfb7c92957fb4a3ebc056d22098d648a9611.
+  It changes only FAT-entry bytes at file offsets 0x24014 and 0xc4214 to
+  force the kernel chain's next read to an invalid LBA. It is diagnostic-only
+  and is not stored; the authoritative ISO/kernel are untouched.
+
+SeaBIOS, emulator, media and snapshot
+  Original recreated diagnostic ROM SHA-256:
+  69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d
+  ACPI-ID probe ROM SHA-256:
+  012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5
+  Emulator SHA-256 for initial G3 replays:
+  fda918a7ae559b5145fbb2c7a94c9b0214145043240fd7429d18be1a1059ef65
+  Emulator SHA-256 with PAM-aware debugger peek before snapshot-v2 fix:
+  e86bd0bd1cdc97cb2e78f22b336971c13978964d0df11c494a500d7dd84701df
+  Current O2 emulator (PAM-aware peeks, snapshot format v2):
+  2bc9832051d4114ca1c26c03fc360900b0ca35d287df7adedde70de09bd6afd9
+  Zero-filled USB image: 1 MiB, SHA-256
+  30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58
+  Current v2 raw ACPI table snapshot (not stored): 19,148,154 bytes,
+  SHA-256 c802a8236633280f8cae3469b730df475bb55ea7d9015994dd8419bbcc70ee3c.
+
+Candidate-only boot_info_t handoff capture (not acceptance evidence)
+  Candidate ISO SHA-256 b9d650b93a3894be4c5ea0ddcf8f3cd1bbae9958a00fc0743ee5aef56d0bb905
+  Probe ROM SHA-256 012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5
+  Kernel-entry breakpoint: RIP=0xffffffff80191640, RDI=0x10000.
+  Raw v2 snapshot (not stored): 30,080,378 bytes, SHA-256
+  784ca493b84daa8371722ebb86d87c13b5de717caf898717b45d6481bc509925.
+  Parser and generated host-header offsets are in
+  inspect_bootinfo_snapshot.py, bootinfo-layout.* and stage2-bootinfo-candidate*.
+  The candidate block matches selected fields/layout of the pinned header;
+  it does not validate the authoritative ISO's handoff.
+
+Limited QEMU reference (rootless Debian 13 package extraction)
+  qemu-system-x86 package SHA-256
+  5e841d0723a657fd8bc2e9e1a085d24f47fcb3e4a0f94762e6c38b429f22fbb1
+  SeaBIOS bios-256k.bin SHA-256 fc6d2ea888862e6b26d53fb877ab712324726eb8f44eb6baf076c64a31f1c3fb
+  Pinned and candidate ISOs both reached the kernel shell in QEMU 10.0.13.
+  Their QEMU boot_info blocks are byte-identical, SHA-256
+  9119c44956fae7044f125c52c42aaea7d76e8347333516fe74747ee447cbdd42.
+  Selected stable fields match the x86emu candidate; E820/RSDP differ under
+  the distinct firmware/transport setup. Details: qemu-reference-g3.txt.
+
+Same-stock-ROM xemu A/B (diagnostic only)
+  Current O2 x86emu, same Haswell profile and blank-USB + SATA transport;
+  unmodified Debian SeaBIOS 1.16.3-2 bios.bin (128 KiB), SHA-256
+  4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca.
+  Pinned ISO reaches ELF parse FAILED; the temporary candidate ISO reaches
+  shell active. Both report no RSDP/BSP-only, halted=1, fault=0 and the same
+  1.3-billion-step cap. The passing ISO is modified; this is a mechanism A/B,
+  not acceptance or a boot_info handoff validation. See stock-bios-ab.txt.
+  A separate stock-ROM candidate-only kernel-entry snapshot records RDI=0x10000
+  and a valid 7,776-byte block with mmap_count=7 and rsdp_phys=0; see
+  stock-bios-candidate-entry.txt. It does not validate the pinned ISO handoff.
+
+Same 128-KiB stock-ROM QEMU A/B (diagnostic only)
+  QEMU 10.0.13 used the exact same bios.bin SHA-256 above, q35/TCG, Haswell,
+  128 MiB, one vCPU and -snapshot. Under explicit AHCI + blank USB, pinned ISO
+  reaches ELF parse FAILED and the modified candidate reaches shell-active.
+  QEMU `if=ide` with the same BIOS also reproduces the pinned/candidate split.
+  QEMU finds RSDP/MADT; declared E820/RSDP fields match within each pair, but
+  initrd is absent on the pinned failure and loaded on the candidate. Raw-block
+  comparisons and the distinct 256-KiB-BIOS reference caveat are in
+  qemu-samebios-ab.txt. QEMU candidate vs xemu candidate matches selected
+  stable fields but differs in RSDP/E820; no allocator-zone inference is made.
+
+Test gates
+  make test: PASS (RC 0); 12 snapshot split lanes passed. Optional frozen
+  KERNEL/INITRD lanes and gdb lanes skipped because their inputs/tools are
+  absent. NASM 2.16.03 was placed on PATH for this run.
+  make test-sanitize: PASS (RC 0), including snapshot, debugger and monitor
+  sanitizer lanes. The full logs are in emulator-make-test-v2.log and
+  emulator-make-test-sanitize-v2.log.
+  The candidate Stage-2 INT 13h success and exhausted-failure exits were both
+  observed with flat FS/GS after go_unreal; the failure was forced only in the
+  separate bad-FAT-link temporary ISO. These are diagnostic checks, not
+  acceptance evidence.
+
+Earlier temporary Stage-2 experiment (superseded; not acceptance evidence)
+  Stage 2 SHA-256 a4165a8b10755ac9d6a197aa29ffc5a213b6fd98c504a7117bc95594fd85b7db
+  Temporary ISO SHA-256 7bbb78592c5a80276184e43f8cc12e23acf3ea6dba5024b34156f320dc2ddf8a
+  This version called go_unreal after popad; see stage2-unreal-restore.patch.
+  The only changed input was LBA 34–159; these values do not describe the
+  current candidate fix.
+
+The source fix is present in the compatibility checkout but remains a
+candidate. No change was made to the authoritative release ISO/kernel.

@@ -99,6 +99,11 @@ static uint32_t cf9_read(void *ctx, uint16_t port, int size) {
 static void cf9_write(void *ctx, uint16_t port, int size, uint32_t val) {
     machine_t *m = ctx;
     (void)port; (void)size;
+    static unsigned probe_writes;
+    if (probe_writes++ < 16)
+        mlog(&m->log, "[cf9-probe] write=0x%02x old=0x%02x CS:IP=%04x:%llx vt=%llu",
+             (unsigned)val & 0xff, m->chipset.cf9, m->cpu.seg[SEG_CS].sel,
+             (unsigned long long)m->cpu.rip, (unsigned long long)m->vtime_instr);
     uint8_t old = m->chipset.cf9;
     m->chipset.cf9 = (uint8_t)val;
     /* Hard reset: SYS_RST rises while RST_CPU is set (0x06/0x0E, also

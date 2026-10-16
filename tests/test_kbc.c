@@ -62,6 +62,49 @@ static void test_self_test_sequence(void) {
     assert((io_read(&f.m, 0x64, 1) & 0x08));         /* A2 pinned per datasheet */
 }
 
+static void set_keyboard_port_enabled(fx_t *f) {
+    io_write(&f->m, 0x64, 1, 0x60);                   /* write command byte */
+    io_write(&f->m, 0x60, 1, 0x20);                   /* keyboard enabled, IRQ off */
+}
+
+static void test_keyboard_reset_ack_bat(void) {
+    fx_t f; fx_init(&f);
+    set_keyboard_port_enabled(&f);
+    io_write(&f.m, 0x60, 1, 0xFF);                   /* keyboard reset */
+    assert(io_read(&f.m, 0x64, 1) & 0x01);           /* ACK available */
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+    assert(io_read(&f.m, 0x64, 1) & 0x01);           /* BAT follows ACK */
+    assert(io_read(&f.m, 0x60, 1) == 0xAA);
+    assert(!(io_read(&f.m, 0x64, 1) & 0x01));
+    assert(!pic_pending(&f.m));
+}
+
+static void test_keyboard_command_replies(void) {
+    fx_t f; fx_init(&f);
+    set_keyboard_port_enabled(&f);
+
+    io_write(&f.m, 0x60, 1, 0xF0);                   /* set/query scan set */
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+    io_write(&f.m, 0x60, 1, 0x00);                   /* query current set */
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+    assert(io_read(&f.m, 0x60, 1) == 0x02);         /* power-on set 2 */
+
+    io_write(&f.m, 0x60, 1, 0xED);                   /* LEDs + parameter */
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+    io_write(&f.m, 0x60, 1, 0x07);
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+
+    io_write(&f.m, 0x60, 1, 0xF2);                   /* MF2 identify */
+    assert(io_read(&f.m, 0x60, 1) == 0xFA);
+    assert(io_read(&f.m, 0x60, 1) == 0xAB);
+    assert(io_read(&f.m, 0x60, 1) == 0x83);
+    io_write(&f.m, 0x60, 1, 0xFE);                   /* resend last reply */
+    assert(io_read(&f.m, 0x60, 1) == 0x83);
+
+    io_write(&f.m, 0x60, 1, 0xEE);                   /* echo */
+    assert(io_read(&f.m, 0x60, 1) == 0xEE);
+}
+
 static void test_command_byte_roundtrip(void) {
     fx_t f; fx_init(&f);
     io_write(&f.m, 0x64, 1, 0x60);                   /* write cmd byte */
@@ -180,6 +223,8 @@ static void test_cli_parse(void) {
 
 int main(void) {
     test_self_test_sequence();
+    test_keyboard_reset_ack_bat();
+    test_keyboard_command_replies();
     test_command_byte_roundtrip();
     test_injected_key_irq1_drain_quiet();
     test_queue_flows_in_order();

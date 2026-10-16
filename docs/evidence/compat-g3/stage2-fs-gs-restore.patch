@@ -1,0 +1,61 @@
+diff --git a/boot/bios/stage2/disk.inc b/boot/bios/stage2/disk.inc
+index 0211b6d..2b9f5f2 100644
+--- a/boot/bios/stage2/disk.inc
++++ b/boot/bios/stage2/disk.inc
+@@ -67,12 +67,19 @@ disk_read_lba:
+ .ok:
+     pop  es
+     pop  ds
++    ; INT 13h may return through a 32-bit BIOS thunk that reloads the
++    ; hidden FS/GS caches with 64 KiB real-mode limits.  Restore the
++    ; unreal-mode flat caches before returning to fat_load/elf_load.
++    ; Keep the caller's full register frame live until the flat-cache
++    ; helper returns; popad below restores disk_read_lba's GPR contract.
++    call go_unreal
+     popad
+     clc
+     ret
+ .fail:
+     pop  es
+     pop  ds
++    call go_unreal                      ; restore flat FS/GS on all exits
+     popad
+     stc
+     ret
+diff --git a/boot/bios/stage2/stage2_start.asm b/boot/bios/stage2/stage2_start.asm
+index 4e5a101..e00d723 100644
+--- a/boot/bios/stage2/stage2_start.asm
++++ b/boot/bios/stage2/stage2_start.asm
+@@ -322,8 +322,8 @@ stage2_entry:
+     call log16_puts
+ 
+     ; Parse the ELF and copy its PT_LOAD segments to their physical
+-    ; addresses.  Requires FS still be in unreal-mode flat form; we
+-    ; never touched FS after go_unreal, so we are fine.
++    ; addresses.  INT 13h may reload FS/GS while returning through a BIOS
++    ; thunk; disk_read_lba re-establishes their unreal-mode flat caches.
+     ;
+     ; Class dispatch (I1): each loader validates its own ELFCLASS, so
+     ; a KERNEL32.ELF that is accidentally a 64-bit binary (or vice
+diff --git a/boot/bios/stage2/unreal.inc b/boot/bios/stage2/unreal.inc
+index 851114a..61e9a37 100644
+--- a/boot/bios/stage2/unreal.inc
++++ b/boot/bios/stage2/unreal.inc
+@@ -30,7 +30,7 @@
+ ; are masked across the CR0 toggle and the caller's IF is restored.
+ go_unreal:
+     pushf
+-    pusha
++    pushad
+     push ds
+     push es
+     cli
+@@ -61,7 +61,7 @@ go_unreal:
+ 
+     pop  es
+     pop  ds
+-    popa
++    popad
+     popf
+     ret
+ 
