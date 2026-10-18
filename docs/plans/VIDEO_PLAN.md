@@ -573,7 +573,68 @@ it would move the guest-visible firmware contract, which §5 forbids, and
 it would not remove the need for the clamp anyway, only reduce how often
 it fires).
 
-## 5. Standing constraints
+## 5. V5 — post-closure: the 16 MiB aperture + `vbe_start_addr` panning
+
+The V4 close-out left two measured gaps ("Not in V4"): the VRAM window was
+the 800x600x4 = 1,920,000-byte display buffer rather than a real VGA
+aperture, and the offsets were "clamped and readable but the visible
+display still renders from offset 0" -- no panning consumer.  Both are
+closed here, together, because they share one code path (`dispi_fixup`'s
+offset fold).
+
+**What changed (`src/devices.c`):**
+
+- **The aperture is the full 16 MiB Bochs/QEMU std-VGA window.**  The
+  `make_ramwindow` at `0xD0000000` now allocates `GPU_VRAM_BYTES` (16 MiB)
+  instead of `fb_w*fb_h*4`; `m->fb_w/fb_h` remain the published 800x600x32
+  DISPLAY (boot_info.fb, the 0x00200000 marker, the firmware probe -- all
+  unmoved).  Everything that used to measure "VRAM = fb_w*fb_h*4" --
+  the YRES clamp (`maxy`), the offset ladder, the enable-edge clear,
+  `VIDEO_MEMORY_64K`, the BANK mask -- now measures the aperture, exactly
+  as QEMU's `vram_size` does.  Consequences a guest can see: 1024x768x32
+  (the V4 ASan repro) **fits now**, `VIDEO_MEMORY_64K` reads 256 (was 29),
+  the BANK mask is 255 (was 28), and the clamp still fires one line short
+  of the window for oversized modes (16000x12000x32 -> YRES 262).
+- **`vbe_start_addr` is kept and consumed.**  `dispi_fixup` folds the
+  offset exactly as QEMU (`offset = X_OFFSET*bits/8 + Y_OFFSET*linelength,
+  vbe_start_addr = offset >> 2`, DWORDS), and `vga_render_display` now
+  renders the visible surface from `m->fb + vbe_start_addr` at the VBE
+  line offset (VIRT_WIDTH may exceed XRES -> the pitch may exceed a row of
+  output pixels).  Reads past the aperture render black instead of running
+  off the window -- the offset clamp only guards `YRES` rows while the
+  renderer draws `fb_h`, a case the unit vector pins explicitly.
+
+**Contract preservation (measured):**
+
+- The firmware lane is byte-stable: `GUEST_OK`, `framebuffer marker OK:
+  pixel[0]=0x00200000`, `framebuffer.ppm (800x600)` -- the firmware never
+  touches the dispi (measured: no `0x1CE`/`0x1CF` in
+  `firmware/sample_firmware.nas`) and never reads BAR size.
+- `kloader`'s FRAMEBUF memmap entry stays `fb_w*fb_h*4` -- the published
+  framebuffer, not the aperture.
+- With no dispi mode ever set (the plain `--rom` path), `vbe_start_addr`
+  is 0 and the render falls back to the historical tightly-packed copy.
+
+**Receipts (measured, this phase):**
+
+- `tests/test_video.c`: `test_dispi_mem_bank` (256/255), the reworked
+  `test_dispi_mode_clamped_to_vram` (1024x768x32 fits unclamped;
+  16000x12000x32 clamps at 262 lines with `262*64000 <= VRAM <
+  263*64000`; the offset ladder re-derived against 16 MiB: rung 1
+  8x1x8, rung 2 400x1x32, rung 3 1024x4096x32), and the new
+  `test_vbe_start_addr_panning` (Y-offset fold, X-offset pixel shift,
+  VIRT_WIDTH pitch, bounded tail render).
+- Negative control: revert `src/devices.c`, the suite aborts at the first
+  V5 assertion (`MEMORY_64K == 256`).  RC measured non-zero.
+- The 800x600x32 PPM path is byte-identical (pitch == w, offset 0).
+
+**Still not modelled** (unchanged): the BPP-4 write-handler divergence
+recorded in V4 (bounded), QEMU's `vbe_update_vgaregs` full VGA-register
+re-assertion (no sizing surface exists in this model's `vga_io_write`),
+and text-mode panning (the CRTC start address is not implemented; VBE
+panning only).
+
+## 6. Standing constraints
 
 - The guest-visible firmware contract (`firmware/sample_firmware.nas`)
   does not change; its GPU probe (`0:2:0`, `0x8086:0x0412`, BAR0

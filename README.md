@@ -13,8 +13,8 @@ A from-scratch C emulator for raw x86 firmware, with a switchable Intel platform
 - Storage, USB, video, and networking:
   - **AHCI SATA** (`src/ahci.c`, `docs/plans/STORE_PLAN.md` S0–S5): command-list/FIS/PRDT engine, `IDENTIFY`, `READ/WRITE DMA EXT`, 128 KiB transfers, up to 2 controllers (`--sata=`, `--sata-portN=`, `--ahci2`, `--sata2=`, `--sata-writethrough`), INTx delivery.
   - **USB** (`src/devices.c`, `docs/plans/USB_PLAN.md` U0–U5): EHCI (`0:29.0`) + UHCI companion (`0:1.2`, `--no-usb-uhci`) with control/bulk schedules and BOT/SCSI mass storage (`INQUIRY`, `READ CAPACITY(10)`, `TEST UNIT READY`, `REQUEST SENSE`, `READ(10)`).
-  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V4): 800×600×32 linear framebuffer (`0xD0000000`), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`).
-  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N3): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP.
+  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V5): 16 MiB VGA aperture at `0xD0000000` with the published 800×600×32 display (boot_info.fb), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`) with `vbe_start_addr` display panning.
+  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N4): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP; honest INTx (IRQ 11 / INTA#, `(ICR & IMS)` level).
 - Direct ELF64 kernel loader (`--kernel=`, `--initrd=`, `--cpus=`) and full BIOS boot route (`SeaBIOS → Stage 1 → Stage 2 → kernel.elf → init` on 1 to 4 vCPUs).
 - Non-perturbing tooling (`docs/plans/TOOLING_PLAN.md` T0–T5): standalone disassembler (`x86dis`), instruction trace with CPU-vs-disassembler self-check (`--trace-file=`), interactive debugger REPL (`--debug`, `--debug-script=`, `--symbols=`), GDB RSP server (`--gdb=`), whole-machine `AURASNP1` v2 snapshots (`--snapshot-save=`, `--snapshot-load=`), and live HTTP/WebSocket browser monitor (`--monitor=`).
 
@@ -36,10 +36,40 @@ On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries wit
 ```bat
 build.bat           REM Build x86emu.exe, x86dis.exe, and (if nasm is in PATH) firmware/disk images
 build.bat demo      REM Build and run the Haswell sample firmware demo
+build.bat gui       REM Open the full GUI at http://127.0.0.1:8080/ (same as gui.bat)
 build.bat monitor   REM Start the live browser monitor at http://127.0.0.1:8080/
 build.bat test      REM Run the native Windows C unit tests + Python G3/G5/G6 acceptance gates
 build.bat wsl test  REM Delegate full `make test` to WSL2
 ```
+
+## GUI — no command line needed
+
+`make gui` (or `python3 tools/launcher.py`; on Windows `build.bat gui` or
+double-click `gui.bat`) opens **http://127.0.0.1:8080/** — a single page that
+exposes everything the CLI offers:
+
+- **Machine setup**: boot path (firmware ROM / direct kernel ELF / disk),
+  platform profile, SMP, chipset (LPC identity, USB), SATA disks (both AHCI
+  controllers), VBE mode, TAP networking with a managed host responder
+  (`tools/tap_responder.py`), run limits, artifacts (log / PPM / text /
+  trace), debug options (gdb port, watch-phys, symbols, script, keys).
+- **Run control**: start / restart / stop, pause / continue / step, run to
+  the end, breakpoints, keyboard scancodes and ASCII typing.
+- **Live view**: framebuffer (PNG export), registers, vCPUs, mode / stop
+  state, the machine log, and the x86dbg REPL (`x/8i`, `info break`,
+  `xlate`, `savevm`/`loadvm` behind the snapshot buttons).
+- **Results**: per-run artifact download, named snapshots, named config
+  presets, and the process output (stdout receipts + stderr log ring).
+
+The launcher builds the emulator's argv strictly from its option schema
+(unknown/injected values are refused), runs each machine exactly like the
+CLI would (`--monitor=127.0.0.1:<free port>` on loopback, spliced to the
+page's `/ws`), and keeps its state (`~/.x86emu-gui` by default: presets,
+per-run artifacts, snapshots) outside the repository. At the post-mortem
+"end" stop the page keeps the final state visible; **Остановить** sends the
+monitor's `quit` so the emulator prints its stats and writes the artifacts
+before exiting. There is no authentication — same rules as the live
+monitor: keep the launcher on loopback unless remote access is intentional.
 
 ## Run
 
@@ -154,8 +184,9 @@ make test-unit
 payload (`tests/nic_tx.asm`) boots through the real firmware transport
 off a throwaway `--disk=` image, transmits a frame through the e1000 TX
 ring and a host-side responder records what arrived on the TAP endpoint.
-It needs `nasm` and `python3`, and the fixed endpoint `UDP
-127.0.0.1:8080` free; it SKIPs (exit 0) when a dependency is missing.
+It needs `nasm` and `python3`, and the TAP endpoint (default `UDP
+127.0.0.1:8080`; `AURALITE_TAP_PORT` moves the whole 8080/8081/8082
+family) free; it SKIPs (exit 0) when a dependency is missing.
 The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
 an AuraLite-OS build.
 
@@ -189,8 +220,10 @@ python3 tools/tap_responder.py --drop=arp,icmp,dhcp,dns          # withhold L2/L
 python3 tools/tap_responder.py --no-tcp                          # withhold TCP (the N3 control)
 ```
 
-It needs `python3` and the endpoints `UDP 127.0.0.1:8080`/`:8081` free —
-both harnesses now *check* that before starting a lane, because
+It needs `python3` and the TAP endpoints free (default `UDP
+127.0.0.1:8080`/`:8081`/`:8082`; set `AURALITE_TAP_PORT` to move the
+family, e.g. for two parallel test runs) —
+all three net harnesses now *check* the port before starting a lane, because
 `SO_REUSEADDR` lets two sockets bind the same port and a leftover
 responder will silently split the datagrams (ledger **D11**). `--gw-mac`
 overrides the gateway MAC, `--dns-ip` / `--dns-ttl` the A record

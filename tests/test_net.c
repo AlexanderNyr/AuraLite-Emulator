@@ -309,6 +309,118 @@ static void test_interrupt_register_semantics(void) {
     printf("ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)\n");
 }
 
+/* N4 (ledger D4): the INTx line -- the plan's `(ICR & IMS) != 0` condition
+ * on the E1000_IRQ board wire (pin level on ISA line 11 = slave bit 3,
+ * published at PCI cfg 0x3C/0x3D).  The NIC payloads unmask IMS=0xD5 but
+ * run at IF=0 and drain ICR before idling, so their receipts must not see
+ * this line -- but the machine must, and this pins it: a masked cause stays
+ * quiet, unmasking asserts, and every clear path (IMC, ICR read-to-clear,
+ * ICR W1C, CTRL.RST) drops the pin again. */
+static void test_intx_line(void) {
+    fx_t f; fx_init(&f);
+    const uint64_t line_bit = 1u << 3;              /* ISA IRQ 11 -> slave */
+
+    /* the published route: Interrupt Line 11, Interrupt Pin INTA# (the
+     * config window is dword-aligned, so both bytes read at 0x3C) */
+    io_write(&f.m, 0xCF8, 4, 0x8000203Cu);          /* 0:4.0 cfg addr, reg 0x3C */
+    {
+        uint32_t v = io_read(&f.m, 0xCFC, 4);
+        assert((v & 0xFF) == 11);                   /* cfg 0x3C: IRQ line */
+        assert(((v >> 8) & 0xFF) == 1);             /* cfg 0x3D: pin INTA# */
+    }
+
+    /* quiet out of reset */
+    assert(!(f.m.pic.slave.lines & line_bit));
+    assert(!pic_pending(&f.m));
+
+    /* a masked cause must NOT assert: ICS raises TXQE with IMS=0 */
+    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE */
+    assert(!(f.m.pic.slave.lines & line_bit));
+    assert(!pic_pending(&f.m));
+
+    /* The PIC powers up with IMR=0xFF; a guest programs its masks at boot
+     * (here: unmask master IRQ2/cascade and slave IRQ11) BEFORE the device
+     * raises anything.  With nothing deliverable the pin is still quiet. */
+    io_write(&f.m, 0x21, 1, 0xFB);                  /* unmask master IRQ2 (cascade) */
+    io_write(&f.m, 0xA1, 1, 0xF7);                  /* unmask slave IRQ11 */
+    assert(!pic_pending(&f.m));
+
+    /* unmasking the pending cause asserts the line */
+    wr(&f, 0x00D0, (1u << 7));                      /* IMS |= TXQE */
+    assert(f.m.pic.slave.lines & line_bit);         /* the pin is high */
+    assert(f.m.pic.slave.irr & line_bit);           /* edge latched into IRR */
+    assert(pic_pending(&f.m));                      /* and deliverable now */
+
+    /* the complete handler loop the plan's "EOI" element means:
+     * INTA claims the line, the handler drains ICR (pin drops), EOI. */
+    assert(pic_intack(&f.m) == 0x70 + 3);           /* vector base + 11 */
+    assert(rd(&f, 0x00C0) == (1u << 7));            /* handler: read-to-clear */
+    assert(!(f.m.pic.slave.lines & line_bit));
+    io_write(&f.m, 0xA0, 1, 0x20);                  /* slave EOI (OCW2) */
+    io_write(&f.m, 0x20, 1, 0x20);                  /* master EOI */
+    assert(!pic_pending(&f.m));                     /* quiet after the loop */
+
+    /* IMC masking drops the pin (level follows the condition) */
+    wr(&f, 0x00C8, (1u << 7));                      /* ICS: raise TXQE again */
+    assert(f.m.pic.slave.lines & line_bit);
+    wr(&f, 0x00D8, (1u << 7));                      /* IMC: mask TXQE again */
+    assert(!(f.m.pic.slave.lines & line_bit));
+    wr(&f, 0x00D0, (1u << 7));                      /* unmask for the next legs */
+    (void)rd(&f, 0x00C0);                           /* drain for a clean slate */
+
+    /* ICR read-to-clear drops the line (the handler's natural clear) */
+    wr(&f, 0x00C8, (1u << 7));
+    assert(f.m.pic.slave.lines & line_bit);
+    assert(rd(&f, 0x00C0) == (1u << 7));            /* drain TXQE */
+    assert(!(f.m.pic.slave.lines & line_bit));
+
+    /* ICR W1C drops the line too */
+    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE */
+    assert(f.m.pic.slave.lines & line_bit);
+    wr(&f, 0x00C0, (1u << 7));                      /* W1C TXQE */
+    assert(!(f.m.pic.slave.lines & line_bit));
+
+    /* a real TX doorbell asserts with IMS unmasked; draining ICR drops it */
+    {
+        const uint64_t ring = 0x100000, buf = 0x200000;
+        tx_ring_setup(&f, ring, 32);                /* CTRL.RST + rings + TCTL */
+        tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
+        (void)rd(&f, 0x00C0);                       /* drain setup TXQE */
+        wr(&f, 0x00D0, (1u << 7));                  /* IMS |= TXQE (RST cleared it) */
+        assert(!(f.m.pic.slave.lines & line_bit));  /* drained: quiet */
+        wr(&f, 0x0000, (1u << 0) | (1u << 6));      /* CTRL FD|SLU */
+        wr(&f, 0x3818, 1);                          /* the doorbell */
+        assert(f.m.pic.slave.lines & line_bit);     /* TXDW|TXQE unmasked */
+        (void)rd(&f, 0x00C0);                       /* handler drain */
+        assert(!(f.m.pic.slave.lines & line_bit));
+    }
+
+    /* RX completion asserts on RXT0; the drain drops it */
+    {
+        const uint64_t ring = 0x300000, buf = 0x400000;
+        mem_write(&f.m, ring + 0, 4, (uint32_t)buf);
+        mem_write(&f.m, ring + 4, 4, 0);
+        wr(&f, 0x2800, (uint32_t)ring); wr(&f, 0x2804, 0);
+        wr(&f, 0x2808, 8 * 16); wr(&f, 0x2810, 0); wr(&f, 0x2818, 7);
+        wr(&f, 0x0100, (1u << 1) | (1u << 15) | (1u << 26));
+        wr(&f, 0x00D0, (1u << 7));                  /* IMS |= RXT0 */
+        e1000_rx_frame(&f.m, (const uint8_t *)"\xaa\xbb", 2);
+        assert(f.m.pic.slave.lines & line_bit);
+        (void)rd(&f, 0x00C0);
+        assert(!(f.m.pic.slave.lines & line_bit));
+    }
+
+    /* CTRL.RST drops an asserted line as part of the register reset */
+    wr(&f, 0x00D0, (1u << 7));
+    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE -> assert */
+    assert(f.m.pic.slave.lines & line_bit);
+    wr(&f, 0x0000, (1u << 26));                     /* CTRL.RST */
+    assert(!(f.m.pic.slave.lines & line_bit));
+
+    fx_done(&f);
+    printf("ok e1000 intx line (cfg 0x3C/0x3D, (ICR&IMS) level, every clear path)\n");
+}
+
 static void test_tx_link_gate(void) {
     fx_t f; fx_init(&f);
     const uint64_t ring = 0x100000, buf = 0x200000;
@@ -342,6 +454,7 @@ int main(void) {
     test_tx_tctl_gate_and_doorbell();
     test_tx_multidescriptor_and_wrap();
     test_interrupt_register_semantics();
+    test_intx_line();
     test_tx_link_gate();
     printf("test-net: all tests passed\n");
     return 0;

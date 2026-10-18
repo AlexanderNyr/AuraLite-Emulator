@@ -1,4 +1,4 @@
-# NET plan — e1000 networking (N0–N3)
+# NET plan — e1000 networking (N0–N4)
 
 > **House style** (adopted from
 > [`AuraLite-OS/docs/plans`](https://github.com/AlexanderNyr/AuraLite-OS/tree/main/docs/plans)):
@@ -1187,6 +1187,53 @@ authored in N3 has a trailing-whitespace line:
 `tests/integration/n2_responder.sh`,
 `tests/integration/n3_net_e2e.sh`, `Makefile`, `CHANGELOG.md`,
 `README.md`, `ROADMAP.md`, `docs/STATUS.md` and this plan.
+
+### N4 — Honest INTx (ledger D4) — ✅ done
+
+The deferred D4 line from §3.8 is now wired, in the AHCI S5 house pattern:
+
+- **PCI config publishes the route.** `e1000_add` seeds cfg `0x3C`
+  (Interrupt Line) = `E1000_IRQ` = **11** and cfg `0x3D` (Interrupt Pin) =
+  **INTA#**; the N0 "IRQ line 0" reading is gone.  Nothing in the shipped
+  lanes pinned that string (measured: no receipt greps `IRQ line`).
+- **The board wire is the plan's condition.**  `e1000_intx_update()` drives
+  `pic_set_irq(m, 11, level)` with `level = ((ICR & IMS) != 0)`, on change
+  only (the S5 convention -- correct for both edge- and level-triggered PIC
+  configurations; `pic_set_irq` fans the same line out to the I/O APIC,
+  CHIPSET H7).  Every mutation of ICR/IMS calls it: the TX walk, RX
+  completion, ICS, ICR W1C, IMS, IMC, ICR read-to-clear, and reset
+  (CTRL.RST / device add).
+- **The EOI loop closes.**  A guest handler's natural sequence --
+  `pic_intack` claims the line, `read ICR` drops the pin, `EOI` (OCW2) --
+  is pinned end to end by the new unit vector, including the deliverability
+  order the PIC requires (IMR=0xFF at power-on; a guest unmasks master
+  IRQ2/cascade **before** the device raises, so the cascade edge latches).
+
+Why this could not ship in N1 (the D4 note): "raising a line with no ack
+path" was the fear.  Measured now: the ack path is the PIC's INTA, the
+payloads unmask IMS=0xD5 but run at IF=0 and drain ICR before idling, and
+the PIC comes up fully masked so a high pin is not deliverable until a guest
+programs it.  The wire is machine honesty in the frozen-guest lanes, and a
+real interrupt-driven guest finally gets what cfg `0x3C` advertises.
+
+**Receipts (measured, this phase):**
+
+- `tests/test_net.c` `test_intx_line`: cfg readback through the 0xCF8/0xCFC
+  window (line 11, pin INTA#), masked cause stays quiet, unmask asserts,
+  full handler loop (intack -> vector 0x73 -> ICR drain -> pin drop -> EOI),
+  IMC drop, ICR read-to-clear drop, ICR W1C drop, TX doorbell assert/drop,
+  RX completion assert/drop, CTRL.RST drop.
+- `make test-unit` green; `n1_tx_tap.sh`, `n2_responder.sh`,
+  `n3_net_e2e.sh` all "ALL PASS" with **byte-identical receipts** -- the
+  76-frame N3 tape, `N1TXOK status=01 tdh=01 icr=81`, `N3OK` -- and
+  identical wall time (n2 76 s, n3 181 s, before and after).
+- Negative control: revert `src/e1000.c` to the N3 state, `test-net` aborts
+  at the first new assertion (`cfg 0x3C == 11` -- the "IRQ line 0" world).
+  RC measured non-zero.
+
+**Still not in N4** (unchanged from §3.8): D7 (gateway MAC, unmeasurable
+here), the polled-payload design itself, and MSI/MSI-X (the 82540EM has
+MSI capability in silicon; this machine models INTx only, like AHCI).
 
 ## 3. Standing constraints
 

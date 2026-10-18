@@ -1,0 +1,385 @@
+From 8b193e2f8b667541b6724e75d55124d95a2c6088 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sun, 18 Oct 2026 15:56:12 +0000
+Subject: [PATCH] NET N4: honest INTx (ledger D4)
+
+The e1000 finally drives its interrupt line.  e1000_add seeds PCI cfg 0x3C
+(Interrupt Line) = E1000_IRQ = 11 and 0x3D (Interrupt Pin) = INTA#, and
+e1000_intx_update() drives pic_set_irq(m, 11, level) with the plan's
+((ICR & IMS) != 0) condition -- on change only, the AHCI S5 pattern, with
+the CHIPSET H7 fan-out to the I/O APIC inside pic_set_irq.  Every ICR/IMS
+mutation recomputes the level: the TX walk, RX completion, ICS, ICR W1C,
+IMS, IMC, ICR read-to-clear, and reset (CTRL.RST / device add).
+
+N1 could not raise a line without an ack path; measured now, the ack path
+is the PIC's INTA, the NIC payloads unmask IMS=0xD5 but run at IF=0 and
+drain ICR before idling, and the PIC powers up with IMR=0xFF so a high pin
+is not deliverable until a guest programs its masks.  The full handler
+loop (intack -> vector 0x73 -> ICR drain -> pin drop -> EOI) is pinned by
+test_net.c test_intx_line, including the guest's programming order (unmask
+master IRQ2/cascade before the device raises, so the cascade edge latches).
+
+Receipts: make test-unit green; n1/n2/n3 ALL PASS with byte-identical
+receipts (the 76-frame N3 tape, N1TXOK ... icr=81, N3OK) and identical
+wall time.  NC: revert src/e1000.c and test-net aborts at 'cfg 0x3C == 11'
+(the "IRQ line 0" world).  No shipped receipt pinned that string.
+---
+ CHANGELOG.md           |  18 +++++++
+ docs/plans/NET_PLAN.md |  49 +++++++++++++++++-
+ src/e1000.c            |  51 +++++++++++++++++--
+ tests/test_net.c       | 113 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 225 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5a08151..d73e4c7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,24 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0067 (NET N4, honest INTx — ledger D4)
++
++- **The e1000 INTx line is wired** (the deferred D4, its own phase because
++  it touches `src/`): PCI cfg `0x3C` = IRQ 11 and `0x3D` = INTA# are
++  seeded, and `e1000_intx_update()` drives `pic_set_irq(m, 11, level)`
++  with the plan's `((ICR & IMS) != 0)` condition -- on change only, the
++  AHCI S5 pattern; `pic_set_irq` fans out to the I/O APIC (H7).  Every
++  ICR/IMS mutation recomputes the level: the TX walk, RX completion, ICS,
++  ICR W1C, IMS, IMC, ICR read-to-clear, reset.  The EOI loop is pinned end
++  to end by the new `test_intx_line` (intack -> vector 0x73 -> ICR drain ->
++  pin drop -> EOI), including the PIC power-on IMR=0xFF deliverability
++  order.
++- The N1 "IRQ line 0" guest reading is gone; no shipped receipt pinned
++  that string (measured).  n1/n2/n3 stay ALL PASS with byte-identical
++  receipts (76-frame tape, `N1TXOK ... icr=81`, `N3OK`) and identical
++  wall time.  NC: revert `src/e1000.c` -> `test-net` aborts at
++  `cfg 0x3C == 11`.
++
+ ### Fixed — patch 0066 (post-audit A1–A3: debugger clarity, alias warning, TAP port)
+ 
+ - **A1 debugger linear address.**  `$rip` is the raw IP while `$lin` is
+diff --git a/docs/plans/NET_PLAN.md b/docs/plans/NET_PLAN.md
+index d58c950..20dc00f 100644
+--- a/docs/plans/NET_PLAN.md
++++ b/docs/plans/NET_PLAN.md
+@@ -1,4 +1,4 @@
+-# NET plan — e1000 networking (N0–N3)
++# NET plan — e1000 networking (N0–N4)
+ 
+ > **House style** (adopted from
+ > [`AuraLite-OS/docs/plans`](https://github.com/AlexanderNyr/AuraLite-OS/tree/main/docs/plans)):
+@@ -1188,6 +1188,53 @@ authored in N3 has a trailing-whitespace line:
+ `tests/integration/n3_net_e2e.sh`, `Makefile`, `CHANGELOG.md`,
+ `README.md`, `ROADMAP.md`, `docs/STATUS.md` and this plan.
+ 
++### N4 — Honest INTx (ledger D4) — ✅ done
++
++The deferred D4 line from §3.8 is now wired, in the AHCI S5 house pattern:
++
++- **PCI config publishes the route.** `e1000_add` seeds cfg `0x3C`
++  (Interrupt Line) = `E1000_IRQ` = **11** and cfg `0x3D` (Interrupt Pin) =
++  **INTA#**; the N0 "IRQ line 0" reading is gone.  Nothing in the shipped
++  lanes pinned that string (measured: no receipt greps `IRQ line`).
++- **The board wire is the plan's condition.**  `e1000_intx_update()` drives
++  `pic_set_irq(m, 11, level)` with `level = ((ICR & IMS) != 0)`, on change
++  only (the S5 convention -- correct for both edge- and level-triggered PIC
++  configurations; `pic_set_irq` fans the same line out to the I/O APIC,
++  CHIPSET H7).  Every mutation of ICR/IMS calls it: the TX walk, RX
++  completion, ICS, ICR W1C, IMS, IMC, ICR read-to-clear, and reset
++  (CTRL.RST / device add).
++- **The EOI loop closes.**  A guest handler's natural sequence --
++  `pic_intack` claims the line, `read ICR` drops the pin, `EOI` (OCW2) --
++  is pinned end to end by the new unit vector, including the deliverability
++  order the PIC requires (IMR=0xFF at power-on; a guest unmasks master
++  IRQ2/cascade **before** the device raises, so the cascade edge latches).
++
++Why this could not ship in N1 (the D4 note): "raising a line with no ack
++path" was the fear.  Measured now: the ack path is the PIC's INTA, the
++payloads unmask IMS=0xD5 but run at IF=0 and drain ICR before idling, and
++the PIC comes up fully masked so a high pin is not deliverable until a guest
++programs it.  The wire is machine honesty in the frozen-guest lanes, and a
++real interrupt-driven guest finally gets what cfg `0x3C` advertises.
++
++**Receipts (measured, this phase):**
++
++- `tests/test_net.c` `test_intx_line`: cfg readback through the 0xCF8/0xCFC
++  window (line 11, pin INTA#), masked cause stays quiet, unmask asserts,
++  full handler loop (intack -> vector 0x73 -> ICR drain -> pin drop -> EOI),
++  IMC drop, ICR read-to-clear drop, ICR W1C drop, TX doorbell assert/drop,
++  RX completion assert/drop, CTRL.RST drop.
++- `make test-unit` green; `n1_tx_tap.sh`, `n2_responder.sh`,
++  `n3_net_e2e.sh` all "ALL PASS" with **byte-identical receipts** -- the
++  76-frame N3 tape, `N1TXOK status=01 tdh=01 icr=81`, `N3OK` -- and
++  identical wall time (n2 76 s, n3 181 s, before and after).
++- Negative control: revert `src/e1000.c` to the N3 state, `test-net` aborts
++  at the first new assertion (`cfg 0x3C == 11` -- the "IRQ line 0" world).
++  RC measured non-zero.
++
++**Still not in N4** (unchanged from §3.8): D7 (gateway MAC, unmeasurable
++here), the polled-payload design itself, and MSI/MSI-X (the 82540EM has
++MSI capability in silicon; this machine models INTx only, like AHCI).
++
+ ## 3. Standing constraints
+ 
+ - The e1000 exists **only** under `--tap=`; historical lanes (K0–K8
+diff --git a/src/e1000.c b/src/e1000.c
+index 20889af..ff57ba6 100644
+--- a/src/e1000.c
++++ b/src/e1000.c
+@@ -113,6 +113,20 @@
+ #define E1000_DLEN_MASK    0xfff80u   /* QEMU set_dlen: TDLEN/RDLEN are 128B
+                                        * multiples (both rings)                */
+ 
++/* NET N4 (ledger D4): the INTx line.  Board wire: the device asserts ISA
++ * line E1000_IRQ (published at PCI cfg 0x3C = line, 0x3D = pin INTA#)
++ * through pic_set_irq(), which fans the same line out to the I/O APIC
++ * (CHIPSET H7 board wire) -- the AHCI S5 pattern.  The line is held exactly
++ * while the interrupt condition holds, the plan's `(ICR & IMS) != 0`:
++ * a cause that is still masked stays quiet, and the natural clear paths
++ * (ICR read-to-clear, ICR W1C, IMC masking) drop the line, so a guest
++ * handler's "read ICR, then EOI" sequence re-services correctly.
++ *
++ * The NIC payloads unmask IMS=0xD5 but run at IF=0 on a polled path and
++ * drain ICR before idling, so the wire is machine honesty -- pinned by the
++ * unit vectors below, invisible to their receipts. */
++#define E1000_IRQ          11
++
+ 
+ typedef struct {
+     machine_t *m;
+@@ -129,11 +143,27 @@ typedef struct {
+      * every frame that reached the TAP socket, and every frame dropped
+      * because no socket is attached (the socketless unit lane). */
+     uint64_t tx_frames, tx_dropped;
++    /* N4: current INTx line level (the E1000_IRQ board wire).  Tracked so
++     * pic_set_irq is driven on CHANGE, the AHCI S5 convention -- correct for
++     * both edge- and level-triggered PIC configurations. */
++    int      intx;
+ } e1000_t;
+ static e1000_t g_e1000;
+ 
+ /* QEMU's e1000_reset behavioural core: zeroed register file, link up,
+  * pre-initialized RAL/RAH (AddrValid + the QEMU default MAC), RXCSUM 0. */
++/* N4: the INTx board wire.  Level = ((ICR & IMS) != 0), driven on change
++ * onto ISA line E1000_IRQ (AHCI S5 pattern; pic_set_irq fans out to the
++ * I/O APIC).  Every mutation of ICR or IMS -- causes, read-to-clear,
++ * W1C, mask, unmask, reset -- must call this. */
++static void e1000_intx_update(e1000_t *e) {
++    int line = (e->regs[E1000_ICR / 4] & e->regs[E1000_IMS / 4]) != 0;
++    if (line != e->intx) {
++        e->intx = line;
++        pic_set_irq(e->m, E1000_IRQ, line);
++    }
++}
++
+ static void e1000_reset_regs(void) {
+     memset(g_e1000.regs, 0, sizeof g_e1000.regs);
+     /* N1: the TX assembly state and the wire counters are device state, so a
+@@ -147,6 +177,7 @@ static void e1000_reset_regs(void) {
+     /* 52:54:00:12:34:56 -> RAL = 0x12005452, RAH = AV | 0x5634 */
+     g_e1000.regs[E1000_RA / 4] = 0x12005452u;
+     g_e1000.regs[(E1000_RA + 4) / 4] = RAH_AV | 0x5634u;
++    e1000_intx_update(&g_e1000);   /* N4: reset drops the INTx line */
+ }
+ 
+ /* ============================ TX ring egress ============================== */
+@@ -267,12 +298,11 @@ static void e1000_start_xmit(machine_t *m) {
+     }
+ 
+     e->tx_busy = 0;
+-    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line would
+-     * follow when (ICR & IMS) != 0.  This device has no board line wired
+-     * (the guest reads PCI cfg 0x3C as 0 and drives a polled fallback), so
+-     * ICR/ICS bookkeeping is the whole honest surface here -- see the N1
+-     * ledger entry D4 in docs/plans/NET_PLAN.md. */
++    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line (N4,
++     * ledger D4) follows the plan's `(ICR & IMS) != 0` condition -- the
++     * bookkeeping-only era of N1 is over. */
+     e->regs[E1000_ICR / 4] |= cause;
++    e1000_intx_update(e);
+ }
+ 
+ /* =============================== MMIO ===================================== */
+@@ -284,6 +314,7 @@ uint64_t e1000_mmio_read(void *ctx, uint64_t addr, int size) {
+     if (off == E1000_ICR) {                 /* read-to-clear */
+         uint32_t v = e->regs[E1000_ICR / 4];
+         e->regs[E1000_ICR / 4] = 0;
++        e1000_intx_update(e);               /* N4: clearing the cause drops the line */
+         return v;
+     }
+     return e->regs[off / 4];
+@@ -316,15 +347,19 @@ void e1000_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+          * to the guest; both are updated to keep the register file honest. */
+         e->regs[E1000_ICR / 4] |= (uint32_t)val;
+         e->regs[E1000_ICS / 4] |= (uint32_t)val;
++        e1000_intx_update(e);
+         return;
+     case E1000_ICR:
+         e->regs[E1000_ICR / 4] &= ~(uint32_t)val;
++        e1000_intx_update(e);
+         return;
+     case E1000_IMS:
+         e->regs[E1000_IMS / 4] |= (uint32_t)val;
++        e1000_intx_update(e);
+         return;
+     case E1000_IMC:
+         e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
++        e1000_intx_update(e);
+         return;
+     case E1000_TDLEN: case E1000_RDLEN:
+         e->regs[off / 4] = (uint32_t)val & E1000_DLEN_MASK;
+@@ -373,6 +408,7 @@ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len) {
+     mem_write(m, desc + 12, 1, RXD_STAT_DD);       /* status: DD */
+     g_e1000.regs[E1000_RDH / 4] = (rdh + 1) % n;
+     g_e1000.regs[E1000_ICR / 4] |= ICR_RXT0;
++    e1000_intx_update(&g_e1000);                   /* N4: RX completion raises INTx */
+ }
+ 
+ /* ===================== device model + TAP attach ========================== */
+@@ -389,6 +425,11 @@ static void e1000_add(machine_t *m) {
+     e_pci->cfg[0x11] = (uint8_t)(E1000_MMIO_BASE >> 8);
+     e_pci->cfg[0x12] = (uint8_t)(E1000_MMIO_BASE >> 16);
+     e_pci->cfg[0x13] = (uint8_t)(E1000_MMIO_BASE >> 24);
++    /* N4 (ledger D4): publish the interrupt route -- pin INTA# and the ISA
++     * line the board wire above drives, so a guest that routes interrupts
++     * reads the truth instead of "IRQ line 0". */
++    e_pci->cfg[0x3C] = (uint8_t)E1000_IRQ;    /* Interrupt Line */
++    e_pci->cfg[0x3D] = 0x01;                  /* Interrupt Pin: INTA# */
+     mem_register_mmio(m, E1000_MMIO_BASE, E1000_MMIO_SIZE,
+                       e1000_mmio_read, e1000_mmio_write, &g_e1000,
+                       "e1000 MMIO");
+diff --git a/tests/test_net.c b/tests/test_net.c
+index cf12b8e..b47cc3e 100644
+--- a/tests/test_net.c
++++ b/tests/test_net.c
+@@ -309,6 +309,118 @@ static void test_interrupt_register_semantics(void) {
+     printf("ok e1000 interrupt/register write-op parity (IMS|=, ICR&=~val, 16-bit heads)\n");
+ }
+ 
++/* N4 (ledger D4): the INTx line -- the plan's `(ICR & IMS) != 0` condition
++ * on the E1000_IRQ board wire (pin level on ISA line 11 = slave bit 3,
++ * published at PCI cfg 0x3C/0x3D).  The NIC payloads unmask IMS=0xD5 but
++ * run at IF=0 and drain ICR before idling, so their receipts must not see
++ * this line -- but the machine must, and this pins it: a masked cause stays
++ * quiet, unmasking asserts, and every clear path (IMC, ICR read-to-clear,
++ * ICR W1C, CTRL.RST) drops the pin again. */
++static void test_intx_line(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t line_bit = 1u << 3;              /* ISA IRQ 11 -> slave */
++
++    /* the published route: Interrupt Line 11, Interrupt Pin INTA# (the
++     * config window is dword-aligned, so both bytes read at 0x3C) */
++    io_write(&f.m, 0xCF8, 4, 0x8000203Cu);          /* 0:4.0 cfg addr, reg 0x3C */
++    {
++        uint32_t v = io_read(&f.m, 0xCFC, 4);
++        assert((v & 0xFF) == 11);                   /* cfg 0x3C: IRQ line */
++        assert(((v >> 8) & 0xFF) == 1);             /* cfg 0x3D: pin INTA# */
++    }
++
++    /* quiet out of reset */
++    assert(!(f.m.pic.slave.lines & line_bit));
++    assert(!pic_pending(&f.m));
++
++    /* a masked cause must NOT assert: ICS raises TXQE with IMS=0 */
++    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE */
++    assert(!(f.m.pic.slave.lines & line_bit));
++    assert(!pic_pending(&f.m));
++
++    /* The PIC powers up with IMR=0xFF; a guest programs its masks at boot
++     * (here: unmask master IRQ2/cascade and slave IRQ11) BEFORE the device
++     * raises anything.  With nothing deliverable the pin is still quiet. */
++    io_write(&f.m, 0x21, 1, 0xFB);                  /* unmask master IRQ2 (cascade) */
++    io_write(&f.m, 0xA1, 1, 0xF7);                  /* unmask slave IRQ11 */
++    assert(!pic_pending(&f.m));
++
++    /* unmasking the pending cause asserts the line */
++    wr(&f, 0x00D0, (1u << 7));                      /* IMS |= TXQE */
++    assert(f.m.pic.slave.lines & line_bit);         /* the pin is high */
++    assert(f.m.pic.slave.irr & line_bit);           /* edge latched into IRR */
++    assert(pic_pending(&f.m));                      /* and deliverable now */
++
++    /* the complete handler loop the plan's "EOI" element means:
++     * INTA claims the line, the handler drains ICR (pin drops), EOI. */
++    assert(pic_intack(&f.m) == 0x70 + 3);           /* vector base + 11 */
++    assert(rd(&f, 0x00C0) == (1u << 7));            /* handler: read-to-clear */
++    assert(!(f.m.pic.slave.lines & line_bit));
++    io_write(&f.m, 0xA0, 1, 0x20);                  /* slave EOI (OCW2) */
++    io_write(&f.m, 0x20, 1, 0x20);                  /* master EOI */
++    assert(!pic_pending(&f.m));                     /* quiet after the loop */
++
++    /* IMC masking drops the pin (level follows the condition) */
++    wr(&f, 0x00C8, (1u << 7));                      /* ICS: raise TXQE again */
++    assert(f.m.pic.slave.lines & line_bit);
++    wr(&f, 0x00D8, (1u << 7));                      /* IMC: mask TXQE again */
++    assert(!(f.m.pic.slave.lines & line_bit));
++    wr(&f, 0x00D0, (1u << 7));                      /* unmask for the next legs */
++    (void)rd(&f, 0x00C0);                           /* drain for a clean slate */
++
++    /* ICR read-to-clear drops the line (the handler's natural clear) */
++    wr(&f, 0x00C8, (1u << 7));
++    assert(f.m.pic.slave.lines & line_bit);
++    assert(rd(&f, 0x00C0) == (1u << 7));            /* drain TXQE */
++    assert(!(f.m.pic.slave.lines & line_bit));
++
++    /* ICR W1C drops the line too */
++    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE */
++    assert(f.m.pic.slave.lines & line_bit);
++    wr(&f, 0x00C0, (1u << 7));                      /* W1C TXQE */
++    assert(!(f.m.pic.slave.lines & line_bit));
++
++    /* a real TX doorbell asserts with IMS unmasked; draining ICR drops it */
++    {
++        const uint64_t ring = 0x100000, buf = 0x200000;
++        tx_ring_setup(&f, ring, 32);                /* CTRL.RST + rings + TCTL */
++        tx_desc_put(&f, ring, 0, buf, 14, 0x0B);
++        (void)rd(&f, 0x00C0);                       /* drain setup TXQE */
++        wr(&f, 0x00D0, (1u << 7));                  /* IMS |= TXQE (RST cleared it) */
++        assert(!(f.m.pic.slave.lines & line_bit));  /* drained: quiet */
++        wr(&f, 0x0000, (1u << 0) | (1u << 6));      /* CTRL FD|SLU */
++        wr(&f, 0x3818, 1);                          /* the doorbell */
++        assert(f.m.pic.slave.lines & line_bit);     /* TXDW|TXQE unmasked */
++        (void)rd(&f, 0x00C0);                       /* handler drain */
++        assert(!(f.m.pic.slave.lines & line_bit));
++    }
++
++    /* RX completion asserts on RXT0; the drain drops it */
++    {
++        const uint64_t ring = 0x300000, buf = 0x400000;
++        mem_write(&f.m, ring + 0, 4, (uint32_t)buf);
++        mem_write(&f.m, ring + 4, 4, 0);
++        wr(&f, 0x2800, (uint32_t)ring); wr(&f, 0x2804, 0);
++        wr(&f, 0x2808, 8 * 16); wr(&f, 0x2810, 0); wr(&f, 0x2818, 7);
++        wr(&f, 0x0100, (1u << 1) | (1u << 15) | (1u << 26));
++        wr(&f, 0x00D0, (1u << 7));                  /* IMS |= RXT0 */
++        e1000_rx_frame(&f.m, (const uint8_t *)"\xaa\xbb", 2);
++        assert(f.m.pic.slave.lines & line_bit);
++        (void)rd(&f, 0x00C0);
++        assert(!(f.m.pic.slave.lines & line_bit));
++    }
++
++    /* CTRL.RST drops an asserted line as part of the register reset */
++    wr(&f, 0x00D0, (1u << 7));
++    wr(&f, 0x00C8, (1u << 7));                      /* ICS: TXQE -> assert */
++    assert(f.m.pic.slave.lines & line_bit);
++    wr(&f, 0x0000, (1u << 26));                     /* CTRL.RST */
++    assert(!(f.m.pic.slave.lines & line_bit));
++
++    fx_done(&f);
++    printf("ok e1000 intx line (cfg 0x3C/0x3D, (ICR&IMS) level, every clear path)\n");
++}
++
+ static void test_tx_link_gate(void) {
+     fx_t f; fx_init(&f);
+     const uint64_t ring = 0x100000, buf = 0x200000;
+@@ -342,6 +454,7 @@ int main(void) {
+     test_tx_tctl_gate_and_doorbell();
+     test_tx_multidescriptor_and_wrap();
+     test_interrupt_register_semantics();
++    test_intx_line();
+     test_tx_link_gate();
+     printf("test-net: all tests passed\n");
+     return 0;
+-- 
+2.47.3
+

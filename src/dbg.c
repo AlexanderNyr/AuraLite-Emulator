@@ -905,6 +905,14 @@ static void cmd_regs(machine_t *m, FILE *o, int v) {
         fprintf(o, "%-3s 0x%016llx%s", gpr64n[i], (unsigned long long)c->gpr[i], (i % 4 == 3) ? "\n" : "  ");
     fprintf(o, "rip 0x%016llx  rflags 0x%016llx ", (unsigned long long)c->rip, (unsigned long long)c->rflags);
     print_flags(o, c->rflags);
+    /* A1: print the LINEAR address next to the raw RIP.  In real mode the
+     * two differ by the CS base (0xFFFF0000 for the reset vector), so
+     * "x/i $rip" reads RAM instead of the ROM at the reset vector and shows
+     * zeros -- measured, and the reason the disassembly looked empty.  The
+     * linear form is what every other address in the debugger means, so
+     * show it right where the user is already looking. */
+    fprintf(o, "\nlin 0x%016llx  (cs.base + rip; $lin in expressions, "
+               "x/i with no address uses it)", (unsigned long long)(c->seg[SEG_CS].base + c->rip));
     fprintf(o, "\ncs %04x ss %04x ds %04x es %04x fs %04x gs %04x  mode %s cpl %d vcpu %d\n",
             c->seg[SEG_CS].sel, c->seg[SEG_SS].sel, c->seg[SEG_DS].sel, c->seg[SEG_ES].sel,
             c->seg[SEG_FS].sel, c->seg[SEG_GS].sel, cpu_mode_name(c), c->seg[SEG_CS].sel & 3, v);
@@ -1114,7 +1122,11 @@ static const char *const help_text =
     "modify:      set $REG = EXPR   poke ADDR VALUE [SIZE]   (RAM only)\n"
     "snapshots:   savevm FILE   loadvm FILE   (one vCPU; taken between instructions)\n"
     "             vcpu N\n"
-    "ADDR/EXPR:   numbers, $reg, symbols (--symbols/--kernel ELF), + - * ( ), *ADDR (8-byte load)\n";
+    "ADDR/EXPR:   numbers, $reg, symbols (--symbols/--kernel ELF), + - * ( ), *ADDR (8-byte load)\n"
+    "             $rip = the raw instruction pointer; $lin = its LINEAR address\n"
+    "             (cs.base + rip).  In real mode they differ (reset vector:\n"
+    "             $rip=0xfff0, $lin=0xfffffff0), so `x/i` with NO address uses\n"
+    "             $lin, while `x/i $rip` reads the raw IP -- use $lin there.\n";
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;

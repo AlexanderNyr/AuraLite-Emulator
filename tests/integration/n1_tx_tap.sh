@@ -43,7 +43,13 @@ WORK=${1:-/tmp/n1-tx-tap}   # fixed default: the tape embeds the --disk= path, s
 KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
 INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
 RESP_TIMEOUT=${RESP_TIMEOUT:-20}
-TAP=127.0.0.1:8080
+# A3: the ground-rule endpoint is UDP 127.0.0.1:8080, but the PORT is now
+# overridable so two lanes (or two CI jobs, or a developer with something
+# else on 8080) do not collide.  The default is unchanged, so every recorded
+# receipt -- the frame hex, the responder log, the serial tape -- stays
+# byte-identical.  The emulator already takes the endpoint as --tap=host:port.
+TAP_PORT=${AURALITE_TAP_PORT:-8080}
+TAP=127.0.0.1:$TAP_PORT
 FRAME_HEX=ffffffffffff52540012345608004e3154584f4b
 
 mkdir -p "$WORK"
@@ -68,8 +74,24 @@ EOF
 # ---- endpoint would silently cost us the frame), then the emulator.
 run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
     tag=$1; shift
+    # D11: SO_REUSEADDR lets two UDP sockets split the same port's datagrams
+    # (a leftover responder silently eats the lane's frames), so refuse to
+    # start on a busy endpoint rather than misreport a harness collision.
+    python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+try:
+    s.bind(('127.0.0.1',int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+s.close(); sys.exit(0)" "$TAP_PORT" 2>/dev/null \
+        || { echo "  ERROR: UDP $TAP_PORT is already in use -- a leftover"
+             echo "         responder would split the lane's datagrams;"
+             echo "         pkill -f n1_tap_responder.py and re-run"
+             fail=1; return 1; }
     python3 "$ROOT/tests/integration/n1_tap_responder.py" \
         --out "$WORK/$tag-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
+        --port "$TAP_PORT" \
         > "$WORK/$tag-resp.out" 2>&1 &
     resp=$!
     # wait until the endpoint is actually bound
@@ -79,10 +101,10 @@ run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
 import socket,sys
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 try:
-    s.bind(('127.0.0.1',8080))
+    s.bind(('127.0.0.1',int(sys.argv[1])))
 except OSError:
     sys.exit(0)
-s.close(); sys.exit(1)" 2>/dev/null; then break; fi
+s.close(); sys.exit(1)" "$TAP_PORT" 2>/dev/null; then break; fi
         i=$((i+1)); sleep 0.05
     done
     "$X86EMU" --platform=haswell --disk="$WORK/disk.img" "$@" \

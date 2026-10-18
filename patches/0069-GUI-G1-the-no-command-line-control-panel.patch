@@ -1,0 +1,2143 @@
+From 9e6ab61fcee8f1ebaf21098c8855fce7e6c43aca Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sun, 18 Oct 2026 17:06:11 +0000
+Subject: [PATCH] GUI G1: the no-command-line control panel
+
+tools/launcher.py (stdlib-only Python 3) + web/gui.html put the whole CLI
+surface on one page: machine setup (boot path, platform, SMP, LPC/USB, the
+two SATA controllers, VBE, TAP networking with a managed tap_responder.py,
+run limits, artifact toggles, debug options), run control (start/restart/
+stop, pause/continue/step, breakpoints, scancodes and typing), the live
+view (framebuffer + PNG export, registers, vCPUs, log, the x86dbg REPL),
+named snapshots (savevm/loadvm behind buttons), per-run artifact download
+and named config presets -- all in Russian, no shell required.
+
+The launcher builds argv strictly from its option SCHEMA (choice/regex/
+int-range/existing-path; unknown keys and injected values refused -- the
+tests pin ten rejection NCs including "platform: haswell; rm -rf /"),
+runs each machine exactly like the CLI (argv list, cwd = repo root) with
+--monitor=127.0.0.1:<free port>, and splices the RFC 6455 monitor protocol
+through /ws with two independent relay pumps.  Measured defect fixed in
+the splice: the single-loop relay dropped a pending quit command when the
+client vanished mid-keyframe (one direction's sendall failure killed the
+other).
+
+T5 end-stop semantics kept: at the post-mortem stop the page keeps the
+final state visible and "Stop" sends the monitor's quit first, so the
+emulator prints stats/receipts and writes artifacts (SIGTERM is the
+fallback).  Windows: build.bat gui, gui.bat double-click, x86emu.exe
+discovery, killpg-free process termination.
+
+Gates: tests/test_gui_launcher.py (41 vectors: schema + argv shape,
+HTTP surface, lifecycle through the proxy -- 101 handshake, state push,
+continue, end stop, quit -> exit 0 -> GUEST_OK + PPM artifacts -- and the
+502/404/traversal refusals) wired into make test and make test-sanitize;
+make test 597 ok / 0 FAIL, ASan+UBSan clean, fuzz 12288 states match.
+savevm/loadvm round trip measured live through the GUI path.
+---
+ CHANGELOG.md               |  32 ++
+ Makefile                   |  11 +-
+ README.md                  |  30 ++
+ ROADMAP.md                 |   8 +
+ build.bat                  |  18 +
+ gui.bat                    |   6 +
+ tests/test_gui_launcher.py | 306 ++++++++++++++
+ tools/launcher.py          | 778 ++++++++++++++++++++++++++++++++++++
+ web/gui.html               | 794 +++++++++++++++++++++++++++++++++++++
+ 9 files changed, 1981 insertions(+), 2 deletions(-)
+ create mode 100644 gui.bat
+ create mode 100644 tests/test_gui_launcher.py
+ create mode 100644 tools/launcher.py
+ create mode 100644 web/gui.html
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1beea02..639ccbd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,38 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0069 (GUI G1, the no-command-line control panel)
++
++- **`tools/launcher.py` + `web/gui.html`: the whole CLI surface reachable
++  from one page.**  The launcher (stdlib-only Python 3) serves
++  `web/gui.html`, spawns `x86emu` exactly like the CLI would (argv list, no
++  shell, cwd = repo root) with `--monitor=127.0.0.1:<free port>`, and
++  splices the RFC 6455 monitor protocol through `/ws` (two independent
++  relay pumps -- measured: the single-loop splice dropped a pending `quit`
++  when a client vanished mid-keyframe).  The page (Russian, dark theme)
++  covers machine setup (boot path, platform, SMP, LPC/USB, SATA x2, VBE,
++  TAP + managed `tap_responder.py`, run limits, artifacts, debug options),
++  run control (start/restart/stop, pause/continue/step, breakpoints,
++  keys/typing), the live view (framebuffer + PNG export, registers, vCPUs,
++  log, x86dbg REPL), snapshots (`savevm`/`loadvm` behind buttons), per-run
++  artifact download and named config presets.
++- **argv is schema-built.**  Every option is validated against the SCHEMA
++  (choice/regex/int-range/existing-path); unknown keys and injected values
++  are refused -- `tests/test_gui_launcher.py` pins ten rejection NCs
++  (`platform: "haswell; rm -rf /"` etc.) plus the argv shape, the managed
++  output paths, the full lifecycle (start -> 101 handshake -> state push ->
++  continue -> post-mortem `end` stop -> `quit` -> exit 0 -> `GUEST_OK` +
++  PPM artifacts), presets, the 502/404 refusals and path-traversal
++  rejection (41 vectors).
++- **T5 end-stop semantics kept.**  At the post-mortem stop the page shows
++  the final state; «Остановить» sends the monitor's `quit` first so the
++  emulator prints stats/receipts and writes artifacts (SIGTERM is only the
++  fallback), then `api/stop`.
++- Integration: `make gui`, `make test-gui` (in `make test` and
++  `make test-sanitize`), `build.bat gui`, `gui.bat` double-click shortcut;
++  launcher state (`~/.x86emu-gui`: presets, runs, snapshots) stays outside
++  the repo; Windows-safe process termination.
++
+ ### Added — patch 0068 (VIDEO V5, the 16 MiB aperture + vbe_start_addr panning)
+ 
+ - **The VRAM window is the full Bochs/QEMU std-VGA aperture (16 MiB),**
+diff --git a/Makefile b/Makefile
+index 6c87c5f..2470094 100644
+--- a/Makefile
++++ b/Makefile
+@@ -273,6 +273,13 @@ test-monitor-codec: tests/test_monitor_codec.c src/ws.c src/ws.h
+ test-monitor: x86emu firmware/firmware.bin disk/disk.img tests/test_monitor.py web/monitor.html
+ 	X86EMU=./x86emu python3 tests/test_monitor.py
+ 
++test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py tools/launcher.py web/gui.html
++	python3 tests/test_gui_launcher.py
++
++gui: x86emu firmware/firmware.bin disk/disk.img
++	@echo "GUI launcher: http://127.0.0.1:8080/  (Ctrl-C to stop)"
++	python3 tools/launcher.py
++
+ # Exactly one T5 NC (wrong RFC 6455 accept GUID); the handshake lane must go red.
+ test-monitor-nc: tests/integration/t5_monitor_nc.sh
+ 	sh tests/integration/t5_monitor_nc.sh
+@@ -326,7 +333,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -336,7 +343,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+diff --git a/README.md b/README.md
+index 952cae6..8aaa5aa 100644
+--- a/README.md
++++ b/README.md
+@@ -36,11 +36,41 @@ On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries wit
+ ```bat
+ build.bat           REM Build x86emu.exe, x86dis.exe, and (if nasm is in PATH) firmware/disk images
+ build.bat demo      REM Build and run the Haswell sample firmware demo
++build.bat gui       REM Open the full GUI at http://127.0.0.1:8080/ (same as gui.bat)
+ build.bat monitor   REM Start the live browser monitor at http://127.0.0.1:8080/
+ build.bat test      REM Run the native Windows C unit tests + Python G3/G5/G6 acceptance gates
+ build.bat wsl test  REM Delegate full `make test` to WSL2
+ ```
+ 
++## GUI — no command line needed
++
++`make gui` (or `python3 tools/launcher.py`; on Windows `build.bat gui` or
++double-click `gui.bat`) opens **http://127.0.0.1:8080/** — a single page that
++exposes everything the CLI offers:
++
++- **Machine setup**: boot path (firmware ROM / direct kernel ELF / disk),
++  platform profile, SMP, chipset (LPC identity, USB), SATA disks (both AHCI
++  controllers), VBE mode, TAP networking with a managed host responder
++  (`tools/tap_responder.py`), run limits, artifacts (log / PPM / text /
++  trace), debug options (gdb port, watch-phys, symbols, script, keys).
++- **Run control**: start / restart / stop, pause / continue / step, run to
++  the end, breakpoints, keyboard scancodes and ASCII typing.
++- **Live view**: framebuffer (PNG export), registers, vCPUs, mode / stop
++  state, the machine log, and the x86dbg REPL (`x/8i`, `info break`,
++  `xlate`, `savevm`/`loadvm` behind the snapshot buttons).
++- **Results**: per-run artifact download, named snapshots, named config
++  presets, and the process output (stdout receipts + stderr log ring).
++
++The launcher builds the emulator's argv strictly from its option schema
++(unknown/injected values are refused), runs each machine exactly like the
++CLI would (`--monitor=127.0.0.1:<free port>` on loopback, spliced to the
++page's `/ws`), and keeps its state (`~/.x86emu-gui` by default: presets,
++per-run artifacts, snapshots) outside the repository. At the post-mortem
++"end" stop the page keeps the final state visible; **Остановить** sends the
++monitor's `quit` so the emulator prints its stats and writes the artifacts
++before exiting. There is no authentication — same rules as the live
++monitor: keep the launcher on loopback unless remote access is intentional.
++
+ ## Run
+ 
+ The emulator returns exit code `0` for a normal stop or instruction-limit stop and exit code `2` when the CPU enters a fault state. Input-file errors return exit code `1`.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index d6b8f06..edc61ae 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -55,6 +55,14 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ All ten plans in the ledger above are **CLOSED**. Recent patches:
+ 
++- ~~`0069` — GUI G1: `tools/launcher.py` + `web/gui.html` make the whole
++  CLI surface reachable from one page -- machine setup (every option,
++  schema-validated), run control, live framebuffer/registers/log/REPL,
++  snapshots, artifact download, presets, managed TAP responder; the
++  monitor protocol spliced through `/ws` (two-pump relay), `make gui`,
++  `make test-gui` (41 vectors incl. ten injection-rejection NCs),
++  `gui.bat`.~~ shipped.
++
+ - ~~`0068` — VIDEO V5: the VRAM window is the full 16 MiB Bochs/QEMU
+   std-VGA aperture (decoupled from the published 800x600x32 display that
+   `boot_info.fb` and the `0x00200000` marker pin), and `dispi_fixup`'s
+diff --git a/build.bat b/build.bat
+index ea14f2e..e0c16a9 100644
+--- a/build.bat
++++ b/build.bat
+@@ -25,6 +25,7 @@ if /I "%TARGET%"=="all"      goto :build_all
+ if /I "%TARGET%"=="firmware" goto :build_firmware
+ if /I "%TARGET%"=="demo"     goto :run_demo
+ if /I "%TARGET%"=="monitor"  goto :run_monitor
++if /I "%TARGET%"=="gui"      goto :run_gui
+ if /I "%TARGET%"=="test"     goto :run_tests
+ 
+ echo [build.bat] Unknown command: "%TARGET%"
+@@ -164,6 +165,23 @@ echo             Open http://127.0.0.1:8080/ in your browser.
+ .\x86emu.exe --platform=haswell --max-instr=5000000 --monitor=127.0.0.1:8080 --debug
+ exit /b %ERRORLEVEL%
+ 
++:run_gui
++if not exist x86emu.exe call :build_all
++if errorlevel 1 exit /b 1
++if not exist firmware\firmware.bin call :build_firmware
++if errorlevel 1 exit /b 1
++set "PY="
++where py >nul 2>nul && set "PY=py -3"
++if not defined PY where python >nul 2>nul && set "PY=python"
++if not defined PY (
++  echo [build.bat] Python 3 is required for the GUI launcher.
++  exit /b 1
++)
++echo [build.bat] Starting the GUI launcher on http://127.0.0.1:8080/ ...
++echo             Open http://127.0.0.1:8080/ in your browser -- from here everything is GUI.
++%PY% tools\launcher.py
++exit /b %ERRORLEVEL%
++
+ REM ----------------------------------------------------------------------------
+ REM Unit, Tooling, and COMPAT acceptance tests
+ REM ----------------------------------------------------------------------------
+diff --git a/gui.bat b/gui.bat
+new file mode 100644
+index 0000000..6c64fd0
+--- /dev/null
++++ b/gui.bat
+@@ -0,0 +1,6 @@
++@echo off
++REM gui.bat -- double-click to open the AuraLite-Emulator GUI in your browser.
++REM Everything (machine setup, start/stop, live view, snapshots, artifacts)
++REM happens in the browser at http://127.0.0.1:8080/ -- no command line needed.
++cd /d "%~dp0"
++call build.bat gui
+diff --git a/tests/test_gui_launcher.py b/tests/test_gui_launcher.py
+new file mode 100644
+index 0000000..73dc107
+--- /dev/null
++++ b/tests/test_gui_launcher.py
+@@ -0,0 +1,306 @@
++#!/usr/bin/env python3
++"""tests/test_gui_launcher.py -- GUI G1 vectors for tools/launcher.py.
++
++The launcher is the no-command-line back end: it must build the emulator's
++argv strictly from its SCHEMA (nothing user-supplied can become a flag),
++serve the GUI page, manage the machine lifecycle, and splice the WebSocket
++monitor protocol through /ws.
++
++Vectors:
++  A. argv construction and schema validation (incl. the rejection NCs).
++  B. HTTP surface: page, status, meta, files, presets round trip.
++  C. lifecycle + WS proxy against the real emulator: start -> running,
++     RFC 6455 handshake through the proxy, first frame is a state push,
++     continue -> the run ends with exit 0 and the known receipts, artifacts
++     land in the run dir, output tails readable.
++  D. refusals: /ws with no machine is 502, unknown API 404, snapshot delete
++     of a missing file, bad preset name.
++"""
++import base64
++import json
++import os
++import socket
++import subprocess
++import sys
++import tempfile
++import time
++import urllib.error
++import urllib.request
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++import launcher  # noqa: E402
++
++fails = 0
++
++
++def check(cond, label):
++    global fails
++    if cond:
++        print("ok  ", label)
++    else:
++        print("FAIL", label)
++        fails += 1
++
++
++def http(port, path, method="GET", body=None):
++    url = "http://127.0.0.1:%d%s" % (port, path)
++    data = json.dumps(body).encode() if body is not None else None
++    req = urllib.request.Request(url, data=data, method=method,
++                                 headers={"Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(req, timeout=10) as r:
++            return r.status, r.read()
++    except urllib.error.HTTPError as e:
++        return e.code, e.read()
++
++
++def jhttp(port, path, method="GET", body=None):
++    code, raw = http(port, path, method, body)
++    try:
++        return code, json.loads(raw.decode() or "{}")
++    except ValueError:
++        return code, {}
++
++
++# ---------------- A. schema / argv ------------------------------------------
++
++def test_schema():
++    cfg = launcher.validate_config({
++        "platform": "haswell", "rom": "firmware/firmware.bin",
++        "disk": "disk/disk.img", "max_instr": 200000, "stats": True,
++        "log": True, "dump_fb": True, "smp": 2, "lpc": "ich9",
++        "vbe": "1024x768x32", "tap": "127.0.0.1:8080", "ahci2": True,
++        "gdb": "1234", "watch_phys": "0x100000", "keys": "1E,9E",
++    })
++    argv = launcher.build_argv("./x86emu", cfg, "/tmp/runX", 4242)
++    joined = " ".join(argv)
++    check(argv[0] == "./x86emu", "argv starts at the emulator")
++    check("--monitor=127.0.0.1:4242" in joined, "argv carries exactly the monitor spec")
++    check(joined.count("--monitor=") == 1, "monitor spec appears once")
++    check("--platform=haswell" in joined and "--smp=2" in joined, "choice + int flags")
++    check("--stats" in joined and "--ahci2" in joined, "bool flags")
++    check("--log=/tmp/runX/log.txt" in joined and "--dump-fb=/tmp/runX/framebuffer.ppm" in joined,
++          "managed outputs point into the run dir")
++    check("--vbe=1024x768x32" in joined and "--tap=127.0.0.1:8080" in joined, "regex strings")
++    check("--gdb=1234" in joined and "--watch-phys=0x100000" in joined, "debug strings")
++
++    # rejection NCs: every one of these must be refused, not sanitized
++    def rejects(cfg, label):
++        try:
++            launcher.validate_config(cfg)
++            check(False, label + " (accepted!)")
++        except launcher.ConfigError:
++            check(True, label)
++
++    rejects({"platform": "haswell; rm -rf /"}, "reject platform injection")
++    rejects({"unknown_flag": 1}, "reject unknown key")
++    rejects({"rom": "/nonexistent/nope.bin"}, "reject missing path")
++    rejects({"smp": 99}, "reject smp out of range")
++    rejects({"max_instr": "abc"}, "reject non-integer")
++    rejects({"lpc": "evil"}, "reject lpc choice")
++    rejects({"vbe": "99999x99999x7"}, "reject vbe pattern")
++    rejects({"tap": "host;cat /etc/passwd"}, "reject tap pattern")
++    rejects({"keys": "zz,zz"}, "reject keys pattern")
++    rejects({"log": "/etc/passwd"}, "reject managed output override")
++
++# ---------------- B. HTTP surface -------------------------------------------
++
++
++def test_http_surface(port):
++    code, raw = http(port, "/")
++    check(code == 200 and b"AuraLite" in raw and "GUI".encode() in raw,
++          "GET / serves the GUI page")
++    code, st = jhttp(port, "/api/status")
++    check(code == 200 and st.get("ok") and st.get("state") in ("off", "exited", "running"),
++          "status endpoint answers")
++    code, meta = jhttp(port, "/api/meta")
++    check(code == 200 and "haswell" in meta.get("platforms", []), "meta lists platforms")
++    code, files = jhttp(port, "/api/files?path=firmware&ext=.bin")
++    check(code == 200 and any(e["name"] == "firmware.bin" for e in files.get("entries", [])),
++          "file browser lists the ROM")
++    code, _ = jhttp(port, "/api/presets", "POST", {"name": "smoke", "config": {"platform": "haswell"}})
++    check(code == 200, "preset save")
++    code, p = jhttp(port, "/api/presets")
++    check(code == 200 and p.get("presets", {}).get("smoke", {}).get("platform") == "haswell",
++          "preset round trip")
++    code, _ = jhttp(port, "/api/presets?name=smoke", "DELETE")
++    code, p = jhttp(port, "/api/presets")
++    check("smoke" not in p.get("presets", {}), "preset delete")
++    code, _ = jhttp(port, "/api/presets", "POST", {"name": "bad name!!", "config": {}})
++    check(code == 400, "reject bad preset name")
++    code, _ = jhttp(port, "/api/nope")
++    check(code == 404, "unknown API is 404")
++
++# ---------------- C. lifecycle + WS proxy -----------------------------------
++
++
++def ws_handshake(port):
++    s = socket.create_connection(("127.0.0.1", port), timeout=5)
++    key = base64.b64encode(os.urandom(16)).decode()
++    s.sendall(("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
++               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
++               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
++               % (port, key)).encode())
++    s.settimeout(10)
++    buf = b""
++    while b"\r\n\r\n" not in buf:
++        chunk = s.recv(4096)
++        if not chunk:
++            break
++        buf += chunk
++    head = buf.split(b"\r\n\r\n")[0].decode(errors="replace")
++    return s, head
++
++
++def ws_frame(s):
++    h = s.recv(2)
++    if len(h) < 2:
++        return None, None
++    ln = h[1] & 0x7F
++    if ln == 126:
++        ln = int.from_bytes(s.recv(2), "big")
++    elif ln == 127:
++        ln = int.from_bytes(s.recv(8), "big")
++    data = b""
++    while len(data) < ln:
++        data += s.recv(ln - len(data))
++    return h[0] & 0x0F, data
++
++
++def test_lifecycle(port):
++    # refusals first: no machine yet
++    try:
++        s = socket.create_connection(("127.0.0.1", port), timeout=5)
++        key = base64.b64encode(os.urandom(16)).decode()
++        s.sendall(("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
++                   "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
++                   "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
++        s.settimeout(5)
++        head = s.recv(200).decode(errors="replace")
++        s.close()
++        check("502" in head, "/ws without a machine is 502")
++    except OSError:
++        check(False, "/ws without a machine is 502")
++
++    code, r = jhttp(port, "/api/start", "POST", {"config": {
++        "platform": "haswell", "rom": "firmware/firmware.bin",
++        "disk": "disk/disk.img", "max_instr": 60000, "stats": True,
++        "log": True, "dump_fb": True}})
++    check(code == 200 and r.get("ok"), "machine starts")
++    time.sleep(0.6)
++    code, st = jhttp(port, "/api/status")
++    check(st.get("state") == "running", "status reports running")
++
++    s, head = ws_handshake(port)
++    check("101" in head.splitlines()[0] and "Sec-WebSocket-Accept" in head,
++          "WS proxy: 101 + Sec-WebSocket-Accept")
++    op, data = ws_frame(s)
++    first = json.loads(data) if op == 1 else {}
++    check(op == 1 and first.get("kind") == "state", "first WS frame is a state push")
++    check("platform" in first and "registers" in first, "state carries registers")
++
++    # unmasked frames from a raw client are refused by the monitor codec --
++    # the proxy must pass MASKED client frames through untouched
++    raw = json.dumps({"cmd": "continue"}).encode()
++    mask = os.urandom(4)
++    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
++    s.sendall(bytes([0x81, 0x80 | len(raw)]) + mask + masked)
++    saw_reply = False
++    end_stop = False
++    for _ in range(40):
++        op, data = ws_frame(s)
++        if op == 1:
++            m = json.loads(data)
++            if m.get("kind") == "reply":
++                saw_reply = True
++            if m.get("kind") == "state" and m.get("stop_reason") == "end":
++                end_stop = True
++                break
++    check(saw_reply, "continue reaches the machine through the proxy")
++    check(end_stop, "run reaches the post-mortem end stop (T5 semantics)")
++
++    # the polite way down: quit makes the emulator print stats/receipts and
++    # write the artifacts (SIGTERM would skip the teardown block)
++    raw = json.dumps({"cmd": "quit"}).encode()
++    mask = os.urandom(4)
++    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
++    s.sendall(bytes([0x81, 0x80 | len(raw)]) + mask + masked)
++    acked = False
++    for _ in range(20):
++        op, data = ws_frame(s)
++        if op == 1 and json.loads(data).get("kind") == "reply":
++            acked = True
++            break
++    check(acked, "quit is acknowledged at the end stop")
++    s.close()
++
++    deadline = time.time() + 20
++    while time.time() < deadline:
++        code, st = jhttp(port, "/api/status")
++        if st.get("state") == "exited":
++            break
++        time.sleep(0.3)
++    check(st.get("state") == "exited" and st.get("exit_code") == 0,
++          "run ends with exit code 0 after quit")
++
++    code, arts = jhttp(port, "/api/artifacts")
++    names = [e["name"] for e in arts.get("entries", [])]
++    check("framebuffer.ppm" in names and "log.txt" in names and "stdout.log" in names,
++          "artifacts land in the run dir")
++    code, out = jhttp(port, "/api/output?which=stdout&tail=40")
++    check("GUEST_OK" in out.get("output", ""), "stdout tail shows the guest receipt")
++    code, raw = http(port, "/api/artifact/framebuffer.ppm")
++    check(code == 200 and raw[:2] == b"P6", "artifact download returns the PPM")
++    code, raw = http(port, "/api/artifact/../../etc/passwd")
++    check(code in (404, 400), "artifact path traversal is refused")
++
++    code, r = jhttp(port, "/api/snapshots?name=missing.snap", "DELETE")
++    check(code == 200 and not r.get("ok"), "missing snapshot delete is refused")
++
++    code, r = jhttp(port, "/api/stop", "POST", {})
++    check(code == 200, "stop on an exited machine is harmless")
++
++
++def main():
++    emu = os.path.join(ROOT, "x86emu")
++    if not os.path.isfile(emu):
++        print("SKIP: build x86emu first")
++        return 0
++    tmp = tempfile.mkdtemp(prefix="gui-test-")
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    proc = subprocess.Popen(
++        [sys.executable, os.path.join(ROOT, "tools", "launcher.py"),
++         "--bind", "127.0.0.1", "--port", str(port), "--state-dir", tmp,
++         "--emu", emu],
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    try:
++        for _ in range(50):
++            try:
++                code, _ = jhttp(port, "/api/status")
++                if code == 200:
++                    break
++            except OSError:
++                pass
++            time.sleep(0.1)
++        test_schema()
++        test_http_surface(port)
++        test_lifecycle(port)
++    finally:
++        proc.terminate()
++        try:
++            proc.wait(timeout=5)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++    if fails:
++        print("test-gui-launcher: %d FAILED" % fails)
++        return 1
++    print("test-gui-launcher: all vectors passed")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/launcher.py b/tools/launcher.py
+new file mode 100644
+index 0000000..4253aaa
+--- /dev/null
++++ b/tools/launcher.py
+@@ -0,0 +1,778 @@
++#!/usr/bin/env python3
++"""tools/launcher.py -- the no-command-line GUI back end (GUI G1).
++
++A single stdlib-only Python service that makes every x86emu facility
++reachable from `web/gui.html`:
++
++  * machine configuration and process lifecycle (start / stop / restart),
++    built strictly from the option SCHEMA below -- user input can never
++    become an arbitrary flag;
++  * a raw WebSocket proxy (/ws) spliced onto the running machine's live
++    monitor (RFC 6455 frames pass through untouched, so the existing
++    monitor protocol -- state/reply/framebuffer -- works as-is);
++  * server-side file browsing for ROM / disk / kernel / initrd / snapshot
++    paths, artifact download (log, trace, dumps, stats), named presets
++    and the host TAP responder as a managed side process.
++
++Ground rules:
++  * the emulator is spawned exactly like the CLI would (`argv` list, no
++    shell) with cwd = the repo root, so every measured receipt of the
++    command-line world is byte-identical here;
++  * the machine's monitor is bound to 127.0.0.1:<free port> and only the
++    launcher's /ws is exposed -- one port for the whole GUI;
++  * run state (presets, per-run output, snapshots) lives in a state
++    directory (--state-dir, default ~/.x86emu-gui), never in the repo.
++"""
++import argparse
++import json
++import os
++import re
++import signal
++import socket
++import subprocess
++import sys
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from urllib.parse import parse_qs, urlparse, unquote
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++GUI_PAGE = os.path.join(ROOT, "web", "gui.html")
++DEFAULT_EMU = os.path.join(ROOT, "x86emu")
++RESPONDER = os.path.join(ROOT, "tools", "tap_responder.py")
++
++# ---------------------------------------------------------------------------
++# Option schema: the single source of truth for what the GUI may start.
++# Each key is a GUI field; the value describes the flag it becomes.
++# ---------------------------------------------------------------------------
++
++PLATFORMS = ["sandybridge", "ivybridge", "haswell", "broadwell", "baytrail"]
++LPCS = ["pantherpoint", "ich9"]
++
++SCHEMA = {
++    # boot path
++    "rom":            {"flag": "--rom=",           "type": "path"},
++    "disk":           {"flag": "--disk=",          "type": "path"},
++    "kernel":         {"flag": "--kernel=",        "type": "path"},
++    "initrd":         {"flag": "--initrd=",        "type": "path"},
++    "snapshot_load":  {"flag": "--snapshot-load=", "type": "path"},
++    # cpu / platform
++    "platform":       {"flag": "--platform=",      "type": "choice", "choices": PLATFORMS},
++    "smp":            {"flag": "--smp=",           "type": "int", "min": 1, "max": 8},
++    "cpus":           {"flag": "--cpus=",          "type": "int", "min": 1, "max": 64},
++    "smp_probe":      {"flag": "--smp-probe",      "type": "bool"},
++    # chipset
++    "lpc":            {"flag": "--lpc=",           "type": "choice", "choices": LPCS},
++    "no_usb_uhci":    {"flag": "--no-usb-uhci",    "type": "bool"},
++    # storage (ports 0..3 per controller; port 0 == the shorthand form)
++    "sata":           {"flag": "--sata=",          "type": "path"},
++    "sata1":          {"flag": "--sata-port1=",    "type": "path"},
++    "sata2p":         {"flag": "--sata-port2=",    "type": "path"},
++    "sata3":          {"flag": "--sata-port3=",    "type": "path"},
++    "ahci2":          {"flag": "--ahci2",          "type": "bool"},
++    "sata2":          {"flag": "--sata2=",         "type": "path"},
++    "sata2_port1":    {"flag": "--sata2-port1=",   "type": "path"},
++    "sata_writethrough": {"flag": "--sata-writethrough", "type": "bool"},
++    # video
++    "vbe":            {"flag": "--vbe=",           "type": "str", "regex": r"^(\d{1,5}x\d{1,5}x(4|8|15|16|24|32)|off)$"},
++    "no_fb":          {"flag": "--no-fb",          "type": "bool"},
++    # network
++    "tap":            {"flag": "--tap=",           "type": "str", "regex": r"^[A-Za-z0-9_.\-]{1,64}:\d{1,5}$"},
++    # run
++    "max_instr":      {"flag": "--max-instr=",     "type": "int", "min": 0, "max": 10 ** 15},
++    "stats":          {"flag": "--stats",          "type": "bool"},
++    # outputs (paths the launcher fills with per-run artifact locations)
++    "log":            {"flag": "--log=",           "type": "str", "managed": "log.txt"},
++    "dump_fb":        {"flag": "--dump-fb=",       "type": "str", "managed": "framebuffer.ppm"},
++    "dump_text":      {"flag": "--dump-text=",     "type": "str", "managed": "text-screen.txt"},
++    "trace_file":     {"flag": "--trace-file=",    "type": "str", "managed": "trace.txt"},
++    "trace_from":     {"flag": "--trace-from=",    "type": "int", "min": 0, "max": 10 ** 15},
++    "trace_count":    {"flag": "--trace-count=",   "type": "int", "min": 0, "max": 10 ** 15},
++    # debug
++    "gdb":            {"flag": "--gdb=",           "type": "str", "regex": r"^([A-Za-z0-9_.\-]{1,64}:)?\d{1,5}$"},
++    "watch_phys":     {"flag": "--watch-phys=",    "type": "str", "regex": r"^(0x[0-9a-fA-F]+|\d+)$"},
++    "symbols":        {"flag": "--symbols=",       "type": "path"},
++    "debug_script":   {"flag": "--debug-script=",  "type": "path"},
++    "keys":           {"flag": "--keys=",          "type": "str", "regex": r"^[0-9a-fA-F]{1,4}(,[0-9a-fA-F]{1,4})*$"},
++    "keys_at":        {"flag": "--keys-at=",       "type": "str", "regex": r"^(prompt|0x[0-9a-fA-F]+|\d+)$"},
++    "snapshot_save":  {"flag": "--snapshot-save=", "type": "path"},
++}
++
++BUILTIN_CONFIG = {
++    "platform": "haswell",
++    "rom": "firmware/firmware.bin",
++    "disk": "disk/disk.img",
++    "max_instr": 200000000,
++    "stats": True,
++    "log": True,
++    "dump_fb": True,
++    "lpc": "pantherpoint",
++}
++
++
++class ConfigError(ValueError):
++    pass
++
++
++def _resolve_path(value):
++    """Accept absolute paths as-is; resolve anything else against the repo
++    root so GUI runs behave exactly like `make demo` from the root."""
++    if not isinstance(value, str) or not value.strip():
++        raise ConfigError("empty path")
++    value = value.strip()
++    if "\x00" in value:
++        raise ConfigError("bad path")
++    return value if os.path.isabs(value) else os.path.join(ROOT, value)
++
++
++def validate_config(cfg, state_dir=None):
++    """Return a sanitized {key: value} dict.  Unknown keys are refused;
++    every accepted value is coerced/checked against the SCHEMA."""
++    if not isinstance(cfg, dict):
++        raise ConfigError("config must be an object")
++    out = {}
++    for key, value in cfg.items():
++        if key not in SCHEMA:
++            raise ConfigError("unknown option: %s" % key)
++        spec = SCHEMA[key]
++        if value is None or value is False or value == "":
++            continue
++        t = spec["type"]
++        if t == "bool":
++            if value is not True and value not in (1, "1", "true", "on"):
++                raise ConfigError("%s: expected boolean" % key)
++            out[key] = True
++        elif t == "int":
++            try:
++                n = int(str(value), 0)
++            except ValueError:
++                raise ConfigError("%s: expected an integer" % key)
++            if n < spec["min"] or n > spec["max"]:
++                raise ConfigError("%s: out of range" % key)
++            out[key] = n
++        elif t == "choice":
++            if value not in spec["choices"]:
++                raise ConfigError("%s: expected one of %s" % (key, ", ".join(spec["choices"])))
++            out[key] = value
++        elif t == "path":
++            p = _resolve_path(value)
++            if not os.path.exists(p):
++                raise ConfigError("%s: file not found: %s" % (key, value))
++            out[key] = p
++        elif t == "str":
++            s = str(value)
++            if "managed" in spec:
++                # managed outputs: the toggle is a boolean-ish request for a
++                # per-run artifact path the launcher owns
++                if value is True or s in ("1", "true", "on", "yes") or s == spec["managed"]:
++                    out[key] = spec["managed"]
++                else:
++                    raise ConfigError("%s: unexpected value %r" % (key, s))
++            else:
++                if not re.match(spec["regex"], s):
++                    raise ConfigError("%s: bad value %r" % (key, s))
++                out[key] = s
++        else:  # pragma: no cover - schema bug
++            raise ConfigError("internal schema error for %s" % key)
++    return out
++
++
++def build_argv(emu_path, cfg, run_dir, monitor_port):
++    """Translate a validated config into the emulator argv list.  Managed
++    output options point into run_dir so the GUI can download them."""
++    cfg = validate_config(cfg)
++    argv = [emu_path, "--monitor=127.0.0.1:%d" % monitor_port]
++    for key, value in cfg.items():
++        spec = SCHEMA[key]
++        if "managed" in spec:
++            argv.append(spec["flag"] + os.path.join(run_dir, value))
++        elif spec["type"] == "bool":
++            argv.append(spec["flag"])
++        else:
++            argv.append(spec["flag"] + str(value))
++    return argv
++
++
++# ---------------------------------------------------------------------------
++# Process / run state
++# ---------------------------------------------------------------------------
++
++def _terminate(proc, timeout=5):
++    """POSIX: signal the whole process group (the emulator may have children).
++    Windows: no killpg/getpgid -- fall back to terminate/kill."""
++    try:
++        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
++    except (AttributeError, OSError, ProcessLookupError, PermissionError):
++        try:
++            proc.terminate()
++        except OSError:
++            pass
++    try:
++        proc.wait(timeout=timeout)
++        return proc.returncode
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
++        except (AttributeError, OSError, ProcessLookupError, PermissionError):
++            try:
++                proc.kill()
++            except OSError:
++                pass
++        try:
++            proc.wait(timeout=timeout)
++        except subprocess.TimeoutExpired:
++            pass
++        return proc.returncode
++
++
++class Machine:
++    def __init__(self, emu_path, state_dir):
++        self.emu_path = emu_path
++        self.state_dir = state_dir
++        self.runs_dir = os.path.join(state_dir, "runs")
++        self.snap_dir = os.path.join(state_dir, "snaps")
++        for d in (state_dir, self.runs_dir, self.snap_dir):
++            os.makedirs(d, exist_ok=True)
++        self.lock = threading.RLock()
++        self.proc = None
++        self.run_dir = None
++        self.monitor_port = None
++        self.config = dict(BUILTIN_CONFIG)
++        self.started_at = None
++        self.exit_code = None
++        self.argv = None
++        self.responder = None
++
++    # -- lifecycle ---------------------------------------------------------
++    def status(self):
++        with self.lock:
++            running = self.proc is not None and self.proc.poll() is None
++            return {
++                "state": "running" if running else ("exited" if self.exit_code is not None else "off"),
++                "exit_code": self.exit_code,
++                "pid": self.proc.pid if self.proc and self.proc.poll() is None else None,
++                "started_at": self.started_at,
++                "run_dir": self.run_dir,
++                "snap_dir": self.snap_dir,
++                "monitor_port": self.monitor_port,
++                "emu": self.emu_path,
++                "config": self.config,
++                "argv": self.argv,
++                "responder": self.responder_status(),
++            }
++
++    def start(self, cfg):
++        with self.lock:
++            if self.proc is not None and self.proc.poll() is None:
++                raise ConfigError("machine is already running")
++            config = validate_config(cfg)
++            ts = time.strftime("%Y%m%d-%H%M%S")
++            run_dir = os.path.join(self.runs_dir, ts)
++            os.makedirs(run_dir, exist_ok=True)
++            monitor_port = free_port()
++            argv = build_argv(self.emu_path, config, run_dir, monitor_port)
++            out = open(os.path.join(run_dir, "stdout.log"), "wb")
++            err = open(os.path.join(run_dir, "stderr.log"), "wb")
++            self.proc = subprocess.Popen(
++                argv, cwd=ROOT, stdout=out, stderr=err,
++                stdin=subprocess.DEVNULL, start_new_session=True)
++            out.close(); err.close()
++            self.run_dir = run_dir
++            self.monitor_port = monitor_port
++            self.config = config
++            self.argv = argv
++            self.started_at = time.time()
++            self.exit_code = None
++            threading.Thread(target=self._watch, daemon=True).start()
++            self._write_meta(run_dir, argv)
++            return {"ok": True, "monitor_port": monitor_port, "run_dir": run_dir}
++
++    def _write_meta(self, run_dir, argv):
++        with open(os.path.join(run_dir, "argv.json"), "w", encoding="utf-8") as f:
++            json.dump({"argv": argv, "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=1)
++
++    def _watch(self):
++        proc = self.proc
++        if proc is None:
++            return
++        rc = proc.wait()
++        with self.lock:
++            if self.proc is proc:
++                self.exit_code = rc
++
++    def stop(self):
++        with self.lock:
++            if self.proc is None or self.proc.poll() is not None:
++                return {"ok": True, "exit_code": self.exit_code, "already": True}
++            proc = self.proc
++        rc = _terminate(proc)
++        with self.lock:
++            self.exit_code = rc
++        return {"ok": True, "exit_code": rc}
++
++    # -- output / artifacts -------------------------------------------------
++    def output(self, which, tail=200):
++        with self.lock:
++            run_dir = self.run_dir
++        if not run_dir:
++            return ""
++        name = "stderr.log" if which == "stderr" else "stdout.log"
++        path = os.path.join(run_dir, name)
++        try:
++            with open(path, "r", encoding="utf-8", errors="replace") as f:
++                lines = f.readlines()
++            return "".join(lines[-int(tail):])
++        except OSError:
++            return ""
++
++    def artifacts(self):
++        with self.lock:
++            run_dir = self.run_dir
++        if not run_dir:
++            return []
++        out = []
++        for name in sorted(os.listdir(run_dir)):
++            p = os.path.join(run_dir, name)
++            if os.path.isfile(p):
++                out.append({"name": name, "size": os.path.getsize(p),
++                            "mtime": int(os.path.getmtime(p))})
++        return out
++
++    def artifact_path(self, name):
++        name = os.path.basename(unquote(name))
++        with self.lock:
++            run_dir = self.run_dir
++        if not run_dir or not name:
++            return None
++        path = os.path.join(run_dir, name)
++        return path if os.path.isfile(path) else None
++
++    # -- snapshots ----------------------------------------------------------
++    def snapshots(self):
++        out = []
++        for name in sorted(os.listdir(self.snap_dir)):
++            p = os.path.join(self.snap_dir, name)
++            if os.path.isfile(p):
++                out.append({"name": name, "size": os.path.getsize(p),
++                            "mtime": int(os.path.getmtime(p))})
++        return out
++
++    def snapshot_delete(self, name):
++        name = os.path.basename(unquote(str(name)))
++        path = os.path.join(self.snap_dir, name)
++        if name and os.path.isfile(path):
++            os.remove(path)
++            return {"ok": True}
++        return {"ok": False, "error": "no such snapshot"}
++
++    # -- TAP responder -------------------------------------------------------
++    def responder_start(self, opts):
++        with self.lock:
++            if self.responder is not None and self.responder.poll() is None:
++                raise ConfigError("responder is already running")
++            port = int(opts.get("port", 8080))
++            if not (1 <= port <= 65535):
++                raise ConfigError("responder port out of range")
++            argv = [sys.executable, RESPONDER, "--host", "127.0.0.1", "--port", str(port)]
++            drop = opts.get("drop") or ""
++            if drop:
++                for item in str(drop).split(","):
++                    if item.strip() not in ("arp", "icmp", "dhcp", "dns", "tcp", ""):
++                        raise ConfigError("bad --drop item: %s" % item)
++                argv += ["--drop", ",".join(x.strip() for x in drop.split(",") if x.strip())]
++            if opts.get("no_tcp"):
++                argv.append("--no-tcp")
++            argv += ["--timeout", "0"]
++            log = open(os.path.join(self.runs_dir, "responder.log"), "ab")
++            self.responder = subprocess.Popen(
++                argv, cwd=ROOT, stdout=log, stderr=log,
++                stdin=subprocess.DEVNULL, start_new_session=True)
++            log.close()
++            return {"ok": True, "pid": self.responder.pid}
++
++    def responder_stop(self):
++        with self.lock:
++            r, self.responder = self.responder, None
++        if r is not None and r.poll() is None:
++            _terminate(r, timeout=3)
++        return {"ok": True}
++
++    def responder_status(self):
++        with self.lock:
++            r = self.responder
++        return {"running": r is not None and r.poll() is None,
++                "pid": r.pid if r and r.poll() is None else None}
++
++
++def free_port():
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    return port
++
++
++# ---------------------------------------------------------------------------
++# Presets
++# ---------------------------------------------------------------------------
++
++class Presets:
++    def __init__(self, state_dir):
++        self.path = os.path.join(state_dir, "presets.json")
++        self.lock = threading.RLock()   # save() calls load() under the lock
++
++    def load(self):
++        with self.lock:
++            try:
++                with open(self.path, "r", encoding="utf-8") as f:
++                    data = json.load(f)
++                return data if isinstance(data, dict) else {}
++            except (OSError, ValueError):
++                return {}
++
++    def save(self, name, config):
++        name = str(name).strip()
++        if not re.match(r"^[\w .\-]{1,64}$", name):
++            raise ConfigError("bad preset name")
++        validate_config(config)  # presets store only schema-clean configs
++        with self.lock:
++            data = self.load()
++            data[name] = config
++            tmp = self.path + ".tmp"
++            with open(tmp, "w", encoding="utf-8") as f:
++                json.dump(data, f, indent=1)
++            os.replace(tmp, self.path)
++        return {"ok": True}
++
++    def delete(self, name):
++        with self.lock:
++            data = self.load()
++            data.pop(name, None)
++            with open(self.path, "w", encoding="utf-8") as f:
++                json.dump(data, f, indent=1)
++        return {"ok": True}
++
++
++# ---------------------------------------------------------------------------
++# WebSocket proxy: after the RFC 6455 handshake the connection is a raw
++# byte pipe to the emulator's monitor socket.  Frames stay untouched
++# (client frames remain masked, server frames unmasked), so no re-framing
++# is needed and the monitor protocol works verbatim.
++# ---------------------------------------------------------------------------
++
++WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++
++
++def _ws_handshake_key():
++    import base64, os as _os
++    return base64.b64encode(_os.urandom(16)).decode("ascii")
++
++
++def ws_proxy(client_sock, client_request_bytes, host, port, on_done=None):
++    backend = None
++    try:
++        try:
++            backend = socket.create_connection((host, port), timeout=10)
++        except OSError:
++            try:
++                client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
++            except OSError:
++                pass
++            return
++        backend.sendall(client_request_bytes)
++        backend.settimeout(10)
++        # read the backend's 101 response headers
++        buf = b""
++        while b"\r\n\r\n" not in buf:
++            chunk = backend.recv(4096)
++            if not chunk:
++                raise OSError("backend closed during handshake")
++            buf += chunk
++        head, rest = buf.split(b"\r\n\r\n", 1)
++        if b" 101 " not in head.split(b"\r\n", 1)[0]:
++            client_sock.sendall(head + b"\r\n\r\n" + rest)
++            return
++        client_sock.sendall(head + b"\r\n\r\n")
++        if rest:
++            client_sock.sendall(rest)
++        backend.settimeout(None)
++        client_sock.settimeout(None)
++
++        def pump(src, dst):
++            try:
++                while True:
++                    data = src.recv(65536)
++                    if not data:
++                        return
++                    dst.sendall(data)
++            except OSError:
++                return
++
++        # Two independent directions: a client-side send failure (browser
++        # tab closed mid-keyframe) must not drop already-received client
++        # data such as a pending `quit` -- measured, the single-loop splice
++        # lost exactly that frame.
++        t1 = threading.Thread(target=pump, args=(client_sock, backend), daemon=True)
++        t2 = threading.Thread(target=pump, args=(backend, client_sock), daemon=True)
++        t1.start(); t2.start()
++        t1.join(); t2.join()
++    except OSError:
++        pass
++    finally:
++        if backend is not None:
++            try:
++                backend.close()
++            except OSError:
++                pass
++        try:
++            client_sock.close()
++        except OSError:
++            pass
++        if on_done:
++            on_done()
++
++
++# ---------------------------------------------------------------------------
++# HTTP API
++# ---------------------------------------------------------------------------
++
++class Handler(BaseHTTPRequestHandler):
++    server_version = "x86emu-launcher/1"
++    machine = None      # injected
++    presets = None
++
++    # -- helpers -----------------------------------------------------------
++    def _json(self, obj, code=200):
++        body = json.dumps(obj).encode("utf-8")
++        self.send_response(code)
++        self.send_header("Content-Type", "application/json; charset=utf-8")
++        self.send_header("Cache-Control", "no-store")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def _file(self, path, download=None):
++        try:
++            with open(path, "rb") as f:
++                data = f.read()
++        except OSError:
++            self._json({"ok": False, "error": "file not found"}, 404)
++            return
++        self.send_response(200)
++        self.send_header("Content-Type", "application/octet-stream")
++        if download:
++            self.send_header("Content-Disposition",
++                             "attachment; filename=\"%s\"" % os.path.basename(download))
++        self.send_header("Content-Length", str(len(data)))
++        self.end_headers()
++        self.wfile.write(data)
++
++    def _body(self):
++        length = int(self.headers.get("Content-Length") or 0)
++        if length > 1 << 20:
++            raise ConfigError("body too large")
++        raw = self.rfile.read(length) if length else b"{}"
++        try:
++            return json.loads(raw.decode("utf-8") or "{}")
++        except ValueError:
++            raise ConfigError("invalid JSON body")
++
++    def log_message(self, fmt, *args):  # quiet
++        pass
++
++    # -- GET ---------------------------------------------------------------
++    def do_GET(self):
++        u = urlparse(self.path)
++        path = u.path
++        try:
++            if path == "/ws":
++                return self._upgrade_ws()
++            if path in ("/", "/index.html"):
++                with open(GUI_PAGE, "rb") as f:
++                    body = f.read()
++                self.send_response(200)
++                self.send_header("Content-Type", "text/html; charset=utf-8")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++                return
++            if path == "/api/status":
++                return self._json({"ok": True, **self.machine.status()})
++            if path == "/api/meta":
++                return self._json({"ok": True, "platforms": PLATFORMS, "lpcs": LPCS,
++                                   "schema": sorted(SCHEMA.keys()),
++                                   "builtin": BUILTIN_CONFIG})
++            if path == "/api/output":
++                q = parse_qs(u.query)
++                which = (q.get("which") or ["stdout"])[0]
++                tail = (q.get("tail") or ["200"])[0]
++                return self._json({"ok": True, "which": which,
++                                   "output": self.machine.output(which, tail)})
++            if path == "/api/artifacts":
++                return self._json({"ok": True, "entries": self.machine.artifacts()})
++            if path.startswith("/api/artifact/"):
++                name = path[len("/api/artifact/"):]
++                p = self.machine.artifact_path(name)
++                if not p:
++                    return self._json({"ok": False, "error": "no such artifact"}, 404)
++                return self._file(p, download=name)
++            if path == "/api/snapshots":
++                return self._json({"ok": True, "entries": self.machine.snapshots()})
++            if path == "/api/presets":
++                return self._json({"ok": True, "presets": self.presets.load()})
++            if path == "/api/files":
++                q = parse_qs(u.query)
++                raw = (q.get("path") or [ROOT])[0]
++                exts = [e.lower() for e in (q.get("ext") or [""])[0].split(",") if e]
++                d = raw if os.path.isabs(raw) else os.path.join(ROOT, raw)
++                d = os.path.abspath(d)
++                if not os.path.isdir(d):
++                    return self._json({"ok": False, "error": "not a directory: %s" % d}, 404)
++                entries = []
++                try:
++                    for name in sorted(os.listdir(d)):
++                        p = os.path.join(d, name)
++                        if os.path.isdir(name) or True:
++                            pass
++                        is_dir = os.path.isdir(p)
++                        if not is_dir and exts and not any(name.lower().endswith(e) for e in exts):
++                            continue
++                        entries.append({"name": name, "dir": is_dir,
++                                        "size": 0 if is_dir else os.path.getsize(p)})
++                except OSError as e:
++                    return self._json({"ok": False, "error": str(e)}, 403)
++                return self._json({"ok": True, "path": d, "entries": entries[:500],
++                                   "parent": os.path.dirname(d)})
++            return self._json({"ok": False, "error": "not found"}, 404)
++        except ConfigError as e:
++            return self._json({"ok": False, "error": str(e)}, 400)
++
++    # -- POST / DELETE -------------------------------------------------------
++    def do_POST(self):
++        u = urlparse(self.path)
++        try:
++            body = self._body()
++            if u.path == "/api/start":
++                cfg = body.get("config", body)
++                res = self.machine.start(cfg)
++                return self._json({"ok": True, **res})
++            if u.path == "/api/stop":
++                return self._json(self.machine.stop())
++            if u.path == "/api/restart":
++                self.machine.stop()
++                res = self.machine.start(body.get("config") or self.machine.config)
++                return self._json({"ok": True, **res})
++            if u.path == "/api/presets":
++                return self._json(self.presets.save(body.get("name"), body.get("config")))
++            if u.path == "/api/responder":
++                if body.get("on"):
++                    return self._json(self.machine.responder_start(body))
++                return self._json(self.machine.responder_stop())
++            return self._json({"ok": False, "error": "not found"}, 404)
++        except ConfigError as e:
++            return self._json({"ok": False, "error": str(e)}, 400)
++        except Exception as e:                       # pragma: no cover
++            return self._json({"ok": False, "error": str(e)}, 500)
++
++    def do_DELETE(self):
++        u = urlparse(self.path)
++        q = parse_qs(u.query)
++        if u.path == "/api/presets":
++            return self._json(self.presets.delete((q.get("name") or [""])[0]))
++        if u.path == "/api/snapshots":
++            return self._json(self.machine.snapshot_delete((q.get("name") or [""])[0]))
++        return self._json({"ok": False, "error": "not found"}, 404)
++
++    # -- WebSocket upgrade ----------------------------------------------------
++    def _upgrade_ws(self):
++        if (self.headers.get("Upgrade") or "").lower() != "websocket":
++            return self._json({"ok": False, "error": "websocket upgrade required"}, 426)
++        status = self.machine.status()
++        port = status.get("monitor_port")
++        if status["state"] != "running" or not port:
++            return self._json({"ok": False, "error": "no running machine"}, 502)
++        key = self.headers.get("Sec-WebSocket-Key")
++        if not key:
++            return self._json({"ok": False, "error": "missing Sec-WebSocket-Key"}, 400)
++        # rebuild the request for the backend monitor
++        lines = ["GET /ws HTTP/1.1",
++                 "Host: 127.0.0.1:%d" % port,
++                 "Upgrade: websocket",
++                 "Connection: Upgrade",
++                 "Sec-WebSocket-Key: %s" % key,
++                 "Sec-WebSocket-Version: 13"]
++        if self.headers.get("Sec-WebSocket-Protocol"):
++            lines.append("Sec-WebSocket-Protocol: %s" % self.headers["Sec-WebSocket-Protocol"])
++        req = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
++        sock = self.connection
++        self.server.hijack(self.request)   # the proxy thread owns the socket now
++        threading.Thread(target=ws_proxy,
++                         args=(sock, req, "127.0.0.1", port,
++                               lambda: self.server.unhijack(self.request)),
++                         daemon=True).start()
++        self.close_connection = True
++
++
++# ---------------------------------------------------------------------------
++# main
++# ---------------------------------------------------------------------------
++
++def make_server(bind, port, machine, presets):
++    handler = type("BoundHandler", (Handler,),
++                   {"machine": machine, "presets": presets})
++
++    class ProxyHTTPServer(ThreadingHTTPServer):
++        daemon_threads = True
++
++        def __init__(self, *a, **kw):
++            super().__init__(*a, **kw)
++            self._hijacked = {}          # id(socket) -> socket owned by ws_proxy
++
++        def hijack(self, sock):
++            self._hijacked[id(sock)] = sock
++
++        def unhijack(self, sock):
++            self._hijacked.pop(id(sock), None)
++
++        def shutdown_request(self, request):
++            if id(request) in self._hijacked:
++                return                  # the ws_proxy thread owns this socket
++            super().shutdown_request(request)
++
++        def close_request(self, request):
++            if id(request) in self._hijacked:
++                return
++            super().close_request(request)
++
++    return ProxyHTTPServer((bind, port), handler)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description="AuraLite-Emulator GUI launcher")
++    ap.add_argument("--bind", default="127.0.0.1",
++                    help="bind address (0.0.0.0 exposes the GUI on the network)")
++    ap.add_argument("--port", type=int, default=8080)
++    ap.add_argument("--state-dir", default=os.path.expanduser("~/.x86emu-gui"))
++    ap.add_argument("--emu", default=DEFAULT_EMU, help="path to the x86emu binary")
++    a = ap.parse_args(argv)
++
++    if not os.path.isfile(a.emu) and os.path.isfile(a.emu + ".exe"):
++        a.emu += ".exe"                     # Windows build.bat output
++    if not os.path.isfile(a.emu):
++        print("launcher: %s not found -- run `make` first" % a.emu, file=sys.stderr)
++        return 2
++    machine = Machine(os.path.abspath(a.emu), os.path.abspath(a.state_dir))
++    presets = Presets(machine.state_dir)
++    srv = make_server(a.bind, a.port, machine, presets)
++    print("x86emu GUI launcher: http://%s:%d/  (state: %s)" %
++          (a.bind, a.port, machine.state_dir), flush=True)
++    try:
++        srv.serve_forever()
++    except KeyboardInterrupt:
++        machine.stop()
++        machine.responder_stop()
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/web/gui.html b/web/gui.html
+new file mode 100644
+index 0000000..c350078
+--- /dev/null
++++ b/web/gui.html
+@@ -0,0 +1,794 @@
++<!doctype html>
++<html lang="ru">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>AuraLite x86 Emulator — GUI</title>
++<style>
++:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--panel2:#0e1626;--line:#263451;--muted:#8fa2c2;
++--accent:#58d6ff;--green:#62e6a6;--warn:#ffd36a;--red:#ff8585;--text:#e7efff}
++*{box-sizing:border-box}
++body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}
++header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 20px;
++background:linear-gradient(110deg,#15243d,#10182b);border-bottom:1px solid var(--line)}
++header h1{margin:0;font-size:19px;color:var(--accent);white-space:nowrap}
++.badge{padding:4px 11px;border-radius:999px;border:1px solid var(--line);color:var(--muted);font-size:12px}
++.badge.ok{color:var(--green);border-color:#2c5c46}.badge.warn{color:var(--warn);border-color:#6b5b2a}
++.badge.bad{color:var(--red);border-color:#6b3a3a}.badge.accent{color:var(--accent);border-color:#2b5a72}
++button{padding:8px 13px;border:1px solid #34758a;border-radius:7px;background:#14273b;color:var(--accent);
++font:inherit;cursor:pointer;white-space:nowrap}
++button:hover{background:#1d3850}button:disabled{opacity:.45;cursor:default}
++button.primary{background:#15557a;border-color:#2b87b8;color:#d9f3ff}
++button.danger{border-color:#774454;color:#ffb0b0;background:#2a1620}
++button.small{padding:4px 9px;font-size:12px}
++input,select,textarea{padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:#0b1324;
++color:var(--text);font:inherit;min-width:0}
++input[type=text],input[type=number],select{max-width:100%}
++input.wide{flex:1}
++label{display:flex;gap:7px;align-items:center;color:var(--muted)}
++label.stack{flex-direction:column;align-items:flex-start;gap:3px}
++label.stack span{font-size:11.5px;letter-spacing:.02em}
++main{display:grid;grid-template-columns:minmax(320px,430px) 1fr;gap:14px;padding:14px;max-width:1750px;margin:0 auto}
++@media(max-width:1050px){main{grid-template-columns:1fr}}
++.panel{background:var(--panel);border:1px solid var(--line);border-radius:11px;overflow:hidden}
++.panel>h2{margin:0;padding:10px 14px;font-size:13px;color:#b8d7ff;border-bottom:1px solid var(--line);
++display:flex;justify-content:space-between;align-items:center;gap:8px}
++.panel .body{padding:12px 14px}
++details{border:1px solid var(--line);border-radius:9px;margin:9px 0;background:var(--panel2)}
++summary{cursor:pointer;padding:9px 12px;color:#c8dcff;font-size:13px;user-select:none;list-style:none}
++summary::before{content:"▸ ";color:var(--accent)}
++details[open] summary::before{content:"▾ "}
++details .inner{padding:2px 12px 12px;display:grid;gap:9px}
++.grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
++.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px}
++.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
++.hint{color:var(--muted);font-size:11.5px;line-height:1.4}
++.runbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);
++background:#101a30}
++.tabs{display:flex;gap:2px;padding:8px 10px 0;border-bottom:1px solid var(--line);background:#101a30;flex-wrap:wrap}
++.tab{padding:8px 15px;border:1px solid transparent;border-bottom:none;border-radius:8px 8px 0 0;
++color:var(--muted);cursor:pointer;font-size:13px}
++.tab.active{background:var(--panel);border-color:var(--line);color:var(--accent)}
++.page{display:none}.page.active{display:block}
++pre,code{white-space:pre-wrap;overflow-wrap:anywhere}
++pre{margin:0;max-height:340px;overflow:auto;background:#090f1c;border:1px solid var(--line);border-radius:8px;
++padding:10px;color:#b9cbe8;font-size:12px}
++.screenbox{display:flex;gap:14px;flex-wrap:wrap}
++canvas.screen{background:#030611;border:1px solid var(--line);border-radius:8px;image-rendering:pixelated;
++aspect-ratio:4/3;width:min(100%,720px)}
++.kv{display:grid;grid-template-columns:auto 1fr;gap:5px 13px;align-items:baseline}
++.kv .k{color:var(--muted);font-size:12px}.kv .v{color:#c8f4ff;overflow-wrap:anywhere}
++.regs{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:4px 12px}
++.regs .r{display:flex;justify-content:space-between;border-bottom:1px dotted #22304d;padding:2px 0}
++.regs .r b{color:var(--muted);font-weight:normal}
++table.list{width:100%;border-collapse:collapse;font-size:12.5px}
++table.list th{text-align:left;color:var(--muted);font-weight:normal;padding:4px 6px;border-bottom:1px solid var(--line)}
++table.list td{padding:4px 6px;border-bottom:1px solid #1a2438;overflow-wrap:anywhere}
++tr:hover td{background:#16203a}
++.modal{display:none;position:fixed;inset:0;background:rgba(3,6,14,.72);z-index:50;align-items:center;justify-content:center}
++.modal.open{display:flex}
++.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(680px,92vw);
++max-height:82vh;display:flex;flex-direction:column}
++.modal .box h3{margin:0;padding:13px 16px;border-bottom:1px solid var(--line);color:var(--accent);font-size:14px}
++.modal .box .list{overflow:auto;padding:8px 10px}
++.modal .box .foot{padding:11px 16px;border-top:1px solid var(--line);display:flex;gap:9px;align-items:center}
++.frow{padding:6px 9px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between;gap:10px}
++.frow:hover{background:#1a2742}.frow.dir{color:var(--accent)}
++.toast{position:fixed;right:18px;bottom:18px;background:#16233c;border:1px solid var(--line);color:var(--text);
++padding:11px 16px;border-radius:9px;display:none;max-width:420px;z-index:60;box-shadow:0 8px 26px rgba(0,0,0,.5)}
++.toast.show{display:block}.toast.err{border-color:#7a3c3c;color:#ffc9c9}
++.flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
++.spacer{flex:1}
++footer{color:var(--muted);text-align:center;padding:12px;font-size:11.5px}
++</style>
++</head>
++<body>
++<header>
++  <h1>AuraLite x86 Emulator</h1>
++  <span class="badge accent" id="stState">машина выключена</span>
++  <span class="badge" id="stConn">GUI: …</span>
++  <span class="badge" id="stStop">—</span>
++  <div class="spacer"></div>
++  <button class="primary" id="btnStart">▶ Запустить</button>
++  <button id="btnRestart">↻ Перезапустить</button>
++  <button class="danger" id="btnStop">■ Остановить</button>
++</header>
++
++<main>
++<!-- ============================ КОНФИГУРАЦИЯ ============================ -->
++<section class="panel" id="cfgPanel">
++  <h2>Конфигурация машины
++    <span class="flex">
++      <button class="small" id="btnPresetSave">Сохранить как…</button>
++      <select id="presetSel"><option value="">— пресеты —</option></select>
++      <button class="small" id="btnPresetLoad">Открыть</button>
++      <button class="small danger" id="btnPresetDel">Удалить</button>
++    </span>
++  </h2>
++  <div class="body">
++    <details open><summary>Загрузка</summary><div class="inner">
++      <div class="row">
++        <label><input type="radio" name="bootPath" value="rom" checked> Прошивка (ROM)</label>
++        <label><input type="radio" name="bootPath" value="kernel"> Ядро ELF</label>
++      </div>
++      <label class="stack"><span>Прошивка ROM (--rom)</span>
++        <div class="row"><input class="wide" type="text" id="fRom" value="firmware/firmware.bin">
++        <button class="small" data-browse="fRom" data-ext=".bin,.rom">Обзор…</button></div></label>
++      <label class="stack"><span>Загрузочный диск (--disk)</span>
++        <div class="row"><input class="wide" type="text" id="fDisk" value="disk/disk.img">
++        <button class="small" data-browse="fDisk" data-ext=".img,.raw,.qcow">Обзор…</button></div></label>
++      <label class="stack"><span>Ядро ELF (--kernel)</span>
++        <div class="row"><input class="wide" type="text" id="fKernel" placeholder="например /home/user/AuraLite-OS/build/kernel.elf">
++        <button class="small" data-browse="fKernel" data-ext=".elf">Обзор…</button></div></label>
++      <label class="stack"><span>Initrd (--initrd)</span>
++        <div class="row"><input class="wide" type="text" id="fInitrd" placeholder="initrd.tar">
++        <button class="small" data-browse="fInitrd" data-ext=".tar,.img">Обзор…</button></div></label>
++      <label class="stack"><span>Снапшот при старте (--snapshot-load)</span>
++        <div class="row"><input class="wide" type="text" id="fSnapLoad">
++        <button class="small" data-browse="fSnapLoad" data-ext=".snap">Обзор…</button></div></label>
++      <div class="hint">В режиме «Прошивка» загружается ROM-образ, диск отдаётся гостю как USB&nbsp;MSC / SATA.
++      В режиме «Ядро ELF» ROM пропускается, ядро стартует напрямую из точки входа.</div>
++    </div></details>
++
++    <details open><summary>Процессор и платформа</summary><div class="inner">
++      <div class="grid2">
++        <label class="stack"><span>Профиль (--platform)</span>
++          <select id="fPlatform">
++            <option value="sandybridge">Sandy Bridge (2011)</option>
++            <option value="ivybridge">Ivy Bridge (2012)</option>
++            <option value="haswell" selected>Haswell (2013)</option>
++            <option value="broadwell">Broadwell (2015)</option>
++            <option value="baytrail">Bay Trail (2013, Atom)</option>
++          </select></label>
++        <label class="stack"><span>Потоков vCPU (--smp), до 8</span>
++          <input type="number" id="fSmp" min="1" max="8" value="1"></label>
++      </div>
++      <div class="grid2">
++        <label class="stack"><span>Публиковать CPU в boot_info/MADT (--cpus)</span>
++          <input type="number" id="fCpus" min="1" max="64" placeholder="авто"></label>
++        <label><input type="checkbox" id="fSmpProbe"> --smp-probe (probe SMP)</label>
++      </div>
++    </div></details>
++
++    <details><summary>Чипсет и USB</summary><div class="inner">
++      <label class="stack"><span>LPC-мост (--lpc)</span>
++        <select id="fLpc">
++          <option value="pantherpoint" selected>Panther Point 8086:1e55 (исторический)</option>
++          <option value="ich9">ICH9 8086:2918 (SeaBIOS + ACPI/SMP)</option>
++        </select></label>
++      <label><input type="checkbox" id="fNoUhci"> Только EHCI (без UHCI-компаньона)</label>
++    </div></details>
++
++    <details><summary>Диски SATA/AHCI</summary><div class="inner">
++      <label class="stack"><span>Доп. диск, порт 1 (--sata-port1)</span>
++        <div class="row"><input class="wide" type="text" id="fSata1"><button class="small" data-browse="fSata1" data-ext=".img,.raw">Обзор…</button></div></label>
++      <div class="grid2">
++        <label class="stack"><span>Порт 2 (--sata-port2)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2p"><button class="small" data-browse="fSata2p" data-ext=".img,.raw">Обзор…</button></div></label>
++        <label class="stack"><span>Порт 3 (--sata-port3)</span>
++          <div class="row"><input class="wide" type="text" id="fSata3"><button class="small" data-browse="fSata3" data-ext=".img,.raw">Обзор…</button></div></label>
++      </div>
++      <label><input type="checkbox" id="fAhci2"> Второй контроллер AHCI (--ahci2, 0:31:3)</label>
++      <div class="grid2">
++        <label class="stack"><span>Диск AHCI-2, порт 0 (--sata2)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2"><button class="small" data-browse="fSata2" data-ext=".img,.raw">Обзор…</button></div></label>
++        <label class="stack"><span>Диск AHCI-2, порт 1 (--sata2-port1)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2p1"><button class="small" data-browse="fSata2p1" data-ext=".img,.raw">Обзор…</button></div></label>
++      </div>
++      <label><input type="checkbox" id="fWritethrough"> Запись гостя сразу в файлы образов (--sata-writethrough)</label>
++    </div></details>
++
++    <details><summary>Видео</summary><div class="inner">
++      <label class="stack"><span>Режим VBE (--vbe)</span>
++        <select id="fVbe">
++          <option value="">не задавать (как есть)</option>
++          <option value="off">off — только VGA text</option>
++          <option value="800x600x32">800×600×32 (режим по умолчанию)</option>
++          <option value="1024x768x32">1024×768×32</option>
++          <option value="1280x800x32">1280×800×32</option>
++          <option value="custom">свой WxHxBPP…</option>
++        </select></label>
++      <label class="stack" id="vbeCustomWrap" style="display:none"><span>Свой режим</span>
++        <input type="text" id="fVbeCustom" placeholder="например 1600x1200x32"></label>
++      <label><input type="checkbox" id="fNoFb"> Без линейного фреймбуфера (--no-fb)</label>
++    </div></details>
++
++    <details><summary>Сеть (e1000 + TAP)</summary><div class="inner">
++      <label class="stack"><span>TAP-эндпоинт (--tap, UDP host:port)</span>
++        <input type="text" id="fTap" placeholder="127.0.0.1:8080"></label>
++      <div class="row">
++        <label class="stack"><span>Порт респондера</span><input type="number" id="fRespPort" min="1" max="65535" value="8080"></label>
++        <label class="stack"><span>Не отвечать (--drop)</span><input type="text" id="fRespDrop" placeholder="arp,icmp,dhcp,dns,tcp"></label>
++        <label><input type="checkbox" id="fRespNoTcp"> --no-tcp</label>
++      </div>
++      <div class="row">
++        <button class="small primary" id="btnRespOn">Запустить респондер</button>
++        <button class="small danger" id="btnRespOff">Остановить респондер</button>
++        <span class="badge" id="respState">responder: выкл</span>
++      </div>
++      <div class="hint">Хостовый респондер (tools/tap_responder.py) отвечает как slirp: DHCP, ARP, ICMP, DNS, TCP —
++      гость получает адрес 10.0.2.15, шлюз 10.0.2.2, DNS 10.0.2.3.</div>
++    </div></details>
++
++    <details><summary>Параметры прогона</summary><div class="inner">
++      <div class="grid2">
++        <label class="stack"><span>Лимит инструкций (--max-instr, 0 — без лимита)</span>
++          <input type="number" id="fMaxInstr" min="0" value="200000000"></label>
++        <label><input type="checkbox" id="fStats" checked> Печатать статистику (--stats)</label>
++      </div>
++    </div></details>
++
++    <details><summary>Сохранение результатов</summary><div class="inner">
++      <div class="grid2">
++        <label><input type="checkbox" id="fLog" checked> Журнал (--log)</label>
++        <label><input type="checkbox" id="fDumpFb" checked> Кадр фреймбуфера PPM (--dump-fb)</label>
++        <label><input type="checkbox" id="fDumpText"> Текстовый экран (--dump-text)</label>
++        <label><input type="checkbox" id="fTrace"> Трассировка (--trace-file)</label>
++      </div>
++      <div class="grid2">
++        <label class="stack"><span>Трасса с vtime (--trace-from)</span><input type="number" id="fTraceFrom" min="0" placeholder="с начала"></label>
++        <label class="stack"><span>Сколько инструкций (--trace-count)</span><input type="number" id="fTraceCount" min="0" placeholder="все"></label>
++      </div>
++      <div class="hint">Файлы сохраняются в каталог прогона; скачать их можно во вкладке «Файлы» после (или во время) запуска.</div>
++    </div></details>
++
++    <details><summary>Отладка</summary><div class="inner">
++      <div class="grid2">
++        <label class="stack"><span>GDB-порт (--gdb, [host:]port)</span><input type="text" id="fGdb" placeholder="1234"></label>
++        <label class="stack"><span>Физ. адрес внимания (--watch-phys)</span><input type="text" id="fWatchPhys" placeholder="0x100000"></label>
++      </div>
++      <label class="stack"><span>Символы (--symbols, ELF)</span>
++        <div class="row"><input class="wide" type="text" id="fSymbols"><button class="small" data-browse="fSymbols" data-ext=".elf">Обзор…</button></div></label>
++      <label class="stack"><span>Скрипт отладчика (--debug-script)</span>
++        <div class="row"><input class="wide" type="text" id="fDebugScript"><button class="small" data-browse="fDebugScript" data-ext=".txt,.dbg">Обзор…</button></div></label>
++      <div class="grid2">
++        <label class="stack"><span>Сканкоды при старте (--keys, напр. 1E,9E)</span><input type="text" id="fKeys"></label>
++        <label class="stack"><span>Момент ввода (--keys-at: vtime или prompt)</span><input type="text" id="fKeysAt"></label>
++      </div>
++      <div class="hint">Внутренние флаги: интерактивная отладка REPL доступна во вкладке «Регистры» (команда exec),
++      gdb подключается к своему порту и перехватывает управление (монитор станет read-only).</div>
++    </div></details>
++  </div>
++</section>
++
++<!-- ============================ ГЛАВНАЯ ОБЛАСТЬ ============================ -->
++<section class="panel">
++  <div class="runbar">
++    <button class="primary" id="btnRun">▶ Продолжить</button>
++    <button id="btnPause">⏸ Пауза</button>
++    <button id="btnStep">⏭ Шаг</button>
++    <button class="danger" id="btnQuit">Завершить прогон</button>
++    <span style="width:8px"></span>
++    <label class="stack"><span>Точка останова (адрес / символ)</span>
++      <div class="row"><input type="text" id="fBreak" placeholder="0x100000" style="width:150px">
++      <button class="small" id="btnBreak">Установить</button>
++      <button class="small" id="btnBreaks">Список</button></div></label>
++    <label><input type="checkbox" id="fAutoRun" checked> Стартовать сразу при запуске</label>
++    <div class="spacer"></div>
++    <div class="row">
++      <input type="text" id="fKeyCodes" placeholder="сканкоды: 1E,9E" style="width:130px">
++      <button class="small" id="btnKeys">Клавиши</button>
++      <input type="text" id="fTypeText" placeholder="текст (\\n — Enter)" style="width:170px">
++      <button class="small" id="btnType">Ввод текста</button>
++    </div>
++  </div>
++
++  <div class="tabs">
++    <div class="tab active" data-tab="machine">Машина</div>
++    <div class="tab" data-tab="regs">Регистры и REPL</div>
++    <div class="tab" data-tab="log">Журнал</div>
++    <div class="tab" data-tab="snap">Снапшоты</div>
++    <div class="tab" data-tab="files">Файлы</div>
++  </div>
++
++  <div class="body">
++    <!-- Машина -->
++    <div class="page active" id="tab-machine">
++      <div class="screenbox">
++        <div>
++          <canvas class="screen" id="screen" width="800" height="600"></canvas>
++          <div class="row" style="margin-top:8px">
++            <label>Масштаб
++              <select id="fbScale"><option value="1">1×</option><option value="1.5">1.5×</option>
++              <option value="2">2×</option><option value="fit" selected>по ширине</option></select></label>
++            <button class="small" id="btnFbPng">Сохранить PNG</button>
++            <span class="badge" id="fbInfo">фреймбуфер: —</span>
++          </div>
++        </div>
++        <div style="flex:1;min-width:260px">
++          <div class="kv">
++            <div class="k">Платформа</div><div class="v" id="mPlatform">—</div>
++            <div class="k">Режим CPU</div><div class="v" id="mMode">—</div>
++            <div class="k">Останов</div><div class="v" id="mStop">—</div>
++            <div class="k">vTime</div><div class="v" id="mVtime">—</div>
++            <div class="k">Инструкций</div><div class="v" id="mExec">—</div>
++            <div class="k">Команда</div><div class="v" id="mDisasm">—</div>
++          </div>
++          <h3 style="margin:14px 0 6px;font-size:12.5px;color:var(--muted)">vCPU</h3>
++          <pre id="mVcpus">—</pre>
++        </div>
++      </div>
++    </div>
++
++    <!-- Регистры / REPL -->
++    <div class="page" id="tab-regs">
++      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Регистры выбранного vCPU</h3>
++      <div class="regs" id="rGrid">—</div>
++      <h3 style="margin:16px 0 8px;font-size:12.5px;color:var(--muted)">REPL отладчика (команды x86dbg: regs, x/8i, info break, xlate …)</h3>
++      <div class="row">
++        <input class="wide" type="text" id="fExec" placeholder="например: x/8i $lin   |   info vcpu   |   p $rax+1">
++        <button class="primary" id="btnExec">Выполнить</button>
++      </div>
++      <pre id="execOut" style="margin-top:9px">—</pre>
++    </div>
++
++    <!-- Журнал -->
++    <div class="page" id="tab-log">
++      <div class="row" style="margin-bottom:8px">
++        <label><input type="checkbox" id="logScroll" checked> автопрокрутка</label>
++        <input class="wide" type="text" id="logFilter" placeholder="фистр по строке…">
++        <button class="small" id="btnLogClear">Очистить</button>
++        <button class="small" id="btnLogDownload">Скачать</button>
++      </div>
++      <pre id="logBox" style="max-height:520px">журнал машины появится здесь после подключения…</pre>
++      <h3 style="margin:14px 0 8px;font-size:12.5px;color:var(--muted)">Вывод процесса (stdout / stderr прогона)</h3>
++      <div class="row">
++        <button class="small" id="btnOutRefresh">Обновить</button>
++        <label>поток <select id="outWhich"><option value="stdout">stdout (рецепты)</option>
++        <option value="stderr">stderr (лог кольца)</option></select></label>
++      </div>
++      <pre id="outBox" style="margin-top:8px">—</pre>
++    </div>
++
++    <!-- Снапшоты -->
++    <div class="page" id="tab-snap">
++      <div class="row">
++        <input type="text" id="fSnapName" placeholder="имя снапшота (например boot-mid)">
++        <button class="primary" id="btnSnapSave">Сохранить снапшот</button>
++        <button class="small" id="btnSnapRefresh">Обновить список</button>
++      </div>
++      <div class="hint" style="margin:8px 0">Снапшот сохраняется через debugger savevm в каталог snaps и загружается
++      либо здесь (loadvm на остановленной машине), либо при следующем запуске через «Снапшот при старте».</div>
++      <table class="list"><thead><tr><th>Имя</th><th>Размер</th><th>Изменён</th><th></th></tr></thead>
++      <tbody id="snapRows"><tr><td colspan="4">—</td></tr></tbody></table>
++    </div>
++
++    <!-- Файлы -->
++    <div class="page" id="tab-files">
++      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Артефакты текущего/последнего прогона</h3>
++      <div class="row"><button class="small" id="btnArtRefresh">Обновить</button>
++      <span class="hint" id="runDirLabel">каталог: —</span></div>
++      <table class="list" style="margin-top:8px"><thead><tr><th>Файл</th><th>Размер</th><th>Изменён</th><th></th></tr></thead>
++      <tbody id="artRows"><tr><td colspan="4">—</td></tr></tbody></table>
++    </div>
++  </div>
++</section>
++</main>
++
++<!-- модальное окно выбора файла -->
++<div class="modal" id="fileModal">
++  <div class="box">
++    <h3>Выбор файла</h3>
++    <div class="row" style="padding:10px 16px 0">
++      <input class="wide" type="text" id="fPath">
++      <button class="small" id="btnPathGo">Перейти</button>
++    </div>
++    <div class="list" id="fileList"></div>
++    <div class="foot">
++      <span class="hint" id="fileHint">двойной клик по каталогу — войти</span>
++      <div class="spacer"></div>
++      <button class="small" id="btnFileCancel">Отмена</button>
++      <button class="small primary" id="btnFileOk">Выбрать</button>
++    </div>
++  </div>
++</div>
++
++<div class="toast" id="toast"></div>
++<footer>AuraLite-Emulator · GUI G1 · всё управление — без командной строки ·
++документация: README.md, docs/</footer>
++
++<script>
++'use strict';
++const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
++const canvas=$('#screen'), ctx=canvas.getContext('2d');
++let ws=null, lastLog=[], logSeq=0, machineState='off', autoRan=false;
++
++/* ---------------- уведомления ---------------- */
++function toast(msg, err){const t=$('#toast');t.textContent=msg;t.className='toast show'+(err?' err':'');
++  clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast', err?6500:3200);}
++
++async function api(path, method='GET', body){
++  const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},
++    body: body!==undefined?JSON.stringify(body):undefined});
++  let j={};try{j=await r.json()}catch(_e){}
++  if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
++  return j;
++}
++
++/* ---------------- конфигурация ---------------- */
++function cfgFromForm(){
++  const c={};
++  const put=(k,v)=>{if(v!==''&&v!==null&&v!==undefined&&v!==false)c[k]=v;};
++  put('rom',$('#fRom').value); put('disk',$('#fDisk').value);
++  put('kernel',$('#fKernel').value); put('initrd',$('#fInitrd').value);
++  put('snapshot_load',$('#fSnapLoad').value);
++  put('platform',$('#fPlatform').value);
++  put('smp',$('#fSmp').value|0 || '');
++  put('cpus',$('#fCpus').value);
++  if($('#fSmpProbe').checked)put('smp_probe',true);
++  if($('#fLpc').value!=='pantherpoint')put('lpc',$('#fLpc').value);
++  if($('#fNoUhci').checked)put('no_usb_uhci',true);
++  put('sata1',$('#fSata1').value); put('sata2p',$('#fSata2p').value); put('sata3',$('#fSata3').value);
++  if($('#fAhci2').checked)put('ahci2',true);
++  put('sata2',$('#fSata2').value); put('sata2_port1',$('#fSata2p1').value);
++  if($('#fWritethrough').checked)put('sata_writethrough',true);
++  const vbe=$('#fVbe').value;
++  if(vbe==='custom')put('vbe',$('#fVbeCustom').value);else if(vbe)put('vbe',vbe);
++  if($('#fNoFb').checked)put('no_fb',true);
++  put('tap',$('#fTap').value);
++  put('max_instr',$('#fMaxInstr').value);
++  if($('#fStats').checked)put('stats',true);
++  if($('#fLog').checked)put('log',true);
++  if($('#fDumpFb').checked)put('dump_fb',true);
++  if($('#fDumpText').checked)put('dump_text',true);
++  if($('#fTrace').checked)put('trace_file',true);
++  put('trace_from',$('#fTraceFrom').value); put('trace_count',$('#fTraceCount').value);
++  put('gdb',$('#fGdb').value); put('watch_phys',$('#fWatchPhys').value);
++  put('symbols',$('#fSymbols').value); put('debug_script',$('#fDebugScript').value);
++  put('keys',$('#fKeys').value); put('keys_at',$('#fKeysAt').value);
++  return c;
++}
++function cfgToForm(c){
++  const set=(sel,v)=>{const e=$(sel);if(e&&v!==undefined&&v!==null&&v!==false)e.value=v;};
++  set('#fRom',c.rom);set('#fDisk',c.disk);set('#fKernel',c.kernel);set('#fInitrd',c.initrd);
++  set('#fSnapLoad',c.snapshot_load);set('#fPlatform',c.platform||'haswell');
++  set('#fSmp',c.smp||1);set('#fCpus',c.cpus);set('#fLpc',c.lpc||'pantherpoint');
++  set('#fSata1',c.sata1);set('#fSata2p',c.sata2p);set('#fSata3',c.sata3);
++  set('#fSata2',c.sata2);set('#fSata2p1',c.sata2_port1);set('#fVbe',c.vbe||'');
++  set('#fTap',c.tap);set('#fMaxInstr',c.max_instr!==undefined?c.max_instr:'200000000');
++  set('#fTraceFrom',c.trace_from);set('#fTraceCount',c.trace_count);
++  set('#fGdb',c.gdb);set('#fWatchPhys',c.watch_phys);set('#fSymbols',c.symbols);
++  set('#fDebugScript',c.debug_script);set('#fKeys',c.keys);set('#fKeysAt',c.keys_at);
++  $('#fSmpProbe').checked=!!c.smp_probe;$('#fNoUhci').checked=!!c.no_usb_uhci;
++  $('#fAhci2').checked=!!c.ahci2;$('#fWritethrough').checked=!!c.sata_writethrough;
++  $('#fNoFb').checked=!!c.no_fb;$('#fStats').checked=c.stats!==false;
++  $('#fLog').checked=c.log!==false;$('#fDumpFb').checked=c.dump_fb!==false;
++  $('#fDumpText').checked=!!c.dump_text;$('#fTrace').checked=!!c.trace_file;
++  if(c.vbe&&c.vbe!=='off'&&['800x600x32','1024x768x32','1280x800x32'].indexOf(c.vbe)<0){
++    $('#fVbe').value='custom';$('#fVbeCustom').value=c.vbe;$('#vbeCustomWrap').style.display='';
++  }
++}
++
++/* ---------------- WebSocket (протокол монитора) ---------------- */
++function wsURL(){
++  const proto=location.protocol==='https:'?'wss://':'ws://';
++  return proto+location.host+'/ws';
++}
++function connectWS(){
++  if(ws){try{ws.close()}catch(_e){}}
++  $('#stConn').textContent='GUI: подключение…';$('#stConn').className='badge warn';
++  ws=new WebSocket(wsURL());ws.binaryType='arraybuffer';
++  ws.onopen=()=>{$('#stConn').textContent='GUI: на связи';$('#stConn').className='badge ok';
++    if($('#fAutoRun').checked&&!autoRan){autoRan=true;sendCommand('continue');}};
++  ws.onclose=()=>{$('#stConn').textContent='GUI: отключён';$('#stConn').className='badge bad';};
++  ws.onerror=()=>{$('#stConn').textContent='GUI: ошибка WS';$('#stConn').className='badge bad';};
++  ws.onmessage=e=>{if(typeof e.data==='string'){
++    try{const m=JSON.parse(e.data);
++      if(m.kind==='state')renderState(m);else if(m.kind==='reply')renderReply(m);
++    }catch(_e){}
++  }else renderFramebuffer(e.data)};
++}
++function sendCommand(cmd,extra){
++  if(!ws||ws.readyState!==WebSocket.OPEN){toast('нет соединения с машиной',true);return}
++  ws.send(JSON.stringify(Object.assign({cmd},extra||{})));
++}
++function renderReply(r){
++  const txt=(r.ok?'OK':'ОШИБКА')+' '+(r.cmd||'')+': '+(r.message||'')+(r.output?('\n'+r.output):'');
++  $('#execOut').textContent=txt;
++  if(!r.ok)toast(r.message||'ошибка команды',true);
++}
++
++/* ---------------- отрисовка состояния ---------------- */
++function renderState(s){
++  $('#mPlatform').textContent=s.platform||'—';
++  $('#mMode').textContent=s.mode||'—';
++  $('#mStop').textContent=(s.stop_reason||'—')+(s.stop_lin?(' · '+s.stop_lin):'');
++  $('#stStop').textContent=s.stop_reason||'—';
++  if(s.stop_reason==='end'){
++    $('#stStop').className='badge ok';
++    $('#stStop').textContent='прогон завершён (end) — «Остановить» сохранит результаты';
++  }else{
++    $('#stStop').className='badge';
++    $('#stStop').textContent=s.stop_reason||'—';
++  }
++  $('#mVtime').textContent=s.vtime||'—';
++  $('#mExec').textContent=s.executed||'—';
++  $('#mDisasm').textContent=s.disassembly||'—';
++  const regs=s.registers||{};
++  $('#rGrid').innerHTML=Object.entries(regs).map(([k,v])=>
++    `<div class="r"><b>${k}</b><span>${v}</span></div>`).join('')||'—';
++  $('#mVcpus').textContent=(s.vcpus||[]).map(v=>
++    `vcpu${v.id}  ${v.state}  ${v.mode}  RIP=${v.rip}  steps=${v.executed_steps}`+
++    (v.halted?'  halted':'')+(v.fault?'  FAULT':'')).join('\n')||'—';
++  if(Array.isArray(s.logs)&&s.logs.length){
++    lastLog.push(...s.logs);
++    if(lastLog.length>2000)lastLog=lastLog.slice(-2000);
++    paintLog();
++  }
++  if(s.framebuffer)$('#fbInfo').textContent=`фреймбуфер: ${s.framebuffer.width}×${s.framebuffer.height}`;
++}
++function paintLog(){
++  const f=($('#logFilter').value||'').toLowerCase();
++  const txt=lastLog.filter(l=>!f||l.toLowerCase().includes(f)).join('\n');
++  $('#logBox').textContent=txt||'(пусто)';
++  if($('#logScroll').checked)$('#logBox').scrollTop=$('#logBox').scrollHeight;
++}
++function renderFramebuffer(buffer){
++  const b=new Uint8Array(buffer);
++  if(b.length<10||b[0]!==70||b[1]!==66||b[2]!==1)return;
++  const d=new DataView(buffer), flags=b[3], w=d.getUint16(4,true), h=d.getUint16(6,true), rows=d.getUint16(8,true);
++  if(!w||!h||w>4096||h>4096)return;
++  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}
++  if(flags&1)ctx.clearRect(0,0,w,h);
++  let off=10;const rowImage=ctx.createImageData(w,1);
++  for(let n=0;n<rows;n++){
++    if(off+2>b.length)return;
++    const y=d.getUint16(off,true);off+=2;
++    if(y>=h||off+w*3>b.length)return;
++    for(let x=0;x<w;x++){const q=x*4,p=off+x*3;
++      rowImage.data[q]=b[p];rowImage.data[q+1]=b[p+1];rowImage.data[q+2]=b[p+2];rowImage.data[q+3]=255}
++    ctx.putImageData(rowImage,0,y);off+=w*3;
++  }
++}
++function applyScale(){
++  const v=$('#fbScale').value, w=canvas.width,h=canvas.height;
++  if(v==='fit')canvas.style.width='min(100%,720px)';
++  else canvas.style.width=(w*parseFloat(v))+'px';
++}
++
++/* ---------------- жизненный цикл машины ---------------- */
++async function refreshStatus(){
++  try{
++    const s=await api('/api/status');
++    machineState=s.state;
++    const map={off:['машина выключена',''],running:['машина работает','ok'],
++      exited:['прогон завершён'+(s.exit_code!==null?` (код ${s.exit_code})`:''), s.exit_code===0?'ok':'bad']};
++    const [txt,cls]=map[s.state]||[s.state,''];
++    $('#stState').textContent=txt;$('#stState').className='badge accent '+cls;
++    $('#btnStart').disabled=(s.state==='running');
++    $('#btnStop').disabled=(s.state!=='running');
++    $('#btnRestart').disabled=false;
++    if(s.run_dir)$('#runDirLabel').textContent='каталог: '+s.run_dir;
++    const r=s.responder||{};
++    $('#respState').textContent='responder: '+(r.running?'вкл (pid '+r.pid+')':'выкл');
++    $('#respState').className='badge '+(r.running?'ok':'');
++    return s;
++  }catch(e){$('#stState').textContent='GUI: лаунчер недоступен';
++    $('#stState').className='badge bad';return null}
++}
++async function startMachine(){
++  try{
++    const cfg=cfgFromForm();
++    const st=await refreshStatus();
++    if(st&&st.state==='running'){if(!confirm('Машина уже работает. Перезапустить?'))return;
++      await api('/api/stop','POST',{});}
++    await api('/api/start','POST',{config:cfg});
++    autoRan=false;
++    toast('машина запускается…');
++    await refreshStatus();
++    setTimeout(connectWS,250);
++    setTimeout(()=>{refreshArtifacts()},1200);
++  }catch(e){toast('запуск: '+e.message,true)}
++}
++async function stopMachine(){
++  try{
++    /* T5 semantics: at the post-mortem "end" stop (and at any stop) the
++       polite way down is the monitor's quit -- it makes the emulator print
++       its stats/receipts and write the artifacts.  SIGTERM is the fallback. */
++    if(ws&&ws.readyState===WebSocket.OPEN&&machineState==='running'){sendCommand('quit');
++      for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,250));
++        const s=await refreshStatus();if(s&&s.state!=='running')break;}}
++    const r=await api('/api/stop','POST',{});
++    toast('остановлено, код '+r.exit_code);
++    await refreshStatus();refreshArtifacts();refreshOutput();
++  }catch(e){toast('остановка: '+e.message,true)}
++}
++async function restartMachine(){
++  try{await api('/api/stop','POST',{});autoRan=false;
++    await api('/api/restart','POST',{config:cfgFromForm()});
++    toast('перезапуск…');await refreshStatus();setTimeout(connectWS,250);}
++  catch(e){toast('перезапуск: '+e.message,true)}
++}
++
++/* ---------------- артефакты / вывод / снапшоты ---------------- */
++async function refreshArtifacts(){
++  try{
++    const a=await api('/api/artifacts');
++    $('#artRows').innerHTML=a.entries.map(e=>
++      `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
++      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Скачать</button></a></td></tr>`).join('')
++      ||'<tr><td colspan="4">— нет файлов —</td></tr>';
++  }catch(e){}
++}
++async function refreshOutput(){
++  try{
++    const o=await api('/api/output?which='+$('#outWhich').value+'&tail=300');
++    $('#outBox').textContent=o.output||'(пусто)';
++  }catch(e){}
++}
++async function refreshSnaps(){
++  try{
++    const s=await api('/api/snapshots');
++    $('#snapRows').innerHTML=s.entries.map(e=>
++      `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
++      <td class="flex"><button class="small" onclick="snapLoad('${e.name}')">Загрузить</button>
++      <button class="small danger" onclick="snapDel('${e.name}')">Удалить</button></td></tr>`).join('')
++      ||'<tr><td colspan="4">— нет снапшотов —</td></tr>';
++  }catch(e){}
++}
++async function snapSave(){
++  const name=($('#fSnapName').value||'').trim();
++  if(!name){toast('введите имя снапшота',true);return}
++  const st=await refreshStatus();
++  const dir=(st&&st.snap_dir)||'';
++  sendCommand('exec',{line:'savevm '+dir+'/'+name.replace(/[^\w.\-]/g,'_')+'.snap'});
++  setTimeout(refreshSnaps,800);
++}
++window.snapLoad=async name=>{
++  const st=await refreshStatus();const dir=(st&&st.snap_dir)||'';
++  sendCommand('exec',{line:'loadvm '+dir+'/'+name});
++};
++window.snapDel=async name=>{
++  if(!confirm('Удалить снапшот '+name+'?'))return;
++  try{await api('/api/snapshots?name='+encodeURIComponent(name),'DELETE');refreshSnaps();}
++  catch(e){toast(e.message,true)}
++};
++
++/* ---------------- пресеты ---------------- */
++async function refreshPresets(){
++  try{
++    const p=await api('/api/presets');
++    const sel=$('#presetSel');
++    sel.innerHTML='<option value="">— пресеты —</option>'+
++      Object.keys(p.presets).sort().map(n=>`<option value="${n}">${n}</option>`).join('');
++  }catch(e){}
++}
++async function presetSave(){
++  const name=prompt('Название пресета:');
++  if(!name)return;
++  try{await api('/api/presets','POST',{name,config:cfgFromForm()});
++    toast('пресет сохранён');refreshPresets();}
++  catch(e){toast(e.message,true)}
++}
++async function presetLoad(){
++  const name=$('#presetSel').value;
++  if(!name){toast('выберите пресет',true);return}
++  try{const p=await api('/api/presets');if(p.presets[name]){cfgToForm(p.presets[name]);
++    toast('пресет «'+name+'» загружен');}}
++  catch(e){toast(e.message,true)}
++}
++async function presetDel(){
++  const name=$('#presetSel').value;
++  if(!name)return;
++  if(!confirm('Удалить пресет «'+name+'»?'))return;
++  try{await api('/api/presets?name='+encodeURIComponent(name),'DELETE');refreshPresets();}
++  catch(e){toast(e.message,true)}
++}
++
++/* ---------------- выбор файла ---------------- */
++let browseTarget=null, browseDir='';
++function openBrowser(fieldId, exts){
++  browseTarget=fieldId;
++  $('#fileModal').classList.add('open');
++  const cur=$('#'+fieldId).value.trim();
++  browseDir=cur?cur.replace(/[^/]+$/,''):'.';
++  if(!browseDir)browseDir='.';
++  loadDir(browseDir,exts);
++}
++async function loadDir(dir,exts){
++  try{
++    const r=await api('/api/files?path='+encodeURIComponent(dir)+
++      (exts?('&ext='+encodeURIComponent(exts)):''));
++    browseDir=r.path;
++    $('#fPath').value=r.path;
++    $('#fileList').innerHTML=
++      (r.parent?`<div class="frow dir" data-dir="${r.parent}">../</div>`:'')+
++      r.entries.map(e=>e.dir
++        ?`<div class="frow dir" data-dir="${r.path.replace(/\/$/,'')}/${e.name}">${e.name}/</div>`
++        :`<div class="frow" data-file="${r.path.replace(/\/$/,'')}/${e.name}">${e.name}
++           <span class="hint">${e.size}</span></div>`).join('')||'<div class="hint" style="padding:10px">пусто</div>';
++  }catch(e){toast(e.message,true)}
++}
++
++/* ---------------- события ---------------- */
++$('#btnStart').onclick=startMachine;
++$('#btnStop').onclick=stopMachine;
++$('#btnRestart').onclick=restartMachine;
++$('#btnRun').onclick=()=>sendCommand('continue');
++$('#btnPause').onclick=()=>sendCommand('pause');
++$('#btnStep').onclick=()=>sendCommand('step');
++$('#btnQuit').onclick=()=>sendCommand('quit');
++$('#btnBreak').onclick=()=>{const a=$('#fBreak').value.trim();if(a)sendCommand('break',{addr:a})};
++$('#btnBreaks').onclick=()=>sendCommand('exec',{line:'info break'});
++$('#btnKeys').onclick=()=>{const c=$('#fKeyCodes').value.trim();if(c)sendCommand('keys',{codes:c})};
++$('#btnType').onclick=()=>{const t=$('#fTypeText').value.replace(/\\n/g,'\n');if(t)sendCommand('type',{text:t})};
++$('#btnExec').onclick=()=>{const l=$('#fExec').value;if(l)sendCommand('exec',{line:l})};
++$('#fExec').addEventListener('keydown',e=>{if(e.key==='Enter')$('#btnExec').click()});
++$('#btnFbPng').onclick=()=>{
++  const a=document.createElement('a');a.download='framebuffer.png';
++  a.href=canvas.toDataURL('image/png');a.click();
++};
++$('#fbScale').onchange=applyScale;
++$('#logFilter').oninput=paintLog;
++$('#btnLogClear').onclick=()=>{lastLog=[];paintLog()};
++$('#btnLogDownload').onclick=()=>{
++  const blob=new Blob([lastLog.join('\n')],{type:'text/plain'});
++  const a=document.createElement('a');a.download='machine-log.txt';
++  a.href=URL.createObjectURL(blob);a.click();
++};
++$('#btnOutRefresh').onclick=refreshOutput;
++$('#outWhich').onchange=refreshOutput;
++$('#btnArtRefresh').onclick=refreshArtifacts;
++$('#btnSnapRefresh').onclick=refreshSnaps;
++$('#btnSnapSave').onclick=snapSave;
++$('#btnPresetSave').onclick=presetSave;
++$('#btnPresetLoad').onclick=presetLoad;
++$('#btnPresetDel').onclick=presetDel;
++$('#btnRespOn').onclick=async()=>{
++  try{await api('/api/responder','POST',{on:true,port:+$('#fRespPort').value||8080,
++    drop:$('#fRespDrop').value,no_tcp:$('#fRespNoTcp').checked});
++    toast('респондер запущен');refreshStatus();}
++  catch(e){toast(e.message,true)}
++};
++$('#btnRespOff').onclick=async()=>{
++  try{await api('/api/responder','POST',{on:false});toast('респондер остановлен');refreshStatus();}
++  catch(e){toast(e.message,true)}
++};
++$('#fVbe').onchange=()=>{$('#vbeCustomWrap').style.display=$('#fVbe').value==='custom'?'':'none'};
++$$('input[name=bootPath]').forEach(r=>r.onchange=()=>{
++  const k=$('input[name=bootPath]:checked').value==='kernel';
++  $('#fKernel').style.opacity=k?1:.55;$('#fInitrd').style.opacity=k?1:.55;
++  $('#fRom').style.opacity=k?.55:1;
++});
++$$('[data-browse]').forEach(b=>b.onclick=()=>openBrowser(b.dataset.browse,b.dataset.ext));
++$('#btnPathGo').onclick=()=>loadDir($('#fPath').value);
++$('#btnFileCancel').onclick=()=>$('#fileModal').classList.remove('open');
++$('#btnFileOk').onclick=()=>{
++  const sel=$('#fileList .frow.sel');
++  if(sel&&sel.dataset.file&&browseTarget)$('#'+browseTarget).value=sel.dataset.file;
++  $('#fileModal').classList.remove('open');
++};
++$('#fileList').addEventListener('click',e=>{
++  const row=e.target.closest('.frow');if(!row)return;
++  if(row.dataset.dir){loadDir(row.dataset.dir,$('#fileModal').dataset.exts||'');return}
++  $$('#fileList .frow').forEach(x=>x.classList.remove('sel'));
++  row.classList.add('sel');
++});
++$('#fileList').addEventListener('dblclick',e=>{
++  const row=e.target.closest('.frow');if(row&&row.dataset.file&&browseTarget){
++    $('#'+browseTarget).value=row.dataset.file;$('#fileModal').classList.remove('open');}
++});
++$$('.tab').forEach(t=>t.onclick=()=>{
++  $$('.tab').forEach(x=>x.classList.remove('active'));
++  $$('.page').forEach(x=>x.classList.remove('active'));
++  t.classList.add('active');
++  $('#tab-'+t.dataset.tab).classList.add('active');
++  if(t.dataset.tab==='files'){refreshArtifacts();refreshOutput()}
++  if(t.dataset.tab==='snap')refreshSnaps();
++});
++
++/* ---------------- старт ---------------- */
++(async function init(){
++  applyScale();
++  await refreshStatus();
++  refreshPresets();
++  setInterval(refreshStatus,2500);
++  try{
++    const s=await api('/api/status');
++    if(s.state==='running'){autoRan=true;connectWS();}
++    if(s.config)cfgToForm(s.config);
++  }catch(_e){}
++})();
++</script>
++</body>
++</html>
+-- 
+2.47.3
+

@@ -1,0 +1,666 @@
+From 2a84ca280935ba0e3234a1de9ea6683bfc478c92 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sun, 18 Oct 2026 15:56:31 +0000
+Subject: [PATCH] VIDEO V5: the 16 MiB aperture + vbe_start_addr panning
+
+The V4 close-out left two measured gaps: the VRAM window was the 800x600x4
+display buffer rather than a real VGA aperture, and the dispi offsets were
+clamped and readable but never consumed (the display always rendered from
+offset 0).  Both are closed on the one code path they share (dispi_fixup's
+offset fold).
+
+The make_ramwindow at 0xD0000000 now allocates GPU_VRAM_BYTES (the full
+16 MiB Bochs/QEMU std-VGA aperture); m->fb_w/fb_h stay the published
+800x600x32 DISPLAY (boot_info.fb, the 0x00200000 marker, the firmware
+probe -- all unmoved, measured byte-stable).  Everything that treated
+fb_w*fb_h*4 as 'the VRAM size' -- the YRES clamp, the offset ladder, the
+enable-edge clear, VIDEO_MEMORY_64K, the BANK mask -- now measures the
+aperture exactly as QEMU's vram_size does: --vbe=1024x768x32 (the V4 ASan
+repro) fits unclamped, oversized modes clamp one line short of the window
+(16000x12000x32 -> YRES 262), MEMORY_64K reads 256, bank mask 255.
+
+dispi_fixup now keeps QEMU's fold (vbe_start_addr = offset >> 2, DWORDS)
+and vga_render_display consumes it: the visible surface renders from
+m->fb + vbe_start_addr at the VBE line offset (VIRT_WIDTH > XRES advances
+whole lines at the pitch), and reads past the aperture render black rather
+than running off the window -- the offset clamp guards YRES rows while the
+renderer draws fb_h, which test_vbe_start_addr_panning pins explicitly.
+
+Vectors: reworked test_dispi_mem_bank + test_dispi_mode_clamped_to_vram
+(16 MiB offset ladder: rung 1 8x1x8, rung 2 400x1x32, rung 3
+1024x4096x32), new test_vbe_start_addr_panning (Y/X fold, pitch, bounded
+tail).  NC: revert src/devices.c -> abort at 'MEMORY_64K == 256'.
+Firmware lane byte-stable (GUEST_OK, marker, 800x600 PPM).
+
+README feature lines and the ROADMAP ledger/queue land here as the phase
+close-out for the A1-A3/N4/V5 stretch.
+---
+ CHANGELOG.md             |  23 +++++++
+ README.md                |  15 ++--
+ ROADMAP.md               |  34 ++++++++-
+ docs/plans/VIDEO_PLAN.md |  63 ++++++++++++++++-
+ src/devices.c            |  90 +++++++++++++++++-------
+ tests/test_video.c       | 145 ++++++++++++++++++++++++++++-----------
+ 6 files changed, 293 insertions(+), 77 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d73e4c7..1beea02 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,29 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0068 (VIDEO V5, the 16 MiB aperture + vbe_start_addr panning)
++
++- **The VRAM window is the full Bochs/QEMU std-VGA aperture (16 MiB),**
++  decoupled from the published 800x600x32 DISPLAY (`m->fb_w/fb_h`,
++  `boot_info.fb`, the 0x00200000 marker all unmoved).  Everything that
++  measured "VRAM = fb_w*fb_h*4" -- the YRES clamp, the offset ladder, the
++  enable-edge clear, `VIDEO_MEMORY_64K`, the BANK mask -- now measures
++  `GPU_VRAM_BYTES`, as QEMU's `vram_size` does.  `--vbe=1024x768x32` (the
++  V4 ASan repro) fits unclamped now; oversized modes still clamp one line
++  short of the window (16000x12000x32 -> YRES 262).
++- **`vbe_start_addr` is kept and consumed:** `dispi_fixup` folds
++  X/Y_OFFSET exactly as QEMU (dword index), and `vga_render_display`
++  renders from `m->fb + vbe_start_addr` at the VBE line offset -- the
++  display PANS when a guest programs the offsets, VIRT_WIDTH > XRES
++  advances whole lines at the pitch, and reads past the aperture render
++  black (the clamp guards YRES rows while the renderer draws fb_h).
++- Vectors: reworked `test_dispi_mem_bank` (256/255),
++  `test_dispi_mode_clamped_to_vram` (16 MiB ladder: rung 1 8x1x8, rung 2
++  400x1x32, rung 3 1024x4096x32), new `test_vbe_start_addr_panning`.
++  NC: revert `src/devices.c` -> the suite aborts at `MEMORY_64K == 256`.
++  Firmware lane byte-stable (`GUEST_OK`, marker, 800x600 PPM).
++
++
+ ### Added — patch 0067 (NET N4, honest INTx — ledger D4)
+ 
+ - **The e1000 INTx line is wired** (the deferred D4, its own phase because
+diff --git a/README.md b/README.md
+index 396270b..952cae6 100644
+--- a/README.md
++++ b/README.md
+@@ -13,8 +13,8 @@ A from-scratch C emulator for raw x86 firmware, with a switchable Intel platform
+ - Storage, USB, video, and networking:
+   - **AHCI SATA** (`src/ahci.c`, `docs/plans/STORE_PLAN.md` S0–S5): command-list/FIS/PRDT engine, `IDENTIFY`, `READ/WRITE DMA EXT`, 128 KiB transfers, up to 2 controllers (`--sata=`, `--sata-portN=`, `--ahci2`, `--sata2=`, `--sata-writethrough`), INTx delivery.
+   - **USB** (`src/devices.c`, `docs/plans/USB_PLAN.md` U0–U5): EHCI (`0:29.0`) + UHCI companion (`0:1.2`, `--no-usb-uhci`) with control/bulk schedules and BOT/SCSI mass storage (`INQUIRY`, `READ CAPACITY(10)`, `TEST UNIT READY`, `REQUEST SENSE`, `READ(10)`).
+-  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V4): 800×600×32 linear framebuffer (`0xD0000000`), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`).
+-  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N3): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP.
++  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V5): 16 MiB VGA aperture at `0xD0000000` with the published 800×600×32 display (boot_info.fb), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`) with `vbe_start_addr` display panning.
++  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N4): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP; honest INTx (IRQ 11 / INTA#, `(ICR & IMS)` level).
+ - Direct ELF64 kernel loader (`--kernel=`, `--initrd=`, `--cpus=`) and full BIOS boot route (`SeaBIOS → Stage 1 → Stage 2 → kernel.elf → init` on 1 to 4 vCPUs).
+ - Non-perturbing tooling (`docs/plans/TOOLING_PLAN.md` T0–T5): standalone disassembler (`x86dis`), instruction trace with CPU-vs-disassembler self-check (`--trace-file=`), interactive debugger REPL (`--debug`, `--debug-script=`, `--symbols=`), GDB RSP server (`--gdb=`), whole-machine `AURASNP1` v2 snapshots (`--snapshot-save=`, `--snapshot-load=`), and live HTTP/WebSocket browser monitor (`--monitor=`).
+ 
+@@ -154,8 +154,9 @@ make test-unit
+ payload (`tests/nic_tx.asm`) boots through the real firmware transport
+ off a throwaway `--disk=` image, transmits a frame through the e1000 TX
+ ring and a host-side responder records what arrived on the TAP endpoint.
+-It needs `nasm` and `python3`, and the fixed endpoint `UDP
+-127.0.0.1:8080` free; it SKIPs (exit 0) when a dependency is missing.
++It needs `nasm` and `python3`, and the TAP endpoint (default `UDP
++127.0.0.1:8080`; `AURALITE_TAP_PORT` moves the whole 8080/8081/8082
++family) free; it SKIPs (exit 0) when a dependency is missing.
+ The frozen-guest lane inside it SKIPs unless `KERNEL`/`INITRD` point at
+ an AuraLite-OS build.
+ 
+@@ -189,8 +190,10 @@ python3 tools/tap_responder.py --drop=arp,icmp,dhcp,dns          # withhold L2/L
+ python3 tools/tap_responder.py --no-tcp                          # withhold TCP (the N3 control)
+ ```
+ 
+-It needs `python3` and the endpoints `UDP 127.0.0.1:8080`/`:8081` free —
+-both harnesses now *check* that before starting a lane, because
++It needs `python3` and the TAP endpoints free (default `UDP
++127.0.0.1:8080`/`:8081`/`:8082`; set `AURALITE_TAP_PORT` to move the
++family, e.g. for two parallel test runs) —
++all three net harnesses now *check* the port before starting a lane, because
+ `SO_REUSEADDR` lets two sockets bind the same port and a leftover
+ responder will silently split the datagrams (ledger **D11**). `--gw-mac`
+ overrides the gateway MAC, `--dns-ip` / `--dns-ttl` the A record
+diff --git a/ROADMAP.md b/ROADMAP.md
+index f6931f5..d6b8f06 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -29,8 +29,8 @@ maps to exactly one plan below.
+ | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
+ | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+-| `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+-| `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
++| `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post — and V5 ✅: the window is the full 16 MiB std-VGA aperture with `vbe_start_addr` display panning, the display contract 800x600x32 unmoved) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V5 |
++| `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK` — plus N4 ✅: the deferred D4 INTx line, cfg `0x3C`/`0x3D` seeded and `((ICR & IMS) != 0)` driven onto IRQ 11/INTA# the AHCI S5 way) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N4 |
+ | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | ✅ **CLOSED** (P0 ✅ `0051`, P1 ✅ `0052`, P2 ✅ `0053`, P3 ✅ `0054`, P4 NO-GO measured, P5 ✅ `0055`) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+ | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+@@ -53,7 +53,35 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ ## Immediate queue (next patches)
+ 
+-All ten plans in the ledger above are **CLOSED**. Recent COMPAT phase patches:
++All ten plans in the ledger above are **CLOSED**. Recent patches:
++
++- ~~`0068` — VIDEO V5: the VRAM window is the full 16 MiB Bochs/QEMU
++  std-VGA aperture (decoupled from the published 800x600x32 display that
++  `boot_info.fb` and the `0x00200000` marker pin), and `dispi_fixup`'s
++  offset fold is now consumed: `vga_render_display` pans from
++  `m->fb + vbe_start_addr` at the VBE line offset with a bounded tail.
++  `--vbe=1024x768x32` fits unclamped; `VIDEO_MEMORY_64K`=256 / bank mask
++  255 follow the aperture.  Gates: reworked `test_dispi_mem_bank` +
++  `test_dispi_mode_clamped_to_vram` (16 MiB ladder) and the new
++  `test_vbe_start_addr_panning`; NC = revert `src/devices.c` red at
++  `MEMORY_64K == 256`; firmware lane byte-stable.~~ shipped.
++- ~~`0067` — NET N4: the deferred D4 INTx.  PCI cfg `0x3C`/`0x3D` seeded
++  (IRQ 11, INTA#) and `e1000_intx_update()` drives `pic_set_irq(m, 11,
++  ((ICR & IMS) != 0))` on change -- the AHCI S5 pattern, I/O APIC fan-out
++  included -- with every ICR/IMS mutation recomputing the level.  The EOI
++  loop (intack -> vector 0x73 -> ICR drain -> pin drop -> EOI) is pinned
++  by `test_intx_line` in `make test-unit`; n1/n2/n3 receipts byte-identical
++  (76-frame tape, `N3OK`), NC = revert `src/e1000.c` red at
++  `cfg 0x3C == 11`.~~ shipped.
++- ~~`0066` — post-audit fixes A1–A3: `regs` prints the linear address
++  beside the raw `$rip` (real mode: 0xfff0 vs 0xfffffff0) and `help`
++  documents the pair, `mem_init` documents the ROM-alias/RAM overlap that
++  `perf_tlb_plain_table()` depends on, and the net harness TAP port family
++  (8080/8081/8082) is movable via `AURALITE_TAP_PORT` (n1 gains the D11
++  port-free pre-flight).  Defaults unchanged, receipts byte-identical.~~
++  shipped.
++
++Recent COMPAT phase patches:
+ 
+ - ~~`0065` — COMPAT G6: 4-vCPU BIOS SMP bring-up, MADT publication, and guest
+   SMP test suite (`EM_MAX_VCPU = 8`, `CMOS[0x5F] = nv - 1`, broadcast INIT/SIPI
+diff --git a/docs/plans/VIDEO_PLAN.md b/docs/plans/VIDEO_PLAN.md
+index 6121c7a..4106a54 100644
+--- a/docs/plans/VIDEO_PLAN.md
++++ b/docs/plans/VIDEO_PLAN.md
+@@ -573,7 +573,68 @@ it would move the guest-visible firmware contract, which §5 forbids, and
+ it would not remove the need for the clamp anyway, only reduce how often
+ it fires).
+ 
+-## 5. Standing constraints
++## 5. V5 — post-closure: the 16 MiB aperture + `vbe_start_addr` panning
++
++The V4 close-out left two measured gaps ("Not in V4"): the VRAM window was
++the 800x600x4 = 1,920,000-byte display buffer rather than a real VGA
++aperture, and the offsets were "clamped and readable but the visible
++display still renders from offset 0" -- no panning consumer.  Both are
++closed here, together, because they share one code path (`dispi_fixup`'s
++offset fold).
++
++**What changed (`src/devices.c`):**
++
++- **The aperture is the full 16 MiB Bochs/QEMU std-VGA window.**  The
++  `make_ramwindow` at `0xD0000000` now allocates `GPU_VRAM_BYTES` (16 MiB)
++  instead of `fb_w*fb_h*4`; `m->fb_w/fb_h` remain the published 800x600x32
++  DISPLAY (boot_info.fb, the 0x00200000 marker, the firmware probe -- all
++  unmoved).  Everything that used to measure "VRAM = fb_w*fb_h*4" --
++  the YRES clamp (`maxy`), the offset ladder, the enable-edge clear,
++  `VIDEO_MEMORY_64K`, the BANK mask -- now measures the aperture, exactly
++  as QEMU's `vram_size` does.  Consequences a guest can see: 1024x768x32
++  (the V4 ASan repro) **fits now**, `VIDEO_MEMORY_64K` reads 256 (was 29),
++  the BANK mask is 255 (was 28), and the clamp still fires one line short
++  of the window for oversized modes (16000x12000x32 -> YRES 262).
++- **`vbe_start_addr` is kept and consumed.**  `dispi_fixup` folds the
++  offset exactly as QEMU (`offset = X_OFFSET*bits/8 + Y_OFFSET*linelength,
++  vbe_start_addr = offset >> 2`, DWORDS), and `vga_render_display` now
++  renders the visible surface from `m->fb + vbe_start_addr` at the VBE
++  line offset (VIRT_WIDTH may exceed XRES -> the pitch may exceed a row of
++  output pixels).  Reads past the aperture render black instead of running
++  off the window -- the offset clamp only guards `YRES` rows while the
++  renderer draws `fb_h`, a case the unit vector pins explicitly.
++
++**Contract preservation (measured):**
++
++- The firmware lane is byte-stable: `GUEST_OK`, `framebuffer marker OK:
++  pixel[0]=0x00200000`, `framebuffer.ppm (800x600)` -- the firmware never
++  touches the dispi (measured: no `0x1CE`/`0x1CF` in
++  `firmware/sample_firmware.nas`) and never reads BAR size.
++- `kloader`'s FRAMEBUF memmap entry stays `fb_w*fb_h*4` -- the published
++  framebuffer, not the aperture.
++- With no dispi mode ever set (the plain `--rom` path), `vbe_start_addr`
++  is 0 and the render falls back to the historical tightly-packed copy.
++
++**Receipts (measured, this phase):**
++
++- `tests/test_video.c`: `test_dispi_mem_bank` (256/255), the reworked
++  `test_dispi_mode_clamped_to_vram` (1024x768x32 fits unclamped;
++  16000x12000x32 clamps at 262 lines with `262*64000 <= VRAM <
++  263*64000`; the offset ladder re-derived against 16 MiB: rung 1
++  8x1x8, rung 2 400x1x32, rung 3 1024x4096x32), and the new
++  `test_vbe_start_addr_panning` (Y-offset fold, X-offset pixel shift,
++  VIRT_WIDTH pitch, bounded tail render).
++- Negative control: revert `src/devices.c`, the suite aborts at the first
++  V5 assertion (`MEMORY_64K == 256`).  RC measured non-zero.
++- The 800x600x32 PPM path is byte-identical (pitch == w, offset 0).
++
++**Still not modelled** (unchanged): the BPP-4 write-handler divergence
++recorded in V4 (bounded), QEMU's `vbe_update_vgaregs` full VGA-register
++re-assertion (no sizing surface exists in this model's `vga_io_write`),
++and text-mode panning (the CRTC start address is not implemented; VBE
++panning only).
++
++## 6. Standing constraints
+ 
+ - The guest-visible firmware contract (`firmware/sample_firmware.nas`)
+   does not change; its GPU probe (`0:2:0`, `0x8086:0x0412`, BAR0
+diff --git a/src/devices.c b/src/devices.c
+index f1afef5..bc4c31e 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -895,12 +895,52 @@ int vga_display_is_text(machine_t *m) {
+     return g_vga.m == m && g_vga.text_mode;
+ }
+ 
++/* Bochs VBE dispi state.  Declared here, above the display renderer (its
++ * V5 panning consumer), defined in the dispi section below. */
++typedef struct {
++    machine_t *m;
++    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
++    uint16_t index;
++    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
++    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */
++    uint32_t vram_bytes;      /* V5: the LFB aperture (16 MiB, QEMU std-VGA) */
++    uint32_t vbe_start_addr;  /* V5: QEMU's folded pan offset, in DWORDS  */
++    int prev_text;            /* display state captured at the enable edge */
++} dispi_t;
++static dispi_t g_dispi;
++
++/* V5: the VRAM window is the full Bochs/QEMU std-VGA aperture, 16 MiB,
++ * decoupled from the DISPLAY geometry (m->fb_w/fb_h stay the published
++ * 800x600x32 that boot_info.fb and the 0x00200000 marker pin).  Everything
++ * that used to treat `fb_w*fb_h*4` as "the VRAM size" -- the YRES clamp,
++ * the offset clamps, VIDEO_MEMORY_64K, the BANK mask, the enable-edge
++ * clear -- now measures against this aperture instead, exactly as QEMU's
++ * `vram_size` does. */
++#define GPU_VRAM_BYTES   (16u * 1024u * 1024u)
++
+ /* Render the visible display into px (w*h pixels, 0x00RRGGBB): the mode-3
+  * console (glyphs + palette) or the LFB as-is.  Graphics mode copies m->fb
+  * exactly, so historical framebuffer.ppm bytes do not move. */
+ void vga_render_display(machine_t *m, uint32_t *px, int w, int h) {
+     if (g_vga.m != m || !g_vga.text_mode) {
+-        for (int i = 0; i < w*h; i++) px[i] = m->fb ? m->fb[i] : 0;
++        /* V5 panning: QEMU renders the visible surface from
++         * `vram + vbe_start_addr*4`, one display row per scanline at the VBE
++         * line offset (VIRT_WIDTH may exceed XRES, so the pitch can be wider
++         * than a row of output pixels).  Reads past the aperture render as
++         * black rather than running off the window.  With no dispi mode ever
++         * set (the plain firmware path) start_addr is 0 and line_offset 0,
++         * which falls back to the historical tightly-packed w*h copy. */
++        uint32_t start = (g_dispi.m == m) ? g_dispi.vbe_start_addr : 0;
++        uint32_t pitch = (g_dispi.m == m && g_dispi.line_offset)
++                             ? g_dispi.line_offset / 4u : (uint32_t)w;
++        uint32_t words = (g_dispi.m == m) ? g_dispi.vram_bytes / 4u
++                                          : (uint32_t)m->fb_w * (uint32_t)m->fb_h;
++        for (int y = 0; y < h; y++) {
++            for (int x = 0; x < w; x++) {
++                uint64_t i = (uint64_t)start + (uint64_t)y * pitch + (uint32_t)x;
++                px[y * w + x] = (m->fb && i < words) ? m->fb[i] : 0;
++            }
++        }
+         return;
+     }
+     memset(px, 0, (size_t)w * (size_t)h * 4);     /* panel around the console */
+@@ -974,15 +1014,8 @@ void vga_dump_text(machine_t *m, const char *path) {
+ #define DISPI_MAX_YRES      12000
+ #define DISPI_MAX_BPP       32
+ 
+-typedef struct {
+-    machine_t *m;
+-    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
+-    uint16_t index;
+-    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
+-    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */ 
+-    int prev_text;            /* display state captured at the enable edge */
+-} dispi_t;
+-static dispi_t g_dispi;
++/* dispi_t / g_dispi are declared above vga_render_display (the V5 panning
++ * consumer). */
+ 
+ /* VIDEO V4: QEMU hw/display/vga.c `vbe_fixup_regs`, complete.
+  *
+@@ -1026,31 +1059,31 @@ static void dispi_fixup(void) {
+ 
+     /* check height -- THIS is the clamp that bounds the clear-to-screen */
+     linelength = (uint32_t)r[DISPI_VIRT_WIDTH] * bits / 8;
+-    maxy = (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
++    maxy = g_dispi.vram_bytes / linelength;            /* V5: 16 MiB aperture */
+     if (r[DISPI_YRES] == 0) r[DISPI_YRES] = 1;
+     if (r[DISPI_YRES] > DISPI_MAX_YRES) r[DISPI_YRES] = DISPI_MAX_YRES;
+     if (r[DISPI_YRES] > maxy) r[DISPI_YRES] = (uint16_t)maxy;
+ 
+-    /* check offset.  QEMU folds the result into `s->vbe_start_addr`, which its
+-     * display code uses to pan inside VRAM; this model has no panning consumer
+-     * (the visible display is rendered from `m->fb` at offset 0), so the value
+-     * is not kept -- but the clamps are performed anyway, because they are
+-     * observable through the register readbacks a guest client polls. */
++    /* check offset.  QEMU folds the result into `s->vbe_start_addr` (in
++     * DWORDS), which its display code uses to pan inside VRAM.  V5: this
++     * model now keeps the fold AND a panning consumer -- vga_render_display
++     * renders from `m->fb + vbe_start_addr` at the VBE line offset -- so a
++     * guest that pans via X/Y_OFFSET sees the display move, like QEMU.  The
++     * clamps stay observable through the register readbacks a guest client
++     * polls. */
+     if (r[DISPI_X_OFFSET] > DISPI_MAX_XRES) r[DISPI_X_OFFSET] = DISPI_MAX_XRES;
+     if (r[DISPI_Y_OFFSET] > DISPI_MAX_YRES) r[DISPI_Y_OFFSET] = DISPI_MAX_YRES;
+     offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
+     offset += (uint32_t)r[DISPI_Y_OFFSET] * linelength;
+-    if (offset + (uint32_t)r[DISPI_YRES] * linelength >
+-        (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
++    if (offset + (uint32_t)r[DISPI_YRES] * linelength > g_dispi.vram_bytes) {
+         r[DISPI_Y_OFFSET] = 0;
+         offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
+-        if (offset + (uint32_t)r[DISPI_YRES] * linelength >
+-            (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
++        if (offset + (uint32_t)r[DISPI_YRES] * linelength > g_dispi.vram_bytes) {
+             r[DISPI_X_OFFSET] = 0;
+             offset = 0;
+         }
+     }
+-    (void)offset;
++    g_dispi.vbe_start_addr = offset >> 2;   /* QEMU: dword index into VRAM */
+ 
+     /* update vga state.  QEMU assigns VIRT_HEIGHT = maxy unconditionally here;
+      * the earlier transcription kept a guest-set VIRT_HEIGHT when it already
+@@ -1075,7 +1108,7 @@ static uint32_t dispi_data_read(void *ctx, uint16_t port, int size) {
+     (void)ctx; (void)port; (void)size;
+     uint16_t idx = g_dispi.index;
+     if (idx == DISPI_MEMORY_64K)
+-        return (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / (64u * 1024u);
++        return g_dispi.vram_bytes / (64u * 1024u);   /* V5: 256 for 16 MiB */
+     if (idx >= 0x0A) return 0;
+     if (g_dispi.regs[DISPI_ENABLE] & DISPI_GETCAPS) {
+         /* QEMU capability probe: XRES/YRES/BPP reads return the maxima */
+@@ -1144,7 +1177,7 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
+              * heap corruption. */
+             if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb) {
+                 size_t clear = (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset;
+-                size_t vram = (size_t)g_dispi.m->fb_w * (size_t)g_dispi.m->fb_h * 4u;
++                size_t vram = g_dispi.vram_bytes;     /* V5: the 16 MiB aperture */
+                 if (clear > vram) clear = vram;      /* belt and braces */
+                 memset(g_dispi.m->fb, 0, clear);
+             }
+@@ -1161,7 +1194,7 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
+     }
+     case DISPI_BANK:
+         /* QEMU: val &= vbe_bank_mask ((vram >> 16) - 1) */
+-        v = (uint16_t)(v & (uint16_t)(((g_dispi.m->fb_w * g_dispi.m->fb_h * 4u) >> 16) - 1));
++        v = (uint16_t)(v & (uint16_t)((g_dispi.vram_bytes >> 16) - 1));
+         g_dispi.regs[idx] = v;
+         g_dispi.bank_offset = (uint32_t)v << 16;
+         break;
+@@ -1340,9 +1373,13 @@ void devices_init_common(machine_t *m) {
+     /* HCCPARAMS @0x08 = 0: 32-bit addressing only */
+ 
+     /* GPU VRAM / framebuffer, BAR0 = 0xD0000000 as the firmware's own "enable:" code
+-     * sets it; this buffer doubles as the pixel buffer shown in the GUI. */
++     * sets it; this buffer doubles as the pixel buffer shown in the GUI.
++     * V5: the aperture is the full 16 MiB QEMU/Bochs std-VGA window (modes
++     * up to that size are legal now -- 1024x768x32 fits), while the DISPLAY
++     * stays the published 800x600x32 that boot_info.fb and the firmware's
++     * 0x00200000 pixel marker pin. */
+     m->fb_w = 800; m->fb_h = 600;
+-    rw2_t *vram = make_ramwindow(m, 0xD0000000ULL, (uint64_t)m->fb_w*m->fb_h*4, 0, "GPU VRAM/Framebuffer");
++    rw2_t *vram = make_ramwindow(m, 0xD0000000ULL, (uint64_t)GPU_VRAM_BYTES, 0, "GPU VRAM/Framebuffer");
+     m->fb = (uint32_t*)vram->buf;
+ 
+     /* CAR (cache-as-RAM) scratch window -- real silicon has no DRAM behind
+@@ -1366,6 +1403,7 @@ void devices_init_common(machine_t *m) {
+      * value of ID is ID0 (QEMU vga_reset); the rest zeroes. */
+     memset(&g_dispi, 0, sizeof g_dispi);
+     g_dispi.m = m;
++    g_dispi.vram_bytes = GPU_VRAM_BYTES;   /* V5: the 16 MiB aperture */
+     g_dispi.regs[DISPI_ID] = 0xB0C0;
+     io_register(m, 0x1CE, 1, dispi_index_read, dispi_index_write, NULL, "vbe-dispi-index");
+     io_register(m, 0x1CF, 1, dispi_data_read, dispi_data_write, NULL, "vbe-dispi-data");
+diff --git a/tests/test_video.c b/tests/test_video.c
+index 92754d0..658bdcf 100644
+--- a/tests/test_video.c
++++ b/tests/test_video.c
+@@ -191,22 +191,23 @@ static void test_dispi_mode_regs(void) {
+ 
+ static void test_dispi_mem_bank(void) {
+     fx_t f; fx_init(&f);
+-    /* VIDEO_MEMORY_64K = vram / 64K = 1920000/65536 = 29, read-only */
++    /* VIDEO_MEMORY_64K = vram / 64K = 16777216/65536 = 256 (V5: the full
++     * 16 MiB std-VGA aperture), read-only */
+     io_write(&f.m, 0x1CE, 2, 0x0A);
+-    assert(io_read(&f.m, 0x1CF, 2) == 29);
++    assert(io_read(&f.m, 0x1CF, 2) == 256);
+     io_write(&f.m, 0x1CF, 2, 0xFFFF);            /* ignored */
+-    assert(io_read(&f.m, 0x1CF, 2) == 29);
+-    /* BANK: QEMU mask = (vram >> 16) - 1 = 28 */
++    assert(io_read(&f.m, 0x1CF, 2) == 256);
++    /* BANK: QEMU mask = (vram >> 16) - 1 = 255 */
+     io_write(&f.m, 0x1CE, 2, 0x05);
+     io_write(&f.m, 0x1CF, 2, 0xFFFF);
+-    assert(io_read(&f.m, 0x1CF, 2) == 28);
+-    io_write(&f.m, 0x1CF, 2, 5);                 /* 5 & 28 = 4 */
+-    assert(io_read(&f.m, 0x1CF, 2) == 4);
++    assert(io_read(&f.m, 0x1CF, 2) == 255);
++    io_write(&f.m, 0x1CF, 2, 5);                 /* 5 & 255 = 5 */
++    assert(io_read(&f.m, 0x1CF, 2) == 5);
+     /* out-of-range index reads 0 */
+     io_write(&f.m, 0x1CE, 2, 0x0B);
+     assert(io_read(&f.m, 0x1CF, 2) == 0);
+     fx_done(&f);
+-    printf("ok vga dispi mem/bank (MEMORY_64K=29 RO, bank mask 28, oob=0)\n");
++    printf("ok vga dispi mem/bank (MEMORY_64K=256 RO, bank mask 255, oob=0)\n");
+ }
+ 
+ static void test_dispi_enable_display(void) {
+@@ -223,7 +224,7 @@ static void test_dispi_enable_display(void) {
+     io_write(&f.m, 0x1CE, 2, 0x06);
+     assert(io_read(&f.m, 0x1CF, 2) == 800);      /* VIRT_WIDTH clamped up */
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 600);      /* 1920000 / (800*4) */
++    assert(io_read(&f.m, 0x1CF, 2) == 5242);     /* V5: 16777216 / (800*4) */
+     io_write(&f.m, 0x1CE, 2, 0x08);
+     assert(io_read(&f.m, 0x1CF, 2) == 0);        /* X_OFFSET reset */
+     /* disable: back to the previous display (text) */
+@@ -318,28 +319,29 @@ static void test_gc_mode3_path(void) {
+  * three registers are only observable by writing them while already enabled. */
+ static void test_dispi_mode_clamped_to_vram(void) {
+     fx_t f; fx_init(&f);
+-    const uint32_t VRAM = 800u * 600u * 4u;        /* 1920000 */
++    const uint32_t VRAM = 16u * 1024u * 1024u;  /* V5: the std-VGA aperture */
+ 
+-    /* 1024x768x32: linelength 4096 -> maxy = 1920000/4096 = 468.  This is the
+-     * exact mode that aborted the unsanitized emulator, so reaching the
+-     * readback at all means the clear stayed inside the window. */
++    /* 1024x768x32: linelength 4096 -> maxy = 16777216/4096 = 4096.  V5:
++     * the mode that overflowed the old 1920000-byte window now FITS -- the
++     * clamps no longer fire and the clear is 768*4096 = 3145728 <= VRAM. */
+     vbe_mode_set(&f.m, 1024, 768, 32);
+     io_write(&f.m, 0x1CE, 2, 0x02);
+-    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* YRES clamped from 768 */
++    assert(io_read(&f.m, 0x1CF, 2) == 768);        /* YRES unclamped now */
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* VIRT_HEIGHT = maxy */
+-    assert(468u * 4096u <= VRAM);
++    assert(io_read(&f.m, 0x1CF, 2) == 4096);       /* VIRT_HEIGHT = maxy */
++    assert(768u * 4096u <= VRAM);
+ 
+     /* 16000x12000x32, the largest pair the write handler accepts at all:
+-     * linelength 64000 -> maxy = 30, and the clear is 30*64000 = 1920000 --
+-     * EXACTLY the window, so one unclamped line would overflow. */
++     * linelength 64000 -> maxy = 262, and the clear is 262*64000 =
++     * 16768000 <= VRAM with exactly one more line overflowing -- the V4
++     * overflow property, pinned on the 16 MiB window. */
+     fx_done(&f); fx_init(&f);
+     vbe_mode_set(&f.m, 16000, 12000, 32);
+     io_write(&f.m, 0x1CE, 2, 0x02);
+-    assert(io_read(&f.m, 0x1CF, 2) == 30);
++    assert(io_read(&f.m, 0x1CF, 2) == 262);
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 30);
+-    assert(30u * 64000u == VRAM);
++    assert(io_read(&f.m, 0x1CF, 2) == 262);
++    assert(262u * 64000u <= VRAM && 263u * 64000u > VRAM);
+ 
+     /* YRES 0 -> 1 (QEMU: "if YRES == 0, YRES = 1") -- not 0, not maxy. */
+     fx_done(&f); fx_init(&f);
+@@ -357,7 +359,9 @@ static void test_dispi_mode_clamped_to_vram(void) {
+     io_write(&f.m, 0x1CE, 2, 0x06);
+     assert(io_read(&f.m, 0x1CF, 2) == 8);          /* VIRT_WIDTH raised to XRES */
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 60000);      /* 1920000 / (8*4) */
++    /* 16777216 / (8*4) = 524288, truncated to the 16-bit register as 0
++     * (QEMU's vbe_regs are u16 too -- the same fold, not a divergence). */
++    assert(io_read(&f.m, 0x1CF, 2) == (uint16_t)(VRAM / 32u));
+ 
+     /* BPP the write handler accepts but QEMU's depth switch does not list is
+      * normalised to 8 by the fixup's default arm (33 is stored verbatim by the
+@@ -368,20 +372,20 @@ static void test_dispi_mode_clamped_to_vram(void) {
+     assert(io_read(&f.m, 0x1CF, 2) == 8);
+ 
+     /* VIRT_WIDTH, written while enabled: 65535 & ~7 = 65528, over MAX, so
+-     * 16000 -- and maxy follows at 1920000/(16000*4) = 30. */
++     * 16000 -- and maxy follows at 16777216/(16000*4) = 262. */
+     fx_done(&f); fx_init(&f);
+     vbe_mode_set(&f.m, 800, 600, 32);
+     io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 65535);
+     assert(io_read(&f.m, 0x1CF, 2) == 16000);
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 30);
++    assert(io_read(&f.m, 0x1CF, 2) == 262);
+     /* and the ~7 rounding on its own: 9 -> 8, then raised back to XRES */
+     io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 9);
+     assert(io_read(&f.m, 0x1CF, 2) == 800);
+ 
+     /* The offset ladder, rung by rung.  Rung 1 (clamp to MAX, nothing zeroed)
+      * needs a mode small enough that the clamped maxima still FIT: at 8x1x8bpp
+-     * linelength is 8, so 16000/4 + 12000*8 + 1*8 = 100008 <= 1920000. */
++     * linelength is 8, so 16000/1 + 12000*8 + 1*8 = 112008 <= VRAM. */
+     fx_done(&f); fx_init(&f);
+     vbe_mode_set(&f.m, 8, 1, 8);
+     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
+@@ -391,25 +395,25 @@ static void test_dispi_mode_clamped_to_vram(void) {
+ 
+     /* Rung 2: Y_OFFSET alone is zeroed, X_OFFSET survives.  It needs
+      * 12000 * linelength + YRES * linelength > VRAM, and since Y_OFFSET is
+-     * clamped to MAX_YRES = 12000 first, that means linelength >= 160 -- so
+-     * 40x1x32 (linelength 160): 12000*160 + 1*160 = 1920160 > 1920000, while
+-     * the retest with Y_OFFSET = 0 leaves 25 + 160 = 185, which fits.  At
+-     * 8x1x8 or 8x1x32 this rung is unreachable by construction: the clamped
+-     * Y_OFFSET can only reach 12000*8 = 96000 and 12000*32 = 384000 bytes. */
++     * clamped to MAX_YRES = 12000 first, that means linelength >= 1400 -- so
++     * 400x1x32 (linelength 1600): 12000*1600 + 1*1600 = 19201600 > VRAM,
++     * while the retest with Y_OFFSET = 0 leaves 400 + 1600 = 2000, which
++     * fits. */
+     fx_done(&f); fx_init(&f);
+-    vbe_mode_set(&f.m, 40, 1, 32);
++    vbe_mode_set(&f.m, 400, 1, 32);
+     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 100);
+-    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* 25 bytes, fits as-is */
++    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* 400 bytes, fits as-is */
+     io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
+     assert(io_read(&f.m, 0x1CF, 2) == 0);          /* clamped to 12000, then zeroed */
+     io_write(&f.m, 0x1CE, 2, 0x08);
+     assert(io_read(&f.m, 0x1CF, 2) == 100);        /* X_OFFSET untouched */
+ 
+-    /* Rung 3: neither fits, so both are zeroed.  At 800x600x32 the clamped
+-     * maxima give 16000 + 38400000 + 1920000 > VRAM, and dropping Y_OFFSET
+-     * still leaves 16000 + 1920000 > VRAM. */
++    /* Rung 3: neither fits, so both are zeroed.  At 1024x4096x32 the screen
++     * alone is exactly VRAM (4096*4096 = 16777216), so the clamped maxima
++     * give 64000 + 49152000 + 16777216 > VRAM -- and dropping Y_OFFSET still
++     * leaves 64000 + 16777216 > VRAM. */
+     fx_done(&f); fx_init(&f);
+-    vbe_mode_set(&f.m, 800, 600, 32);
++    vbe_mode_set(&f.m, 1024, 4096, 32);
+     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
+     io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
+     io_write(&f.m, 0x1CE, 2, 0x08);
+@@ -417,17 +421,75 @@ static void test_dispi_mode_clamped_to_vram(void) {
+     io_write(&f.m, 0x1CE, 2, 0x09);
+     assert(io_read(&f.m, 0x1CF, 2) == 0);
+ 
+-    /* The documented mode is untouched by every clamp: 800x600x32 gives
+-     * linelength 3200, maxy 600, clear 1920000 == the window exactly. */
++    /* The documented display mode is untouched by every clamp: 800x600x32
++     * gives linelength 3200, and its 1920000-byte clear is well inside the
++     * window (VIRT_HEIGHT still reports the full aperture / linesize). */
+     fx_done(&f); fx_init(&f);
+     vbe_mode_set(&f.m, 800, 600, 32);
+     io_write(&f.m, 0x1CE, 2, 0x02);
+     assert(io_read(&f.m, 0x1CF, 2) == 600);
+     io_write(&f.m, 0x1CE, 2, 0x07);
+-    assert(io_read(&f.m, 0x1CF, 2) == 600);
+-    assert(600u * 3200u == VRAM);
++    assert(io_read(&f.m, 0x1CF, 2) == 5242);
++    assert(600u * 3200u == 800u * 600u * 4u && 600u * 3200u < VRAM);
++    fx_done(&f);
++    printf("ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow, 16 MiB)\n");
++}
++
++/* V5 panning: QEMU folds X/Y_OFFSET into `vbe_start_addr` (dwords) and its
++ * display code renders from `vram + vbe_start_addr*4` at the VBE line
++ * offset.  This model now does the same -- the visible display PANS when a
++ * guest programs the offsets, and a VIRT_WIDTH wider than XRES advances
++ * whole lines at the pitch. */
++static void test_vbe_start_addr_panning(void) {
++    fx_t f; fx_init(&f);
++    const uint64_t L = 3200;                      /* 800x32bpp line bytes */
++    vbe_mode_set(&f.m, 800, 600, 32);
++    /* plant distinct pixels: row 100 col 0, and row 0 col 1 */
++    mem_write(&f.m, GPU_BASE + 100 * L + 0, 4, 0x00AABBCC);
++    mem_write(&f.m, GPU_BASE + 0, 4, 0x00112233);
++    uint32_t px[800 * 600];
++
++    /* no offsets: the historical tightly-packed render (pitch == w) */
++    vga_render_display(&f.m, px, 800, 600);
++    assert(px[0] == 0x00112233);
++    assert(px[100 * 800] == 0x00AABBCC);          /* row 100 col 0 */
++
++    /* Y_OFFSET=100: the visible row 0 IS vram row 100 */
++    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 100);
++    mem_write(&f.m, GPU_BASE + 100 * L + 4, 4, 0x00445566);
++    vga_render_display(&f.m, px, 800, 600);
++    assert(px[0] == 0x00AABBCC);                  /* panned */
++    assert(px[1] == 0x00445566);                  /* vram row 100 col 1 */
++
++    /* X_OFFSET=1 shifts one PIXEL: offset bytes = X_OFFSET*bits/8, so the
++     * visible col 0 is vram col 1 of the panned row */
++    io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 1);
++    vga_render_display(&f.m, px, 800, 600);
++    assert(px[0] == 0x00445566);                  /* one pixel right */
++
++    /* VIRT_WIDTH=1600 doubles the pitch: with start 0, output row 1 col 0
++     * (== px[800]) reads vram word 1600, not 800. */
++    fx_done(&f); fx_init(&f);
++    vbe_mode_set(&f.m, 800, 600, 32);
++    io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 1600);
++    assert(io_read(&f.m, 0x1CF, 2) == 1600);
++    mem_write(&f.m, GPU_BASE + 800 * 4, 4, 0x00000001);
++    mem_write(&f.m, GPU_BASE + 1600 * 4, 4, 0x00000002);
++    vga_render_display(&f.m, px, 800, 600);
++    assert(px[800] == 0x00000002);                /* pitch = 1600 words */
++    assert(px[0] == 0x00000000);
++
++    /* reads past the aperture render black rather than running off it.
++     * The offset clamp only guards YRES rows -- a one-line mode can legally
++     * pan to the end of VRAM while the renderer still draws fb_h rows. */
++    fx_done(&f); fx_init(&f);
++    vbe_mode_set(&f.m, 800, 1, 32);
++    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 4643); /* near end */
++    assert(io_read(&f.m, 0x1CF, 2) == 4643);      /* survives the clamp */
++    vga_render_display(&f.m, px, 800, 600);
++    assert(px[800 * 600 - 1] == 0);               /* black past the window */
+     fx_done(&f);
+-    printf("ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow)\n");
++    printf("ok vbe_start_addr panning (Y/X offset fold, pitch, bounded render)\n");
+ }
+ 
+ int main(void) {
+@@ -441,6 +503,7 @@ int main(void) {
+     test_dispi_enable_display();
+     test_vbe_mode_set_clear();
+     test_dispi_mode_clamped_to_vram();
++    test_vbe_start_addr_panning();
+     test_gc_mode3_path();
+     printf("test-video: all tests passed\n");
+     return 0;
+-- 
+2.47.3
+

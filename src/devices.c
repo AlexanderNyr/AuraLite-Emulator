@@ -895,12 +895,52 @@ int vga_display_is_text(machine_t *m) {
     return g_vga.m == m && g_vga.text_mode;
 }
 
+/* Bochs VBE dispi state.  Declared here, above the display renderer (its
+ * V5 panning consumer), defined in the dispi section below. */
+typedef struct {
+    machine_t *m;
+    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
+    uint16_t index;
+    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
+    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */
+    uint32_t vram_bytes;      /* V5: the LFB aperture (16 MiB, QEMU std-VGA) */
+    uint32_t vbe_start_addr;  /* V5: QEMU's folded pan offset, in DWORDS  */
+    int prev_text;            /* display state captured at the enable edge */
+} dispi_t;
+static dispi_t g_dispi;
+
+/* V5: the VRAM window is the full Bochs/QEMU std-VGA aperture, 16 MiB,
+ * decoupled from the DISPLAY geometry (m->fb_w/fb_h stay the published
+ * 800x600x32 that boot_info.fb and the 0x00200000 marker pin).  Everything
+ * that used to treat `fb_w*fb_h*4` as "the VRAM size" -- the YRES clamp,
+ * the offset clamps, VIDEO_MEMORY_64K, the BANK mask, the enable-edge
+ * clear -- now measures against this aperture instead, exactly as QEMU's
+ * `vram_size` does. */
+#define GPU_VRAM_BYTES   (16u * 1024u * 1024u)
+
 /* Render the visible display into px (w*h pixels, 0x00RRGGBB): the mode-3
  * console (glyphs + palette) or the LFB as-is.  Graphics mode copies m->fb
  * exactly, so historical framebuffer.ppm bytes do not move. */
 void vga_render_display(machine_t *m, uint32_t *px, int w, int h) {
     if (g_vga.m != m || !g_vga.text_mode) {
-        for (int i = 0; i < w*h; i++) px[i] = m->fb ? m->fb[i] : 0;
+        /* V5 panning: QEMU renders the visible surface from
+         * `vram + vbe_start_addr*4`, one display row per scanline at the VBE
+         * line offset (VIRT_WIDTH may exceed XRES, so the pitch can be wider
+         * than a row of output pixels).  Reads past the aperture render as
+         * black rather than running off the window.  With no dispi mode ever
+         * set (the plain firmware path) start_addr is 0 and line_offset 0,
+         * which falls back to the historical tightly-packed w*h copy. */
+        uint32_t start = (g_dispi.m == m) ? g_dispi.vbe_start_addr : 0;
+        uint32_t pitch = (g_dispi.m == m && g_dispi.line_offset)
+                             ? g_dispi.line_offset / 4u : (uint32_t)w;
+        uint32_t words = (g_dispi.m == m) ? g_dispi.vram_bytes / 4u
+                                          : (uint32_t)m->fb_w * (uint32_t)m->fb_h;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                uint64_t i = (uint64_t)start + (uint64_t)y * pitch + (uint32_t)x;
+                px[y * w + x] = (m->fb && i < words) ? m->fb[i] : 0;
+            }
+        }
         return;
     }
     memset(px, 0, (size_t)w * (size_t)h * 4);     /* panel around the console */
@@ -974,15 +1014,8 @@ void vga_dump_text(machine_t *m, const char *path) {
 #define DISPI_MAX_YRES      12000
 #define DISPI_MAX_BPP       32
 
-typedef struct {
-    machine_t *m;
-    uint16_t regs[0x0A];      /* 0x00..0x09 (0x0A is derived on read) */
-    uint16_t index;
-    uint32_t bank_offset;     /* BANK << 16 (QEMU s->bank_offset) */
-    uint32_t line_offset;     /* QEMU s->vbe_line_offset: VIRT_WIDTH * bytes */ 
-    int prev_text;            /* display state captured at the enable edge */
-} dispi_t;
-static dispi_t g_dispi;
+/* dispi_t / g_dispi are declared above vga_render_display (the V5 panning
+ * consumer). */
 
 /* VIDEO V4: QEMU hw/display/vga.c `vbe_fixup_regs`, complete.
  *
@@ -1026,31 +1059,31 @@ static void dispi_fixup(void) {
 
     /* check height -- THIS is the clamp that bounds the clear-to-screen */
     linelength = (uint32_t)r[DISPI_VIRT_WIDTH] * bits / 8;
-    maxy = (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / linelength;
+    maxy = g_dispi.vram_bytes / linelength;            /* V5: 16 MiB aperture */
     if (r[DISPI_YRES] == 0) r[DISPI_YRES] = 1;
     if (r[DISPI_YRES] > DISPI_MAX_YRES) r[DISPI_YRES] = DISPI_MAX_YRES;
     if (r[DISPI_YRES] > maxy) r[DISPI_YRES] = (uint16_t)maxy;
 
-    /* check offset.  QEMU folds the result into `s->vbe_start_addr`, which its
-     * display code uses to pan inside VRAM; this model has no panning consumer
-     * (the visible display is rendered from `m->fb` at offset 0), so the value
-     * is not kept -- but the clamps are performed anyway, because they are
-     * observable through the register readbacks a guest client polls. */
+    /* check offset.  QEMU folds the result into `s->vbe_start_addr` (in
+     * DWORDS), which its display code uses to pan inside VRAM.  V5: this
+     * model now keeps the fold AND a panning consumer -- vga_render_display
+     * renders from `m->fb + vbe_start_addr` at the VBE line offset -- so a
+     * guest that pans via X/Y_OFFSET sees the display move, like QEMU.  The
+     * clamps stay observable through the register readbacks a guest client
+     * polls. */
     if (r[DISPI_X_OFFSET] > DISPI_MAX_XRES) r[DISPI_X_OFFSET] = DISPI_MAX_XRES;
     if (r[DISPI_Y_OFFSET] > DISPI_MAX_YRES) r[DISPI_Y_OFFSET] = DISPI_MAX_YRES;
     offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
     offset += (uint32_t)r[DISPI_Y_OFFSET] * linelength;
-    if (offset + (uint32_t)r[DISPI_YRES] * linelength >
-        (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
+    if (offset + (uint32_t)r[DISPI_YRES] * linelength > g_dispi.vram_bytes) {
         r[DISPI_Y_OFFSET] = 0;
         offset = (uint32_t)r[DISPI_X_OFFSET] * bits / 8;
-        if (offset + (uint32_t)r[DISPI_YRES] * linelength >
-            (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4)) {
+        if (offset + (uint32_t)r[DISPI_YRES] * linelength > g_dispi.vram_bytes) {
             r[DISPI_X_OFFSET] = 0;
             offset = 0;
         }
     }
-    (void)offset;
+    g_dispi.vbe_start_addr = offset >> 2;   /* QEMU: dword index into VRAM */
 
     /* update vga state.  QEMU assigns VIRT_HEIGHT = maxy unconditionally here;
      * the earlier transcription kept a guest-set VIRT_HEIGHT when it already
@@ -1075,7 +1108,7 @@ static uint32_t dispi_data_read(void *ctx, uint16_t port, int size) {
     (void)ctx; (void)port; (void)size;
     uint16_t idx = g_dispi.index;
     if (idx == DISPI_MEMORY_64K)
-        return (uint32_t)(g_dispi.m->fb_w * g_dispi.m->fb_h * 4) / (64u * 1024u);
+        return g_dispi.vram_bytes / (64u * 1024u);   /* V5: 256 for 16 MiB */
     if (idx >= 0x0A) return 0;
     if (g_dispi.regs[DISPI_ENABLE] & DISPI_GETCAPS) {
         /* QEMU capability probe: XRES/YRES/BPP reads return the maxima */
@@ -1144,7 +1177,7 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
              * heap corruption. */
             if (!(v & DISPI_NOCLEARMEM) && g_dispi.m->fb) {
                 size_t clear = (size_t)g_dispi.regs[DISPI_YRES] * g_dispi.line_offset;
-                size_t vram = (size_t)g_dispi.m->fb_w * (size_t)g_dispi.m->fb_h * 4u;
+                size_t vram = g_dispi.vram_bytes;     /* V5: the 16 MiB aperture */
                 if (clear > vram) clear = vram;      /* belt and braces */
                 memset(g_dispi.m->fb, 0, clear);
             }
@@ -1161,7 +1194,7 @@ static void dispi_data_write(void *ctx, uint16_t port, int size, uint32_t val) {
     }
     case DISPI_BANK:
         /* QEMU: val &= vbe_bank_mask ((vram >> 16) - 1) */
-        v = (uint16_t)(v & (uint16_t)(((g_dispi.m->fb_w * g_dispi.m->fb_h * 4u) >> 16) - 1));
+        v = (uint16_t)(v & (uint16_t)((g_dispi.vram_bytes >> 16) - 1));
         g_dispi.regs[idx] = v;
         g_dispi.bank_offset = (uint32_t)v << 16;
         break;
@@ -1340,9 +1373,13 @@ void devices_init_common(machine_t *m) {
     /* HCCPARAMS @0x08 = 0: 32-bit addressing only */
 
     /* GPU VRAM / framebuffer, BAR0 = 0xD0000000 as the firmware's own "enable:" code
-     * sets it; this buffer doubles as the pixel buffer shown in the GUI. */
+     * sets it; this buffer doubles as the pixel buffer shown in the GUI.
+     * V5: the aperture is the full 16 MiB QEMU/Bochs std-VGA window (modes
+     * up to that size are legal now -- 1024x768x32 fits), while the DISPLAY
+     * stays the published 800x600x32 that boot_info.fb and the firmware's
+     * 0x00200000 pixel marker pin. */
     m->fb_w = 800; m->fb_h = 600;
-    rw2_t *vram = make_ramwindow(m, 0xD0000000ULL, (uint64_t)m->fb_w*m->fb_h*4, 0, "GPU VRAM/Framebuffer");
+    rw2_t *vram = make_ramwindow(m, 0xD0000000ULL, (uint64_t)GPU_VRAM_BYTES, 0, "GPU VRAM/Framebuffer");
     m->fb = (uint32_t*)vram->buf;
 
     /* CAR (cache-as-RAM) scratch window -- real silicon has no DRAM behind
@@ -1366,6 +1403,7 @@ void devices_init_common(machine_t *m) {
      * value of ID is ID0 (QEMU vga_reset); the rest zeroes. */
     memset(&g_dispi, 0, sizeof g_dispi);
     g_dispi.m = m;
+    g_dispi.vram_bytes = GPU_VRAM_BYTES;   /* V5: the 16 MiB aperture */
     g_dispi.regs[DISPI_ID] = 0xB0C0;
     io_register(m, 0x1CE, 1, dispi_index_read, dispi_index_write, NULL, "vbe-dispi-index");
     io_register(m, 0x1CF, 1, dispi_data_read, dispi_data_write, NULL, "vbe-dispi-data");

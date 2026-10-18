@@ -7,6 +7,97 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0069 (GUI G1, the no-command-line control panel)
+
+- **`tools/launcher.py` + `web/gui.html`: the whole CLI surface reachable
+  from one page.**  The launcher (stdlib-only Python 3) serves
+  `web/gui.html`, spawns `x86emu` exactly like the CLI would (argv list, no
+  shell, cwd = repo root) with `--monitor=127.0.0.1:<free port>`, and
+  splices the RFC 6455 monitor protocol through `/ws` (two independent
+  relay pumps -- measured: the single-loop splice dropped a pending `quit`
+  when a client vanished mid-keyframe).  The page (Russian, dark theme)
+  covers machine setup (boot path, platform, SMP, LPC/USB, SATA x2, VBE,
+  TAP + managed `tap_responder.py`, run limits, artifacts, debug options),
+  run control (start/restart/stop, pause/continue/step, breakpoints,
+  keys/typing), the live view (framebuffer + PNG export, registers, vCPUs,
+  log, x86dbg REPL), snapshots (`savevm`/`loadvm` behind buttons), per-run
+  artifact download and named config presets.
+- **argv is schema-built.**  Every option is validated against the SCHEMA
+  (choice/regex/int-range/existing-path); unknown keys and injected values
+  are refused -- `tests/test_gui_launcher.py` pins ten rejection NCs
+  (`platform: "haswell; rm -rf /"` etc.) plus the argv shape, the managed
+  output paths, the full lifecycle (start -> 101 handshake -> state push ->
+  continue -> post-mortem `end` stop -> `quit` -> exit 0 -> `GUEST_OK` +
+  PPM artifacts), presets, the 502/404 refusals and path-traversal
+  rejection (41 vectors).
+- **T5 end-stop semantics kept.**  At the post-mortem stop the page shows
+  the final state; «Остановить» sends the monitor's `quit` first so the
+  emulator prints stats/receipts and writes artifacts (SIGTERM is only the
+  fallback), then `api/stop`.
+- Integration: `make gui`, `make test-gui` (in `make test` and
+  `make test-sanitize`), `build.bat gui`, `gui.bat` double-click shortcut;
+  launcher state (`~/.x86emu-gui`: presets, runs, snapshots) stays outside
+  the repo; Windows-safe process termination.
+
+### Added — patch 0068 (VIDEO V5, the 16 MiB aperture + vbe_start_addr panning)
+
+- **The VRAM window is the full Bochs/QEMU std-VGA aperture (16 MiB),**
+  decoupled from the published 800x600x32 DISPLAY (`m->fb_w/fb_h`,
+  `boot_info.fb`, the 0x00200000 marker all unmoved).  Everything that
+  measured "VRAM = fb_w*fb_h*4" -- the YRES clamp, the offset ladder, the
+  enable-edge clear, `VIDEO_MEMORY_64K`, the BANK mask -- now measures
+  `GPU_VRAM_BYTES`, as QEMU's `vram_size` does.  `--vbe=1024x768x32` (the
+  V4 ASan repro) fits unclamped now; oversized modes still clamp one line
+  short of the window (16000x12000x32 -> YRES 262).
+- **`vbe_start_addr` is kept and consumed:** `dispi_fixup` folds
+  X/Y_OFFSET exactly as QEMU (dword index), and `vga_render_display`
+  renders from `m->fb + vbe_start_addr` at the VBE line offset -- the
+  display PANS when a guest programs the offsets, VIRT_WIDTH > XRES
+  advances whole lines at the pitch, and reads past the aperture render
+  black (the clamp guards YRES rows while the renderer draws fb_h).
+- Vectors: reworked `test_dispi_mem_bank` (256/255),
+  `test_dispi_mode_clamped_to_vram` (16 MiB ladder: rung 1 8x1x8, rung 2
+  400x1x32, rung 3 1024x4096x32), new `test_vbe_start_addr_panning`.
+  NC: revert `src/devices.c` -> the suite aborts at `MEMORY_64K == 256`.
+  Firmware lane byte-stable (`GUEST_OK`, marker, 800x600 PPM).
+
+
+### Added — patch 0067 (NET N4, honest INTx — ledger D4)
+
+- **The e1000 INTx line is wired** (the deferred D4, its own phase because
+  it touches `src/`): PCI cfg `0x3C` = IRQ 11 and `0x3D` = INTA# are
+  seeded, and `e1000_intx_update()` drives `pic_set_irq(m, 11, level)`
+  with the plan's `((ICR & IMS) != 0)` condition -- on change only, the
+  AHCI S5 pattern; `pic_set_irq` fans out to the I/O APIC (H7).  Every
+  ICR/IMS mutation recomputes the level: the TX walk, RX completion, ICS,
+  ICR W1C, IMS, IMC, ICR read-to-clear, reset.  The EOI loop is pinned end
+  to end by the new `test_intx_line` (intack -> vector 0x73 -> ICR drain ->
+  pin drop -> EOI), including the PIC power-on IMR=0xFF deliverability
+  order.
+- The N1 "IRQ line 0" guest reading is gone; no shipped receipt pinned
+  that string (measured).  n1/n2/n3 stay ALL PASS with byte-identical
+  receipts (76-frame tape, `N1TXOK ... icr=81`, `N3OK`) and identical
+  wall time.  NC: revert `src/e1000.c` -> `test-net` aborts at
+  `cfg 0x3C == 11`.
+
+### Fixed — patch 0066 (post-audit A1–A3: debugger clarity, alias warning, TAP port)
+
+- **A1 debugger linear address.**  `$rip` is the raw IP while `$lin` is
+  `cs.base + rip`; in real mode they differ (reset vector: 0xfff0 vs
+  0xfffffff0) and `x/i $rip` read RAM instead of the ROM, showing zeros.
+  `regs` now prints the linear address next to the raw one, `help`
+  documents the pair, and `test_dbg.c` pins the arithmetic and both `x/i`
+  forms.
+- **A2 ROM-alias/RAM overlap warning.**  `mem_init` now documents that the
+  0xE0000-0xFFFFF alias lives INSIDE `m->ram` (flash copy is `m->rom`),
+  the fact that `perf_tlb_plain_table()` depends on, so future RAM-only
+  caches keep excluding the window.
+- **A3 TAP port family overridable.**  The net harnesses hard-bind the
+  ground-rule endpoint (UDP 127.0.0.1:8080/8081/8082); `AURALITE_TAP_PORT`
+  now moves the whole family (n1 gains the D11 port-free pre-flight it
+  lacked).  Defaults unchanged -- every recorded receipt is byte-identical
+  (measured: n1/n2/n3 ALL PASS on 8080 and on a moved port).
+
 ### Added — patch 0065 (COMPAT G6, 4-vCPU BIOS SMP bring-up and guest SMP test suite)
 
 - **Multi-AP BIOS SMP bring-up (`--lpc=ich9 --smp=4`, up to `EM_MAX_VCPU = 8`).**

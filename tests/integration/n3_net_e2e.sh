@@ -66,8 +66,14 @@ KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
 INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
 RESP_TIMEOUT=${RESP_TIMEOUT:-60}
 MAX_INSTR=${MAX_INSTR:-200000000}
-TAP=127.0.0.1:8080
-NC_TAP=127.0.0.1:8082
+# A3: the ground-rule endpoint is UDP 127.0.0.1:8080; the PORT is overridable
+# (AURALITE_TAP_PORT) so parallel lanes/jobs cannot collide.  Defaults keep
+# every recorded receipt byte-identical.  Lane D derives its own port from the
+# same base (+2, matching the historical 8080/8082 pairing with n2's 8081).
+TAP_PORT=${AURALITE_TAP_PORT:-8080}
+NC_TAP_PORT=$((TAP_PORT+2))
+TAP=127.0.0.1:$TAP_PORT
+NC_TAP=127.0.0.1:$NC_TAP_PORT
 GW_MAC=52:55:0a:00:02:02
 DNS_ANSWER=93.184.216.34
 # Measured composition of the 76 frames lane A puts on the wire: ARP 2
@@ -142,7 +148,8 @@ run_lane() { # run_lane <tag> <tap|none> <responder args...>
                  echo "         pkill -f tools/tap_responder.py and re-run"
                  fail=1; return 1; }
         python3 "$ROOT/tools/tap_responder.py" \
-            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" "$@" \
+            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" \
+            --port "${mode##*:}" "$@" \
             > "$WORK/$tag-resp.out" 2>&1 &
         resp=$!
         wait_bound "${mode##*:}" || { fail=1; return 1; }
@@ -238,6 +245,7 @@ echo "== lane C: frozen-guest receipts (the DoD as the guest prints it)"
 if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
     python3 "$ROOT/tools/tap_responder.py" \
         --out "$WORK/c1-frames.hex" --timeout "$RESP_TIMEOUT" \
+        --port "$TAP_PORT" \
         > "$WORK/c1-resp.out" 2>&1 &
     "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
         --tap="$TAP" --log="$WORK/c1.log" \
@@ -264,7 +272,7 @@ else
 fi
 
 echo "== lane D: negative control -- TCP refused entirely (--no-tcp)"
-run_lane d1 "$NC_TAP" --port 8082 --no-tcp
+run_lane d1 "$NC_TAP" --no-tcp
 need "\[dns\] PASS: 'example.com' -> $DNS_ANSWER" "$WORK/d1.log" \
     "lane D: DNS over UDP still works (the lever is TCP-only)"
 need "\[tcp\] SYN options: 8 bytes" "$WORK/d1.log" \

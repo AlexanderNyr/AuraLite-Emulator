@@ -33,8 +33,16 @@ void mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len) {
     /* The low decode is ROM until PAM enables reads from this RAM-backed
      * shadow. Seed it from the right-aligned flash image so enabling PAM
      * does not expose uninitialized data before SeaBIOS copies its writable
-     * code/data sections. The flash buffer itself remains immutable. */
-    memcpy(m->ram + ROM_ALIAS_LOW_BASE, m->rom, ROM_SIZE);
+     * code/data sections. The flash buffer itself remains immutable.
+     *
+     * WARNING (the one spatial surprise on this machine): the alias window
+     * 0x000E0000..0x00100000 lives INSIDE `m->ram`, not in `m->rom`.  Every
+     * raw RAM read therefore sees the shadow copy -- flash contents until a
+     * guest stores over it -- and a raw RAM write mutates it while `m->rom`
+     * keeps the pristine image (which is exactly what PAM's RAM-write
+     * select wants).  Anything that treats "in-range" as "plain RAM" must
+     * know this: perf_tlb_plain_table() excludes the window for exactly
+     * that reason, and a future RAM-only cache MUST keep doing so. */
     m->mmio_list = NULL;
 }
 

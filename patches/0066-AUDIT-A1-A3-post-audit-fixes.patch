@@ -1,0 +1,365 @@
+From 3aeb40930dfd88eee3894369aaddd3ebd2ab1243 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sun, 18 Oct 2026 15:55:46 +0000
+Subject: [PATCH] Post-audit fixes A1-A3: debugger linear address, alias
+ warning, TAP port
+
+A1: $rip is the raw instruction pointer while $lin is cs.base+rip; in real
+mode they differ (reset vector: 0xfff0 vs 0xfffffff0), so 'x/i $rip' read
+RAM instead of the ROM and displayed zeros.  cmd_regs now prints the linear
+address beside the raw one, help documents the pair and when to use which,
+and tests/test_dbg.c pins the arithmetic plus both x/i forms (including that
+they disagree on purpose when the CS base is nonzero).  NC: without the lin
+row the new vector reddens (RC measured).
+
+A2: mem_init documents the one spatial surprise of this machine -- the
+0xE0000-0xFFFFF alias lives INSIDE m->ram (m->rom keeps the pristine flash)
+-- and that perf_tlb_plain_table() excludes the window for exactly that
+reason, so future RAM-only caches must keep doing so.
+
+A3: the net harnesses hard-bound the ground-rule TAP endpoint
+(UDP 127.0.0.1:8080/8081/8082).  AURALITE_TAP_PORT now moves the whole
+family (n2/n3 derive their NC lanes as +1/+2, responders get --port from
+the lane endpoint), and n1 gains the D11 port-free pre-flight the other
+two already had.  Defaults unchanged: n1/n2/n3 receipts byte-identical on
+8080 and on a moved port (measured, ALL PASS).
+---
+ CHANGELOG.md                      | 18 ++++++++
+ src/dbg.c                         | 14 +++++-
+ src/mem.c                         | 12 ++++-
+ tests/integration/n1_tx_tap.sh    | 28 ++++++++++--
+ tests/integration/n2_responder.sh | 16 +++++--
+ tests/integration/n3_net_e2e.sh   | 16 +++++--
+ tests/test_dbg.c                  | 74 +++++++++++++++++++++++++++++++
+ 7 files changed, 164 insertions(+), 14 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9ee6301..5a08151 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,24 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0066 (post-audit A1–A3: debugger clarity, alias warning, TAP port)
++
++- **A1 debugger linear address.**  `$rip` is the raw IP while `$lin` is
++  `cs.base + rip`; in real mode they differ (reset vector: 0xfff0 vs
++  0xfffffff0) and `x/i $rip` read RAM instead of the ROM, showing zeros.
++  `regs` now prints the linear address next to the raw one, `help`
++  documents the pair, and `test_dbg.c` pins the arithmetic and both `x/i`
++  forms.
++- **A2 ROM-alias/RAM overlap warning.**  `mem_init` now documents that the
++  0xE0000-0xFFFFF alias lives INSIDE `m->ram` (flash copy is `m->rom`),
++  the fact that `perf_tlb_plain_table()` depends on, so future RAM-only
++  caches keep excluding the window.
++- **A3 TAP port family overridable.**  The net harnesses hard-bind the
++  ground-rule endpoint (UDP 127.0.0.1:8080/8081/8082); `AURALITE_TAP_PORT`
++  now moves the whole family (n1 gains the D11 port-free pre-flight it
++  lacked).  Defaults unchanged -- every recorded receipt is byte-identical
++  (measured: n1/n2/n3 ALL PASS on 8080 and on a moved port).
++
+ ### Added — patch 0065 (COMPAT G6, 4-vCPU BIOS SMP bring-up and guest SMP test suite)
+ 
+ - **Multi-AP BIOS SMP bring-up (`--lpc=ich9 --smp=4`, up to `EM_MAX_VCPU = 8`).**
+diff --git a/src/dbg.c b/src/dbg.c
+index 5212441..0413855 100644
+--- a/src/dbg.c
++++ b/src/dbg.c
+@@ -905,6 +905,14 @@ static void cmd_regs(machine_t *m, FILE *o, int v) {
+         fprintf(o, "%-3s 0x%016llx%s", gpr64n[i], (unsigned long long)c->gpr[i], (i % 4 == 3) ? "\n" : "  ");
+     fprintf(o, "rip 0x%016llx  rflags 0x%016llx ", (unsigned long long)c->rip, (unsigned long long)c->rflags);
+     print_flags(o, c->rflags);
++    /* A1: print the LINEAR address next to the raw RIP.  In real mode the
++     * two differ by the CS base (0xFFFF0000 for the reset vector), so
++     * "x/i $rip" reads RAM instead of the ROM at the reset vector and shows
++     * zeros -- measured, and the reason the disassembly looked empty.  The
++     * linear form is what every other address in the debugger means, so
++     * show it right where the user is already looking. */
++    fprintf(o, "\nlin 0x%016llx  (cs.base + rip; $lin in expressions, "
++               "x/i with no address uses it)", (unsigned long long)(c->seg[SEG_CS].base + c->rip));
+     fprintf(o, "\ncs %04x ss %04x ds %04x es %04x fs %04x gs %04x  mode %s cpl %d vcpu %d\n",
+             c->seg[SEG_CS].sel, c->seg[SEG_SS].sel, c->seg[SEG_DS].sel, c->seg[SEG_ES].sel,
+             c->seg[SEG_FS].sel, c->seg[SEG_GS].sel, cpu_mode_name(c), c->seg[SEG_CS].sel & 3, v);
+@@ -1114,7 +1122,11 @@ static const char *const help_text =
+     "modify:      set $REG = EXPR   poke ADDR VALUE [SIZE]   (RAM only)\n"
+     "snapshots:   savevm FILE   loadvm FILE   (one vCPU; taken between instructions)\n"
+     "             vcpu N\n"
+-    "ADDR/EXPR:   numbers, $reg, symbols (--symbols/--kernel ELF), + - * ( ), *ADDR (8-byte load)\n";
++    "ADDR/EXPR:   numbers, $reg, symbols (--symbols/--kernel ELF), + - * ( ), *ADDR (8-byte load)\n"
++    "             $rip = the raw instruction pointer; $lin = its LINEAR address\n"
++    "             (cs.base + rip).  In real mode they differ (reset vector:\n"
++    "             $rip=0xfff0, $lin=0xfffffff0), so `x/i` with NO address uses\n"
++    "             $lin, while `x/i $rip` reads the raw IP -- use $lin there.\n";
+ 
+ static char *trim(char *s) {
+     while (*s == ' ' || *s == '\t') s++;
+diff --git a/src/mem.c b/src/mem.c
+index 7fd11be..a6771ee 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -33,8 +33,16 @@ void mem_init(machine_t *m, const uint8_t *rom_image, size_t rom_len) {
+     /* The low decode is ROM until PAM enables reads from this RAM-backed
+      * shadow. Seed it from the right-aligned flash image so enabling PAM
+      * does not expose uninitialized data before SeaBIOS copies its writable
+-     * code/data sections. The flash buffer itself remains immutable. */
+-    memcpy(m->ram + ROM_ALIAS_LOW_BASE, m->rom, ROM_SIZE);
++     * code/data sections. The flash buffer itself remains immutable.
++     *
++     * WARNING (the one spatial surprise on this machine): the alias window
++     * 0x000E0000..0x00100000 lives INSIDE `m->ram`, not in `m->rom`.  Every
++     * raw RAM read therefore sees the shadow copy -- flash contents until a
++     * guest stores over it -- and a raw RAM write mutates it while `m->rom`
++     * keeps the pristine image (which is exactly what PAM's RAM-write
++     * select wants).  Anything that treats "in-range" as "plain RAM" must
++     * know this: perf_tlb_plain_table() excludes the window for exactly
++     * that reason, and a future RAM-only cache MUST keep doing so. */
+     m->mmio_list = NULL;
+ }
+ 
+diff --git a/tests/integration/n1_tx_tap.sh b/tests/integration/n1_tx_tap.sh
+index f1e413e..e7543fb 100644
+--- a/tests/integration/n1_tx_tap.sh
++++ b/tests/integration/n1_tx_tap.sh
+@@ -43,7 +43,13 @@ WORK=${1:-/tmp/n1-tx-tap}   # fixed default: the tape embeds the --disk= path, s
+ KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
+ INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
+ RESP_TIMEOUT=${RESP_TIMEOUT:-20}
+-TAP=127.0.0.1:8080
++# A3: the ground-rule endpoint is UDP 127.0.0.1:8080, but the PORT is now
++# overridable so two lanes (or two CI jobs, or a developer with something
++# else on 8080) do not collide.  The default is unchanged, so every recorded
++# receipt -- the frame hex, the responder log, the serial tape -- stays
++# byte-identical.  The emulator already takes the endpoint as --tap=host:port.
++TAP_PORT=${AURALITE_TAP_PORT:-8080}
++TAP=127.0.0.1:$TAP_PORT
+ FRAME_HEX=ffffffffffff52540012345608004e3154584f4b
+ 
+ mkdir -p "$WORK"
+@@ -68,8 +74,24 @@ EOF
+ # ---- endpoint would silently cost us the frame), then the emulator.
+ run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
+     tag=$1; shift
++    # D11: SO_REUSEADDR lets two UDP sockets split the same port's datagrams
++    # (a leftover responder silently eats the lane's frames), so refuse to
++    # start on a busy endpoint rather than misreport a harness collision.
++    python3 -c "
++import socket,sys
++s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
++try:
++    s.bind(('127.0.0.1',int(sys.argv[1])))
++except OSError:
++    sys.exit(1)
++s.close(); sys.exit(0)" "$TAP_PORT" 2>/dev/null \
++        || { echo "  ERROR: UDP $TAP_PORT is already in use -- a leftover"
++             echo "         responder would split the lane's datagrams;"
++             echo "         pkill -f n1_tap_responder.py and re-run"
++             fail=1; return 1; }
+     python3 "$ROOT/tests/integration/n1_tap_responder.py" \
+         --out "$WORK/$tag-frames.hex" --count 1 --timeout "$RESP_TIMEOUT" \
++        --port "$TAP_PORT" \
+         > "$WORK/$tag-resp.out" 2>&1 &
+     resp=$!
+     # wait until the endpoint is actually bound
+@@ -79,10 +101,10 @@ run_tx_lane() { # run_tx_lane <tag> <extra emu args...>
+ import socket,sys
+ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+ try:
+-    s.bind(('127.0.0.1',8080))
++    s.bind(('127.0.0.1',int(sys.argv[1])))
+ except OSError:
+     sys.exit(0)
+-s.close(); sys.exit(1)" 2>/dev/null; then break; fi
++s.close(); sys.exit(1)" "$TAP_PORT" 2>/dev/null; then break; fi
+         i=$((i+1)); sleep 0.05
+     done
+     "$X86EMU" --platform=haswell --disk="$WORK/disk.img" "$@" \
+diff --git a/tests/integration/n2_responder.sh b/tests/integration/n2_responder.sh
+index cff67a4..bf41b21 100644
+--- a/tests/integration/n2_responder.sh
++++ b/tests/integration/n2_responder.sh
+@@ -69,8 +69,14 @@ KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
+ INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
+ RESP_TIMEOUT=${RESP_TIMEOUT:-25}
+ MAX_INSTR=${MAX_INSTR:-60000000}
+-TAP=127.0.0.1:8080
+-NC_TAP=127.0.0.1:8081          # lane D binds its own port so it cannot race A
++# A3: the ground-rule endpoint is UDP 127.0.0.1:8080; the PORT is overridable
++# (AURALITE_TAP_PORT) so parallel lanes/jobs cannot collide.  Defaults keep
++# every recorded receipt byte-identical.  Lane D derives its own port from the
++# same base (+1) so it cannot race lane A even when the base moves.
++TAP_PORT=${AURALITE_TAP_PORT:-8080}
++NC_TAP_PORT=$((TAP_PORT+1))
++TAP=127.0.0.1:$TAP_PORT
++NC_TAP=127.0.0.1:$NC_TAP_PORT   # lane D binds its own port so it cannot race A
+ GW_MAC=52:55:0a:00:02:02
+ 
+ mkdir -p "$WORK"
+@@ -137,7 +143,8 @@ run_lane() { # run_lane <tag> <tap|none> <responder args...>
+                  echo "         pkill -f tools/tap_responder.py and re-run"
+                  fail=1; return 1; }
+         python3 "$ROOT/tools/tap_responder.py" \
+-            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" "$@" \
++            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" \
++            --port "${mode##*:}" "$@" \
+             > "$WORK/$tag-resp.out" 2>&1 &
+         resp=$!
+         wait_bound "${mode##*:}" || { fail=1; return 1; }
+@@ -216,6 +223,7 @@ echo "== lane C: frozen-guest receipts (the DoD as the guest prints it)"
+ if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
+     python3 "$ROOT/tools/tap_responder.py" \
+         --out "$WORK/c1-frames.hex" --timeout "$RESP_TIMEOUT" \
++        --port "$TAP_PORT" \
+         > "$WORK/c1-resp.out" 2>&1 &
+     "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
+         --tap="$TAP" --log="$WORK/c1.log" \
+@@ -234,7 +242,7 @@ else
+ fi
+ 
+ echo "== lane D: negative control -- responder answers nothing (--drop)"
+-run_lane d1 "$NC_TAP" --port 8081 --drop=arp,icmp,dhcp
++run_lane d1 "$NC_TAP" --drop=arp,icmp,dhcp
+ need "\[dhcp\] DISCOVER sent"        "$WORK/d1.log" "lane D: the request still went out"
+ need "\[dhcp\] FAIL: no OFFER received" "$WORK/d1.log" "lane D: first timeout receipt"
+ need "\[net\] FAIL: no DHCP lease"   "$WORK/d1.log" "lane D: no lease"
+diff --git a/tests/integration/n3_net_e2e.sh b/tests/integration/n3_net_e2e.sh
+index 7885b4f..a6b6980 100644
+--- a/tests/integration/n3_net_e2e.sh
++++ b/tests/integration/n3_net_e2e.sh
+@@ -66,8 +66,14 @@ KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
+ INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
+ RESP_TIMEOUT=${RESP_TIMEOUT:-60}
+ MAX_INSTR=${MAX_INSTR:-200000000}
+-TAP=127.0.0.1:8080
+-NC_TAP=127.0.0.1:8082
++# A3: the ground-rule endpoint is UDP 127.0.0.1:8080; the PORT is overridable
++# (AURALITE_TAP_PORT) so parallel lanes/jobs cannot collide.  Defaults keep
++# every recorded receipt byte-identical.  Lane D derives its own port from the
++# same base (+2, matching the historical 8080/8082 pairing with n2's 8081).
++TAP_PORT=${AURALITE_TAP_PORT:-8080}
++NC_TAP_PORT=$((TAP_PORT+2))
++TAP=127.0.0.1:$TAP_PORT
++NC_TAP=127.0.0.1:$NC_TAP_PORT
+ GW_MAC=52:55:0a:00:02:02
+ DNS_ANSWER=93.184.216.34
+ # Measured composition of the 76 frames lane A puts on the wire: ARP 2
+@@ -142,7 +148,8 @@ run_lane() { # run_lane <tag> <tap|none> <responder args...>
+                  echo "         pkill -f tools/tap_responder.py and re-run"
+                  fail=1; return 1; }
+         python3 "$ROOT/tools/tap_responder.py" \
+-            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" "$@" \
++            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" \
++            --port "${mode##*:}" "$@" \
+             > "$WORK/$tag-resp.out" 2>&1 &
+         resp=$!
+         wait_bound "${mode##*:}" || { fail=1; return 1; }
+@@ -238,6 +245,7 @@ echo "== lane C: frozen-guest receipts (the DoD as the guest prints it)"
+ if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
+     python3 "$ROOT/tools/tap_responder.py" \
+         --out "$WORK/c1-frames.hex" --timeout "$RESP_TIMEOUT" \
++        --port "$TAP_PORT" \
+         > "$WORK/c1-resp.out" 2>&1 &
+     "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
+         --tap="$TAP" --log="$WORK/c1.log" \
+@@ -264,7 +272,7 @@ else
+ fi
+ 
+ echo "== lane D: negative control -- TCP refused entirely (--no-tcp)"
+-run_lane d1 "$NC_TAP" --port 8082 --no-tcp
++run_lane d1 "$NC_TAP" --no-tcp
+ need "\[dns\] PASS: 'example.com' -> $DNS_ANSWER" "$WORK/d1.log" \
+     "lane D: DNS over UDP still works (the lever is TCP-only)"
+ need "\[tcp\] SYN options: 8 bytes" "$WORK/d1.log" \
+diff --git a/tests/test_dbg.c b/tests/test_dbg.c
+index 92b45c1..20cfd8d 100644
+--- a/tests/test_dbg.c
++++ b/tests/test_dbg.c
+@@ -230,11 +230,85 @@ static void vectors_quit_pause_eval(void) {
+     printf("ok quit abandons the step, pause stops at the next boundary, expressions, registers\n");
+ }
+ 
++/* A1: the debugger's LINEAR address.  $rip is the raw instruction pointer
++ * and $lin is cs.base + rip; in real mode with a non-zero CS base the two
++ * differ, and the confusion that caused was the reason $lin became a
++ * first-class name and the `regs` listing grew a linear-address row.
++ *
++ * The vector pins three things:
++ *   1. the register arithmetic ($lin == cs.base + rip, $rip unchanged),
++ *   2. that `x/i` with NO address reads the LINEAR address (so it finds the
++ *      code the CPU is actually executing), and
++ *   3. that `x/i $rip` really is the raw IP -- a different byte, because
++ *      the two addresses are different places in memory.
++ */
++static char *exec_capture(machine_t *m, const char *cmd) {
++    FILE *f = tmpfile();
++    if (!f) return NULL;
++    dbg_exec(m, cmd, f);
++    fflush(f);
++    long n = ftell(f);
++    if (n < 0) n = 0;
++    char *buf = calloc(1, (size_t)n + 1);
++    if (!buf) { fclose(f); return NULL; }
++    rewind(f);
++    if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) { /* short read: keep what we got */ }
++    buf[n] = 0;
++    fclose(f);
++    return buf;
++}
++
++static void vectors_linear_address(void) {
++    load();
++    dbg_attach(&g_m);
++    uint64_t v; const char *err;
++
++    /* 1. the arithmetic, on the reset vector's real-mode CS base */
++    g_m.cpu.seg[SEG_CS].sel = 0xF000;
++    g_m.cpu.seg[SEG_CS].base = 0xFFFF0000ull;
++    g_m.cpu.rip = 0xFFF0;
++    EXPECT(dbg_reg_get(&g_m, 0, "lin", &v) && v == 0xFFFFFFF0ull,
++           "lin = cs.base + rip (got %llx)", (unsigned long long)v);
++    EXPECT(dbg_eval(&g_m, "$lin", &v, &err) && v == 0xFFFFFFF0ull, "$lin evaluates to the linear address");
++    EXPECT(dbg_eval(&g_m, "$rip", &v, &err) && v == 0xFFF0ull, "$rip stays the raw IP");
++
++    /* `regs` shows the linear address next to the raw one */
++    char *regs = exec_capture(&g_m, "regs");
++    EXPECT(regs && strstr(regs, "lin 0x00000000fffffff0"), "regs prints the linear address");
++    free(regs);
++
++    /* 2/3. `x/i` with no address follows cs.base; `x/i $rip` does not.  A
++     * CS base of 0x1000 makes the linear address land in RAM where the
++     * vector can place a known byte, and the raw IP land on a different
++     * known byte -- so a transcript that disagrees PROVES which address
++     * was used instead of merely printing one. */
++    g_m.cpu.seg[SEG_CS].sel = 0x0000;
++    g_m.cpu.seg[SEG_CS].base = 0x1000ull;
++    g_m.cpu.rip = 0x20;
++    g_m.ram[0x1020] = 0x90;   /* nop  -- at cs.base + rip */
++    g_m.ram[0x0020] = 0xF4;   /* hlt  -- at the raw rip */
++
++    char *at_lin = exec_capture(&g_m, "x/i");
++    char *at_dollar_lin = exec_capture(&g_m, "x/i $lin");
++    char *at_rip = exec_capture(&g_m, "x/i $rip");
++    EXPECT(at_lin && strstr(at_lin, "0000000000001020") && strstr(at_lin, "nop"),
++           "x/i with no address disassembles the LINEAR address");
++    EXPECT(at_dollar_lin && at_lin && strcmp(at_dollar_lin, at_lin) == 0,
++           "x/i $lin agrees with the default x/i");
++    EXPECT(at_rip && strstr(at_rip, "0000000000000020") && strstr(at_rip, "hlt"),
++           "x/i $rip reads the raw IP (documented, distinct from $lin)");
++    free(at_lin); free(at_dollar_lin); free(at_rip);
++
++    dbg_detach(&g_m);
++    printf("ok linear address: $lin = cs.base + rip, x/i defaults to it, $rip stays raw\n");
++}
++
+ int main(void) {
+     reference();
+     vectors_run_control();
+     vectors_bp_everywhere();
+     vectors_quit_pause_eval();
++    vectors_linear_address();
+     if (fails) { printf("test-dbg: %d FAILED\n", fails); return 1; }
+     puts("test-dbg: all vectors passed");
+     return 0;
+-- 
+2.47.3
+

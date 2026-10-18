@@ -113,6 +113,20 @@
 #define E1000_DLEN_MASK    0xfff80u   /* QEMU set_dlen: TDLEN/RDLEN are 128B
                                        * multiples (both rings)                */
 
+/* NET N4 (ledger D4): the INTx line.  Board wire: the device asserts ISA
+ * line E1000_IRQ (published at PCI cfg 0x3C = line, 0x3D = pin INTA#)
+ * through pic_set_irq(), which fans the same line out to the I/O APIC
+ * (CHIPSET H7 board wire) -- the AHCI S5 pattern.  The line is held exactly
+ * while the interrupt condition holds, the plan's `(ICR & IMS) != 0`:
+ * a cause that is still masked stays quiet, and the natural clear paths
+ * (ICR read-to-clear, ICR W1C, IMC masking) drop the line, so a guest
+ * handler's "read ICR, then EOI" sequence re-services correctly.
+ *
+ * The NIC payloads unmask IMS=0xD5 but run at IF=0 on a polled path and
+ * drain ICR before idling, so the wire is machine honesty -- pinned by the
+ * unit vectors below, invisible to their receipts. */
+#define E1000_IRQ          11
+
 
 typedef struct {
     machine_t *m;
@@ -129,11 +143,27 @@ typedef struct {
      * every frame that reached the TAP socket, and every frame dropped
      * because no socket is attached (the socketless unit lane). */
     uint64_t tx_frames, tx_dropped;
+    /* N4: current INTx line level (the E1000_IRQ board wire).  Tracked so
+     * pic_set_irq is driven on CHANGE, the AHCI S5 convention -- correct for
+     * both edge- and level-triggered PIC configurations. */
+    int      intx;
 } e1000_t;
 static e1000_t g_e1000;
 
 /* QEMU's e1000_reset behavioural core: zeroed register file, link up,
  * pre-initialized RAL/RAH (AddrValid + the QEMU default MAC), RXCSUM 0. */
+/* N4: the INTx board wire.  Level = ((ICR & IMS) != 0), driven on change
+ * onto ISA line E1000_IRQ (AHCI S5 pattern; pic_set_irq fans out to the
+ * I/O APIC).  Every mutation of ICR or IMS -- causes, read-to-clear,
+ * W1C, mask, unmask, reset -- must call this. */
+static void e1000_intx_update(e1000_t *e) {
+    int line = (e->regs[E1000_ICR / 4] & e->regs[E1000_IMS / 4]) != 0;
+    if (line != e->intx) {
+        e->intx = line;
+        pic_set_irq(e->m, E1000_IRQ, line);
+    }
+}
+
 static void e1000_reset_regs(void) {
     memset(g_e1000.regs, 0, sizeof g_e1000.regs);
     /* N1: the TX assembly state and the wire counters are device state, so a
@@ -147,6 +177,7 @@ static void e1000_reset_regs(void) {
     /* 52:54:00:12:34:56 -> RAL = 0x12005452, RAH = AV | 0x5634 */
     g_e1000.regs[E1000_RA / 4] = 0x12005452u;
     g_e1000.regs[(E1000_RA + 4) / 4] = RAH_AV | 0x5634u;
+    e1000_intx_update(&g_e1000);   /* N4: reset drops the INTx line */
 }
 
 /* ============================ TX ring egress ============================== */
@@ -267,12 +298,11 @@ static void e1000_start_xmit(machine_t *m) {
     }
 
     e->tx_busy = 0;
-    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line would
-     * follow when (ICR & IMS) != 0.  This device has no board line wired
-     * (the guest reads PCI cfg 0x3C as 0 and drives a polled fallback), so
-     * ICR/ICS bookkeeping is the whole honest surface here -- see the N1
-     * ledger entry D4 in docs/plans/NET_PLAN.md. */
+    /* set_ics(): the cause bits land in ICR (and ICS); the INTx line (N4,
+     * ledger D4) follows the plan's `(ICR & IMS) != 0` condition -- the
+     * bookkeeping-only era of N1 is over. */
     e->regs[E1000_ICR / 4] |= cause;
+    e1000_intx_update(e);
 }
 
 /* =============================== MMIO ===================================== */
@@ -284,6 +314,7 @@ uint64_t e1000_mmio_read(void *ctx, uint64_t addr, int size) {
     if (off == E1000_ICR) {                 /* read-to-clear */
         uint32_t v = e->regs[E1000_ICR / 4];
         e->regs[E1000_ICR / 4] = 0;
+        e1000_intx_update(e);               /* N4: clearing the cause drops the line */
         return v;
     }
     return e->regs[off / 4];
@@ -316,15 +347,19 @@ void e1000_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
          * to the guest; both are updated to keep the register file honest. */
         e->regs[E1000_ICR / 4] |= (uint32_t)val;
         e->regs[E1000_ICS / 4] |= (uint32_t)val;
+        e1000_intx_update(e);
         return;
     case E1000_ICR:
         e->regs[E1000_ICR / 4] &= ~(uint32_t)val;
+        e1000_intx_update(e);
         return;
     case E1000_IMS:
         e->regs[E1000_IMS / 4] |= (uint32_t)val;
+        e1000_intx_update(e);
         return;
     case E1000_IMC:
         e->regs[E1000_IMS / 4] &= ~(uint32_t)val;
+        e1000_intx_update(e);
         return;
     case E1000_TDLEN: case E1000_RDLEN:
         e->regs[off / 4] = (uint32_t)val & E1000_DLEN_MASK;
@@ -373,6 +408,7 @@ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len) {
     mem_write(m, desc + 12, 1, RXD_STAT_DD);       /* status: DD */
     g_e1000.regs[E1000_RDH / 4] = (rdh + 1) % n;
     g_e1000.regs[E1000_ICR / 4] |= ICR_RXT0;
+    e1000_intx_update(&g_e1000);                   /* N4: RX completion raises INTx */
 }
 
 /* ===================== device model + TAP attach ========================== */
@@ -389,6 +425,11 @@ static void e1000_add(machine_t *m) {
     e_pci->cfg[0x11] = (uint8_t)(E1000_MMIO_BASE >> 8);
     e_pci->cfg[0x12] = (uint8_t)(E1000_MMIO_BASE >> 16);
     e_pci->cfg[0x13] = (uint8_t)(E1000_MMIO_BASE >> 24);
+    /* N4 (ledger D4): publish the interrupt route -- pin INTA# and the ISA
+     * line the board wire above drives, so a guest that routes interrupts
+     * reads the truth instead of "IRQ line 0". */
+    e_pci->cfg[0x3C] = (uint8_t)E1000_IRQ;    /* Interrupt Line */
+    e_pci->cfg[0x3D] = 0x01;                  /* Interrupt Pin: INTA# */
     mem_register_mmio(m, E1000_MMIO_BASE, E1000_MMIO_SIZE,
                       e1000_mmio_read, e1000_mmio_write, &g_e1000,
                       "e1000 MMIO");

@@ -69,8 +69,14 @@ KERNEL=${KERNEL:-/home/user/AuraLite-OS/build/kernel.elf}
 INITRD=${INITRD:-/home/user/AuraLite-OS/build/initrd.tar}
 RESP_TIMEOUT=${RESP_TIMEOUT:-25}
 MAX_INSTR=${MAX_INSTR:-60000000}
-TAP=127.0.0.1:8080
-NC_TAP=127.0.0.1:8081          # lane D binds its own port so it cannot race A
+# A3: the ground-rule endpoint is UDP 127.0.0.1:8080; the PORT is overridable
+# (AURALITE_TAP_PORT) so parallel lanes/jobs cannot collide.  Defaults keep
+# every recorded receipt byte-identical.  Lane D derives its own port from the
+# same base (+1) so it cannot race lane A even when the base moves.
+TAP_PORT=${AURALITE_TAP_PORT:-8080}
+NC_TAP_PORT=$((TAP_PORT+1))
+TAP=127.0.0.1:$TAP_PORT
+NC_TAP=127.0.0.1:$NC_TAP_PORT   # lane D binds its own port so it cannot race A
 GW_MAC=52:55:0a:00:02:02
 
 mkdir -p "$WORK"
@@ -137,7 +143,8 @@ run_lane() { # run_lane <tag> <tap|none> <responder args...>
                  echo "         pkill -f tools/tap_responder.py and re-run"
                  fail=1; return 1; }
         python3 "$ROOT/tools/tap_responder.py" \
-            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" "$@" \
+            --out "$WORK/$tag-frames.hex" --timeout "$RESP_TIMEOUT" \
+            --port "${mode##*:}" "$@" \
             > "$WORK/$tag-resp.out" 2>&1 &
         resp=$!
         wait_bound "${mode##*:}" || { fail=1; return 1; }
@@ -216,6 +223,7 @@ echo "== lane C: frozen-guest receipts (the DoD as the guest prints it)"
 if [ -r "$KERNEL" ] && [ -r "$INITRD" ]; then
     python3 "$ROOT/tools/tap_responder.py" \
         --out "$WORK/c1-frames.hex" --timeout "$RESP_TIMEOUT" \
+        --port "$TAP_PORT" \
         > "$WORK/c1-resp.out" 2>&1 &
     "$X86EMU" --platform=haswell --kernel="$KERNEL" --initrd="$INITRD" \
         --tap="$TAP" --log="$WORK/c1.log" \
@@ -234,7 +242,7 @@ else
 fi
 
 echo "== lane D: negative control -- responder answers nothing (--drop)"
-run_lane d1 "$NC_TAP" --port 8081 --drop=arp,icmp,dhcp
+run_lane d1 "$NC_TAP" --drop=arp,icmp,dhcp
 need "\[dhcp\] DISCOVER sent"        "$WORK/d1.log" "lane D: the request still went out"
 need "\[dhcp\] FAIL: no OFFER received" "$WORK/d1.log" "lane D: first timeout receipt"
 need "\[net\] FAIL: no DHCP lease"   "$WORK/d1.log" "lane D: no lease"

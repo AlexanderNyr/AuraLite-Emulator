@@ -273,6 +273,13 @@ test-monitor-codec: tests/test_monitor_codec.c src/ws.c src/ws.h
 test-monitor: x86emu firmware/firmware.bin disk/disk.img tests/test_monitor.py web/monitor.html
 	X86EMU=./x86emu python3 tests/test_monitor.py
 
+test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py tools/launcher.py web/gui.html
+	python3 tests/test_gui_launcher.py
+
+gui: x86emu firmware/firmware.bin disk/disk.img
+	@echo "GUI launcher: http://127.0.0.1:8080/  (Ctrl-C to stop)"
+	python3 tools/launcher.py
+
 # Exactly one T5 NC (wrong RFC 6455 accept GUID); the handshake lane must go red.
 test-monitor-nc: tests/integration/t5_monitor_nc.sh
 	sh tests/integration/t5_monitor_nc.sh
@@ -326,7 +333,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
+test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -336,7 +343,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak

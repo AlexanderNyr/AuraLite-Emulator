@@ -29,8 +29,8 @@ maps to exactly one plan below.
 | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
 | [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
 | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
-| `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
-| `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+| `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post — and V5 ✅: the window is the full 16 MiB std-VGA aperture with `vbe_start_addr` display panning, the display contract 800x600x32 unmoved) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V5 |
+| `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK` — plus N4 ✅: the deferred D4 INTx line, cfg `0x3C`/`0x3D` seeded and `((ICR & IMS) != 0)` driven onto IRQ 11/INTA# the AHCI S5 way) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N4 |
 | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | ✅ **CLOSED** (P0 ✅ `0051`, P1 ✅ `0052`, P2 ✅ `0053`, P3 ✅ `0054`, P4 NO-GO measured, P5 ✅ `0055`) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
 | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
 | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
@@ -53,7 +53,43 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 
 ## Immediate queue (next patches)
 
-All ten plans in the ledger above are **CLOSED**. Recent COMPAT phase patches:
+All ten plans in the ledger above are **CLOSED**. Recent patches:
+
+- ~~`0069` — GUI G1: `tools/launcher.py` + `web/gui.html` make the whole
+  CLI surface reachable from one page -- machine setup (every option,
+  schema-validated), run control, live framebuffer/registers/log/REPL,
+  snapshots, artifact download, presets, managed TAP responder; the
+  monitor protocol spliced through `/ws` (two-pump relay), `make gui`,
+  `make test-gui` (41 vectors incl. ten injection-rejection NCs),
+  `gui.bat`.~~ shipped.
+
+- ~~`0068` — VIDEO V5: the VRAM window is the full 16 MiB Bochs/QEMU
+  std-VGA aperture (decoupled from the published 800x600x32 display that
+  `boot_info.fb` and the `0x00200000` marker pin), and `dispi_fixup`'s
+  offset fold is now consumed: `vga_render_display` pans from
+  `m->fb + vbe_start_addr` at the VBE line offset with a bounded tail.
+  `--vbe=1024x768x32` fits unclamped; `VIDEO_MEMORY_64K`=256 / bank mask
+  255 follow the aperture.  Gates: reworked `test_dispi_mem_bank` +
+  `test_dispi_mode_clamped_to_vram` (16 MiB ladder) and the new
+  `test_vbe_start_addr_panning`; NC = revert `src/devices.c` red at
+  `MEMORY_64K == 256`; firmware lane byte-stable.~~ shipped.
+- ~~`0067` — NET N4: the deferred D4 INTx.  PCI cfg `0x3C`/`0x3D` seeded
+  (IRQ 11, INTA#) and `e1000_intx_update()` drives `pic_set_irq(m, 11,
+  ((ICR & IMS) != 0))` on change -- the AHCI S5 pattern, I/O APIC fan-out
+  included -- with every ICR/IMS mutation recomputing the level.  The EOI
+  loop (intack -> vector 0x73 -> ICR drain -> pin drop -> EOI) is pinned
+  by `test_intx_line` in `make test-unit`; n1/n2/n3 receipts byte-identical
+  (76-frame tape, `N3OK`), NC = revert `src/e1000.c` red at
+  `cfg 0x3C == 11`.~~ shipped.
+- ~~`0066` — post-audit fixes A1–A3: `regs` prints the linear address
+  beside the raw `$rip` (real mode: 0xfff0 vs 0xfffffff0) and `help`
+  documents the pair, `mem_init` documents the ROM-alias/RAM overlap that
+  `perf_tlb_plain_table()` depends on, and the net harness TAP port family
+  (8080/8081/8082) is movable via `AURALITE_TAP_PORT` (n1 gains the D11
+  port-free pre-flight).  Defaults unchanged, receipts byte-identical.~~
+  shipped.
+
+Recent COMPAT phase patches:
 
 - ~~`0065` — COMPAT G6: 4-vCPU BIOS SMP bring-up, MADT publication, and guest
   SMP test suite (`EM_MAX_VCPU = 8`, `CMOS[0x5F] = nv - 1`, broadcast INIT/SIPI

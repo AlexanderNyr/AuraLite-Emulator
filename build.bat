@@ -25,6 +25,7 @@ if /I "%TARGET%"=="all"      goto :build_all
 if /I "%TARGET%"=="firmware" goto :build_firmware
 if /I "%TARGET%"=="demo"     goto :run_demo
 if /I "%TARGET%"=="monitor"  goto :run_monitor
+if /I "%TARGET%"=="gui"      goto :run_gui
 if /I "%TARGET%"=="test"     goto :run_tests
 
 echo [build.bat] Unknown command: "%TARGET%"
@@ -162,6 +163,23 @@ if errorlevel 1 exit /b 1
 echo [build.bat] Starting live browser monitor on http://127.0.0.1:8080/ ...
 echo             Open http://127.0.0.1:8080/ in your browser.
 .\x86emu.exe --platform=haswell --max-instr=5000000 --monitor=127.0.0.1:8080 --debug
+exit /b %ERRORLEVEL%
+
+:run_gui
+if not exist x86emu.exe call :build_all
+if errorlevel 1 exit /b 1
+if not exist firmware\firmware.bin call :build_firmware
+if errorlevel 1 exit /b 1
+set "PY="
+where py >nul 2>nul && set "PY=py -3"
+if not defined PY where python >nul 2>nul && set "PY=python"
+if not defined PY (
+  echo [build.bat] Python 3 is required for the GUI launcher.
+  exit /b 1
+)
+echo [build.bat] Starting the GUI launcher on http://127.0.0.1:8080/ ...
+echo             Open http://127.0.0.1:8080/ in your browser -- from here everything is GUI.
+%PY% tools\launcher.py
 exit /b %ERRORLEVEL%
 
 REM ----------------------------------------------------------------------------

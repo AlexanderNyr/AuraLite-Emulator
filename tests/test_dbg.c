@@ -230,11 +230,85 @@ static void vectors_quit_pause_eval(void) {
     printf("ok quit abandons the step, pause stops at the next boundary, expressions, registers\n");
 }
 
+/* A1: the debugger's LINEAR address.  $rip is the raw instruction pointer
+ * and $lin is cs.base + rip; in real mode with a non-zero CS base the two
+ * differ, and the confusion that caused was the reason $lin became a
+ * first-class name and the `regs` listing grew a linear-address row.
+ *
+ * The vector pins three things:
+ *   1. the register arithmetic ($lin == cs.base + rip, $rip unchanged),
+ *   2. that `x/i` with NO address reads the LINEAR address (so it finds the
+ *      code the CPU is actually executing), and
+ *   3. that `x/i $rip` really is the raw IP -- a different byte, because
+ *      the two addresses are different places in memory.
+ */
+static char *exec_capture(machine_t *m, const char *cmd) {
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    dbg_exec(m, cmd, f);
+    fflush(f);
+    long n = ftell(f);
+    if (n < 0) n = 0;
+    char *buf = calloc(1, (size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    rewind(f);
+    if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) { /* short read: keep what we got */ }
+    buf[n] = 0;
+    fclose(f);
+    return buf;
+}
+
+static void vectors_linear_address(void) {
+    load();
+    dbg_attach(&g_m);
+    uint64_t v; const char *err;
+
+    /* 1. the arithmetic, on the reset vector's real-mode CS base */
+    g_m.cpu.seg[SEG_CS].sel = 0xF000;
+    g_m.cpu.seg[SEG_CS].base = 0xFFFF0000ull;
+    g_m.cpu.rip = 0xFFF0;
+    EXPECT(dbg_reg_get(&g_m, 0, "lin", &v) && v == 0xFFFFFFF0ull,
+           "lin = cs.base + rip (got %llx)", (unsigned long long)v);
+    EXPECT(dbg_eval(&g_m, "$lin", &v, &err) && v == 0xFFFFFFF0ull, "$lin evaluates to the linear address");
+    EXPECT(dbg_eval(&g_m, "$rip", &v, &err) && v == 0xFFF0ull, "$rip stays the raw IP");
+
+    /* `regs` shows the linear address next to the raw one */
+    char *regs = exec_capture(&g_m, "regs");
+    EXPECT(regs && strstr(regs, "lin 0x00000000fffffff0"), "regs prints the linear address");
+    free(regs);
+
+    /* 2/3. `x/i` with no address follows cs.base; `x/i $rip` does not.  A
+     * CS base of 0x1000 makes the linear address land in RAM where the
+     * vector can place a known byte, and the raw IP land on a different
+     * known byte -- so a transcript that disagrees PROVES which address
+     * was used instead of merely printing one. */
+    g_m.cpu.seg[SEG_CS].sel = 0x0000;
+    g_m.cpu.seg[SEG_CS].base = 0x1000ull;
+    g_m.cpu.rip = 0x20;
+    g_m.ram[0x1020] = 0x90;   /* nop  -- at cs.base + rip */
+    g_m.ram[0x0020] = 0xF4;   /* hlt  -- at the raw rip */
+
+    char *at_lin = exec_capture(&g_m, "x/i");
+    char *at_dollar_lin = exec_capture(&g_m, "x/i $lin");
+    char *at_rip = exec_capture(&g_m, "x/i $rip");
+    EXPECT(at_lin && strstr(at_lin, "0000000000001020") && strstr(at_lin, "nop"),
+           "x/i with no address disassembles the LINEAR address");
+    EXPECT(at_dollar_lin && at_lin && strcmp(at_dollar_lin, at_lin) == 0,
+           "x/i $lin agrees with the default x/i");
+    EXPECT(at_rip && strstr(at_rip, "0000000000000020") && strstr(at_rip, "hlt"),
+           "x/i $rip reads the raw IP (documented, distinct from $lin)");
+    free(at_lin); free(at_dollar_lin); free(at_rip);
+
+    dbg_detach(&g_m);
+    printf("ok linear address: $lin = cs.base + rip, x/i defaults to it, $rip stays raw\n");
+}
+
 int main(void) {
     reference();
     vectors_run_control();
     vectors_bp_everywhere();
     vectors_quit_pause_eval();
+    vectors_linear_address();
     if (fails) { printf("test-dbg: %d FAILED\n", fails); return 1; }
     puts("test-dbg: all vectors passed");
     return 0;

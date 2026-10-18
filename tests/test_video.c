@@ -191,22 +191,23 @@ static void test_dispi_mode_regs(void) {
 
 static void test_dispi_mem_bank(void) {
     fx_t f; fx_init(&f);
-    /* VIDEO_MEMORY_64K = vram / 64K = 1920000/65536 = 29, read-only */
+    /* VIDEO_MEMORY_64K = vram / 64K = 16777216/65536 = 256 (V5: the full
+     * 16 MiB std-VGA aperture), read-only */
     io_write(&f.m, 0x1CE, 2, 0x0A);
-    assert(io_read(&f.m, 0x1CF, 2) == 29);
+    assert(io_read(&f.m, 0x1CF, 2) == 256);
     io_write(&f.m, 0x1CF, 2, 0xFFFF);            /* ignored */
-    assert(io_read(&f.m, 0x1CF, 2) == 29);
-    /* BANK: QEMU mask = (vram >> 16) - 1 = 28 */
+    assert(io_read(&f.m, 0x1CF, 2) == 256);
+    /* BANK: QEMU mask = (vram >> 16) - 1 = 255 */
     io_write(&f.m, 0x1CE, 2, 0x05);
     io_write(&f.m, 0x1CF, 2, 0xFFFF);
-    assert(io_read(&f.m, 0x1CF, 2) == 28);
-    io_write(&f.m, 0x1CF, 2, 5);                 /* 5 & 28 = 4 */
-    assert(io_read(&f.m, 0x1CF, 2) == 4);
+    assert(io_read(&f.m, 0x1CF, 2) == 255);
+    io_write(&f.m, 0x1CF, 2, 5);                 /* 5 & 255 = 5 */
+    assert(io_read(&f.m, 0x1CF, 2) == 5);
     /* out-of-range index reads 0 */
     io_write(&f.m, 0x1CE, 2, 0x0B);
     assert(io_read(&f.m, 0x1CF, 2) == 0);
     fx_done(&f);
-    printf("ok vga dispi mem/bank (MEMORY_64K=29 RO, bank mask 28, oob=0)\n");
+    printf("ok vga dispi mem/bank (MEMORY_64K=256 RO, bank mask 255, oob=0)\n");
 }
 
 static void test_dispi_enable_display(void) {
@@ -223,7 +224,7 @@ static void test_dispi_enable_display(void) {
     io_write(&f.m, 0x1CE, 2, 0x06);
     assert(io_read(&f.m, 0x1CF, 2) == 800);      /* VIRT_WIDTH clamped up */
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 600);      /* 1920000 / (800*4) */
+    assert(io_read(&f.m, 0x1CF, 2) == 5242);     /* V5: 16777216 / (800*4) */
     io_write(&f.m, 0x1CE, 2, 0x08);
     assert(io_read(&f.m, 0x1CF, 2) == 0);        /* X_OFFSET reset */
     /* disable: back to the previous display (text) */
@@ -318,28 +319,29 @@ static void test_gc_mode3_path(void) {
  * three registers are only observable by writing them while already enabled. */
 static void test_dispi_mode_clamped_to_vram(void) {
     fx_t f; fx_init(&f);
-    const uint32_t VRAM = 800u * 600u * 4u;        /* 1920000 */
+    const uint32_t VRAM = 16u * 1024u * 1024u;  /* V5: the std-VGA aperture */
 
-    /* 1024x768x32: linelength 4096 -> maxy = 1920000/4096 = 468.  This is the
-     * exact mode that aborted the unsanitized emulator, so reaching the
-     * readback at all means the clear stayed inside the window. */
+    /* 1024x768x32: linelength 4096 -> maxy = 16777216/4096 = 4096.  V5:
+     * the mode that overflowed the old 1920000-byte window now FITS -- the
+     * clamps no longer fire and the clear is 768*4096 = 3145728 <= VRAM. */
     vbe_mode_set(&f.m, 1024, 768, 32);
     io_write(&f.m, 0x1CE, 2, 0x02);
-    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* YRES clamped from 768 */
+    assert(io_read(&f.m, 0x1CF, 2) == 768);        /* YRES unclamped now */
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 468);        /* VIRT_HEIGHT = maxy */
-    assert(468u * 4096u <= VRAM);
+    assert(io_read(&f.m, 0x1CF, 2) == 4096);       /* VIRT_HEIGHT = maxy */
+    assert(768u * 4096u <= VRAM);
 
     /* 16000x12000x32, the largest pair the write handler accepts at all:
-     * linelength 64000 -> maxy = 30, and the clear is 30*64000 = 1920000 --
-     * EXACTLY the window, so one unclamped line would overflow. */
+     * linelength 64000 -> maxy = 262, and the clear is 262*64000 =
+     * 16768000 <= VRAM with exactly one more line overflowing -- the V4
+     * overflow property, pinned on the 16 MiB window. */
     fx_done(&f); fx_init(&f);
     vbe_mode_set(&f.m, 16000, 12000, 32);
     io_write(&f.m, 0x1CE, 2, 0x02);
-    assert(io_read(&f.m, 0x1CF, 2) == 30);
+    assert(io_read(&f.m, 0x1CF, 2) == 262);
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 30);
-    assert(30u * 64000u == VRAM);
+    assert(io_read(&f.m, 0x1CF, 2) == 262);
+    assert(262u * 64000u <= VRAM && 263u * 64000u > VRAM);
 
     /* YRES 0 -> 1 (QEMU: "if YRES == 0, YRES = 1") -- not 0, not maxy. */
     fx_done(&f); fx_init(&f);
@@ -357,7 +359,9 @@ static void test_dispi_mode_clamped_to_vram(void) {
     io_write(&f.m, 0x1CE, 2, 0x06);
     assert(io_read(&f.m, 0x1CF, 2) == 8);          /* VIRT_WIDTH raised to XRES */
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 60000);      /* 1920000 / (8*4) */
+    /* 16777216 / (8*4) = 524288, truncated to the 16-bit register as 0
+     * (QEMU's vbe_regs are u16 too -- the same fold, not a divergence). */
+    assert(io_read(&f.m, 0x1CF, 2) == (uint16_t)(VRAM / 32u));
 
     /* BPP the write handler accepts but QEMU's depth switch does not list is
      * normalised to 8 by the fixup's default arm (33 is stored verbatim by the
@@ -368,20 +372,20 @@ static void test_dispi_mode_clamped_to_vram(void) {
     assert(io_read(&f.m, 0x1CF, 2) == 8);
 
     /* VIRT_WIDTH, written while enabled: 65535 & ~7 = 65528, over MAX, so
-     * 16000 -- and maxy follows at 1920000/(16000*4) = 30. */
+     * 16000 -- and maxy follows at 16777216/(16000*4) = 262. */
     fx_done(&f); fx_init(&f);
     vbe_mode_set(&f.m, 800, 600, 32);
     io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 65535);
     assert(io_read(&f.m, 0x1CF, 2) == 16000);
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 30);
+    assert(io_read(&f.m, 0x1CF, 2) == 262);
     /* and the ~7 rounding on its own: 9 -> 8, then raised back to XRES */
     io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 9);
     assert(io_read(&f.m, 0x1CF, 2) == 800);
 
     /* The offset ladder, rung by rung.  Rung 1 (clamp to MAX, nothing zeroed)
      * needs a mode small enough that the clamped maxima still FIT: at 8x1x8bpp
-     * linelength is 8, so 16000/4 + 12000*8 + 1*8 = 100008 <= 1920000. */
+     * linelength is 8, so 16000/1 + 12000*8 + 1*8 = 112008 <= VRAM. */
     fx_done(&f); fx_init(&f);
     vbe_mode_set(&f.m, 8, 1, 8);
     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
@@ -391,25 +395,25 @@ static void test_dispi_mode_clamped_to_vram(void) {
 
     /* Rung 2: Y_OFFSET alone is zeroed, X_OFFSET survives.  It needs
      * 12000 * linelength + YRES * linelength > VRAM, and since Y_OFFSET is
-     * clamped to MAX_YRES = 12000 first, that means linelength >= 160 -- so
-     * 40x1x32 (linelength 160): 12000*160 + 1*160 = 1920160 > 1920000, while
-     * the retest with Y_OFFSET = 0 leaves 25 + 160 = 185, which fits.  At
-     * 8x1x8 or 8x1x32 this rung is unreachable by construction: the clamped
-     * Y_OFFSET can only reach 12000*8 = 96000 and 12000*32 = 384000 bytes. */
+     * clamped to MAX_YRES = 12000 first, that means linelength >= 1400 -- so
+     * 400x1x32 (linelength 1600): 12000*1600 + 1*1600 = 19201600 > VRAM,
+     * while the retest with Y_OFFSET = 0 leaves 400 + 1600 = 2000, which
+     * fits. */
     fx_done(&f); fx_init(&f);
-    vbe_mode_set(&f.m, 40, 1, 32);
+    vbe_mode_set(&f.m, 400, 1, 32);
     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 100);
-    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* 25 bytes, fits as-is */
+    assert(io_read(&f.m, 0x1CF, 2) == 100);        /* 400 bytes, fits as-is */
     io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
     assert(io_read(&f.m, 0x1CF, 2) == 0);          /* clamped to 12000, then zeroed */
     io_write(&f.m, 0x1CE, 2, 0x08);
     assert(io_read(&f.m, 0x1CF, 2) == 100);        /* X_OFFSET untouched */
 
-    /* Rung 3: neither fits, so both are zeroed.  At 800x600x32 the clamped
-     * maxima give 16000 + 38400000 + 1920000 > VRAM, and dropping Y_OFFSET
-     * still leaves 16000 + 1920000 > VRAM. */
+    /* Rung 3: neither fits, so both are zeroed.  At 1024x4096x32 the screen
+     * alone is exactly VRAM (4096*4096 = 16777216), so the clamped maxima
+     * give 64000 + 49152000 + 16777216 > VRAM -- and dropping Y_OFFSET still
+     * leaves 64000 + 16777216 > VRAM. */
     fx_done(&f); fx_init(&f);
-    vbe_mode_set(&f.m, 800, 600, 32);
+    vbe_mode_set(&f.m, 1024, 4096, 32);
     io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 65535);
     io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 65535);
     io_write(&f.m, 0x1CE, 2, 0x08);
@@ -417,17 +421,75 @@ static void test_dispi_mode_clamped_to_vram(void) {
     io_write(&f.m, 0x1CE, 2, 0x09);
     assert(io_read(&f.m, 0x1CF, 2) == 0);
 
-    /* The documented mode is untouched by every clamp: 800x600x32 gives
-     * linelength 3200, maxy 600, clear 1920000 == the window exactly. */
+    /* The documented display mode is untouched by every clamp: 800x600x32
+     * gives linelength 3200, and its 1920000-byte clear is well inside the
+     * window (VIRT_HEIGHT still reports the full aperture / linesize). */
     fx_done(&f); fx_init(&f);
     vbe_mode_set(&f.m, 800, 600, 32);
     io_write(&f.m, 0x1CE, 2, 0x02);
     assert(io_read(&f.m, 0x1CF, 2) == 600);
     io_write(&f.m, 0x1CE, 2, 0x07);
-    assert(io_read(&f.m, 0x1CF, 2) == 600);
-    assert(600u * 3200u == VRAM);
+    assert(io_read(&f.m, 0x1CF, 2) == 5242);
+    assert(600u * 3200u == 800u * 600u * 4u && 600u * 3200u < VRAM);
     fx_done(&f);
-    printf("ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow)\n");
+    printf("ok vga dispi mode clamped to VRAM (YRES/XRES/offsets, the V4 overflow, 16 MiB)\n");
+}
+
+/* V5 panning: QEMU folds X/Y_OFFSET into `vbe_start_addr` (dwords) and its
+ * display code renders from `vram + vbe_start_addr*4` at the VBE line
+ * offset.  This model now does the same -- the visible display PANS when a
+ * guest programs the offsets, and a VIRT_WIDTH wider than XRES advances
+ * whole lines at the pitch. */
+static void test_vbe_start_addr_panning(void) {
+    fx_t f; fx_init(&f);
+    const uint64_t L = 3200;                      /* 800x32bpp line bytes */
+    vbe_mode_set(&f.m, 800, 600, 32);
+    /* plant distinct pixels: row 100 col 0, and row 0 col 1 */
+    mem_write(&f.m, GPU_BASE + 100 * L + 0, 4, 0x00AABBCC);
+    mem_write(&f.m, GPU_BASE + 0, 4, 0x00112233);
+    uint32_t px[800 * 600];
+
+    /* no offsets: the historical tightly-packed render (pitch == w) */
+    vga_render_display(&f.m, px, 800, 600);
+    assert(px[0] == 0x00112233);
+    assert(px[100 * 800] == 0x00AABBCC);          /* row 100 col 0 */
+
+    /* Y_OFFSET=100: the visible row 0 IS vram row 100 */
+    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 100);
+    mem_write(&f.m, GPU_BASE + 100 * L + 4, 4, 0x00445566);
+    vga_render_display(&f.m, px, 800, 600);
+    assert(px[0] == 0x00AABBCC);                  /* panned */
+    assert(px[1] == 0x00445566);                  /* vram row 100 col 1 */
+
+    /* X_OFFSET=1 shifts one PIXEL: offset bytes = X_OFFSET*bits/8, so the
+     * visible col 0 is vram col 1 of the panned row */
+    io_write(&f.m, 0x1CE, 2, 0x08); io_write(&f.m, 0x1CF, 2, 1);
+    vga_render_display(&f.m, px, 800, 600);
+    assert(px[0] == 0x00445566);                  /* one pixel right */
+
+    /* VIRT_WIDTH=1600 doubles the pitch: with start 0, output row 1 col 0
+     * (== px[800]) reads vram word 1600, not 800. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 600, 32);
+    io_write(&f.m, 0x1CE, 2, 0x06); io_write(&f.m, 0x1CF, 2, 1600);
+    assert(io_read(&f.m, 0x1CF, 2) == 1600);
+    mem_write(&f.m, GPU_BASE + 800 * 4, 4, 0x00000001);
+    mem_write(&f.m, GPU_BASE + 1600 * 4, 4, 0x00000002);
+    vga_render_display(&f.m, px, 800, 600);
+    assert(px[800] == 0x00000002);                /* pitch = 1600 words */
+    assert(px[0] == 0x00000000);
+
+    /* reads past the aperture render black rather than running off it.
+     * The offset clamp only guards YRES rows -- a one-line mode can legally
+     * pan to the end of VRAM while the renderer still draws fb_h rows. */
+    fx_done(&f); fx_init(&f);
+    vbe_mode_set(&f.m, 800, 1, 32);
+    io_write(&f.m, 0x1CE, 2, 0x09); io_write(&f.m, 0x1CF, 2, 4643); /* near end */
+    assert(io_read(&f.m, 0x1CF, 2) == 4643);      /* survives the clamp */
+    vga_render_display(&f.m, px, 800, 600);
+    assert(px[800 * 600 - 1] == 0);               /* black past the window */
+    fx_done(&f);
+    printf("ok vbe_start_addr panning (Y/X offset fold, pitch, bounded render)\n");
 }
 
 int main(void) {
@@ -441,6 +503,7 @@ int main(void) {
     test_dispi_enable_display();
     test_vbe_mode_set_clear();
     test_dispi_mode_clamped_to_vram();
+    test_vbe_start_addr_panning();
     test_gc_mode3_path();
     printf("test-video: all tests passed\n");
     return 0;
