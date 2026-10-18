@@ -29,6 +29,18 @@ make
 make firmware/firmware.bin disk/disk.img
 ```
 
+### Windows 10 / 11 (`build.bat`)
+
+On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries with **MinGW-w64 GCC** (MSYS2 / WinLibs) using the POSIX/Winsock2/ELF compatibility layer in `win32/`, or delegate to **WSL2** (see [`docs/WINDOWS.md`](docs/WINDOWS.md) for the full Windows guide):
+
+```bat
+build.bat           REM Build x86emu.exe, x86dis.exe, and (if nasm is in PATH) firmware/disk images
+build.bat demo      REM Build and run the Haswell sample firmware demo
+build.bat monitor   REM Start the live browser monitor at http://127.0.0.1:8080/
+build.bat test      REM Run the native Windows C unit tests + Python G3/G5/G6 acceptance gates
+build.bat wsl test  REM Delegate full `make test` to WSL2
+```
+
 ## Run
 
 The emulator returns exit code `0` for a normal stop or instruction-limit stop and exit code `2` when the CPU enters a fault state. Input-file errors return exit code `1`.
