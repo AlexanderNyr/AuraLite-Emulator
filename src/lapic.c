@@ -142,7 +142,13 @@ static void vcpu_take_init(machine_t *m, int idx) {
         mlog(&m->log, "[lapic] INIT at the RUNNING vcpu%d ignored (self)", idx);
         return;
     }
+    uint64_t keep_steps = s->c.executed_steps;
+    uint64_t keep_instr = s->c.instr_count;
+    int keep_trace = s->c.trace;
     cpu_reset(&s->c);
+    s->c.executed_steps = keep_steps;
+    s->c.instr_count = keep_instr;
+    s->c.trace = keep_trace;
     lapic_t keep = s->l;                 /* preserve the LAPIC ID value */
     lapic_t *ll = &s->l;
     uint32_t id = keep.id;
@@ -202,12 +208,22 @@ static void lapic_icr_write(machine_t *m, uint32_t v) {
                  "already latched)", dest);
             return;                              /* level-deassert: nothing resets */
         }
-        /* INIT-assert / SIPI: shorthand 0 targeted delivery; the kernel's
-         * bring-up never uses the broadcast forms for these modes. */
+        /* INIT-assert / SIPI: shorthand 0 is targeted delivery (kernel smp_init);
+         * shorthand 2/3 are broadcast forms (SeaBIOS smp_setup uses shorthand 3,
+         * all-excluding-self, during POST).  When n_vcpus <= 1, keep the
+         * historical UP log line unchanged. */
         if (shorthand != 0) {
-            mlog(&m->log, "[lapic] IPI %s: vec=0x%02x shorthand=%d "
-                 "(broadcast form not modeled for INIT/SIPI)", kind,
-                 (unsigned)(v & 0xFF), shorthand);
+            if (m->n_vcpus <= 1 || (shorthand != 2 && shorthand != 3)) {
+                mlog(&m->log, "[lapic] IPI %s: vec=0x%02x shorthand=%d "
+                     "(broadcast form not modeled for INIT/SIPI)", kind,
+                     (unsigned)(v & 0xFF), shorthand);
+                return;
+            }
+            for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++) {
+                if (shorthand == 3 && i == m->cur_vcpu) continue;
+                if (dm == 5) vcpu_take_init(m, i);
+                else         vcpu_take_sipi(m, i, (uint8_t)(v & 0xFF));
+            }
             return;
         }
         int idx = lapic_index_by_id(m, dest);

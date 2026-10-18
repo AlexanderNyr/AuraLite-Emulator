@@ -1,0 +1,20 @@
+G3 acceptance ISO layout receipts (measured with a Python sector dump)
+
+Both images:
+  size                 84,934,656 B (81 MiB)
+  MBR signature        55 aa
+  partition entry      status 0x80, type 0x0c, start LBA 256, 163,840 sectors
+  FAT32 volume label   AURALITE   (at LBA 256 + 0x47)
+
+Stage-2 staging area, LBA 34..46 (13 sectors = 6,656 bytes):
+  pinned     3018fcd50629ceccb45a256e199192ce140a45b5dbe5f8f806b5077ff91ecfac
+  candidate  51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+
+Sector-by-sector comparison pinned vs candidate:
+  differing sectors    34, 35, 39, 40, 41, 42, 43, 44, 45, 46
+  differing sectors    10 of 166,272
+  all differing sectors lie inside the Stage-2 staging area (34..46);
+  sectors 36..38 are identical because the patch does not touch them.
+
+No boot-sector, GPT, FAT metadata, kernel, initrd, UEFI payload or ACPI
+sector differs between the two images.

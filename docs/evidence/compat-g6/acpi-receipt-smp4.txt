@@ -1,0 +1,12 @@
+rsdp addr=0x000f6770 rev=0 checksum=ok rsdt=0x07ffe270
+rsdt sig=RSDT entries=4 checksum=ok
+table sig=FACP addr=0x07ffff80 len=116 checksum=ok
+table sig=SSDT addr=0x07fff5e0 len=2398 checksum=ok
+table sig=APIC addr=0x07fff4e0 len=134 checksum=ok
+table sig=MCFG addr=0x07fff4a0 len=60 checksum=ok
+madt lapic_base=0xfee00000 cpus=4 ioapics=1 isos=4
+madt_ioapic id=0 addr=0xfec00000 gsi_base=0x0
+madt_iso bus=0 source=5 gsi=5 flags=0x000d
+madt_iso bus=0 source=9 gsi=9 flags=0x000d
+madt_iso bus=0 source=10 gsi=10 flags=0x000d
+madt_iso bus=0 source=11 gsi=11 flags=0x000d

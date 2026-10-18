@@ -44,6 +44,13 @@ void rtc_init(machine_t *m) {
     m->rtc.ram[0x31] = (uint8_t)(ext_kb >> 8);
     m->rtc.ram[0x34] = (uint8_t)(ext2_bytes >> 16);
     m->rtc.ram[0x35] = (uint8_t)(ext2_bytes >> 24);
+    /* COMPAT G6: CMOS 0x5F holds the extra-CPU count (present_cpus - 1) that
+     * SeaBIOS qemu_get_present_cpus_count() reads during POST when fw_cfg is
+     * absent.  Zero when n_vcpus/cfg_smp <= 1, keeping UP CMOS identical. */
+    int smp = m->n_vcpus > 1 ? m->n_vcpus : m->cfg_smp;
+    if (smp > EM_MAX_VCPU) smp = EM_MAX_VCPU;
+    if (smp > 1)
+        m->rtc.ram[0x5F] = (uint8_t)(smp - 1);
 }
 
 void rtc_tick(machine_t *m) {

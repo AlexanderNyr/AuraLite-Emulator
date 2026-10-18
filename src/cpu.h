@@ -45,7 +45,11 @@ typedef struct cpu {
     segment_t seg[6];
     uint64_t cr0, cr2, cr3, cr4;
     uint64_t efer;
-    uint64_t kgs_base;
+    uint64_t kgs_base;   /* IA32_KERNEL_GS_BASE (0xC0000102) -- the SWAPGS
+                          * partner of seg[SEG_GS].base which shadows
+                          * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
+                          * long mode flows through these MSRs (measured:
+                          * AuraLite's cpu_local/scheduler init). */
     uint16_t fcw;    /* K3: x87 control word tracked for FLDCW/FNSTCW;
                           * no x87 data model behind it (deliberate). */
     uint32_t mxcsr;    /* K3: SSE control/status; FXSAVE/FXRSTOR/LDMXCSR/
@@ -54,11 +58,7 @@ typedef struct cpu {
                         * measured ring-3 lane (userspace memset/memcpy and
                         * the AuraLite context switch) runs MOVAPS/UPS, MOVDQA/
                         * U, scalar moves and PXOR through it. SIMD arithmetic
-                        * is still deliberately out of scope. */   /* IA32_KERNEL_GS_BASE (0xC0000102) -- the SWAPGS
-                          * partner of seg[SEG_GS].base which shadows
-                          * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
-                          * long mode flows through these MSRs (measured:
-                          * AuraLite's cpu_local/scheduler init). */
+                        * is still deliberately out of scope. */
     uint64_t gdtr_base; uint16_t gdtr_limit;
     uint64_t idtr_base; uint16_t idtr_limit;
     uint64_t tr_base;  uint16_t tr_limit;     /* H6: cached by LTR (0F 00 /3) */
@@ -112,7 +112,17 @@ typedef struct cpu {
 } cpu_t;
 
 void cpu_reset(cpu_t *c);
-/* executes exactly one instruction; returns 0 normally, -1 on fault/halt-without-progress */
+/* Executes exactly one instruction; returns 0 normally, -1 on fault or on a
+ * hlt+cli halt without progress.
+ *
+ * SMP INVARIANT (K6): `c` MUST be the machine's CURRENT context -- the value
+ * in m->cpu, not a parked vcpu slot.  cpu_step() passes m->cpu to every
+ * internal helper (translate, raise_exception, page_fault, descriptor reads),
+ * and the run loop swaps a slot into m->cpu with vcpu_load() before stepping
+ * it.  Calling cpu_step() on a slot copy would execute "one instruction" and
+ * deliver any exception into the live BSP context instead, so the swap is not
+ * an optimization but part of the interface.  Unit harnesses satisfy this by
+ * stepping the machine's own m->cpu. */
 int  cpu_step(cpu_t *c);
 
 uint64_t cpu_get_msr(cpu_t *c, uint32_t idx, int *found);

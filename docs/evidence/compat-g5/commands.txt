@@ -1,0 +1,46 @@
+COMPAT G5 — exact reproduction
+
+1. Acceptance run (158 s, RC 0).  Budget 2 G is not the binding constraint:
+   the guest reaches `shell active` then idles in HLT.
+
+   ./x86emu --lpc=ich9 --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
+       --platform=haswell \
+       --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+       --sata=/tmp/iso-candidate.iso --max-instr=2000000000 --stats \
+       >x86emu-ich9.stdout.txt 2>x86emu-ich9.serial.log
+
+   The serial log was gzipped with `gzip -9n` (no timestamp) to 1.7 MB -> 250 KB.
+
+2. ACPI receipt and handoff block.  Run again to 850 M with a snapshot, then
+   walk it; the kernel is already idle and boot_info_t at 0x10000 is intact.
+
+   ./x86emu ... --max-instr=850000000 --stats --snapshot-save=/tmp/g5-acpi.snap
+   python3 tests/g5_acpi_receipt.py --snapshot /tmp/g5-acpi.snap \
+       --serial <(gzip -dc docs/evidence/compat-g5/x86emu-ich9.serial.log.gz) \
+       --out docs/evidence/compat-g5/acpi-receipt.txt
+   python3 tests/g5_acpi_receipt.py --check \
+       docs/evidence/compat-g5/acpi-receipt.txt --serial <serial>
+   dd if=/tmp/g5-acpi.snap ...   # boot_info_t 0x10000 + 7776 bytes, decoded in
+                                # bootinfo-parse.txt
+
+3. Instruction bound for the first `shell active` line:
+   `shell-active-bisect.txt` (0 at 435 M, 1 at 445 M).  Same lane, only
+   --max-instr changes.
+
+4. Negative control (55 s):
+
+   make test-g5-live     # sh tests/integration/g5_pm_nc.sh
+
+   builds a copy of the tree with pm_timer_now() restored to the pre-fix
+   `0xFFFFFFFF`; that copy prints no `[BL3]` in 300 M instructions, the
+   unmodified tree prints it at 297,585,739.
+
+5. Bundle gates:
+
+   make test-g5          # 54 re-checked conditions, inside `make test`
+   make test-g5-nc       # four tampered bundles must be rejected
+   make test-unit        # includes tests/test_pm.c (6 vectors)
+
+Caveat: the ISO and the SeaBIOS ROM live outside the tree; `inputs.txt`
+records their hashes.  No end-of-run snapshot or raw (uncompressed) serial log
+is stored.

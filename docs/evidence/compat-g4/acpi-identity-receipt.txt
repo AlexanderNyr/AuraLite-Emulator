@@ -1,0 +1,66 @@
+COMPAT G4 -- measured ACPI publication receipts (2026-10-17)
+============================================================
+
+Machine: x86emu @ this tree, --platform=haswell, 128 MiB RAM, Q35 host bridge
+8086:29c0, blank 1 MiB USB image, max-instr=200000000, exit code 0.
+
+A. Default LPC identity 8086:1e55, diagnostic SeaBIOS (match table unmodified)
+   ----------------------------------------------------------------------
+   End-of-run snapshot scan of RAM 0x80000..0x100000:
+       NO RSDP
+   i.e. SeaBIOS POST completes, prints "No bootable device", and publishes no
+   ACPI tables -- the G3-identified LPC-ID gate.
+
+B. Probe ROM (adds 1e55 to SeaBIOS acpi_setup/FADT match), default identity
+   ----------------------------------------------------------------------
+   End-of-run snapshot scan: RSDP at 0xf6210 (rev 0, checksum ok), RSDT at
+   0x7ffe4c0 with 3 entries (FACP/SSDT/APIC), all checksums valid.  This
+   reproduces the G3 evidence placement exactly and validates the scanner.
+   The full walk is printed under C as the control.
+
+C. --lpc=ich9, the SAME unmodified diagnostic SeaBIOS ROM
+   -------------------------------------------------------
+   SeaBIOS debug stream:
+       ACPI DSDT=0x07ffe4b0
+       Copying ACPI RSDP from 0x00006dfc to 0x000f6210
+   End-of-run snapshot chain walk (scan_acpi_snapshot.py):
+       RSDP       @0x000f6210 rev=0 checksum=ok -> RSDT @0x07ffe470
+         RSDT       @0x07ffe470 len=52     checksum=ok
+         RSDT entries: 4
+         FACP       @0x07ffff80 len=116    checksum=ok
+         SSDT       @0x07fff720 len=2073   checksum=ok
+         APIC       @0x07fff630 len=110    checksum=ok
+           MADT local APIC base=0xfee00000
+         MCFG       @0x07fff5f0 len=60     checksum=ok
+       tables: APIC FACP MCFG SSDT
+
+   The probe-ROM control (B) walks as:
+       RSDP       @0x000f6210 rev=0 checksum=ok -> RSDT @0x07ffe4c0
+         RSDT       @0x07ffe4c0 len=48     checksum=ok
+         RSDT entries: 3
+         FACP       @0x07ffff80 len=116    checksum=ok
+         SSDT       @0x07fff720 len=2073   checksum=ok
+         APIC       @0x07fff630 len=110    checksum=ok
+           MADT local APIC base=0xfee00000
+       tables: APIC FACP SSDT
+
+   Both place FACP/SSDT/MADT at the same addresses.  The ICH9 lane publishes
+   one extra table -- MCFG -- because SeaBIOS now takes its full Q35/PCIe
+   path (the probe ROM only taught the old match table about 1e55; it did
+   not change PCIe capability detection).  Every checksum sums to zero.
+
+D. Regression check -- historical lanes untouched
+   ------------------------------------------------
+   ./x86emu --lpc=ich9 --stats  (bundled sample firmware) still prints
+       [serial] GUEST_OK
+       [guest] framebuffer marker OK: pixel[0]=0x00200000
+       [stats] executed=4837677 cap_reached=0
+   and the default (no flag) run is byte-identical to every prior receipt.
+   tests/test_compat.c pins both identities (7/7 vectors).
+
+E. What this does NOT establish
+   -----------------------------
+   No pinned-image BIOS-to-kernel boot, no shell acceptance, no E820/
+   boot_info agreement, no SMP/IOAPIC claim.  The authoritative ISO still
+   carries the original Stage 2 (G3, open); this receipt removes the
+   emulator-side ACPI identity blocker only.

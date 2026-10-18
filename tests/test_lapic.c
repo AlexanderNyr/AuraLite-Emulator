@@ -377,6 +377,97 @@ static void test_hlt_wake_via_ipi_and_latched_irr(void) {
     printf("ok: hlt_wake_via_ipi_and_latched_irr\n");
 }
 
+static void test_smp_broadcast_init_sipi_and_counter_preservation(void) {
+    /* COMPAT G6: 4-vCPU topology.
+     * 1) CPUID(1).EBX[31:24] reports the active vCPU's LAPIC ID.
+     * 2) SeaBIOS broadcast INIT+SIPI (shorthand=3) wakes all 3 APs at vector V.
+     * 3) Subsequent kernel targeted INIT+SIPI (shorthand=0, dest=i) wakes an
+     *    already-parked (VCPU_OFF) AP at the new vector AND preserves the AP's
+     *    monotonic work counters (executed_steps, instr_count, idle_quantum,
+     *    last_vtime) across the cpu_reset() inside vcpu_take_init(). */
+    fx_t f; fx_init(&f);
+    f.m.n_vcpus = 4;
+    f.m.vcpu[0].c = f.m.cpu; f.m.vcpu[0].l = f.m.lapic;
+    f.m.vcpu[0].state = VCPU_RUN;
+    for (int i = 1; i < 4; i++) {
+        f.m.vcpu[i].c.mach = &f.m;
+        cpu_reset(&f.m.vcpu[i].c);
+        f.m.vcpu[i].l = f.m.lapic;
+        f.m.vcpu[i].l.id = (uint32_t)i << 24;
+        f.m.vcpu[i].state = VCPU_WAIT_SIPI;
+    }
+    f.m.cur_vcpu = 0;
+
+    /* At 0x10000 (vector 0x10): mov eax,1; cpuid; shr ebx,24;
+     * mov [0x2500+bx], bl; cli; hlt (16-bit real mode). */
+    static const uint8_t TRAMP10[] = {
+        0x66, 0xB8, 0x01,0x00,0x00,0x00, /* mov eax, 1 */
+        0x0F, 0xA2,                      /* cpuid */
+        0x66, 0xC1, 0xEB, 0x18,          /* shr ebx, 24 */
+        0x88, 0x9F, 0x00,0x25,           /* mov [bx+0x2500], bl */
+        0xFA, 0xF4                       /* cli; hlt */
+    };
+    memcpy(f.m.ram + 0x10000, TRAMP10, sizeof TRAMP10);
+
+    /* Broadcast INIT (shorthand=3, dm=5) + Broadcast SIPI vec=0x10 (dm=6) */
+    lw(&f, LAPIC_SVR, 0x1FF);
+    lw(&f, LAPIC_ICR_LO, 0x000C4500u);
+    for (int i = 1; i < 4; i++) assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
+    lw(&f, LAPIC_ICR_LO, 0x000C4610u);
+    for (int i = 1; i < 4; i++) {
+        assert(f.m.vcpu[i].state == VCPU_RUN);
+        assert(f.m.vcpu[i].c.seg[SEG_CS].sel == 0x1000);
+        assert(f.m.vcpu[i].c.seg[SEG_CS].base == 0x10000);
+        assert(f.m.vcpu[i].c.rip == 0);
+    }
+
+    /* Step each AP until cli;hlt parks it (cpu_step returns -1). */
+    for (int i = 1; i < 4; i++) {
+        vcpu_load(&f.m, i);
+        int rc = 0;
+        for (int s = 0; s < 16 && rc >= 0; s++) rc = cpu_step(&f.m.cpu);
+        assert(rc == -1);
+        vcpu_store(&f.m, i);
+        f.m.vcpu[i].state = VCPU_OFF;
+        assert(mem_read(&f.m, 0x2500 + (uint64_t)i, 1) == (uint32_t)i);
+        assert(f.m.vcpu[i].c.executed_steps == 6);
+        assert(f.m.vcpu[i].c.instr_count == 6);
+    }
+    vcpu_load(&f.m, 0);
+
+    /* Second-stage kernel bring-up: targeted INIT + SIPI vec=0x08 to AP 1..3.
+     * At 0x08000: inc byte [0x2600]; cli; hlt. */
+    static const uint8_t TRAMP08[] = {
+        0xFE, 0x06, 0x00,0x26,           /* inc byte [0x2600] */
+        0xFA, 0xF4                       /* cli; hlt */
+    };
+    load(&f, 0x08000, TRAMP08, sizeof TRAMP08);
+    for (int i = 1; i < 4; i++) {
+        uint64_t prev_exec = f.m.vcpu[i].c.executed_steps;
+        uint64_t prev_inst = f.m.vcpu[i].c.instr_count;
+        lw(&f, LAPIC_ICR_HI, (uint32_t)i << 24);
+        lw(&f, LAPIC_ICR_LO, 0x00004500u);   /* physical INIT to AP i */
+        assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
+        assert(f.m.vcpu[i].c.executed_steps == prev_exec);
+        assert(f.m.vcpu[i].c.instr_count == prev_inst);
+        lw(&f, LAPIC_ICR_HI, (uint32_t)i << 24);
+        lw(&f, LAPIC_ICR_LO, 0x00004608u);   /* physical SIPI vec=0x08 */
+        assert(f.m.vcpu[i].state == VCPU_RUN);
+        assert(f.m.vcpu[i].c.seg[SEG_CS].base == 0x08000);
+        vcpu_load(&f.m, i);
+        int rc = 0;
+        for (int s = 0; s < 16 && rc >= 0; s++) rc = cpu_step(&f.m.cpu);
+        assert(rc == -1);
+        vcpu_store(&f.m, i);
+        assert(f.m.vcpu[i].c.executed_steps == prev_exec + 3);
+        assert(f.m.vcpu[i].c.instr_count == prev_inst + 3);
+        vcpu_load(&f.m, 0);
+    }
+    assert(mem_read(&f.m, 0x2600, 1) == 3);
+    assert(machine_executed_total(&f.m) == f.m.vtime_instr);
+    printf("ok: smp_broadcast_init_sipi_and_counter_preservation\n");
+}
+
 int main(void) {
     test_mmio_registers();
     test_svr_gates_delivery_not_latching();
@@ -387,6 +478,7 @@ int main(void) {
     test_timer_long_mode_fx();  printf("ok: timer_long_mode\n");
     test_msr_apic_base();
     test_hlt_wake_via_ipi_and_latched_irr();
+    test_smp_broadcast_init_sipi_and_counter_preservation();
     printf("test_lapic: all vectors passed\n");
     return 0;
 }

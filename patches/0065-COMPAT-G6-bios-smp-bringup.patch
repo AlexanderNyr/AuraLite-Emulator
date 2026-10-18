@@ -1,0 +1,2689 @@
+From bf62a16a54c63dd222fa205a01a9431683536693 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sat, 17 Oct 2026 19:37:45 +0000
+Subject: [PATCH] COMPAT G6: 4-vCPU BIOS SMP bring-up, MADT publication, and
+ guest SMP tests
+
+Tracing SeaBIOS 1.16.3-2's smp_setup() (0xf1538), smp_probe() (0xe8040),
+handle_smp() (0xef526), and build_madt() (0xe9a3f) identified five
+requirements beyond K6's --kernel SMP path for multi-AP BIOS bring-up:
+
+1. Context capacity (src/machine.h, src/main.c): raise EM_MAX_VCPU from 2 to
+   8, wire nv = min(cfg_smp, EM_MAX_VCPU) contexts with l.id = i << 24, and
+   count remaining VCPU_RUN slots when an AP parks in VCPU_OFF.
+2. CMOS 0x5F (src/rtc.c, src/main.c): set CMOS[0x5F] = nv - 1 when nv > 1
+   (0 in UP) so SeaBIOS smp_probe() sets MaxCountCPUs = nv.
+3. Broadcast INIT and SIPI (src/lapic.c): handle ICR destination shorthands
+   2 (all incl. self) and 3 (all excl. self) on the dm == 5 (INIT) and
+   dm == 6 (SIPI) path used by SeaBIOS smp_setup() (0x000C4500 / 0x000C4610).
+4. Initial APIC ID in CPUID(1).EBX[31:24] (src/cpu.c): report
+   m->lapic.id & 0xFF000000u in EBX[31:24] (0 on BSP/UP, i << 24 on vcpu_i)
+   so SeaBIOS smp_write_msr() sets bit (1 << apic_id) in FoundAPICIDs and
+   build_madt() marks all 4 Processor Local APIC entries enabled (flags=1).
+5. Counter preservation across second-stage INIT (src/lapic.c): preserve
+   executed_steps, instr_count, idle_quantum, and last_vtime across
+   cpu_reset(&s->c) in vcpu_take_init() so the kernel's second-stage targeted
+   INIT does not wipe an AP's SeaBIOS POST work counters.
+
+Measured on --lpc=ich9 --smp=4 (docs/evidence/compat-g6/):
+- Diagnostic SeaBIOS POST prints handle_smp: apic_id=0x1..0x3 and
+  'Found 4 cpu(s) max supported 4 cpu(s)'.
+- Full BIOS boot with stock Debian SeaBIOS 1.16.3-2 + the accepted ISO
+  publishes a 134-byte MADT (cpus=4 ioapics=1 isos=4) and boot_info_t with
+  cpu_count=4, wakes all 3 APs ('[smp] AP #0..#2 online', '[smp] 4 CPU(s)
+  online (3 AP(s) woken)'), logs '[sched] R5 receipt: user thread pid=6 on
+  AP cpu=3', reaches '[kernel] shell active; kmain idling.', and passes typed
+  /tests/irqapwake ('RES-16 receipt', 'IRQAPWAKE PASS') and /tests/smpstress
+  ('O_APPEND 6 x 200 x 32 B intact', '100 fork/wait cycles precise',
+  '8 x 10 signal deliveries counted', 'SMPSTRESS PASS') with fault=0 on all
+  4 vCPUs and exact work-counter identities (executed=1187467939,
+  idle_quantum=180026141696, vtime=181213609635).
+- Historical lanes (p5_history.sh 9/9 plus 40M --kernel UP and --cpus=2
+  --smp=2) are byte-identical against the G5 binary.
+
+Tests: test_cmos_smp_extra_cpus in tests/test_rtc.c,
+test_smp_broadcast_init_sipi_and_counter_preservation in tests/test_lapic.c,
+make test-g6 (73 bundle checks, in make test), make test-g6-nc (five tampered
+bundles), and make test-g6-live (tests/integration/g6_smp_nc.sh).
+---
+ CHANGELOG.md                                  |  37 ++
+ Makefile                                      |  20 +-
+ PROJECT_ANALYSIS.md                           |  31 +-
+ README.md                                     |  52 +-
+ ROADMAP.md                                    |  39 +-
+ docs/STATUS.md                                |  31 +-
+ docs/evidence/compat-g6/README.md             | 129 ++++
+ docs/evidence/compat-g6/SHA256SUMS            |  11 +
+ docs/evidence/compat-g6/acpi-receipt-smp4.txt |  12 +
+ .../compat-g6/bootinfo-smp4-parse.txt         |  22 +
+ docs/evidence/compat-g6/bootinfo-smp4.bin     | Bin 0 -> 7776 bytes
+ docs/evidence/compat-g6/commands.txt          |  46 ++
+ docs/evidence/compat-g6/inputs.txt            |   8 +
+ docs/evidence/compat-g6/nc-smp.txt            |   4 +
+ .../compat-g6/seabios-diag-smp4.stdout.txt    | 563 ++++++++++++++++++
+ docs/evidence/compat-g6/x86emu-smp4.receipt   |   1 +
+ .../compat-g6/x86emu-smp4.serial.log.gz       | Bin 0 -> 25883 bytes
+ .../evidence/compat-g6/x86emu-smp4.stdout.txt |  79 +++
+ docs/plans/COMPAT_PLAN.md                     |  69 ++-
+ src/cpu.c                                     |   6 +
+ src/lapic.c                                   |  26 +-
+ src/machine.h                                 |   2 +-
+ src/main.c                                    |  43 +-
+ src/rtc.c                                     |   7 +
+ tests/integration/g6_acceptance_nc.sh         |  84 +++
+ tests/integration/g6_smp_nc.sh                |  90 +++
+ tests/test_g6_acceptance.py                   | 309 ++++++++++
+ tests/test_lapic.c                            |  92 +++
+ tests/test_rtc.c                              |  26 +
+ 29 files changed, 1770 insertions(+), 69 deletions(-)
+ create mode 100644 docs/evidence/compat-g6/README.md
+ create mode 100644 docs/evidence/compat-g6/SHA256SUMS
+ create mode 100644 docs/evidence/compat-g6/acpi-receipt-smp4.txt
+ create mode 100644 docs/evidence/compat-g6/bootinfo-smp4-parse.txt
+ create mode 100644 docs/evidence/compat-g6/bootinfo-smp4.bin
+ create mode 100644 docs/evidence/compat-g6/commands.txt
+ create mode 100644 docs/evidence/compat-g6/inputs.txt
+ create mode 100644 docs/evidence/compat-g6/nc-smp.txt
+ create mode 100644 docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt
+ create mode 100644 docs/evidence/compat-g6/x86emu-smp4.receipt
+ create mode 100644 docs/evidence/compat-g6/x86emu-smp4.serial.log.gz
+ create mode 100644 docs/evidence/compat-g6/x86emu-smp4.stdout.txt
+ create mode 100755 tests/integration/g6_acceptance_nc.sh
+ create mode 100755 tests/integration/g6_smp_nc.sh
+ create mode 100755 tests/test_g6_acceptance.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a7bffcd..9ee6301 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,43 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0065 (COMPAT G6, 4-vCPU BIOS SMP bring-up and guest SMP test suite)
++
++- **Multi-AP BIOS SMP bring-up (`--lpc=ich9 --smp=4`, up to `EM_MAX_VCPU = 8`).**
++  Tracing SeaBIOS 1.16.3-2's `smp_setup()`, `smp_probe()`, `handle_smp()`, and
++  `build_madt()` identified five requirements beyond K6's `--kernel` SMP path:
++  1. `src/machine.h`, `src/main.c`: raise `EM_MAX_VCPU` from `2` to `8`, wire
++     `nv = min(cfg_smp, EM_MAX_VCPU)` contexts with `l.id = i << 24`, and count
++     remaining `VCPU_RUN` slots when an AP parks in `VCPU_OFF`.
++  2. `src/rtc.c`, `src/main.c`: set `CMOS[0x5F] = nv - 1` when `nv > 1` (`0` in
++     UP) so SeaBIOS `smp_probe()` sets `MaxCountCPUs = nv`.
++  3. `src/lapic.c`: handle broadcast destination shorthands `2` (all incl. self)
++     and `3` (all excl. self) on the `dm == 5` (INIT) and `dm == 6` (SIPI) path
++     used by SeaBIOS `smp_setup()` (`0x000C4500` / `0x000C4610`).
++  4. `src/cpu.c`: report `m->lapic.id & 0xFF000000u` in `CPUID(1).EBX[31:24]`
++     (`0` on BSP/UP, `i << 24` on `vcpu_i`) so SeaBIOS `smp_write_msr()` sets
++     bit `(1 << apic_id)` in `FoundAPICIDs` and `build_madt()` marks all 4
++     Processor Local APIC entries enabled (`flags=1`).
++  5. `src/lapic.c`: preserve `executed_steps`, `instr_count`, `idle_quantum`,
++     and `last_vtime` across `cpu_reset(&s->c)` in `vcpu_take_init()` so the
++     kernel's second-stage targeted `INIT` does not wipe an AP's SeaBIOS POST
++     work counters.
++- Measured on `--lpc=ich9 --smp=4` (`docs/evidence/compat-g6/`): diagnostic
++  SeaBIOS prints `handle_smp: apic_id=0x1..0x3` and `Found 4 cpu(s) max
++  supported 4 cpu(s)`; full BIOS boot with stock Debian SeaBIOS 1.16.3-2 + the
++  accepted ISO publishes a 134-byte MADT (`cpus=4`) and `boot_info_t.cpu_count=4`,
++  wakes all 3 APs (`[smp] AP #0..#2 online`, `[smp] 4 CPU(s) online (3 AP(s)
++  woken)`), logs `[sched] R5 receipt: user thread pid=6 on AP cpu=3`, reaches
++  `[kernel] shell active; kmain idling.`, and passes typed `/tests/irqapwake`
++  (`RES-16 receipt`, `IRQAPWAKE PASS`) and `/tests/smpstress` (`SMPSTRESS PASS`)
++  with `fault=0` on all 4 vCPUs and exact work-counter identities.
++- Historical lanes (`p5_history.sh` 9/9 plus 40 M `--kernel` UP and
++  `--cpus=2 --smp=2`) are byte-identical against the G5 binary.
++- Tests: `test_cmos_smp_extra_cpus` in `tests/test_rtc.c`,
++  `test_smp_broadcast_init_sipi_and_counter_preservation` in `tests/test_lapic.c`,
++  `make test-g6` (73 bundle checks, inside `make test`), `make test-g6-nc`
++  (five tampered bundles), and `make test-g6-live` (`g6_smp_nc.sh`).
++
+ ### Fixed — patch 0064 (COMPAT G5, the ICH9 lane boots)
+ 
+ - **Root cause of the `--lpc=ich9` blocker.**  With the ICH9 LPC identity
+diff --git a/Makefile b/Makefile
+index b7ae3f2..6c87c5f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -107,6 +107,22 @@ test-g5-nc: tests/integration/g5_acceptance_nc.sh
+ test-g5-live: x86emu tests/integration/g5_pm_nc.sh
+ 	sh tests/integration/g5_pm_nc.sh
+ 
++# COMPAT G6 (patch 0065): the 4-vCPU BIOS SMP lane (`--lpc=ich9 --smp=4`).
++# `test-g6` re-checks the recorded bundle (manifest, 4-CPU diagnostic POST,
++# ordered boot + AP wake + irqapwake + smpstress markers, 4-vCPU stats and work
++# invariants, 4-CPU boot_info_t handoff, 134-byte MADT receipt, and negative
++# control) inside `make test`.  `test-g6-nc` tampers five copies of the bundle
++# and requires each to be rejected.  `test-g6-live` replays the broadcast
++# INIT/SIPI negative control on the in-tree diagnostic SeaBIOS ROM (~9 s).
++test-g6: tests/test_g6_acceptance.py tests/g5_acpi_receipt.py docs/evidence/compat-g6/SHA256SUMS
++	python3 tests/test_g6_acceptance.py
++
++test-g6-nc: tests/test_g6_acceptance.py tests/integration/g6_acceptance_nc.sh
++	sh tests/integration/g6_acceptance_nc.sh
++
++test-g6-live: x86emu tests/integration/g6_smp_nc.sh
++	sh tests/integration/g6_smp_nc.sh
++
+ # KERNEL-BOOT K1: direct kernel-load lane. The fixture is a synthetic
+ # higher-half kernel linked at the real AuraLite VMA (tests/kload_fixture.ld);
+ # its flags are frozen on purpose -- the guest image must not inherit the
+@@ -310,7 +326,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+diff --git a/PROJECT_ANALYSIS.md b/PROJECT_ANALYSIS.md
+index 2788846..a8c600c 100644
+--- a/PROJECT_ANALYSIS.md
++++ b/PROJECT_ANALYSIS.md
+@@ -28,10 +28,10 @@ Scale of the current tree:
+ 
+ | Area | Files | Lines (approx.) |
+ |---|---|---|
+-| `src/` | 50 (26 `.c` + 24 `.h`) | 16028 |
+-| `tests/` (+ `integration/`) | 31 `.c`, 10 `.py`, 26 `.sh` | 10,600 |
+-| `docs/` incl. 10 plans | — | 11,000 |
+-| `patches/` phase artifacts | 25 `.patch` (0008–0064) | — |
++| `src/` | 50 (26 `.c` + 24 `.h`) | 16,065 |
++| `tests/` (+ `integration/`) | 31 `.c`, 11 `.py`, 28 `.sh` | 11,000 |
++| `docs/` incl. 10 plans | — | 11,400 |
++| `patches/` phase artifacts | 26 `.patch` (0008–0065) | — |
+ 
+ ## 2. Repository layout
+ 
+@@ -71,7 +71,7 @@ AuraLite-Emulator/
+ ├── web/monitor.html           — live WebSocket monitor UI (served by --monitor)
+ ├── docs/plans/                — CORE, CHIPSET, KERNEL_BOOT, STORE, USB,
+ │   │                            VIDEO, NET, PERF, TOOLING, COMPAT
+-│   └── evidence/              — compat-g2, compat-g3, compat-g4 bundles
++│   └── evidence/              — compat-g2, compat-g3, compat-g4, compat-g5, compat-g6 bundles
+ ├── patches/                   — one format-patch per delivered phase
+ ├── Makefile                   — build, firmware, disk, tests, bench, fuzz
+ ├── CHANGELOG.md / ROADMAP.md / STATUS.md / BUGS.md
+@@ -159,12 +159,16 @@ plain run, and each tool has a negative control.
+    `p_paddr − KERNEL_VMA`, seven-page paging hierarchy, fabricated
+    `boot_info_t` + ACPI set, parked at `_start`. This is the lane that meets
+    the north star: AuraLite OS to its shell on 1 and 2 vCPUs.
+-3. **BIOS compatibility** (COMPAT G0–G6): SeaBIOS → Stage 1 → Stage 2 →
++3. **BIOS compatibility** (COMPAT G0–G6, closed): SeaBIOS → Stage 1 → Stage 2 →
+    flat kernel. G2 fixed the real-mode `SGDT/SIDT` store width; G3 diagnosed
+-   the Stage-2 FS/GS unreal-mode assumption; G4 (this tree) makes the LPC
+-   identity pair with the Q35 host bridge so **stock SeaBIOS publishes
+-   RSDP/RSDT/FACP/SSDT/MADT/MCFG**. Pinned-image acceptance is G5 and still
+-   open.
++   and closed the Stage-2 FS/GS unreal-mode assumption; G4 makes the LPC
++   identity pair with the Q35 host bridge (`--lpc=ich9`) so stock SeaBIOS
++   publishes `RSDP/RSDT/FACP/SSDT/MADT/MCFG`; G5 models the ACPI PM timer at
++   `PMBASE+8` so the ICH9 lane boots to `shell active` with an 8-entry E820 and
++   live RSDP; G6 scales `--smp=N` up to 8 vCPUs (`CMOS[0x5F]`, broadcast
++   INIT/SIPI, `CPUID(1).EBX[31:24]` APIC ID, AP counter preservation across
++   second-stage INIT) and boots `--lpc=ich9 --smp=4` through `irqapwake` and
++   `smpstress`.
+ 
+ ## 5. Build and verification
+ 
+@@ -192,7 +196,7 @@ loads byte-identical; TLB 6,738,321 hits.
+   no AVX, no SMM/VMX/SVM/NMI.
+ - Segment limit/CPL checks are modelled where the guest path needed them, not
+   as a complete protection unit.
+-- At most two vCPU contexts (`EM_MAX_VCPU = 2`), strict 1:1 round-robin.
++- Up to eight vCPU contexts (`EM_MAX_VCPU = 8`), strict 1:1 round-robin.
+ - USB is EHCI/UHCI with a BOT/SCSI subset; no xHCI.
+ - Networking is IPv4-only TAP-over-UDP, DHCP stateless, DNS A/IN only, no
+   TCP window scaling/SACK/TIME_WAIT, e1000 INTx unmounted.
+@@ -224,6 +228,5 @@ A compact, readable, **fully working** DIY PC emulator: reset vector to a
+ source-level debugging. Its distinguishing feature is the evidence discipline:
+ every plan phase ships with its implementation, a regression vector and a
+ negative control, and `docs/STATUS.md` records receipts rather than promises.
+-The open frontier is the BIOS route (COMPAT G3/G5): the emulator side of the
+-ACPI gate is now closed (G4), while the pinned ISO still carries the original
+-Stage 2.
++All ten plans in `ROADMAP.md` (CORE, CHIPSET, KERNEL_BOOT, STORE, USB, VIDEO,
++NET, PERF, TOOLING, COMPAT G0–G6) are delivered and gated by `make test`.
+diff --git a/README.md b/README.md
+index e91962d..ed97a19 100644
+--- a/README.md
++++ b/README.md
+@@ -4,15 +4,19 @@ A from-scratch C emulator for raw x86 firmware, with a switchable Intel platform
+ 
+ ## Current scope
+ 
+-- x86 interpreter starting in real mode and transitioning through protected mode, compatibility mode and long mode.
+-- 16/32/64-bit general registers, ModRM/SIB addressing, segmentation, GDT/IDT loading, CR0/CR3/CR4, EFER/MSR, CPUID, paging (4-level, 2 MiB/1 GiB pages), I/O instructions, PCI config-space access and firmware-oriented integer instructions.
+-- Integer ISA per `docs/plans/CORE_PLAN.md`: all conditional branches (short and near, all 16 conditions), the full shift/rotate group with correct count masks and CF/OF, MUL/IMUL/DIV/IDIV with `#DE`, SMSW/LMSW, SGDT/SIDT, PUSHF/POPF, software interrupts `INT n`/`INT3`/`INTO` delivered through the real-mode IVT or the protected/long-mode IDT, and `IRET`/`IRETQ` returning through the hardware-ordered exception frame.
+-- Physical address space with 128 MiB RAM, 128 KiB ROM and ROM aliases at `0xE0000` and `0xFFFE0000`.
+-- PCI mechanism #1 and ECAM/MMCONFIG.
+-- Platform profiles for Sandy Bridge, Ivy Bridge, Haswell, Broadwell and Bay Trail.
+-- Behavioural DDR3/DDR3L/DDR4 training register models, CAR scratch, GPU framebuffer, SATA/LPC stubs, and an EHCI/USB mass-storage model that walks guest queue descriptors and reads a disk image.
+-- A 64-bit test kernel and a PPM framebuffer dump path.
+-- Circular event log and optional instruction trace.
++- x86 interpreter starting in real mode (`0xFFFFFFF0` reset vector) and transitioning through 16/32-bit protected mode, compatibility mode and 64-bit long mode, with a 256-entry success-only translation TLB (PERF P2) and a 512-slot RAM-only prefix/opcode predecode cache (PERF P3).
++- 16/32/64-bit general registers, ModRM/SIB addressing, segmentation, GDT/IDT/TSS (`LTR`, IST stack switching, Ring-3 ↔ Ring-0 transitions), CR0/CR2/CR3/CR4 (`SMEP`/`SMAP`), EFER/MSR, CPUID, RDTSC, paging (4-level, 4 KiB / 2 MiB / 1 GiB pages), `SYSCALL`/`SYSRET`, `SWAPGS`, SSE media subset (16×128-bit `XMM0..XMM15`), I/O instructions, and the full firmware/OS integer ISA per `docs/plans/CORE_PLAN.md`.
++- Physical address space with 128 MiB RAM, 128 KiB ROM, ROM aliases at `0xE0000` and `0xFFFE0000`, Q35 PAM (`0x90..0x96`) shadow RAM decode for `0xC0000–0xFFFFF`, and A20 gate masking.
++- PCI mechanism #1 (`0xCF8`/`0xCFC`) and 256 MiB ECAM/MMCONFIG (`0xE0000000`), Q35 host bridge (`8086:29c0`), switchable LPC identity (`8086:1e55` default or `--lpc=ich9` `8086:2918` for stock SeaBIOS ACPI table publication, COMPAT G4).
++- Full PC/AT + APIC chipset (`docs/plans/CHIPSET_PLAN.md`, `docs/plans/COMPAT_PLAN.md`): dual 8259A PIC, 8254 PIT, 24-bit ACPI PM timer at `PMBASE+8` (3.579545 MHz = 3×PIT, COMPAT G5), MC146818A RTC/CMOS (including `0x34`/`0x35` high-RAM and `0x5F` SMP CPU count), 8042 KBC with Set-1 scancode injection (`--keys`, `--keys-at`), port `0x92`/`0xCF9` warm reset, xAPIC (`0xFEE00000`, timer, self/peer/broadcast IPI, INIT/SIPI) and 82093AA I/O APIC (`0xFEC00000`, 24 RTEs).
++- Up to 8 vCPU execution contexts (`--smp=N`, `EM_MAX_VCPU = 8`) in deterministic 1:1 round-robin with shared virtual time (`vtime_instr`) and HLT-idle clock yield (`docs/plans/KERNEL_BOOT_PLAN.md` K6–K8, `docs/plans/COMPAT_PLAN.md` G6).
++- Storage, USB, video, and networking:
++  - **AHCI SATA** (`src/ahci.c`, `docs/plans/STORE_PLAN.md` S0–S5): command-list/FIS/PRDT engine, `IDENTIFY`, `READ/WRITE DMA EXT`, 128 KiB transfers, up to 2 controllers (`--sata=`, `--sata-portN=`, `--ahci2`, `--sata2=`, `--sata-writethrough`), INTx delivery.
++  - **USB** (`src/devices.c`, `docs/plans/USB_PLAN.md` U0–U5): EHCI (`0:29.0`) + UHCI companion (`0:1.2`, `--no-usb-uhci`) with control/bulk schedules and BOT/SCSI mass storage (`INQUIRY`, `READ CAPACITY(10)`, `TEST UNIT READY`, `REQUEST SENSE`, `READ(10)`).
++  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V4): 800×600×32 linear framebuffer (`0xD0000000`), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`).
++  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N3): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP.
++- Direct ELF64 kernel loader (`--kernel=`, `--initrd=`, `--cpus=`) and full BIOS boot route (`SeaBIOS → Stage 1 → Stage 2 → kernel.elf → init` on 1 to 4 vCPUs).
++- Non-perturbing tooling (`docs/plans/TOOLING_PLAN.md` T0–T5): standalone disassembler (`x86dis`), instruction trace with CPU-vs-disassembler self-check (`--trace-file=`), interactive debugger REPL (`--debug`, `--debug-script=`, `--symbols=`), GDB RSP server (`--gdb=`), whole-machine `AURASNP1` v2 snapshots (`--snapshot-save=`, `--snapshot-load=`), and live HTTP/WebSocket browser monitor (`--monitor=`).
+ 
+ This is intentionally a firmware-focused, multi-purpose emulator, not yet a drop-in replacement for QEMU: the CPU and devices are implemented locally rather than delegated to an existing virtualization library.
+ 
+@@ -106,6 +110,20 @@ Run any compatible ROM directly; the emulator does not rewrite the guest image.
+ 
+ Select other profiles with `--platform=sandybridge`, `ivybridge`, `broadwell`, or `baytrail`. `--disk=...` supplies the virtual USB storage image. `--rom=...` supplies another firmware image.
+ 
++For a full stock-SeaBIOS boot with ACPI tables (`--lpc=ich9`), AHCI ISO attachment, and 4-vCPU SMP (`--smp=4`):
++
++```sh
++./x86emu --rom=bios.bin --lpc=ich9 --smp=4 \
++  --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++  --sata=auralite.iso --max-instr=1000000000 --stats
++```
++
++For direct ELF64 kernel boot without firmware (`--kernel=`):
++
++```sh
++./x86emu --kernel=kernel.elf --initrd=initrd.tar --cpus=4 --smp=4 --max-instr=500000000 --stats
++```
++
+ ## Testing
+ 
+ Run the CPU unit tests and the platform smoke tests with:
+@@ -169,12 +187,16 @@ published convention but could not be measured here).
+ 
+ ## Architecture
+ 
+-`src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.
+-
+-The next GUI layer can consume the machine event ring and framebuffer without changing the emulation core; the framebuffer export is currently PPM so it works without external graphics dependencies.
++- `src/cpu.c` / `src/cpu.h` — x86/x86-64 interpreter, paging, exceptions/interrupts, P2 translation TLB and P3 prefix/opcode predecode cache.
++- `src/mem.c` / `src/io.c` — physical RAM/ROM/MMIO address space (with Q35 PAM and A20) and 64K I/O port space.
++- `src/pci.c` / `src/platform.c` / `src/chipset.c` — PCI config #1 + ECAM, five Intel CPUID profiles, A20 and warm-reset control.
++- `src/pic.c` / `src/pit.c` / `src/pm.c` / `src/rtc.c` / `src/kbc.c` / `src/serial.c` — 8259A PIC, 8254 PIT, ACPI PM timer (`PMBASE+8`), MC146818A RTC/CMOS, 8042 KBC, 16550 UART.
++- `src/lapic.c` / `src/ioapic.c` — Local APIC (xAPIC, timer, IPIs, INIT/SIPI) and 82093AA I/O APIC.
++- `src/devices.c` / `src/ahci.c` / `src/e1000.c` — GPU framebuffer, VGA text mode 3, Bochs VBE dispi, EHCI + UHCI USB mass storage, dual-controller AHCI SATA, Intel 82540EM NIC.
++- `src/kloader.c` / `src/acpi.c` — direct ELF64 loader, `boot_info_t` builder, and RSDP/RSDT/XSDT/MADT generator.
++- `src/disasm.c` / `src/dbg.c` / `src/gdbstub.c` / `src/snapshot.c` / `src/ws.c` / `src/monitor.c` — disassembler, debugger REPL, GDB RSP stub, `AURASNP1` v2 snapshots, RFC 6455 WebSocket + live browser monitor.
++- `src/machine.h` / `src/main.c` — machine state (`machine_t`, up to 8 `vcpu_slot_t` contexts) and CLI harness.
+ 
+ ## License
+ 
+-The sample firmware carries its applicable license in `firmware/LICENSE`.
+-The emulator core does not currently declare a repository-level license; add
+-one before publishing if you want to grant redistribution and reuse rights.
++The emulator core is licensed under the Apache License, Version 2.0 (see `LICENSE` and `NOTICE.md`). The bundled sample firmware under `firmware/` carries its own MIT license in `firmware/LICENSE`.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index af78aa6..f6931f5 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -31,9 +31,9 @@ maps to exactly one plan below.
+ | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
+ | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+-| [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, 0056–0061) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
+-| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | 🚧 G0–G5 ✅ (`0062`, `0063`, `0064`), G6 planned | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
++| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | ✅ **CLOSED** (P0 ✅ `0051`, P1 ✅ `0052`, P2 ✅ `0053`, P3 ✅ `0054`, P4 NO-GO measured, P5 ✅ `0055`) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
++| [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
++| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -53,6 +53,39 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ ## Immediate queue (next patches)
+ 
++All ten plans in the ledger above are **CLOSED**. Recent COMPAT phase patches:
++
++- ~~`0065` — COMPAT G6: 4-vCPU BIOS SMP bring-up, MADT publication, and guest
++  SMP test suite (`EM_MAX_VCPU = 8`, `CMOS[0x5F] = nv - 1`, broadcast INIT/SIPI
++  `shorthand=2/3`, `CPUID(1).EBX[31:24]` initial APIC ID, AP work-counter
++  preservation across second-stage `INIT`).  Measured on `--lpc=ich9 --smp=4`
++  with stock Debian SeaBIOS 1.16.3-2 + the accepted ISO: 134-byte MADT
++  (`cpus=4`), `boot_info_t.cpu_count=4`, `[smp] AP #0..#2 online`,
++  `[smp] 4 CPU(s) online (3 AP(s) woken)`, `[sched] R5 receipt: user thread
++  pid=6 on AP cpu=3`, `[kernel] shell active; kmain idling.`, and typed
++  `/tests/irqapwake` (`RES-16 receipt`, `IRQAPWAKE PASS`) + `/tests/smpstress`
++  (`SMPSTRESS PASS`) with `fault=0` on all 4 vCPUs and exact work-counter
++  identities.  Gates: `make test-g6` (73 checks), `make test-g6-nc` (5 tampered
++  bundles), `make test-g6-live` (`g6_smp_nc.sh`), plus unit vectors in
++  `tests/test_rtc.c` and `tests/test_lapic.c`.  Evidence:
++  `docs/evidence/compat-g6/`.~~ shipped — **COMPAT plan complete G0–G6**.
++- ~~`0064` — COMPAT G5: ACPI PM timer block (`src/pm.{h,c}`, `PMBASE+8`, 24-bit
++  TMR at 3 counts per PIT tick, movable via LPC config `0x40..0x43`) resolves
++  the `--lpc=ich9` AHCI probe timeout stall.  Stock SeaBIOS + the accepted ISO
++  boots under `--lpc=ich9` to `[kernel] shell active; kmain idling.` with
++  `fault=0`, `rsdp_phys=0xf6830`, an 8-entry E820 map (including the ICH9 RCRB
++  `0xfed1c000+0x4000`), and a validated RSDP → RSDT → FACP/SSDT/APIC/MCFG tree.
++  Gates: `tests/test_pm.c` (6 vectors), `make test-g5` (58 checks),
++  `make test-g5-nc` (4 tampered bundles), `make test-g5-live` (`g5_pm_nc.sh`).
++  Evidence: `docs/evidence/compat-g5/`.~~ shipped.
++- ~~`0063` — COMPAT G3: authoritative rebuild from pinned `AuraLite-OS@518bef0`
++  with the 6-instruction Stage-2 FS/GS unreal-mode fix (`boot/bios/stage2/acpi.inc`,
++  10-of-166,272-sector diff) boots under stock Debian SeaBIOS 1.16.3-2 to
++  `[kernel] shell active; kmain idling.` in both `x86emu` (twice, byte-identical
++  serial + stats) and QEMU, while the unpatched pinned ISO fails at `ELF parse
++  FAILED` in both (negative control).  Gates: `make test-g3` (54 checks),
++  `make test-g3-nc` (4 tampered bundles).  Evidence:
++  `docs/evidence/compat-g3/acceptance/`.~~ shipped.
+ - ~~`0062` — COMPAT G4: LPC identity pairing.  The machine advertised the Q35
+   host bridge `8086:29c0` (and implemented its PAM registers) while the LPC
+   function reported Panther Point `8086:1e55`, an identity stock SeaBIOS's
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 4376d46..bb4936b 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -845,6 +845,31 @@
+   prints `[ioapic] overrides: none in the MADT` although four ISOs exist,
+   because `madt_walk()` requires `elen >= 12` for a 10-byte ACPI structure;
+   QEMU prints the same line, so the emulator is not the difference.
++- **G6 delivered (patch `0065`): 4-vCPU BIOS SMP bring-up and guest SMP test
++  suite close COMPAT.**  `EM_MAX_VCPU` is raised from 2 to 8 (`src/machine.h`,
++  `src/main.c`), `CMOS[0x5F]` reports `nv - 1` extra processors to SeaBIOS
++  `smp_probe()` (`src/rtc.c`), `lapic_icr_write()` handles broadcast
++  destination shorthands `2` and `3` for `INIT` (`dm=5`) and `SIPI` (`dm=6`)
++  (`src/lapic.c`), `do_cpuid()` leaf 1 reports `m->lapic.id & 0xFF000000u` in
++  `EBX[31:24]` so SeaBIOS `handle_smp()` populates `FoundAPICIDs` and marks all
++  4 MADT Type-0 Local APIC entries enabled (`src/cpu.c`), and `vcpu_take_init()`
++  preserves per-AP work counters across the kernel's second-stage `INIT` reset
++  (`src/lapic.c`).  Measured on `--lpc=ich9 --smp=4`: diagnostic SeaBIOS prints
++  `handle_smp: apic_id=0x1..0x3` and `Found 4 cpu(s) max supported 4 cpu(s)`;
++  full BIOS boot with stock Debian SeaBIOS 1.16.3-2 + the accepted ISO publishes
++  a 134-byte MADT (`cpus=4 ioapics=1 isos=4`) and `boot_info_t.cpu_count=4`,
++  wakes all 3 APs (`[smp] AP #0..#2 online`, `[smp] 4 CPU(s) online (3 AP(s)
++  woken)`), prints `[sched] R5 receipt: user thread pid=6 on AP cpu=3`, reaches
++  `[kernel] shell active; kmain idling.`, and passes typed `/tests/irqapwake`
++  (`RES-16 receipt`, `IRQAPWAKE PASS`) and `/tests/smpstress` (`O_APPEND`,
++  `100 fork/wait`, `8 x 10 signal deliveries`, `SMPSTRESS PASS`) with `fault=0`
++  on all 4 vCPUs and exact work-counter identities (`executed=1187467939`,
++  `idle_quantum=180026141696`, `vtime=181213609635`).  All 9 `p5_history.sh`
++  lanes plus 40 M `--kernel` UP and `--cpus=2 --smp=2` runs are byte-identical
++  against the G5 binary.  Gates: `make test-g6` (73 checks, inside `make test`),
++  `make test-g6-nc` (five tampered bundles), `make test-g6-live`
++  (`g6_smp_nc.sh`), and unit vectors in `tests/test_rtc.c` and
++  `tests/test_lapic.c`.  Evidence: `docs/evidence/compat-g6/`.
+ 
+ G3 is closed by a behavioural acceptance: the published ISO `d2110f8b…` is
+ not bit-reproducible (its `kernel.elf` embeds build timestamps), so the
+@@ -862,8 +887,10 @@ blocks are behavioral models rather than cycle-accurate implementations.
+ The live monitor is unauthenticated and defaults to loopback; non-loopback
+ binding is an explicit operator choice. Existing frozen-guest integration
+ lanes still require the separate AuraLite-OS KERNEL/INITRD artifacts.
+-With `--lpc=ich9`, the ACPI tables are published (G4) and the BIOS boot now
+-reaches `[kernel] shell active` (G5).  The default `8086:1e55` identity still
++With `--lpc=ich9`, the ACPI tables are published (G4), the BIOS boot reaches
++`[kernel] shell active` on 1 vCPU (G5), and `--lpc=ich9 --smp=4` boots all 4
++vCPUs through the BIOS route and passes `irqapwake` + `smpstress` (G6, up to
++`EM_MAX_VCPU = 8`).  The default `8086:1e55` identity still
+ publishes no RSDP and reports seven E820 entries; that lane is historical and
+ deliberately unchanged.  The ACPI PM block models only the Timer register
+ (PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
+diff --git a/docs/evidence/compat-g6/README.md b/docs/evidence/compat-g6/README.md
+new file mode 100644
+index 0000000..935db7a
+--- /dev/null
++++ b/docs/evidence/compat-g6/README.md
+@@ -0,0 +1,129 @@
++# COMPAT G6 — 4-vCPU BIOS SMP bring-up, MADT publication, and guest SMP tests
++
++Patch **0065** — final rung of `docs/plans/COMPAT_PLAN.md`.
++
++The G6 gate required the BIOS route (`SeaBIOS → Stage 2 → kernel.elf → init`)
++to boot a kernel with **more than two** executing contexts (`--smp=4`), wake
++real APs over the IOAPIC/LAPIC INIT-SIPI-SIPI path, tick per-AP timers from the
++shared virtual clock without perturbing UP or `--smp=2` receipts, and pass the
++guest's `[smp] AP #k online`, `irqapwake`, and `smpstress` suites.
++
++## What was missing on the BIOS SMP path
++
++Tracing `smp_setup()` (`0xf1538`), `qemu_get_present_cpus_count()` (`0xe8040`),
++`handle_smp()` (`0xef526`), and `build_madt()` (`0xe9a3f`) in SeaBIOS 1.16.3-2
++exposed five concrete gaps between the K6 `--kernel --cpus=2 --smp=2` path and
++a multi-AP BIOS boot:
++
++1. **Context capacity (`src/machine.h`, `src/main.c`):** `EM_MAX_VCPU` was `2`,
++   and `main.c` clamped `--smp>=2` to 2 contexts (`vcpu0` + `vcpu1`) and
++   assumed only 1 context remained live whenever any AP parked (`cli; hlt`).
++2. **CMOS `0x5F` (`src/rtc.c`, `src/main.c`):** SeaBIOS's `smp_probe()` reads
++   CMOS index `0x5F` (`CMOS_BIOS_SMP_COUNT`) and sets
++   `MaxCountCPUs = CMOS[0x5F] + 1`. Without `CMOS[0x5F] = N - 1`, `build_madt()`
++   emits only 1 Processor Local APIC structure (`cpus=1`) regardless of `--smp`.
++3. **Broadcast INIT and SIPI (`src/lapic.c`):** SeaBIOS's `smp_setup()` wakes
++   all APs at once using ICR destination shorthand `3` ("all excluding self"):
++   `ICR_LO = 0x000C4500` (broadcast INIT) followed by `0x000C4610` (broadcast
++   SIPI, vector `0x10` → `0x1000:0x0000`). `lapic_icr_write()` previously
++   rejected `shorthand != 0` on the `dm == 5` / `dm == 6` path.
++4. **Initial APIC ID in `CPUID(1).EBX[31:24]` (`src/cpu.c`):** Inside the
++   SeaBIOS AP trampoline (`smp_write_msr` at `0xef526`), each woken AP executes
++   `cpuid` with `EAX=1`, shifts `EBX` right by 24, and sets bit `(1 << apic_id)`
++   in the `FoundAPICIDs` bitmask (`0xf5a00`). `build_madt()` then sets each
++   MADT Type-0 entry's `Flags.Enabled` bit from `FoundAPICIDs`. `do_cpuid()`
++   previously hardcoded `EBX = 0` on leaf 1, so every AP reported `apic_id = 0`
++   and `build_madt()` marked APIC IDs `1..N-1` disabled (`flags=0`), which
++   Stage 2 (`acpi.inc:211`, `test dword [es:di+4], 1`) skips.
++5. **Counter preservation across second-stage `INIT` (`src/lapic.c`):** On the
++   BIOS route each AP is woken twice: first by SeaBIOS POST (which parks the AP
++   in `cli; hlt` → `VCPU_OFF` after 736–2,038 instructions), and later by the
++   kernel's `smp_init()` via targeted physical `INIT` + `SIPI` at `0x8000`.
++   `vcpu_take_init()` called `cpu_reset(&s->c)`, wiping the AP's accumulated
++   `executed_steps`, `instr_count`, `idle_quantum`, and `last_vtime` from POST
++   and breaking the global work invariants `sum(executed_steps) == executed`
++   and `sum(instr_count) == vtime`.
++
++## The fix
++
++- `src/machine.h`: raise `EM_MAX_VCPU` from `2` to `8`.
++- `src/rtc.c`, `src/main.c`: populate `CMOS[0x5F] = nv - 1` when `nv > 1`
++  (`0` in UP, keeping all UP CMOS bytes unchanged).
++- `src/cpu.c`: set `CPUID(1).EBX[31:24] = m->lapic.id & 0xFF000000u` (`0` on
++  BSP/UP, `i << 24` on `vcpu_i`).
++- `src/lapic.c`: handle `shorthand == 2` (all incl. self) and `shorthand == 3`
++  (all excl. self) for `dm == 5` (INIT) and `dm == 6` (SIPI), and preserve
++  `executed_steps`, `instr_count`, `idle_quantum`, and `last_vtime` across
++  `cpu_reset(&s->c)` in `vcpu_take_init()`.
++- `src/main.c`: wire `nv = min(cfg_smp, EM_MAX_VCPU)` contexts with
++  `l.id = i << 24`, and count remaining `VCPU_RUN` slots when an AP parks in
++  `VCPU_OFF`.
++
++## Measured results (`--lpc=ich9 --smp=4`)
++
++1. **Diagnostic SeaBIOS POST (`seabios-diag-smp4.stdout.txt`, 10 M cap):**
++
++       [smp] G6: 4 vCPU contexts live; vcpu1..3 parked in wait-for-SIPI (LAPIC ids 1..3), strict 1:1 round-robin
++       handle_smp: apic_id=0x1
++       handle_smp: apic_id=0x2
++       handle_smp: apic_id=0x3
++       Found 4 cpu(s) max supported 4 cpu(s)
++
++2. **ACPI MADT and `boot_info_t` handoff (`acpi-receipt-smp4.txt`, `bootinfo-smp4-parse.txt`):**
++   - MADT (`sig=APIC`, `len=134`, `checksum=ok`) publishes `cpus=4 ioapics=1 isos=4`
++     (up from `len=110, cpus=1` in G5: `3 * 8 = 24` bytes of additional enabled
++     Type-0 Processor Local APIC records).
++   - Stage 2 parses all 4 enabled entries into `boot_info_t` at `0x10000`:
++     `cpu_count=4`, `bsp_lapic_id=0`, `cpu[0..3]` with `processor_id = lapic_id = 0..3`.
++
++3. **Full BIOS boot + guest SMP test suite (`x86emu-smp4.serial.log.gz`, `x86emu-smp4.stdout.txt`):**
++
++       [serial] [BL9] ACPI RSDP found
++       [serial] [BL9] ACPI MADT parsed
++       [serial] [smp] BSP lapic_id=0, 4 total CPUs detected
++       [serial] [smp] AP #0 online (lapic_id=1)
++       [serial] [smp] AP #1 online (lapic_id=2)
++       [serial] [smp] AP #2 online (lapic_id=3)
++       [serial] [smp] 4 CPU(s) online (3 AP(s) woken)
++       [serial] [smp] PASS: multi-core system detected
++       [serial] [sched] R5 receipt: user thread pid=6 on AP cpu=3
++       [serial] [kernel] shell active; kmain idling.
++       [serial] auralite#
++       [kbc] --keys-at fired (instr=2362343099, prompt=1)
++       [serial] [smpwake] PASS: 14 RTC(GSI8) device IRQs delivered to cpu1 (apic id 1); hlt looper woken 5 times -- RES-16 receipt
++       [serial] IRQAPWAKE PASS: kernel receipt returned 0
++       [serial] auralite#
++       [serial] SMPSTRESS: O_APPEND 6 x 200 x 32 B intact
++       [serial] SMPSTRESS: 100 fork/wait cycles precise
++       [serial] SMPSTRESS: 8 x 10 signal deliveries counted
++       [serial] SMPSTRESS PASS
++       [serial] auralite#
++
++   Final per-vCPU stats (`cap=4000000000`, `fault=0` on all 4 vCPUs):
++
++       [stats] vcpu=0 executed_steps=935101005 instr_count=46810588237 halted=0 fault=0
++       [stats] vcpu=1 executed_steps=82923322 instr_count=44799802170 halted=1 fault=0
++       [stats] vcpu=2 executed_steps=77538628 instr_count=44794425668 halted=1 fault=0
++       [stats] vcpu=3 executed_steps=91904984 instr_count=44808793560 halted=1 fault=0
++       [stats] executed=1187467939 idle_quantum=180026141696 instr_count_bsp=46810588237 vtime=181213609635
++
++   Exact work identities:
++   - `sum(executed_steps) = 935101005 + 82923322 + 77538628 + 91904984 = 1187467939 == executed`
++   - `sum(instr_count) = 46810588237 + 44799802170 + 44794425668 + 44808793560 = 181213609635 == vtime`
++   - `executed + idle_quantum = 1187467939 + 180026141696 = 181213609635 == vtime`
++
++4. **Historical lane byte-identity:** `tests/integration/p5_history.sh` (all 9
++   firmware/video/`smp2` lanes) plus 40 M guest `--kernel` UP and `--cpus=2 --smp=2`
++   runs are byte-identical against the G5 binary (`ad81722`).
++
++## Files
++
++- `x86emu-smp4.receipt` — RC and wall time of the 4 G acceptance run.
++- `x86emu-smp4.stdout.txt` — final CPU state and 4-vCPU PERF P0 stats block.
++- `x86emu-smp4.serial.log.gz` — full serial + emulator log (`gzip -9n`).
++- `bootinfo-smp4.bin` / `bootinfo-smp4-parse.txt` — 7,776-byte `boot_info_t`
++  handoff block with `cpu_count=4` and its decoded report.
++- `acpi-receipt-smp4.txt` — RSDP → RSDT → 134-byte MADT (`cpus=4`).
++- `seabios-diag-smp4.stdout.txt` — diagnostic SeaBIOS 4-CPU POST output.
++- `nc-smp.txt` — negative control proof (`tests/integration/g6_smp_nc.sh`).
++- `commands.txt`, `inputs.txt`, `SHA256SUMS`.
+diff --git a/docs/evidence/compat-g6/SHA256SUMS b/docs/evidence/compat-g6/SHA256SUMS
+new file mode 100644
+index 0000000..e39ee3c
+--- /dev/null
++++ b/docs/evidence/compat-g6/SHA256SUMS
+@@ -0,0 +1,11 @@
++414f6749fdfb35a31b34ad5f864cd14672b3da401b270fda78e55f513bda8149  README.md
++86d87e34fa8b5a07f215b4f698370a15bcaf8783d15ceea93df41171dd70a363  acpi-receipt-smp4.txt
++3a6c9a3d306f1e510f2bc2fe0d2f16a04eb4b783eb378877c0bc3a7b88ca80c5  bootinfo-smp4-parse.txt
++7cdd21a0d093bed3308f2351def32b7048b80a89af25d781bfb9e0eb72ae8fa0  bootinfo-smp4.bin
++f9a6e3c4d138d200afaa179d39c2e07ef9bdb5c7e02a7ba5f5c8589042a316a1  commands.txt
++bf7cf8594f39db710935972410bc0e00396e8831941453fd35ab1c6b7dc75610  inputs.txt
++a67032a052a77b703555ebf2333b96b44c7d1776e54cb9a8ead4063f88e07bd9  nc-smp.txt
++61e977bca31105b46eed07a1ec26cf4143b4b16e7d02ee4b5a03b5296b91ed72  seabios-diag-smp4.stdout.txt
++d7b1b5eda73a780ebbe72b823fb4e2aeefd12872b3723b844222105b96c9e3aa  x86emu-smp4.receipt
++6becc4b8893e1e0368540258b2bd882cebf3f095783a9ad4fff0e5e8b501226d  x86emu-smp4.serial.log.gz
++a48b1b88c54f4b5a65743e98239a5eea8b5e2d83c03e08ce5a330505e99ac724  x86emu-smp4.stdout.txt
+diff --git a/docs/evidence/compat-g6/acpi-receipt-smp4.txt b/docs/evidence/compat-g6/acpi-receipt-smp4.txt
+new file mode 100644
+index 0000000..aae9db2
+--- /dev/null
++++ b/docs/evidence/compat-g6/acpi-receipt-smp4.txt
+@@ -0,0 +1,12 @@
++rsdp addr=0x000f6770 rev=0 checksum=ok rsdt=0x07ffe270
++rsdt sig=RSDT entries=4 checksum=ok
++table sig=FACP addr=0x07ffff80 len=116 checksum=ok
++table sig=SSDT addr=0x07fff5e0 len=2398 checksum=ok
++table sig=APIC addr=0x07fff4e0 len=134 checksum=ok
++table sig=MCFG addr=0x07fff4a0 len=60 checksum=ok
++madt lapic_base=0xfee00000 cpus=4 ioapics=1 isos=4
++madt_ioapic id=0 addr=0xfec00000 gsi_base=0x0
++madt_iso bus=0 source=5 gsi=5 flags=0x000d
++madt_iso bus=0 source=9 gsi=9 flags=0x000d
++madt_iso bus=0 source=10 gsi=10 flags=0x000d
++madt_iso bus=0 source=11 gsi=11 flags=0x000d
+diff --git a/docs/evidence/compat-g6/bootinfo-smp4-parse.txt b/docs/evidence/compat-g6/bootinfo-smp4-parse.txt
+new file mode 100644
+index 0000000..f30bc6a
+--- /dev/null
++++ b/docs/evidence/compat-g6/bootinfo-smp4-parse.txt
+@@ -0,0 +1,22 @@
++snapshot version=2; RAM=134217728 bytes; boot_info phys=0x10000 size=7776
++Generated C-header offsets/size: bootinfo-layout.inc MATCH
++magic=0x4155524142544c44 OK; boot_from_uefi=0; reserved padding=zero
++fb phys=0x0 0x0 pitch=0 bpp=0 rgb-shift=0,0,0
++mmap_count=8 (max 256); hhdm_offset=0xffff800000000000
++  mmap[0] base=0x00000000 length=0x0009fc00 type=1
++  mmap[1] base=0x0009fc00 length=0x00000400 type=2
++  mmap[2] base=0x000f0000 length=0x00010000 type=2
++  mmap[3] base=0x00100000 length=0x07efc000 type=1
++  mmap[4] base=0x07ffc000 length=0x00004000 type=2
++  mmap[5] base=0xb0000000 length=0x10000000 type=2
++  mmap[6] base=0xfed1c000 length=0x00004000 type=2
++  mmap[7] base=0xfffc0000 length=0x00040000 type=2
++initrd phys=0x1800000 size=0xb22000 (11673600 bytes)
++cpu_count=4 (max 64); bsp_lapic_id=0
++  cpu[0] processor_id=0 lapic_id=0 goto=0x0 extra=0x0
++  cpu[1] processor_id=1 lapic_id=1 goto=0x0 extra=0x0
++  cpu[2] processor_id=2 lapic_id=2 goto=0x0 extra=0x0
++  cpu[3] processor_id=3 lapic_id=3 goto=0x0 extra=0x0
++rsdp_phys=0xf6770 (signature/checksum OK (revision 0))
++Checks: generated C-header offsets/size, magic, array counts, sorted non-overlapping E820 entries, field padding, HHDM, CPU/BSP agreement, and RSDP.
++Scope: candidate Stage-2 + diagnostic-ROM snapshot only; this output alone is not pinned-image acceptance or the separate QEMU reference comparison.
+diff --git a/docs/evidence/compat-g6/bootinfo-smp4.bin b/docs/evidence/compat-g6/bootinfo-smp4.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..63585d70f3769b0b733e2fc0f4c40731d6b66337
+GIT binary patch
+literal 7776
+zcmeI$$xake6vpw}&Afu}1hr)=J^)3)goG98CcFV#6E`kf0hvUQNf1zQU{axNW(8?Q
+zaAInZK?QjL7H(Y-ihtFu?xuqamk>^MepPkPJyofE=|$BoDE8%>C4N)=?{<{obb6xw
+z?pP)3f;U=MneLhHjMuYtJ^UxlK8f8YY&m0<r>EonDyS>UxiD4_M~<EPnf@b7_v;6W
+z^}9EbgCrmcNCJ|8Bp?Y$0+N6vAPGnUl7J*|851}xYcl;MW^s|PP<cIua=w@UDrN9<
+zKF$MP<w?=W*mEA0st4{qpmJ`OUd@i)!!V3%rZ4vj$AmT+oXZ6K!?$iIbsH6^L>2C!
+z8a1dz9qMrx4Y-F!G~qs)(SlaAp&bv<flfR`7rN1dM|g~0^x+Af;u)T!9|IV~5Qgyr
+zFYyW^7)21T5yBY8F@Z@;VHz`dgSVK)9Nu9bVZ6r&EZ`#+v4l_fj4$|#Z&=0(R<VY4
+zM6iKPe8(2Hv4dUwz)$?b9`^AY2e2$Fx=3~|{~hvBl7J*23D^mwpN=75vBn<IOZP^|
+snQ@o@Pj@Ap+s*odgtGI#@vk-dB-(7UNdl69Bp?Y~j0CQiC%)3204Vs5+5i9m
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/evidence/compat-g6/commands.txt b/docs/evidence/compat-g6/commands.txt
+new file mode 100644
+index 0000000..19055a2
+--- /dev/null
++++ b/docs/evidence/compat-g6/commands.txt
+@@ -0,0 +1,46 @@
++COMPAT G6 — exact reproduction
++
++1. SeaBIOS diagnostic SMP POST check (1.5 s, RC 0).  Confirms CMOS 0x5F,
++   broadcast INIT+SIPI (shorthand=3), CPUID(1).EBX[31:24] APIC ID reporting,
++   and 4-CPU MP/MADT publication:
++
++   ./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
++       --lpc=ich9 --smp=4 --max-instr=10000000 --stats \
++       >docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt 2>&1
++
++   Prints `handle_smp: apic_id=0x1..0x3` and
++   `Found 4 cpu(s) max supported 4 cpu(s)`.
++
++2. Full 4-vCPU BIOS acceptance run + guest `/tests/irqapwake` + `/tests/smpstress`
++   (442 s, RC 0):
++
++   KEYS_BOTH="35,B5,14,94,12,92,1F,9F,14,94,1F,9F,35,B5,17,97,13,93,10,90,1E,9E,19,99,11,91,1E,9E,25,A5,12,92,1C,9C,35,B5,14,94,12,92,1F,9F,14,94,1F,9F,35,B5,1F,9F,32,B2,19,99,1F,9F,14,94,13,93,12,92,1F,9F,1F,9F,1C,9C"
++   ./x86emu --rom=/home/user/g3-artifacts/bios.bin \
++       --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++       --sata=/tmp/iso-candidate.iso \
++       --lpc=ich9 --smp=4 \
++       --keys-at=prompt --keys="$KEYS_BOTH" \
++       --max-instr=4000000000 --stats \
++       >x86emu-smp4.stdout.txt 2>x86emu-smp4.serial.log
++   gzip -9n x86emu-smp4.serial.log
++
++3. ACPI receipt and `boot_info_t` handoff block under `--smp=4`:
++
++   ./x86emu ... --lpc=ich9 --smp=4 --max-instr=1700000000 --stats \
++       --snapshot-save=/tmp/g6-smp4.snap
++   python3 docs/evidence/compat-g3/inspect_bootinfo_snapshot.py \
++       /tmp/g6-smp4.snap --write-raw docs/evidence/compat-g6/bootinfo-smp4.bin \
++       > docs/evidence/compat-g6/bootinfo-smp4-parse.txt
++   python3 tests/g5_acpi_receipt.py --snapshot=/tmp/g6-smp4.snap \
++       --serial=<(gzip -dc docs/evidence/compat-g6/x86emu-smp4.serial.log.gz) \
++       --out=docs/evidence/compat-g6/acpi-receipt-smp4.txt
++
++4. Negative control (~9 s, no external ISO required):
++
++   make test-g6-live     # sh tests/integration/g6_smp_nc.sh
++
++5. Bundle and unit gates:
++
++   make test-g6          # 78 re-checked conditions, inside `make test`
++   make test-g6-nc       # five tampered bundles must be rejected
++   make test-unit        # includes test_rtc.c (CMOS 0x5F) and test_lapic.c (4-vCPU INIT/SIPI)
+diff --git a/docs/evidence/compat-g6/inputs.txt b/docs/evidence/compat-g6/inputs.txt
+new file mode 100644
+index 0000000..2454410
+--- /dev/null
++++ b/docs/evidence/compat-g6/inputs.txt
+@@ -0,0 +1,8 @@
++4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca  /home/user/g3-artifacts/bios.bin
++69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d  docs/evidence/compat-g3/seabios-diagnostic-128k.bin
++30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  docs/evidence/compat-g3/blank-usb-1m.img
++0b10727ce02eb5de5da9f61d39a71ffaec0742d041a1bbfcd7e4d99a25a0469b  /tmp/iso-candidate.iso
++99c03a15de9294ba68351ceb7b5d25e2ade358f9b42d1ef37bb96f2a2d2aada0  x86emu
++# x86emu build: gcc -std=c11 -O2 -Wall -Wextra -Werror (default CFLAGS), x86_64
++# bios.bin: unmodified Debian trixie seabios 1.16.3-2 (131072 bytes)
++# iso-candidate.iso: AuraLite-OS pinned 518bef0 + G3 Stage-2 acpi.inc fix (84934656 bytes)
+diff --git a/docs/evidence/compat-g6/nc-smp.txt b/docs/evidence/compat-g6/nc-smp.txt
+new file mode 100644
+index 0000000..c0c2515
+--- /dev/null
++++ b/docs/evidence/compat-g6/nc-smp.txt
+@@ -0,0 +1,4 @@
++# COMPAT G6 SMP broadcast INIT/SIPI negative control
++# rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin budget=10000000
++mutant:  woken=0 found=absent ap_steps=0,0,0
++control: woken=3 found=4/4 ap_steps=736,1387,2038
+diff --git a/docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt b/docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt
+new file mode 100644
+index 0000000..006213b
+--- /dev/null
++++ b/docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt
+@@ -0,0 +1,563 @@
++[ahci] ABAR registered at 0xfeb10000 (6 ports, S1: registers+presence)
++
++[boot] platform=Haswell (LGA1150, model 0x3C) rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin (131072 bytes) disk=disk/disk.img (1048576 bytes)
++[smp] G6: 4 vCPU contexts live; vcpu1..3 parked in wait-for-SIPI (LAPIC ids 1..3), strict 1:1 round-robin
++SeaBIOS (version ?-20261016_123815-e2b.local)
++BUILD: gcc: (Debian 14.2.0-19) 14.2.0 binutils: (GNU Binutils for Debian) 2.44
++Running on QEMU (q35)
++physbits: signature="GenuineIntel", pae=no, lm=yes, phys-bits=32, valid=yes
++cpuid 0x40000000: eax 40000000, signature 'AuraLite HV '
++RamSize: 0x08000000 [cmos]
++Relocating init from 0x000e1d80 to 0x06ff2ce0 (size 53888)
++=== PCI bus & bridge init ===
++PCI: pci_bios_init_bus_rec bus = 0x0
++[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=47811
++[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=ef2e9 vt=47842
++[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=47872
++[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=47927
++[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=ef2e9 vt=47958
++PCI: pci_bios_init_bus_rec bdf = 0x8
++PCI: primary bus = 0x0
++PCI: secondary bus = 0xff -> 0x1
++PCI: pci_bios_init_bus_rec bus = 0x1
++PCI: subordinate bus = 0x0 -> 0x1
++[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=55083
++[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=ef2e9 vt=55113
++[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=55143
++[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=55198
++[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=ef2e9 vt=55228
++=== PCI device probing ===
++[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=64932
++[pci-probe] io-read fn=0 reg=0x00 size=4 val=0x29188086 rip=ef2ac vt=65687
++[pci-probe] io-read fn=0 reg=0x08 size=4 val=0x06010000 rip=ef2ac vt=65704
++[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=65728
++[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=65761
++[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=65816
++[pci-probe] io-read fn=2 reg=0x00 size=4 val=0x1e038086 rip=ef2ac vt=66619
++[pci-probe] io-read fn=2 reg=0x08 size=4 val=0x01060100 rip=ef2ac vt=66636
++[pci-probe] io-read fn=2 reg=0x0e size=1 val=0x00000000 rip=ef326 vt=66660
++Found 6 PCI devices (max PCI bus is 00)
++[pci] host bridge: MMCONFIG (ECAM) window enabled at 0xb0000000
++PCIe: using q35 mmconfig at 0xb0000000
++=== PCI new allocation pass #1 ===
++PCI: check devices
++[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=116340
++[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xffffffff rip=ef1cf vt=116376
++[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0xffffffff rip=ef28e vt=116391
++[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0x00000000 rip=ef1cf vt=116410
++[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=119083
++[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xffffffff rip=ef1cf vt=119119
++[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0xffffffff rip=ef28e vt=119134
++[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0x00000000 rip=ef1cf vt=119153
++[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=121896
++[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xffffffff rip=ef1cf vt=121932
++[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0xffffffff rip=ef28e vt=121947
++[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0x00000000 rip=ef1cf vt=121966
++[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=124779
++[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xffffffff rip=ef1cf vt=124815
++[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0xffffffff rip=ef28e vt=124830
++[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0x00000000 rip=ef1cf vt=124849
++[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=127732
++[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xffffffff rip=ef1cf vt=127768
++[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0xffffffff rip=ef28e vt=127783
++[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0x00000000 rip=ef1cf vt=127802
++[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0x00000000 rip=ef28e vt=130755
++[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xffffffff rip=ef1cf vt=130791
++[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0xffffffff rip=ef28e vt=130806
++[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0x00000000 rip=ef1cf vt=130825
++[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=133851
++[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfffff800 rip=ef1cf vt=133870
++[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0xfffff800 rip=ef28e vt=133892
++[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0x00000000 rip=ef1cf vt=133911
++[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=137020
++[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0xffffffff rip=ef1cf vt=137056
++[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=137071
++[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0x00000000 rip=ef1cf vt=137090
++[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=137125
++[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0xffffffff rip=ef1cf vt=137161
++[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=137176
++[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0x00000000 rip=ef1cf vt=137195
++[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=137230
++[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0xffffffff rip=ef1cf vt=137266
++[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=137281
++[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0x00000000 rip=ef1cf vt=137300
++[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=137335
++[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0xffffffff rip=ef1cf vt=137371
++[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=137386
++[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0x00000000 rip=ef1cf vt=137405
++[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=137440
++[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0xffffffff rip=ef1cf vt=137476
++[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=137491
++[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0x00000000 rip=ef1cf vt=137510
++[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfeb10000 rip=ef28e vt=137545
++[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xffffffff rip=ef1cf vt=137581
++[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfffff000 rip=ef28e vt=137596
++[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfeb10000 rip=ef1cf vt=137615
++[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=140777
++[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0xfffff800 rip=ef1cf vt=140796
++[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=140818
++[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0x00000000 rip=ef1cf vt=140837
++=== PCI new allocation pass #2 ===
++PCI: IO: c000 - bfff
++PCI: 32: 00000000c0000000 - 00000000fec00000
++PCI: map device bdf=00:00.0  bar 0, addr febe0000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 1, addr febe1000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 2, addr febe2000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 3, addr febe3000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 4, addr febe4000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 5, addr febe5000, size 00001000 [mem]
++PCI: map device bdf=00:00.0  bar 6, addr febe6000, size 00001000 [mem]
++PCI: map device bdf=00:01.0  bar 0, addr febe7000, size 00001000 [mem]
++PCI: map device bdf=00:01.0  bar 1, addr febe8000, size 00001000 [mem]
++PCI: map device bdf=00:01.0  bar 6, addr febe9000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 0, addr febea000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 1, addr febeb000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 2, addr febec000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 3, addr febed000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 4, addr febee000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 5, addr febef000, size 00001000 [mem]
++PCI: map device bdf=00:02.0  bar 6, addr febf0000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 0, addr febf1000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 1, addr febf2000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 2, addr febf3000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 3, addr febf4000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 4, addr febf5000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 5, addr febf6000, size 00001000 [mem]
++PCI: map device bdf=00:03.0  bar 6, addr febf7000, size 00001000 [mem]
++PCI: map device bdf=00:1f.0  bar 0, addr febf8000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xfebf8000 rip=ef1cf vt=197213
++PCI: map device bdf=00:1f.0  bar 1, addr febf9000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xfebf9000 rip=ef1cf vt=199356
++PCI: map device bdf=00:1f.0  bar 2, addr febfa000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xfebfa000 rip=ef1cf vt=201502
++PCI: map device bdf=00:1f.0  bar 3, addr febfb000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xfebfb000 rip=ef1cf vt=203648
++PCI: map device bdf=00:1f.0  bar 4, addr febfc000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xfebfc000 rip=ef1cf vt=205794
++PCI: map device bdf=00:1f.0  bar 5, addr febfd000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xfebfd000 rip=ef1cf vt=207940
++PCI: map device bdf=00:1f.0  bar 6, addr febfe000, size 00001000 [mem]
++[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfebfe000 rip=ef1cf vt=210089
++PCI: map device bdf=00:1f.2  bar 5, addr febff000, size 00001000 [mem]
++[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfebff000 rip=ef1cf vt=212235
++PCI: init bdf=00:00.0 id=8086:29c0
++PCI: init bdf=00:01.0 id=8086:0101
++PCI: init bdf=00:02.0 id=8086:0412
++PCI: init bdf=00:03.0 id=8086:1e26
++PCI: init bdf=00:1f.0 id=8086:2918
++[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=219029
++[pci-probe] ecam-write fn=0 reg=0x060 size=1 val=0x0000000a rip=ef251 vt=219127
++[pci-probe] ecam-write fn=0 reg=0x068 size=1 val=0x0000000a rip=ef251 vt=219145
++[pci-probe] ecam-write fn=0 reg=0x061 size=1 val=0x0000000a rip=ef251 vt=219175
++[pci-probe] ecam-write fn=0 reg=0x069 size=1 val=0x0000000a rip=ef251 vt=219193
++[pci-probe] ecam-write fn=0 reg=0x062 size=1 val=0x0000000b rip=ef251 vt=219223
++[pci-probe] ecam-write fn=0 reg=0x06a size=1 val=0x0000000b rip=ef251 vt=219241
++[pci-probe] ecam-write fn=0 reg=0x063 size=1 val=0x0000000b rip=ef251 vt=219271
++[pci-probe] ecam-write fn=0 reg=0x06b size=1 val=0x0000000b rip=ef251 vt=219289
++Q35 LPC init: elcr=00 0c
++[pci-probe] ecam-write fn=0 reg=0x040 size=4 val=0x0000b001 rip=ef1cf vt=220051
++[pci-probe] ecam-write fn=0 reg=0x044 size=1 val=0x00000080 rip=ef251 vt=220070
++[pci-probe] ecam-write fn=0 reg=0x0f0 size=4 val=0xfed1c001 rip=ef1cf vt=220090
++Using pmtimer, ioport 0xb008
++[pci-probe] ecam-read fn=0 reg=0x004 size=2 val=0x00000000 rip=ef2c4 vt=221167
++[pci-probe] ecam-write fn=0 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=221187
++PCI: init bdf=00:1f.2 id=8086:1e03
++[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=222262
++[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000000 rip=ef2c4 vt=222487
++[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=222507
++PCI: Using 00:02.0 for primary VGA
++[lapic] software ENABLED (spurious vector 0xff)
++[lapic] vcpu1 took INIT: state reset, parked in wait-for-SIPI
++[lapic] vcpu2 took INIT: state reset, parked in wait-for-SIPI
++[lapic] vcpu3 took INIT: state reset, parked in wait-for-SIPI
++[lapic] vcpu1 took SIPI: entering real mode at 0x10000:0
++[lapic] vcpu2 took SIPI: entering real mode at 0x10000:0
++[lapic] vcpu3 took SIPI: entering real mode at 0x10000:0
++handle_smp: apic_id=0x1
++[smp] vcpu1 stopped (rc=-1) -- parked; 3 context(s) still live
++handle_smp: apic_id=0x2
++[smp] vcpu2 stopped (rc=-1) -- parked; 2 context(s) still live
++handle_smp: apic_id=0x3
++[smp] vcpu3 stopped (rc=-1) -- parked; 1 context(s) still live
++Found 4 cpu(s) max supported 4 cpu(s)
++Copying PIR from 0x06fffce0 to 0x000f6440
++[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=235772
++[pci-probe] ecam-read fn=0 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=235788
++[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=235819
++[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=235835
++Copying MPTABLE from 0x00006e20/6feaa40 to 0x000f6320
++Copying SMBIOS from 0x00006e20 to 0x000f6170
++ACPI DSDT=0x07ffe380
++Copying ACPI RSDP from 0x00006dfc to 0x000f6150
++Scan for VGA option rom
++Turning on vga text mode console
++[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
++SeaBIOS (version ?-20261016_123815-e2b.local)
++EHCI init on dev 00:03.0 (regs=0xfebf10ff)
++[kbd-probe] status=0x00 rip=6ff48e6 vt=1615892
++[kbd-probe] status=0x00 rip=f05e2 vt=1615914
++[kbd-probe] status=0x18 rip=f05e2 vt=1615952
++[kbd-probe] status=0x18 rip=6ff48e6 vt=1615979
++[kbd-probe] status=0x18 rip=f05e2 vt=1616003
++[kbd-probe] status=0x1d rip=6ff48ac vt=1616020
++[kbd-probe] read=0x55 status=0x1d rip=6ff48d0 vt=1616023
++[kbd-probe] status=0x1c rip=f05e2 vt=1616051
++[kbd-probe] status=0x1d rip=6ff48ac vt=1616068
++[kbd-probe] read=0x00 status=0x1d rip=6ff48d0 vt=1616071
++[kbd-probe] status=0x1c rip=f05e2 vt=1616277
++[kbd-probe] status=0x1c rip=f05e2 vt=1616293
++[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfebff000 rip=ef28e vt=1617623
++[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=ef2c4 vt=1617654
++[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=1617674
++[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=1618349
++AHCI controller at 00:1f.2, iobase 0xfebff000, irq 0
++[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=ef2c4 vt=1619622
++[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000107 rip=ef20e vt=1619642
++[ahci-mmio-probe] read off=0x4 size=4 rip=6ffb991 vt=1619651
++[ahci-mmio-probe] write off=0x4 size=4 val=0x80000000 rip=6ffb99c vt=1619654
++[ahci-mmio-probe] read off=0x0 size=4 rip=6ffb9a2 vt=1619656
++[ahci-mmio-probe] read off=0xc size=4 rip=6ffb9aa vt=1619659
++[ahci-mmio-probe] write off=0x100 size=4 val=0x6ff2000 rip=efa19 vt=1632216
++[ahci-mmio-probe] write off=0x108 size=4 val=0x6ff2500 rip=efa19 vt=1632227
++[ahci-mmio-probe] write off=0x104 size=4 val=0x0 rip=efa19 vt=1632242
++[ahci-mmio-probe] write off=0x10c size=4 val=0x0 rip=efa19 vt=1632253
++[ahci-mmio-probe] read off=0x118 size=4 rip=efa28 vt=1633632
++[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=1633646
++[ahci-mmio-probe] read off=0x110 size=4 rip=efa28 vt=1633655
++[ahci-mmio-probe] read off=0x118 size=4 rip=efa28 vt=1633683
++[ahci-mmio-probe] write off=0x118 size=4 val=0x10 rip=efa19 vt=1633696
++[ahci-mmio-probe] write off=0x118 size=4 val=0x12 rip=efa19 vt=1633708
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1633743
++[kbd-probe] status=0x1c rip=f05e2 vt=1633825
++[kbd-probe] status=0x1c rip=f05e2 vt=1633841
++[kbd-probe] status=0x0c rip=f05e2 vt=1633873
++[kbd-probe] write=0xff pending=0x00 status=0x04 rip=6ff729e vt=1633882
++[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1633882
++[kbd-probe] reply=0xaa status=0x04 rip=6ff729e vt=1633882
++[kbd-probe] status=0x05 rip=6ff7216 vt=1633913
++[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1633917
++[kbd-probe] status=0x05 rip=6ff7216 vt=1633968
++[kbd-probe] read=0xaa status=0x05 rip=6ff7220 vt=1633972
++[kbd-probe] status=0x04 rip=f05e2 vt=1634001
++[kbd-probe] status=0x0c rip=f05e2 vt=1634017
++[kbd-probe] status=0x1c rip=f05e2 vt=1634079
++[kbd-probe] status=0x1c rip=f05e2 vt=1634095
++[ahci-mmio-probe] write off=0x180 size=4 val=0x6fee800 rip=efa19 vt=1648135
++[ahci-mmio-probe] write off=0x188 size=4 val=0x6feee00 rip=efa19 vt=1648146
++[ahci-mmio-probe] write off=0x184 size=4 val=0x0 rip=efa19 vt=1648161
++[ahci-mmio-probe] write off=0x18c size=4 val=0x0 rip=efa19 vt=1648172
++[ahci-mmio-probe] read off=0x198 size=4 rip=efa28 vt=1649755
++[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=1649769
++[ahci-mmio-probe] read off=0x190 size=4 rip=efa28 vt=1649778
++[ahci-mmio-probe] read off=0x198 size=4 rip=efa28 vt=1649806
++[ahci-mmio-probe] write off=0x198 size=4 val=0x10 rip=efa19 vt=1649819
++[ahci-mmio-probe] write off=0x198 size=4 val=0x12 rip=efa19 vt=1649831
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1649866
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1649938
++[kbd-probe] status=0x1c rip=f05e2 vt=1650020
++[kbd-probe] status=0x1c rip=f05e2 vt=1650036
++[kbd-probe] status=0x0c rip=f05e2 vt=1650068
++[kbd-probe] write=0xf5 pending=0x00 status=0x04 rip=6ff729e vt=1650077
++[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1650077
++[kbd-probe] status=0x05 rip=6ff7216 vt=1650108
++[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1650112
++[kbd-probe] status=0x04 rip=f05e2 vt=1650156
++[kbd-probe] status=0x0c rip=f05e2 vt=1650172
++[kbd-probe] status=0x1c rip=f05e2 vt=1650232
++[kbd-probe] status=0x1c rip=f05e2 vt=1650248
++[ahci-mmio-probe] write off=0x200 size=4 val=0x6fee000 rip=efa19 vt=1665104
++[ahci-mmio-probe] write off=0x208 size=4 val=0x6fee600 rip=efa19 vt=1665115
++[ahci-mmio-probe] write off=0x204 size=4 val=0x0 rip=efa19 vt=1665130
++[ahci-mmio-probe] write off=0x20c size=4 val=0x0 rip=efa19 vt=1665141
++[ahci-mmio-probe] read off=0x218 size=4 rip=efa28 vt=1666940
++[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=1666954
++[ahci-mmio-probe] read off=0x210 size=4 rip=efa28 vt=1666963
++[ahci-mmio-probe] read off=0x218 size=4 rip=efa28 vt=1666991
++[ahci-mmio-probe] write off=0x218 size=4 val=0x10 rip=efa19 vt=1667004
++[ahci-mmio-probe] write off=0x218 size=4 val=0x12 rip=efa19 vt=1667016
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1667051
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1667123
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1667195
++[kbd-probe] status=0x1c rip=f05e2 vt=1667277
++[kbd-probe] status=0x1c rip=f05e2 vt=1667293
++[kbd-probe] status=0x0c rip=f05e2 vt=1667325
++[kbd-probe] write=0xf0 pending=0x00 status=0x04 rip=6ff729e vt=1667334
++[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1667334
++[kbd-probe] status=0x05 rip=6ff7216 vt=1667365
++[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1667369
++[kbd-probe] status=0x04 rip=f05e2 vt=1667404
++[kbd-probe] write=0x02 pending=0xf0 status=0x04 rip=6ff729e vt=1667413
++[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1667413
++[kbd-probe] status=0x05 rip=6ff7216 vt=1667444
++[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1667448
++[kbd-probe] status=0x04 rip=f05e2 vt=1667486
++[kbd-probe] status=0x0c rip=f05e2 vt=1667502
++[kbd-probe] status=0x1c rip=f05e2 vt=1667562
++[kbd-probe] status=0x1c rip=f05e2 vt=1667578
++[ahci-mmio-probe] write off=0x280 size=4 val=0x6febc00 rip=efa19 vt=1683430
++[ahci-mmio-probe] write off=0x288 size=4 val=0x6febb00 rip=efa19 vt=1683441
++[ahci-mmio-probe] write off=0x284 size=4 val=0x0 rip=efa19 vt=1683456
++[ahci-mmio-probe] write off=0x28c size=4 val=0x0 rip=efa19 vt=1683467
++[ahci-mmio-probe] read off=0x298 size=4 rip=efa28 vt=1685590
++[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=1685604
++[ahci-mmio-probe] read off=0x290 size=4 rip=efa28 vt=1685613
++[ahci-mmio-probe] read off=0x298 size=4 rip=efa28 vt=1685641
++[ahci-mmio-probe] write off=0x298 size=4 val=0x10 rip=efa19 vt=1685654
++[ahci-mmio-probe] write off=0x298 size=4 val=0x12 rip=efa19 vt=1685666
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1685701
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1685773
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1685845
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1685917
++[kbd-probe] status=0x1c rip=f05e2 vt=1685999
++[kbd-probe] status=0x1c rip=f05e2 vt=1686015
++[kbd-probe] status=0x0c rip=f05e2 vt=1686047
++[kbd-probe] write=0xf4 pending=0x00 status=0x04 rip=6ff729e vt=1686056
++[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1686056
++[kbd-probe] status=0x05 rip=6ff7216 vt=1686087
++[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1686091
++[kbd-probe] status=0x04 rip=f05e2 vt=1686135
++[kbd-probe] status=0x0c rip=f05e2 vt=1686151
++PS2 keyboard initialized
++[ahci-mmio-probe] write off=0x300 size=4 val=0x6ff0800 rip=efa19 vt=1700522
++[ahci-mmio-probe] write off=0x308 size=4 val=0x6ff0e00 rip=efa19 vt=1700533
++[ahci-mmio-probe] write off=0x304 size=4 val=0x0 rip=efa19 vt=1700548
++[ahci-mmio-probe] write off=0x30c size=4 val=0x0 rip=efa19 vt=1700559
++[ahci-mmio-probe] read off=0x318 size=4 rip=efa28 vt=1702478
++[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=1702492
++[ahci-mmio-probe] read off=0x310 size=4 rip=efa28 vt=1702501
++[ahci-mmio-probe] read off=0x318 size=4 rip=efa28 vt=1702529
++[ahci-mmio-probe] write off=0x318 size=4 val=0x10 rip=efa19 vt=1702542
++[ahci-mmio-probe] write off=0x318 size=4 val=0x12 rip=efa19 vt=1702554
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1702589
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1702661
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1702733
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1702805
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1702877
++[ahci-mmio-probe] write off=0x380 size=4 val=0x6ff0400 rip=efa19 vt=1717423
++[ahci-mmio-probe] write off=0x388 size=4 val=0x6ff0300 rip=efa19 vt=1717434
++[ahci-mmio-probe] write off=0x384 size=4 val=0x0 rip=efa19 vt=1717449
++[ahci-mmio-probe] write off=0x38c size=4 val=0x0 rip=efa19 vt=1717460
++[ahci-mmio-probe] read off=0x398 size=4 rip=efa28 vt=1719607
++[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=1719621
++[ahci-mmio-probe] read off=0x390 size=4 rip=efa28 vt=1719630
++[ahci-mmio-probe] read off=0x398 size=4 rip=efa28 vt=1719658
++[ahci-mmio-probe] write off=0x398 size=4 val=0x10 rip=efa19 vt=1719671
++[ahci-mmio-probe] write off=0x398 size=4 val=0x12 rip=efa19 vt=1719683
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1719718
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1719790
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1719862
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1719934
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1720006
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1720078
++Searching bootorder for: HALT
++Found 0 lpt ports
++Found 0 serial ports
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1722485
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1722557
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1722629
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1722701
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1722773
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1722845
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1723208
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1723280
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1723352
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1723424
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1723496
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1723568
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1723931
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1724003
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1724075
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1724147
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1724219
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1724291
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1724654
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1724726
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1724798
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1724870
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1724942
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1725014
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1725377
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1725449
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1725521
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1725593
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1725665
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1725737
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1726100
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1726172
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1726244
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1726316
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1726388
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1726460
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1726823
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1726895
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1726967
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1727039
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1727111
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1727183
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1727546
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1727618
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1727690
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1727762
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1727834
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1727906
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1728269
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1728341
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1728413
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1728485
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1728557
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1728629
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1728992
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1729064
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1729136
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1729208
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1729280
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1729352
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1729715
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1729787
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1729859
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1729931
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730003
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730075
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1730438
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1730510
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1730582
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1730654
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730726
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730798
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731161
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731233
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1731305
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1731377
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1731449
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1731521
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731884
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731956
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732028
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732100
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732172
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732244
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1732607
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1732679
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732751
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732823
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732895
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732967
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1733330
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1733402
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1733474
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1733546
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1733618
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1733690
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734053
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734125
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734197
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734269
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1734341
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1734413
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734776
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734848
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734920
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734992
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735064
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735136
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1735499
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1735571
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1735643
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1735715
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735787
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735859
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1736222
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1736294
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1736366
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1736438
++[ahci-mmio-probe] write off=0x118 size=4 val=0x4000 rip=efa19 vt=6216395
++[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=6217129
++[ahci-mmio-probe] write off=0x198 size=4 val=0x4000 rip=efa19 vt=6232679
++[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=6233341
++[ahci-mmio-probe] write off=0x218 size=4 val=0x4000 rip=efa19 vt=6250135
++[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=6250725
++[ahci-mmio-probe] write off=0x298 size=4 val=0x4000 rip=efa19 vt=6268741
++[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=6269259
++[ahci-mmio-probe] write off=0x318 size=4 val=0x4000 rip=efa19 vt=6285413
++[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=6285859
++[ahci-mmio-probe] write off=0x398 size=4 val=0x4000 rip=efa19 vt=6302621
++[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=6302995
++---- CPU state (mode=real16, instr=9995839) ----
++RAX=0000000000000000 RBX=0000000000009301 RCX=000000000000930c RDX=0000000000000000
++RSI=000000000000df00 RDI=0000000000000000 RBP=000000000000018e RSP=0000000000006e48
++R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
++R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
++RIP=0000000000007e04 RFLAGS=0000000000000012 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
++CS=f000 base=00000000000f0000 L=0 D=0   SS=0000 base=0000000000000000
++
++---- stats (PERF P0) ----
++[stats] vcpu=0 executed_steps=9995839 instr_count=9995839 halted=0 fault=0
++[stats] vcpu=1 executed_steps=736 instr_count=736 halted=1 fault=0
++[stats] vcpu=2 executed_steps=1387 instr_count=1387 halted=1 fault=0
++[stats] vcpu=3 executed_steps=2038 instr_count=2038 halted=1 fault=0
++[stats] executed=10000000 idle_quantum=0 instr_count_bsp=9995839 vtime=10000000
++[stats] cap=10000000 cap_reached=1 n_vcpus=4
++[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=2159106
++[stats] decode_hits=0 decode_misses=0
++
++---- last log lines ----
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730726
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730798
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731161
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731233
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1731305
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1731377
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1731449
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1731521
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731884
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731956
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732028
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732100
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732172
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732244
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1732607
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1732679
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732751
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732823
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732895
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732967
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1733330
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1733402
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1733474
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1733546
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1733618
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1733690
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734053
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734125
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734197
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734269
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1734341
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1734413
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734776
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734848
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734920
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734992
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735064
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735136
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1735499
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1735571
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1735643
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1735715
++[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735787
++[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735859
++[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1736222
++[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1736294
++[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1736366
++[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1736438
++[ahci-mmio-probe] write off=0x118 size=4 val=0x4000 rip=efa19 vt=6216395
++[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=6217129
++[ahci-mmio-probe] write off=0x198 size=4 val=0x4000 rip=efa19 vt=6232679
++[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=6233341
++[ahci-mmio-probe] write off=0x218 size=4 val=0x4000 rip=efa19 vt=6250135
++[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=6250725
++[ahci-mmio-probe] write off=0x298 size=4 val=0x4000 rip=efa19 vt=6268741
++[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=6269259
++[ahci-mmio-probe] write off=0x318 size=4 val=0x4000 rip=efa19 vt=6285413
++[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=6285859
++[ahci-mmio-probe] write off=0x398 size=4 val=0x4000 rip=efa19 vt=6302621
++[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=6302995
+diff --git a/docs/evidence/compat-g6/x86emu-smp4.receipt b/docs/evidence/compat-g6/x86emu-smp4.receipt
+new file mode 100644
+index 0000000..508d417
+--- /dev/null
++++ b/docs/evidence/compat-g6/x86emu-smp4.receipt
+@@ -0,0 +1 @@
++RUN RC=0 elapsed=442s
+diff --git a/docs/evidence/compat-g6/x86emu-smp4.serial.log.gz b/docs/evidence/compat-g6/x86emu-smp4.serial.log.gz
+new file mode 100644
+index 0000000000000000000000000000000000000000..17bc70dff1b1f446ee29e596946b978eba11ddf7
+GIT binary patch
+literal 25883
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/evidence/compat-g6/x86emu-smp4.stdout.txt b/docs/evidence/compat-g6/x86emu-smp4.stdout.txt
+new file mode 100644
+index 0000000..6f8bac4
+--- /dev/null
++++ b/docs/evidence/compat-g6/x86emu-smp4.stdout.txt
+@@ -0,0 +1,79 @@
++---- CPU state (mode=long64, instr=46810588237) ----
++RAX=0000000000000001 RBX=ffffffff8c026f38 RCX=0000000000000063 RDX=000000000000001f
++RSI=0000000000000086 RDI=ffffffff803ff410 RBP=ffffffff8c026ec0 RSP=ffffffff8c026eb0
++R8 =ffffffff88154b30 R9 =0000000000000000 R10=0000000000000002 R11=00000000345c0601
++R12=0000000000000020 R13=ffffffff8c026f38 R14=0000000000000000 R15=0000000000000000
++RIP=ffffffff8017bea9 RFLAGS=0000000000000002 CR0=0000000080010033 CR3=0000000001000000 CR4=0000000000000620 EFER=0000000000000d01
++CS=0008 base=0000000000000000 L=1 D=0   SS=0010 base=0000000000000000
++
++---- stats (PERF P0) ----
++[stats] vcpu=0 executed_steps=935101005 instr_count=46810588237 halted=0 fault=0
++[stats] vcpu=1 executed_steps=82923322 instr_count=44799802170 halted=1 fault=0
++[stats] vcpu=2 executed_steps=77538628 instr_count=44794425668 halted=1 fault=0
++[stats] vcpu=3 executed_steps=91904984 instr_count=44808793560 halted=1 fault=0
++[stats] executed=1187467939 idle_quantum=180026141696 instr_count_bsp=46810588237 vtime=181213609635
++[stats] cap=4000000000 cap_reached=1 n_vcpus=4
++[stats] tlb_hits=2124127917 tlb_misses=540885068 tlb_flushes=333898402
++[stats] decode_hits=277527053 decode_misses=663406545
++
++---- last log lines ----
++[serial] [bc] writeback stores=1764 flushed=939 coalesced=825
++[serial] [bc] writeback stores=1766 flushed=941 coalesced=825
++[serial] [bc] writeback stores=1768 flushed=943 coalesced=825
++[serial] [bc] writeback stores=1770 flushed=945 coalesced=825
++[serial] [bc] writeback stores=1772 flushed=947 coalesced=825
++[serial] [bc] writeback stores=1774 flushed=949 coalesced=825
++[serial] [bc] writeback stores=1783 flushed=955 coalesced=828
++[serial] [bc] writeback stores=1785 flushed=957 coalesced=828
++[serial] [bc] writeback stores=1787 flushed=959 coalesced=828
++[serial] [bc] writeback stores=1789 flushed=961 coalesced=828
++[serial] [bc] writeback stores=1791 flushed=963 coalesced=828
++[serial] [bc] writeback stores=1793 flushed=965 coalesced=828
++[serial] [bc] writeback stores=1795 flushed=967 coalesced=828
++[serial] [bc] writeback stores=1797 flushed=969 coalesced=828
++[serial] [bc] writeback stores=1799 flushed=971 coalesced=828
++[serial] [bc] writeback stores=1801 flushed=973 coalesced=828
++[serial] [bc] writeback stores=1810 flushed=979 coalesced=831
++[serial] [bc] writeback stores=1812 flushed=981 coalesced=831
++[serial] [bc] writeback stores=1814 flushed=983 coalesced=831
++[serial] [bc] writeback stores=1816 flushed=985 coalesced=831
++[serial] [bc] writeback stores=1818 flushed=987 coalesced=831
++[serial] [bc] writeback stores=1820 flushed=989 coalesced=831
++[serial] [bc] writeback stores=1822 flushed=991 coalesced=831
++[serial] [bc] writeback stores=1824 flushed=993 coalesced=831
++[serial] [bc] writeback stores=1826 flushed=995 coalesced=831
++[serial] [bc] writeback stores=1828 flushed=997 coalesced=831
++[serial] [bc] writeback stores=1837 flushed=1003 coalesced=834
++[serial] [bc] writeback stores=1839 flushed=1005 coalesced=834
++[serial] [bc] writeback stores=1841 flushed=1007 coalesced=834
++[serial] [bc] writeback stores=1843 flushed=1009 coalesced=834
++[serial] [bc] writeback stores=1845 flushed=1011 coalesced=834
++[serial] [bc] writeback stores=1847 flushed=1013 coalesced=834
++[serial] [bc] writeback stores=1849 flushed=1015 coalesced=834
++[serial] [bc] writeback stores=1851 flushed=1017 coalesced=834
++[serial] [bc] writeback stores=1853 flushed=1019 coalesced=834
++[serial] [bc] writeback stores=1862 flushed=1025 coalesced=837
++[serial] [bc] writeback stores=1864 flushed=1027 coalesced=837
++[serial] [bc] writeback stores=1866 flushed=1029 coalesced=837
++[serial] [bc] writeback stores=1868 flushed=1031 coalesced=837
++[serial] [bc] writeback stores=1870 flushed=1033 coalesced=837
++[serial] [bc] writeback stores=1872 flushed=1035 coalesced=837
++[serial] [bc] writeback stores=1874 flushed=1037 coalesced=837
++[serial] [bc] writeback stores=1876 flushed=1039 coalesced=837
++[serial] [bc] writeback stores=1878 flushed=1041 coalesced=837
++[serial] [bc] writeback stores=1880 flushed=1043 coalesced=837
++[serial] [bc] writeback stores=1889 flushed=1049 coalesced=840
++[serial] [bc] writeback stores=1891 flushed=1051 coalesced=840
++[serial] [bc] writeback stores=1893 flushed=1053 coalesced=840
++[serial] [bc] writeback stores=1895 flushed=1055 coalesced=840
++[serial] [bc] writeback stores=1897 flushed=1057 coalesced=840
++[serial] [bc] writeback stores=1899 flushed=1059 coalesced=840
++[serial] [bc] writeback stores=1901 flushed=1061 coalesced=840
++[serial] [bc] writeback stores=1903 flushed=1063 coalesced=840
++[serial] [bc] writeback stores=1905 flushed=1065 coalesced=840
++[serial] [bc] writeback stores=1914 flushed=1071 coalesced=843
++[serial] [bc] writeback stores=1916 flushed=1073 coalesced=843
++[serial] [bc] writeback stores=1918 flushed=1075 coalesced=843
++[serial] [bc] writeback stores=1920 flushed=1077 coalesced=843
++[serial] [bc] writeback stores=1922 flushed=1079 coalesced=843
++[serial] [bc] writeback stores=1924 flushed=1081 coalesced=843
+diff --git a/docs/plans/COMPAT_PLAN.md b/docs/plans/COMPAT_PLAN.md
+index b5e67c0..adae447 100644
+--- a/docs/plans/COMPAT_PLAN.md
++++ b/docs/plans/COMPAT_PLAN.md
+@@ -34,7 +34,7 @@ walks it.
+ | G3 | ✅ **delivered** (patch `0063`) | authoritative ISO (pinned `518bef0` + reviewed Stage-2 FS/GS fix, 10-of-166,272-sector diff) boots to `[kernel] shell active` under a **stock** SeaBIOS in x86emu and QEMU; `boot_info_t` at `0x10000` validates | `docs/evidence/compat-g3/acceptance/` |
+ | G4 | ✅ **delivered** (patch `0062`) | ACPI identity pairing on the **emulator** side: `--lpc=ich9` makes the LPC function `8086:2918`, so stock SeaBIOS publishes RSDP/RSDT/FACP/SSDT/MADT(**MCFG**) | `docs/evidence/compat-g4/README.md` |
+ | G5 | ✅ **delivered** (patch `0064`) | ICH9 boot completed: the missing ACPI PM block (PMBASE+8, 24-bit TMR at 3×PIT) was the real blocker, not the `0xefa1f` RIP; `--lpc=ich9` now boots the accepted image to `[kernel] shell active` with `fault=0`, `rsdp_phys=0xf6830`, 8-entry E820 including the ICH9 RCRB, and an RSDP→RSDT→MADT receipt | `docs/evidence/compat-g5/` |
+-| G6 | 📋 planned | SMP as the final rung: more than two vCPU contexts, INIT-SIPI bring-up of real APs through the BIOS route, per-AP timers | — |
++| G6 | ✅ **delivered** (patch `0065`) | SMP as the final rung: `EM_MAX_VCPU = 8`, `CMOS[0x5F]`, broadcast INIT/SIPI (`shorthand=2/3`), `CPUID(1).EBX[31:24]` APIC ID, AP work-counter preservation across second-stage INIT; `--lpc=ich9 --smp=4` boots the accepted image through SeaBIOS, wakes all 3 APs (`4 CPU(s) online`), logs R5, and passes `/tests/irqapwake` + `/tests/smpstress` | `docs/evidence/compat-g6/` |
+ 
+ Ordering rationale: the CPU/bios boundary defects (G1–G2) had to close before
+ the loader's own copy path could even be observed; the copy path (G3) had to
+@@ -259,21 +259,68 @@ stall (`g5_pm_nc.sh`, ~55 s).  `tests/test_pm.c` pins the block itself in
+ `make test-unit`: 3 counts per PIT tick, 24-bit wrap, byte/word/dword reads,
+ zero elsewhere, swallowed writes, PMBASE moves, and the LPC config hook.
+ 
+-## G6 — SMP as the final rung 📋
++## G6 — SMP as the final rung ✅ (patch `0065`)
+ 
+ **Done when:** the BIOS route boots a kernel with **more than two** executing
+ contexts, real APs answer INIT-SIPI-SIPI through the IOAPIC/LAPIC path, and
+ per-AP timers tick on the shared virtual clock without changing UP receipts.
+ 
+-Current state: `EM_MAX_VCPU = 2` (`src/machine.h`), strict 1:1 round-robin,
+-`--smp=2` proven through the K6/K8/KERNEL_BOOT lanes. G6 must decide between
+-extending the context array and a scheduler, keep the K6 identity
+-(`vtime_instr == instr_count` when one context runs), and re-run every
+-historical lane for byte identity.
+-
+-**Gate:** `--smp=4` boots the guest, `[smp] AP #k online` for every AP, the
+-guest's own `smpstress`/`irqapwake` tests pass, and `make test` +
+-`make test-sanitize` stay green.
++**Decision and root causes.** Extending the round-robin context array from
++`EM_MAX_VCPU = 2` to `8` preserves the K6/K8 work-clock identity
++(`vtime_instr == instr_count` when one context runs, and
++`sum(instr_count) == vtime_instr` across `N` contexts) without introducing
++scheduler state.  Disassembling SeaBIOS 1.16.3-2's `smp_setup()` (`0xf1538`),
++`qemu_get_present_cpus_count()` (`0xe8040`), `handle_smp()` (`0xef526`), and
++`build_madt()` (`0xe9a3f`) exposed four firmware/hardware handoff requirements
++beyond K6's `--kernel` path, plus one two-stage bring-up accounting invariant:
++
++1. **CMOS `0x5F` (`src/rtc.c`, `src/main.c`):** SeaBIOS's `smp_probe()` reads
++   CMOS `0x5F` (`CMOS_BIOS_SMP_COUNT`) and sets `MaxCountCPUs = CMOS[0x5F] + 1`.
++   `rtc_init()` and `--smp=N` wiring now write `nv - 1` into `CMOS[0x5F]` when
++   `nv > 1` (`0` in UP).
++2. **Broadcast INIT and SIPI (`src/lapic.c`):** SeaBIOS wakes all APs during
++   POST with ICR destination shorthand `3` ("all excluding self":
++   `0x000C4500` broadcast INIT, then `0x000C4610` broadcast SIPI at vector
++   `0x10`).  `lapic_icr_write()` now handles `shorthand == 2` and `3` on the
++   `dm == 5` (INIT) and `dm == 6` (SIPI) path.
++3. **Initial APIC ID in `CPUID(1).EBX[31:24]` (`src/cpu.c`):** Each woken AP
++   executes `cpuid` leaf 1 inside `smp_write_msr` (`0xef526`) and shifts `EBX`
++   right by 24 to set bit `(1 << apic_id)` in `FoundAPICIDs` (`0xf5a00`), which
++   `build_madt()` tests to set each Type-0 Local APIC entry's `Flags.Enabled`
++   bit.  `do_cpuid()` now reports `m->lapic.id & 0xFF000000u` in `EBX[31:24]`
++   (`0` on BSP/UP, `i << 24` on `vcpu_i`).
++4. **AP counter preservation across second-stage `INIT` (`src/lapic.c`):** On
++   the BIOS route each AP executes 736–2,038 instructions during SeaBIOS POST
++   before parking in `cli; hlt` (`VCPU_OFF`), and is later reset and woken a
++   second time by the kernel's targeted physical `INIT` + `SIPI` at `0x8000`.
++   `vcpu_take_init()` now saves and restores `executed_steps`, `instr_count`,
++   `idle_quantum`, and `last_vtime` across `cpu_reset(&s->c)`, keeping
++   `sum(executed_steps) == executed` and `sum(instr_count) == vtime`.
++
++**Measured on the accepted image** (`docs/evidence/compat-g6/`):
++- Diagnostic SeaBIOS POST (`--lpc=ich9 --smp=4 --max-instr=10000000`) prints
++  `handle_smp: apic_id=0x1..0x3` and `Found 4 cpu(s) max supported 4 cpu(s)`.
++- Full BIOS boot (`--rom=bios.bin --lpc=ich9 --smp=4 --max-instr=4000000000`,
++  RC 0) publishes a 134-byte MADT (`cpus=4 ioapics=1 isos=4`) and a
++  `boot_info_t` with `cpu_count=4` (`processor_id = lapic_id = 0..3`), wakes
++  all three APs (`[smp] AP #0..#2 online`, `[smp] 4 CPU(s) online (3 AP(s)
++  woken)`), prints `[sched] R5 receipt: user thread pid=6 on AP cpu=3`,
++  reaches `[kernel] shell active; kmain idling.`, and passes typed
++  `/tests/irqapwake` (`[smpwake] PASS: 14 RTC(GSI8) device IRQs delivered to
++  cpu1 (apic id 1); hlt looper woken 5 times -- RES-16 receipt`,
++  `IRQAPWAKE PASS: kernel receipt returned 0`) and `/tests/smpstress`
++  (`O_APPEND 6 x 200 x 32 B intact`, `100 fork/wait cycles precise`,
++  `8 x 10 signal deliveries counted`, `SMPSTRESS PASS`) with `fault=0` on all
++  4 vCPUs and exact work-counter identities (`executed=1187467939`,
++  `idle_quantum=180026141696`, `vtime=181213609635`).
++- All 9 historical `p5_history.sh` lanes plus 40 M `--kernel` UP and
++  `--cpus=2 --smp=2` runs are byte-identical against the G5 binary.
++
++**Gates:** `make test-g6` (73 bundle checks, inside `make test`),
++`make test-g6-nc` (five tampered bundles rejected), `make test-g6-live`
++(`tests/integration/g6_smp_nc.sh`, broadcast INIT/SIPI negative control on the
++in-tree diagnostic SeaBIOS ROM), and unit vectors in `tests/test_rtc.c` and
++`tests/test_lapic.c`.
+ 
+ ## Non-claims
+ 
+diff --git a/src/cpu.c b/src/cpu.c
+index bc200e4..1086344 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -841,6 +841,12 @@ static void do_cpuid(machine_t *m) {
+     uint32_t leaf = (uint32_t)c->gpr[RAX];
+     uint32_t a=0,b=0,cc=0,dd=0;
+     platform_cpuid(m->plat, leaf, (uint32_t)c->gpr[RCX], &a,&b,&cc,&dd);
++    /* COMPAT G6: leaf 1 EBX[31:24] reports this logical processor's initial
++     * APIC ID (m->lapic.id[31:24]); 0 on the BSP and in UP, so single-vCPU
++     * and BSP receipts stay bit-identical while APs identify themselves to
++     * SeaBIOS smp_write_msr(). */
++    if (leaf == 1)
++        b = (b & 0x00FFFFFFu) | (m->lapic.id & 0xFF000000u);
+     c->gpr[RAX] = a; c->gpr[RBX] = b; c->gpr[RCX] = cc; c->gpr[RDX] = dd;
+ }
+ 
+diff --git a/src/lapic.c b/src/lapic.c
+index 23f7179..b4cd43a 100644
+--- a/src/lapic.c
++++ b/src/lapic.c
+@@ -142,7 +142,13 @@ static void vcpu_take_init(machine_t *m, int idx) {
+         mlog(&m->log, "[lapic] INIT at the RUNNING vcpu%d ignored (self)", idx);
+         return;
+     }
++    uint64_t keep_steps = s->c.executed_steps;
++    uint64_t keep_instr = s->c.instr_count;
++    int keep_trace = s->c.trace;
+     cpu_reset(&s->c);
++    s->c.executed_steps = keep_steps;
++    s->c.instr_count = keep_instr;
++    s->c.trace = keep_trace;
+     lapic_t keep = s->l;                 /* preserve the LAPIC ID value */
+     lapic_t *ll = &s->l;
+     uint32_t id = keep.id;
+@@ -202,12 +208,22 @@ static void lapic_icr_write(machine_t *m, uint32_t v) {
+                  "already latched)", dest);
+             return;                              /* level-deassert: nothing resets */
+         }
+-        /* INIT-assert / SIPI: shorthand 0 targeted delivery; the kernel's
+-         * bring-up never uses the broadcast forms for these modes. */
++        /* INIT-assert / SIPI: shorthand 0 is targeted delivery (kernel smp_init);
++         * shorthand 2/3 are broadcast forms (SeaBIOS smp_setup uses shorthand 3,
++         * all-excluding-self, during POST).  When n_vcpus <= 1, keep the
++         * historical UP log line unchanged. */
+         if (shorthand != 0) {
+-            mlog(&m->log, "[lapic] IPI %s: vec=0x%02x shorthand=%d "
+-                 "(broadcast form not modeled for INIT/SIPI)", kind,
+-                 (unsigned)(v & 0xFF), shorthand);
++            if (m->n_vcpus <= 1 || (shorthand != 2 && shorthand != 3)) {
++                mlog(&m->log, "[lapic] IPI %s: vec=0x%02x shorthand=%d "
++                     "(broadcast form not modeled for INIT/SIPI)", kind,
++                     (unsigned)(v & 0xFF), shorthand);
++                return;
++            }
++            for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++) {
++                if (shorthand == 3 && i == m->cur_vcpu) continue;
++                if (dm == 5) vcpu_take_init(m, i);
++                else         vcpu_take_sipi(m, i, (uint8_t)(v & 0xFF));
++            }
+             return;
+         }
+         int idx = lapic_index_by_id(m, dest);
+diff --git a/src/machine.h b/src/machine.h
+index 38cb8f2..df5e2ba 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -108,7 +108,7 @@ void mlog(logring_t *lr, const char *fmt, ...);
+  * never touches this machinery: vcpu_load/store are no-ops and
+  * vtime_instr advances exactly like the old cpu.instr_count time base,
+  * which keeps every UP behavior bit-exact. */
+-#define EM_MAX_VCPU   2
++#define EM_MAX_VCPU   8
+ #define VCPU_OFF      0               /* slot unused entirely         */
+ #define VCPU_WAIT_SIPI 1              /* parked after INIT, waits SIPI */
+ #define VCPU_RUN      2               /* executing in the round-robin  */
+diff --git a/src/main.c b/src/main.c
+index 9ea627c..ea488a3 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -253,7 +253,7 @@ int main(int argc, char **argv) {
+                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
+                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
+                    "          [--cpus=N] publish N CPUs in boot_info/MADT with ONE vCPU (KERNEL-BOOT K5 metering)\n"
+-                   "          [--smp=N] run N real vCPUs (max 2; use with --cpus=N for kernel SMP bring-up, K6)\n"
++                   "          [--smp=N] run N real vCPUs (max 8; use with --cpus=N for --kernel or --lpc=ich9 for BIOS SMP, K6/G6)\n"
+                    "                      skips --rom entirely and starts at the ELF entry\n"
+                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+@@ -416,22 +416,31 @@ int main(int argc, char **argv) {
+         mlog(&m->log, "[boot] platform=%s rom=%s (%zu bytes) disk=%s (%zu bytes)",
+              platform_by_name(platform_name)->name, rom_path, rom_len, disk_path, disk_len);
+ 
+-    /* K6 (--smp=2): wire the second execution context BEFORE the run.
+-     * Pristine power-on CPU image + the H6-reset LAPIC image with ID 1
+-     * (matching --cpus=2 kload/MADT metadata); parked in wait-for-SIPI,
+-     * exactly the MP spec's boot-time AP state. */
++    /* K6/G6 (--smp=N): wire the AP execution contexts BEFORE the run.
++     * Pristine power-on CPU image + the H6-reset LAPIC image with ID i
++     * (matching --cpus=N kload/MADT metadata and SeaBIOS CMOS 0x5F); parked in
++     * wait-for-SIPI, exactly the MP spec's boot-time AP state. */
+     if (cfg_smp >= 2) {
+-        m->n_vcpus = 2;
++        int nv = cfg_smp > EM_MAX_VCPU ? EM_MAX_VCPU : cfg_smp;
++        m->n_vcpus = nv;
++        m->rtc.ram[0x5F] = (uint8_t)(nv - 1);
+         m->vcpu[0].c = m->cpu; m->vcpu[0].l = m->lapic;
+         m->vcpu[0].state = VCPU_RUN;
+-        m->vcpu[1].c.mach = m;
+-        cpu_reset(&m->vcpu[1].c);
+-        m->vcpu[1].l = m->lapic;
+-        m->vcpu[1].l.id = 1u << 24;
+-        m->vcpu[1].state = VCPU_WAIT_SIPI;
++        for (int i = 1; i < nv; i++) {
++            m->vcpu[i].c.mach = m;
++            cpu_reset(&m->vcpu[i].c);
++            m->vcpu[i].l = m->lapic;
++            m->vcpu[i].l.id = (uint32_t)i << 24;
++            m->vcpu[i].state = VCPU_WAIT_SIPI;
++        }
+         m->cur_vcpu = 0;
+-        mlog(&m->log, "[smp] K6: 2 vCPU contexts live; vcpu1 parked in "
+-             "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
++        if (nv == 2)
++            mlog(&m->log, "[smp] K6: 2 vCPU contexts live; vcpu1 parked in "
++                 "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
++        else
++            mlog(&m->log, "[smp] G6: %d vCPU contexts live; vcpu1..%d parked in "
++                 "wait-for-SIPI (LAPIC ids 1..%d), strict 1:1 round-robin",
++                 nv, nv - 1, nv - 1);
+     }
+ 
+     /* TOOLING T4: restore a saved machine before any tool attaches, so the
+@@ -533,10 +542,12 @@ int main(int argc, char **argv) {
+             n++;
+             ran = 1;
+             if (step_result != 0) {
+-                mlog(&m->log, "[smp] vcpu%d stopped (rc=%d) -- parked; "
+-                     "%d context(s) still live", i, step_result,
+-                     m->vcpu[1-i].state == VCPU_RUN ? 1 : 0);
+                 m->vcpu[i].state = VCPU_OFF;
++                int live = 0;
++                for (int j = 0; j < m->n_vcpus; j++)
++                    if (m->vcpu[j].state == VCPU_RUN) live++;
++                mlog(&m->log, "[smp] vcpu%d stopped (rc=%d) -- parked; "
++                     "%d context(s) still live", i, step_result, live);
+             }
+             if (keys.keys_list && ((keys.keys_at && m->vtime_instr >= keys.keys_at) ||
+                               (keys.keys_at_prompt && m->shell_prompt_seen))) {
+diff --git a/src/rtc.c b/src/rtc.c
+index cf16a95..89fdc96 100644
+--- a/src/rtc.c
++++ b/src/rtc.c
+@@ -44,6 +44,13 @@ void rtc_init(machine_t *m) {
+     m->rtc.ram[0x31] = (uint8_t)(ext_kb >> 8);
+     m->rtc.ram[0x34] = (uint8_t)(ext2_bytes >> 16);
+     m->rtc.ram[0x35] = (uint8_t)(ext2_bytes >> 24);
++    /* COMPAT G6: CMOS 0x5F holds the extra-CPU count (present_cpus - 1) that
++     * SeaBIOS qemu_get_present_cpus_count() reads during POST when fw_cfg is
++     * absent.  Zero when n_vcpus/cfg_smp <= 1, keeping UP CMOS identical. */
++    int smp = m->n_vcpus > 1 ? m->n_vcpus : m->cfg_smp;
++    if (smp > EM_MAX_VCPU) smp = EM_MAX_VCPU;
++    if (smp > 1)
++        m->rtc.ram[0x5F] = (uint8_t)(smp - 1);
+ }
+ 
+ void rtc_tick(machine_t *m) {
+diff --git a/tests/integration/g6_acceptance_nc.sh b/tests/integration/g6_acceptance_nc.sh
+new file mode 100755
+index 0000000..73cbb62
+--- /dev/null
++++ b/tests/integration/g6_acceptance_nc.sh
+@@ -0,0 +1,84 @@
++#!/bin/sh
++# COMPAT G6 acceptance gate — negative control (patch 0065).
++#
++# Each case copies the bundle, applies one tampering, and requires
++# tests/test_g6_acceptance.py to reject it.  Cases 1-4 re-sign SHA256SUMS, so
++# the manifest cannot be what fails: the semantic checks must catch each
++# mutation themselves.  Case 5 leaves the manifest stale to prove the digest
++# check works.
++set -eu
++
++HERE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++BUNDLE="$HERE/docs/evidence/compat-g6"
++GATE="$HERE/tests/test_g6_acceptance.py"
++TMP=${TMPDIR:-/tmp}/g6-acceptance-nc.$$
++mkdir -p "$TMP"
++trap 'rm -rf "$TMP"' EXIT INT TERM
++
++[ -d "$BUNDLE" ] || { echo "NC setup: missing $BUNDLE" >&2; exit 1; }
++[ -f "$GATE" ] || { echo "NC setup: missing $GATE" >&2; exit 1; }
++
++resign() {
++    ( cd "$1" && sha256sum $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS )
++}
++
++expect_reject() {
++    case_name=$1
++    dir=$2
++    if python3 "$GATE" --evidence "$dir" >"$dir.gate.log" 2>&1; then
++        echo "NC FAIL: $case_name — gate accepted a tampered bundle"
++        cat "$dir.gate.log"
++        exit 1
++    fi
++    echo "NC PASS: $case_name (${dir}.gate.log)"
++}
++
++# Case 1: AP #2 online marker removed from serial log; manifest re-signed.
++C1="$TMP/1-missing-ap2"
++cp -a "$BUNDLE" "$C1"
++gzip -dc "$C1/x86emu-smp4.serial.log.gz" \
++    | grep -v 'AP #2 online (lapic_id=3)' \
++    | gzip -9n > "$C1/x86emu-smp4.serial.log.gz.new"
++mv "$C1/x86emu-smp4.serial.log.gz.new" "$C1/x86emu-smp4.serial.log.gz"
++resign "$C1"
++expect_reject "serial log missing AP #2 online" "$C1"
++
++# Case 2: SMPSTRESS PASS marker removed from serial log; manifest re-signed.
++C2="$TMP/2-no-smpstress"
++cp -a "$BUNDLE" "$C2"
++gzip -dc "$C2/x86emu-smp4.serial.log.gz" \
++    | grep -v 'SMPSTRESS PASS' \
++    | gzip -9n > "$C2/x86emu-smp4.serial.log.gz.new"
++mv "$C2/x86emu-smp4.serial.log.gz.new" "$C2/x86emu-smp4.serial.log.gz"
++resign "$C2"
++expect_reject "serial log without SMPSTRESS PASS" "$C2"
++
++# Case 3: vcpu=1 executed_steps Perturbed in stdout (breaks sum(executed_steps) == executed).
++C3="$TMP/3-counter-drift"
++cp -a "$BUNDLE" "$C3"
++sed -i 's/\[stats\] vcpu=1 executed_steps=82923322/[stats] vcpu=1 executed_steps=82922586/' \
++    "$C3/x86emu-smp4.stdout.txt"
++resign "$C3"
++expect_reject "AP counter reset across second-stage INIT" "$C3"
++
++# Case 4: cpu_count in boot_info_t tampered from 4 to 1; manifest re-signed.
++C4="$TMP/4-bootinfo-cpus1"
++cp -a "$BUNDLE" "$C4"
++python3 - "$C4/bootinfo-smp4.bin" <<'PY'
++import struct, sys
++path = sys.argv[1]
++raw = bytearray(open(path, "rb").read())
++assert struct.unpack_from("<I", raw, 6216)[0] == 4
++struct.pack_into("<I", raw, 6216, 1)
++open(path, "wb").write(raw)
++PY
++resign "$C4"
++expect_reject "boot_info_t with cpu_count=1 instead of 4" "$C4"
++
++# Case 5: MADT cpus=4 altered in acpi-receipt-smp4.txt, manifest left stale.
++C5="$TMP/5-stale-manifest"
++cp -a "$BUNDLE" "$C5"
++sed -i 's/cpus=4/cpus=1/' "$C5/acpi-receipt-smp4.txt"
++expect_reject "ACPI receipt edited with a stale manifest" "$C5"
++
++echo "g6 acceptance NC: all five cases rejected"
+diff --git a/tests/integration/g6_smp_nc.sh b/tests/integration/g6_smp_nc.sh
+new file mode 100755
+index 0000000..c173832
+--- /dev/null
++++ b/tests/integration/g6_smp_nc.sh
+@@ -0,0 +1,90 @@
++#!/bin/sh
++# COMPAT G6 — negative control for SeaBIOS SMP bring-up (patch 0065).
++#
++# SeaBIOS rel-1.16.3's smp_setup() wakes APs with broadcast INIT-assert
++# (ICR_LO = 0x000C4500, shorthand = 3 "all excluding self") followed by
++# broadcast SIPI (ICR_LO = 0x000C4610, shorthand = 3).  Before G6,
++# lapic_icr_write() rejected shorthand != 0 on the dm == 5 / dm == 6 path, so
++# every AP stayed in wait-for-SIPI and SeaBIOS built a 1-CPU MADT even when
++# CMOS 0x5F advertised extra processors.
++#
++#   case "mutant": restore `if (shorthand != 0) return;` on the INIT/SIPI path.
++#     -> must print `Found 1 cpu(s) max supported 4 cpu(s)` and leave
++#        vcpu1..3 at executed_steps=0.
++#   case "control": unmodified tree, same diagnostic ROM and 10M budget.
++#     -> must print `handle_smp: apic_id=0x1..0x3` and
++#        `Found 4 cpu(s) max supported 4 cpu(s)` with all 4 vCPUs executing.
++set -eu
++
++HERE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++TMP=${TMPDIR:-/tmp}/g6-smp-nc.$$
++BUDGET=10000000
++mkdir -p "$TMP"
++trap 'rm -rf "$TMP"' EXIT INT TERM
++
++ROM="$HERE/docs/evidence/compat-g3/seabios-diagnostic-128k.bin"
++[ -f "$ROM" ] || { echo "NC setup: missing $ROM" >&2; exit 2; }
++
++run_post() {   # $1 = tree, $2 = tag
++    ( cd "$1" && ./x86emu --rom="$ROM" --lpc=ich9 --smp=4 \
++        --max-instr="$BUDGET" --stats ) \
++        >"$TMP/$2.out" 2>"$TMP/$2.serial.log"
++}
++
++# --- case 1: pre-G6 shorthand!=0 early return restored ----------------------
++cp -a "$HERE" "$TMP/mutant"
++python3 - "$TMP/mutant/src/lapic.c" <<'PY'
++import sys
++path = sys.argv[1]
++src = open(path).read()
++needle = "if (m->n_vcpus <= 1 || (shorthand != 2 && shorthand != 3)) {"
++repl = "if (1) { /* G6 NC: pre-G6 shorthand != 0 rejection */"
++assert needle in src, "NC setup: lapic_icr_write broadcast block not found"
++src = src.replace(needle, repl, 1)
++open(path, "w").write(src)
++PY
++( cd "$TMP/mutant" && make -j2 x86emu >"$TMP/mutant.build.log" 2>&1 ) || {
++    echo "NC setup: mutant build failed; see $TMP/mutant.build.log" >&2; exit 2; }
++
++run_post "$TMP/mutant" mutant
++m_woken=$(grep -ac "handle_smp: apic_id=" "$TMP/mutant.serial.log" || true)
++m_found=$(sed -n 's/.*Found \([0-9]*\) cpu(s) max supported \([0-9]*\) cpu(s).*/\1\/\2/p' "$TMP/mutant.serial.log" | head -1)
++[ -n "$m_found" ] || m_found="absent"
++m_ap1=$(sed -n 's/.*\[stats\] vcpu=1 executed_steps=\([0-9]*\).*/\1/p' "$TMP/mutant.out" | head -1)
++m_ap2=$(sed -n 's/.*\[stats\] vcpu=2 executed_steps=\([0-9]*\).*/\1/p' "$TMP/mutant.out" | head -1)
++m_ap3=$(sed -n 's/.*\[stats\] vcpu=3 executed_steps=\([0-9]*\).*/\1/p' "$TMP/mutant.out" | head -1)
++if [ "$m_woken" != "0" ] || [ "$m_found" = "4/4" ] || [ "$m_ap1" != "0" ] || [ "$m_ap2" != "0" ] || [ "$m_ap3" != "0" ]; then
++    echo "NC FAIL: mutant unexpectedly woke APs (woken=$m_woken found=$m_found ap_steps=$m_ap1,$m_ap2,$m_ap3)" >&2
++    exit 1
++fi
++grep -qa "broadcast form not modeled for INIT/SIPI" "$TMP/mutant.serial.log" || {
++    echo "NC FAIL: mutant did not log broadcast rejection" >&2; exit 1; }
++echo "NC PASS: mutant leaves APs asleep (woken=$m_woken found=$m_found ap_steps=$m_ap1,$m_ap2,$m_ap3)"
++
++# --- case 2: control --------------------------------------------------------
++run_post "$HERE" control
++c_woken=$(grep -ac "handle_smp: apic_id=" "$TMP/control.serial.log" || true)
++c_found=$(sed -n 's/.*Found \([0-9]*\) cpu(s) max supported \([0-9]*\) cpu(s).*/\1\/\2/p' "$TMP/control.serial.log" | head -1)
++c_ap1=$(sed -n 's/.*\[stats\] vcpu=1 executed_steps=\([0-9]*\).*/\1/p' "$TMP/control.out" | head -1)
++c_ap2=$(sed -n 's/.*\[stats\] vcpu=2 executed_steps=\([0-9]*\).*/\1/p' "$TMP/control.out" | head -1)
++c_ap3=$(sed -n 's/.*\[stats\] vcpu=3 executed_steps=\([0-9]*\).*/\1/p' "$TMP/control.out" | head -1)
++if [ "$c_woken" != "3" ] || [ "$c_found" != "4/4" ] || [ "${c_ap1:-0}" -le 0 ] || [ "${c_ap2:-0}" -le 0 ] || [ "${c_ap3:-0}" -le 0 ]; then
++    echo "NC FAIL: control did not wake all 3 APs (woken=$c_woken found=$c_found ap_steps=$c_ap1,$c_ap2,$c_ap3)" >&2
++    exit 1
++fi
++for id in 0x1 0x2 0x3; do
++    grep -qa "handle_smp: apic_id=$id" "$TMP/control.serial.log" || {
++        echo "NC FAIL: control missing handle_smp: apic_id=$id" >&2; exit 1; }
++done
++echo "NC PASS: control wakes all 3 APs (woken=$c_woken found=$c_found ap_steps=$c_ap1,$c_ap2,$c_ap3)"
++
++diff_log="$HERE/docs/evidence/compat-g6/nc-smp.txt"
++if [ -d "$HERE/docs/evidence/compat-g6" ]; then
++    {
++        echo "# COMPAT G6 SMP broadcast INIT/SIPI negative control"
++        echo "# rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin budget=$BUDGET"
++        echo "mutant:  woken=$m_woken found=$m_found ap_steps=$m_ap1,$m_ap2,$m_ap3"
++        echo "control: woken=$c_woken found=$c_found ap_steps=$c_ap1,$c_ap2,$c_ap3"
++    } > "$diff_log" 2>/dev/null || true
++    echo "NC: log -> ${diff_log#$HERE/}"
++fi
+diff --git a/tests/test_g6_acceptance.py b/tests/test_g6_acceptance.py
+new file mode 100755
+index 0000000..11cded3
+--- /dev/null
++++ b/tests/test_g6_acceptance.py
+@@ -0,0 +1,309 @@
++#!/usr/bin/env python3
++"""COMPAT G6 acceptance gate (patch 0065).
++
++Re-checks the recorded receipts for the 4-vCPU BIOS SMP lane (`--lpc=ich9
++--smp=4`):
++  * SHA256SUMS manifest integrity across the whole evidence bundle;
++  * diagnostic SeaBIOS POST (`seabios-diag-smp4.stdout.txt`) wakes all 3 APs
++    over broadcast INIT+SIPI and prints `Found 4 cpu(s) max supported 4 cpu(s)`;
++  * full BIOS boot (`x86emu-smp4.serial.log.gz`) reaches Stage 2, parses the
++    4-CPU MADT, wakes AP #0..#2 (`4 CPU(s) online (3 AP(s) woken)`), logs the
++    R5 cross-CPU scheduling receipt, reaches `[kernel] shell active; kmain
++    idling.`, and passes both `/tests/irqapwake` (`RES-16 receipt`,
++    `IRQAPWAKE PASS`) and `/tests/smpstress` (all three storm assertions +
++    `SMPSTRESS PASS`);
++  * `x86emu-smp4.stdout.txt` reports `fault=0` and `executed_steps > 0` on all
++    4 vCPUs (`vcpu=0..3`) and satisfies the global work invariants
++    `sum(executed_steps) == executed`, `sum(instr_count) == vtime`, and
++    `executed + idle_quantum == vtime`;
++  * `bootinfo-smp4.bin` reports 8 E820 entries (with the ICH9 RCRB window),
++    `cpu_count == 4`, `bsp_lapic_id == 0`, `cpus[0..3]` with matching
++    processor/LAPIC IDs `0..3`, and a live RSDP equal to the ACPI walk;
++  * `acpi-receipt-smp4.txt` has valid checksums, a 134-byte MADT with
++    `cpus=4 ioapics=1 isos=4`, and passes `tests/g5_acpi_receipt.py --check`;
++  * `nc-smp.txt` records the negative control (`mutant` wakes 0 APs; `control`
++    wakes all 3 APs).
++
++Exit: 0 pass, 1 any check fails, 2 usage/IO.
++"""
++from __future__ import annotations
++
++import argparse
++import gzip
++import hashlib
++import re
++import subprocess
++import struct
++import sys
++import tempfile
++from pathlib import Path
++
++BOOT_INFO_SIZE = 7776
++BOOT_MAGIC = 0x4155524142544C44
++MMAP_OFF, MMAP_ENTRY_SIZE, MMAP_COUNT_OFF = 40, 24, 6184
++HHDM_OFF, INITRD_PHYS_OFF, INITRD_SIZE_OFF = 6192, 6200, 6208
++CPU_COUNT_OFF, BSP_LAPIC_OFF, CPUS_OFF, CPU_ENTRY_SIZE = 6216, 6220, 6224, 24
++RSDP_OFF, UEFI_OFF = 7760, 7768
++HHDM_VALUE = 0xFFFF800000000000
++RCRB = (0xFED1C000, 0x4000)
++
++FAILS: list[str] = []
++
++
++def check(ok: bool, label: str, detail: str = "") -> bool:
++    if ok:
++        print(f"ok   {label}" + (f" ({detail})" if detail else ""))
++    else:
++        print(f"FAIL {label}" + (f" ({detail})" if detail else ""), file=sys.stderr)
++        FAILS.append(label)
++    return ok
++
++
++def verify_manifest(directory: Path) -> None:
++    manifest = directory / "SHA256SUMS"
++    if not check(manifest.is_file(), "SHA256SUMS present"):
++        return
++    listed = 0
++    for line in manifest.read_text().splitlines():
++        if not line.strip():
++            continue
++        digest, name = line.split(None, 1)
++        name = name.lstrip("*")
++        target = directory / name
++        if not check(target.is_file(), f"bundle file {name}"):
++            continue
++        got = hashlib.sha256(target.read_bytes()).hexdigest()
++        check(got == digest, f"sha256 {name}", got[:16])
++        listed += 1
++    present = {p.name for p in directory.iterdir() if p.is_file()} - {"SHA256SUMS"}
++    check(listed == len(present), "manifest covers every file",
++          f"{listed}/{len(present)}")
++
++
++def verify_diag_post(directory: Path) -> None:
++    path = directory / "seabios-diag-smp4.stdout.txt"
++    if not check(path.is_file(), "seabios-diag-smp4.stdout.txt present"):
++        return
++    text = path.read_text(errors="replace")
++    check("[smp] G6: 4 vCPU contexts live; vcpu1..3 parked in wait-for-SIPI" in text,
++          "diagnostic POST wires 4 vCPU contexts")
++    for ap in (1, 2, 3):
++        check(f"handle_smp: apic_id=0x{ap}" in text,
++              f"diagnostic POST wakes AP apic_id=0x{ap}")
++    check("Found 4 cpu(s) max supported 4 cpu(s)" in text,
++          "SeaBIOS POST reports Found 4 cpu(s) max supported 4 cpu(s)")
++
++
++def read_serial(directory: Path) -> str:
++    plain = directory / "x86emu-smp4.serial.log"
++    if plain.is_file():
++        return plain.read_text(errors="replace")
++    gz = directory / "x86emu-smp4.serial.log.gz"
++    if gz.is_file():
++        return gzip.decompress(gz.read_bytes()).decode("utf-8", "replace")
++    return ""
++
++
++def verify_serial(directory: Path) -> str:
++    text = read_serial(directory)
++    if not check(bool(text), "serial log present"):
++        return ""
++    order = [
++        "[smp] G6: 4 vCPU contexts live; vcpu1..3 parked in wait-for-SIPI",
++        "[BL3] AuraLite stage2 alive",
++        "[BL9] ACPI RSDP found",
++        "[BL9] ACPI MADT parsed",
++        "[BL4] ELF PT_LOAD segments copied to phys",
++        "[BL4] entering long mode; jumping to kernel _start",
++        "[smp] BSP lapic_id=0, 4 total CPUs detected",
++        "[smp] AP #0 online (lapic_id=1)",
++        "[smp] AP #1 online (lapic_id=2)",
++        "[smp] AP #2 online (lapic_id=3)",
++        "[smp] 4 CPU(s) online (3 AP(s) woken)",
++        "[smp] PASS: multi-core system detected",
++        "[ioapic] base 0xfec00000 (MADT agree)",
++        "[sched] R5 receipt: user thread pid=",
++        "[kernel] shell active; kmain idling.",
++        "[kbc] --keys-at fired",
++        "[smpwake] PASS:",
++        "RES-16 receipt",
++        "IRQAPWAKE PASS: kernel receipt returned 0",
++        "SMPSTRESS: O_APPEND 6 x 200 x 32 B intact",
++        "SMPSTRESS: 100 fork/wait cycles precise",
++        "SMPSTRESS: 8 x 10 signal deliveries counted",
++        "SMPSTRESS PASS",
++    ]
++    pos = [text.find(m) for m in order]
++    missing = [m for m, p in zip(order, pos) if p < 0]
++    check(not missing, "every G6 boot/SMP/test marker present", str(missing))
++    if not missing:
++        check(pos == sorted(pos), "boot, AP wake, irqapwake, and smpstress markers in order")
++    check("panic" not in text.lower(), "no kernel panic in the serial log")
++    check("did not respond" not in text.lower(), "no AP timeout in smp_init()")
++    r5 = re.search(r"\[sched\] R5 receipt: user thread pid=(\d+) on AP cpu=(\d+)", text)
++    check(r5 is not None and int(r5.group(2)) in (1, 2, 3),
++          "R5 receipt scheduled a user thread on an AP",
++          r5.group(0) if r5 else "missing")
++    return text
++
++
++def verify_stats(directory: Path) -> None:
++    path = directory / "x86emu-smp4.stdout.txt"
++    if not check(path.is_file(), "stats stdout present"):
++        return
++    text = path.read_text(errors="replace")
++    vcpus = {}
++    for m in re.finditer(
++        r"\[stats\] vcpu=(\d+) executed_steps=(\d+) instr_count=(\d+) "
++        r"halted=(\d+) fault=(\d+)", text
++    ):
++        idx = int(m.group(1))
++        vcpus[idx] = {
++            "steps": int(m.group(2)),
++            "instr": int(m.group(3)),
++            "halted": int(m.group(4)),
++            "fault": int(m.group(5)),
++        }
++    check(sorted(vcpus.keys()) == [0, 1, 2, 3], "stats has vcpu=0..3",
++          str(sorted(vcpus.keys())))
++    for idx in range(4):
++        if idx in vcpus:
++            check(vcpus[idx]["fault"] == 0, f"vcpu={idx} fault=0",
++                  str(vcpus[idx]["fault"]))
++            check(vcpus[idx]["steps"] > 0, f"vcpu={idx} executed_steps > 0",
++                  str(vcpus[idx]["steps"]))
++
++    g = re.search(
++        r"\[stats\] executed=(\d+) idle_quantum=(\d+) "
++        r"instr_count_bsp=(\d+) vtime=(\d+)", text
++    )
++    check(g is not None, "global stats line present")
++    if g and len(vcpus) == 4:
++        executed, idle_q, bsp_instr, vtime = (int(x) for x in g.groups())
++        sum_steps = sum(v["steps"] for v in vcpus.values())
++        sum_instr = sum(v["instr"] for v in vcpus.values())
++        check(sum_steps == executed, "sum(vcpu executed_steps) == executed",
++              f"{sum_steps} == {executed}")
++        check(sum_instr == vtime, "sum(vcpu instr_count) == vtime",
++              f"{sum_instr} == {vtime}")
++        check(executed + idle_q == vtime, "executed + idle_quantum == vtime",
++              f"{executed} + {idle_q} == {vtime}")
++        check(vcpus[0]["instr"] == bsp_instr, "vcpu0 instr_count == instr_count_bsp",
++              f"{vcpus[0]['instr']} == {bsp_instr}")
++
++    cap = re.search(r"\[stats\] cap=(\d+) cap_reached=(\d+) n_vcpus=(\d+)", text)
++    check(cap is not None, "cap/n_vcpus line present")
++    if cap:
++        cap_n, reached, nv = (int(x) for x in cap.groups())
++        check(cap_n == 4_000_000_000, "budget is 4 G", str(cap_n))
++        check(reached == 1, "run ended by the cap, not by a fault", str(reached))
++        check(nv == 4, "n_vcpus=4", str(nv))
++    check("mode=long64" in text, "CPU finished in long mode")
++
++
++def verify_bootinfo(directory: Path) -> None:
++    block = directory / "bootinfo-smp4.bin"
++    if not check(block.is_file(), "bootinfo-smp4.bin present"):
++        return
++    raw = block.read_bytes()
++    if not check(len(raw) == BOOT_INFO_SIZE, "boot_info_t size", str(len(raw))):
++        return
++    check(struct.unpack_from("<Q", raw, 0)[0] == BOOT_MAGIC, "BOOT_MAGIC")
++    count = struct.unpack_from("<I", raw, MMAP_COUNT_OFF)[0]
++    check(count == 8, "E820 has 8 entries under --lpc=ich9", str(count))
++    entries = [struct.unpack_from("<QQII", raw, MMAP_OFF + i * MMAP_ENTRY_SIZE)
++               for i in range(min(count, 256))]
++    check(any((base, length) == RCRB and typ == 2
++              for base, length, typ, _ in entries),
++          "ICH9 RCRB 0xfed1c000+0x4000 is reserved")
++    check(struct.unpack_from("<Q", raw, HHDM_OFF)[0] == HHDM_VALUE, "HHDM offset")
++    ip = struct.unpack_from("<Q", raw, INITRD_PHYS_OFF)[0]
++    isz = struct.unpack_from("<Q", raw, INITRD_SIZE_OFF)[0]
++    check(ip == 0x1800000 and isz == 0xB22000, "initrd address and size")
++
++    cpu_count = struct.unpack_from("<I", raw, CPU_COUNT_OFF)[0]
++    bsp_id = struct.unpack_from("<I", raw, BSP_LAPIC_OFF)[0]
++    check(cpu_count == 4, "boot_info_t cpu_count is 4", str(cpu_count))
++    check(bsp_id == 0, "BSP APIC id is 0", str(bsp_id))
++    for i in range(4):
++        pid, lid, goto_addr, extra = struct.unpack_from(
++            "<IIQQ", raw, CPUS_OFF + i * CPU_ENTRY_SIZE
++        )
++        check(pid == i and lid == i and goto_addr == 0 and extra == 0,
++              f"boot_info_t cpu[{i}] has processor_id={i} lapic_id={i}")
++
++    rsdp = struct.unpack_from("<Q", raw, RSDP_OFF)[0]
++    check(rsdp != 0, "boot_info_t carries a live RSDP", f"{rsdp:#x}")
++    check(raw[UEFI_OFF] == 0, "boot_from_uefi is 0")
++    check(not any(raw[UEFI_OFF + 1:]), "reserved padding is zero")
++    receipt = (directory / "acpi-receipt-smp4.txt").read_text().splitlines()
++    at = int(re.search(r"rsdp addr=0x([0-9a-f]+)", receipt[0]).group(1), 16)
++    check(rsdp == at, "handoff RSDP == RSDP found in memory",
++          f"{rsdp:#x} vs {at:#x}")
++
++
++def verify_acpi(directory: Path, tool: Path) -> None:
++    receipt = directory / "acpi-receipt-smp4.txt"
++    if not check(receipt.is_file(), "acpi-receipt-smp4.txt present"):
++        return
++    rtext = receipt.read_text()
++    check("table sig=APIC " in rtext and "len=134 checksum=ok" in rtext,
++          "MADT length is 134 bytes (4 LAPIC entries) with valid checksum")
++    check("madt lapic_base=0xfee00000 cpus=4 ioapics=1 isos=4" in rtext,
++          "MADT receipt reports cpus=4 ioapics=1 isos=4")
++    text = read_serial(directory)
++    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tmp:
++        tmp.write(text)
++        tmp_path = Path(tmp.name)
++    try:
++        proc = subprocess.run([sys.executable, str(tool), "--check", str(receipt),
++                               "--serial", str(tmp_path)], capture_output=True, text=True)
++        check(proc.returncode == 0, "ACPI receipt agrees with the serial log",
++              (proc.stdout or proc.stderr).strip()[:120])
++    finally:
++        tmp_path.unlink(missing_ok=True)
++
++
++def verify_negative_control(directory: Path) -> None:
++    path = directory / "nc-smp.txt"
++    if not check(path.is_file(), "nc-smp.txt present"):
++        return
++    text = path.read_text()
++    mut = re.search(r"mutant:\s+woken=(\d+)\s+found=(\S+)\s+ap_steps=([0-9,]+)", text)
++    ctl = re.search(r"control:\s+woken=(\d+)\s+found=(\S+)\s+ap_steps=([0-9,]+)", text)
++    check(mut is not None and mut.group(1) == "0" and mut.group(3) == "0,0,0",
++          "mutant without broadcast INIT/SIPI wakes 0 APs")
++    if ctl is not None:
++        steps = [int(x) for x in ctl.group(3).split(",")]
++        check(ctl.group(1) == "3" and ctl.group(2) == "4/4" and all(s > 0 for s in steps),
++              "control wakes all 3 APs and reports Found 4/4")
++    else:
++        check(False, "control line present in nc-smp.txt")
++
++
++def main(argv: list[str]) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--evidence", type=Path,
++                    default=Path(__file__).resolve().parent.parent /
++                    "docs/evidence/compat-g6")
++    args = ap.parse_args(argv)
++    d = args.evidence
++    if not d.is_dir():
++        print(f"no such evidence directory: {d}", file=sys.stderr)
++        return 2
++    verify_manifest(d)
++    verify_diag_post(d)
++    verify_serial(d)
++    verify_stats(d)
++    verify_bootinfo(d)
++    verify_acpi(d, Path(__file__).resolve().parent / "g5_acpi_receipt.py")
++    verify_negative_control(d)
++    if FAILS:
++        print(f"\n{len(FAILS)} check(s) failed", file=sys.stderr)
++        return 1
++    print("\nG6 acceptance: PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv[1:]))
+diff --git a/tests/test_lapic.c b/tests/test_lapic.c
+index 524a05e..3b9cec1 100644
+--- a/tests/test_lapic.c
++++ b/tests/test_lapic.c
+@@ -377,6 +377,97 @@ static void test_hlt_wake_via_ipi_and_latched_irr(void) {
+     printf("ok: hlt_wake_via_ipi_and_latched_irr\n");
+ }
+ 
++static void test_smp_broadcast_init_sipi_and_counter_preservation(void) {
++    /* COMPAT G6: 4-vCPU topology.
++     * 1) CPUID(1).EBX[31:24] reports the active vCPU's LAPIC ID.
++     * 2) SeaBIOS broadcast INIT+SIPI (shorthand=3) wakes all 3 APs at vector V.
++     * 3) Subsequent kernel targeted INIT+SIPI (shorthand=0, dest=i) wakes an
++     *    already-parked (VCPU_OFF) AP at the new vector AND preserves the AP's
++     *    monotonic work counters (executed_steps, instr_count, idle_quantum,
++     *    last_vtime) across the cpu_reset() inside vcpu_take_init(). */
++    fx_t f; fx_init(&f);
++    f.m.n_vcpus = 4;
++    f.m.vcpu[0].c = f.m.cpu; f.m.vcpu[0].l = f.m.lapic;
++    f.m.vcpu[0].state = VCPU_RUN;
++    for (int i = 1; i < 4; i++) {
++        f.m.vcpu[i].c.mach = &f.m;
++        cpu_reset(&f.m.vcpu[i].c);
++        f.m.vcpu[i].l = f.m.lapic;
++        f.m.vcpu[i].l.id = (uint32_t)i << 24;
++        f.m.vcpu[i].state = VCPU_WAIT_SIPI;
++    }
++    f.m.cur_vcpu = 0;
++
++    /* At 0x10000 (vector 0x10): mov eax,1; cpuid; shr ebx,24;
++     * mov [0x2500+bx], bl; cli; hlt (16-bit real mode). */
++    static const uint8_t TRAMP10[] = {
++        0x66, 0xB8, 0x01,0x00,0x00,0x00, /* mov eax, 1 */
++        0x0F, 0xA2,                      /* cpuid */
++        0x66, 0xC1, 0xEB, 0x18,          /* shr ebx, 24 */
++        0x88, 0x9F, 0x00,0x25,           /* mov [bx+0x2500], bl */
++        0xFA, 0xF4                       /* cli; hlt */
++    };
++    memcpy(f.m.ram + 0x10000, TRAMP10, sizeof TRAMP10);
++
++    /* Broadcast INIT (shorthand=3, dm=5) + Broadcast SIPI vec=0x10 (dm=6) */
++    lw(&f, LAPIC_SVR, 0x1FF);
++    lw(&f, LAPIC_ICR_LO, 0x000C4500u);
++    for (int i = 1; i < 4; i++) assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
++    lw(&f, LAPIC_ICR_LO, 0x000C4610u);
++    for (int i = 1; i < 4; i++) {
++        assert(f.m.vcpu[i].state == VCPU_RUN);
++        assert(f.m.vcpu[i].c.seg[SEG_CS].sel == 0x1000);
++        assert(f.m.vcpu[i].c.seg[SEG_CS].base == 0x10000);
++        assert(f.m.vcpu[i].c.rip == 0);
++    }
++
++    /* Step each AP until cli;hlt parks it (cpu_step returns -1). */
++    for (int i = 1; i < 4; i++) {
++        vcpu_load(&f.m, i);
++        int rc = 0;
++        for (int s = 0; s < 16 && rc >= 0; s++) rc = cpu_step(&f.m.cpu);
++        assert(rc == -1);
++        vcpu_store(&f.m, i);
++        f.m.vcpu[i].state = VCPU_OFF;
++        assert(mem_read(&f.m, 0x2500 + (uint64_t)i, 1) == (uint32_t)i);
++        assert(f.m.vcpu[i].c.executed_steps == 6);
++        assert(f.m.vcpu[i].c.instr_count == 6);
++    }
++    vcpu_load(&f.m, 0);
++
++    /* Second-stage kernel bring-up: targeted INIT + SIPI vec=0x08 to AP 1..3.
++     * At 0x08000: inc byte [0x2600]; cli; hlt. */
++    static const uint8_t TRAMP08[] = {
++        0xFE, 0x06, 0x00,0x26,           /* inc byte [0x2600] */
++        0xFA, 0xF4                       /* cli; hlt */
++    };
++    load(&f, 0x08000, TRAMP08, sizeof TRAMP08);
++    for (int i = 1; i < 4; i++) {
++        uint64_t prev_exec = f.m.vcpu[i].c.executed_steps;
++        uint64_t prev_inst = f.m.vcpu[i].c.instr_count;
++        lw(&f, LAPIC_ICR_HI, (uint32_t)i << 24);
++        lw(&f, LAPIC_ICR_LO, 0x00004500u);   /* physical INIT to AP i */
++        assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
++        assert(f.m.vcpu[i].c.executed_steps == prev_exec);
++        assert(f.m.vcpu[i].c.instr_count == prev_inst);
++        lw(&f, LAPIC_ICR_HI, (uint32_t)i << 24);
++        lw(&f, LAPIC_ICR_LO, 0x00004608u);   /* physical SIPI vec=0x08 */
++        assert(f.m.vcpu[i].state == VCPU_RUN);
++        assert(f.m.vcpu[i].c.seg[SEG_CS].base == 0x08000);
++        vcpu_load(&f.m, i);
++        int rc = 0;
++        for (int s = 0; s < 16 && rc >= 0; s++) rc = cpu_step(&f.m.cpu);
++        assert(rc == -1);
++        vcpu_store(&f.m, i);
++        assert(f.m.vcpu[i].c.executed_steps == prev_exec + 3);
++        assert(f.m.vcpu[i].c.instr_count == prev_inst + 3);
++        vcpu_load(&f.m, 0);
++    }
++    assert(mem_read(&f.m, 0x2600, 1) == 3);
++    assert(machine_executed_total(&f.m) == f.m.vtime_instr);
++    printf("ok: smp_broadcast_init_sipi_and_counter_preservation\n");
++}
++
+ int main(void) {
+     test_mmio_registers();
+     test_svr_gates_delivery_not_latching();
+@@ -387,6 +478,7 @@ int main(void) {
+     test_timer_long_mode_fx();  printf("ok: timer_long_mode\n");
+     test_msr_apic_base();
+     test_hlt_wake_via_ipi_and_latched_irr();
++    test_smp_broadcast_init_sipi_and_counter_preservation();
+     printf("test_lapic: all vectors passed\n");
+     return 0;
+ }
+diff --git a/tests/test_rtc.c b/tests/test_rtc.c
+index a39e6a1..e55bb78 100644
+--- a/tests/test_rtc.c
++++ b/tests/test_rtc.c
+@@ -158,9 +158,35 @@ static void test_irq8_update_ended(void) {
+     assert(mem_read(&f.m, 0x2000, 1) == 3);        /* two more seconds */
+ }
+ 
++static void test_cmos_smp_extra_cpus(void) {
++    /* COMPAT G6: SeaBIOS smp_probe() reads CMOS 0x5F for extra CPUs (N - 1).
++     * UP leaves it 0; --smp=N sets N - 1, clamped to EM_MAX_VCPU - 1. */
++    fx_t f;
++    setup_machine(&f.m);
++    rtc_init(&f.m); rtc_io_register(&f.m);
++    assert(cmos(&f, 0x5F) == 0);
++
++    setup_machine(&f.m);
++    f.m.cfg_smp = 2;
++    rtc_init(&f.m); rtc_io_register(&f.m);
++    assert(cmos(&f, 0x5F) == 1);
++
++    setup_machine(&f.m);
++    f.m.cfg_smp = 4;
++    rtc_init(&f.m); rtc_io_register(&f.m);
++    assert(cmos(&f, 0x5F) == 3);
++
++    setup_machine(&f.m);
++    f.m.cfg_smp = 99;
++    rtc_init(&f.m); rtc_io_register(&f.m);
++    assert(cmos(&f, 0x5F) == EM_MAX_VCPU - 1);
++    printf("ok: cmos_smp_extra_cpus\n");
++}
++
+ int main(void) {
+     test_cmos_content_and_ports();
+     test_cmos_extended_memory_above_16m();
++    test_cmos_smp_extra_cpus();
+     test_time_advances_bcd_exact();
+     test_uip_freeze_then_commit();
+     test_regc_flags_no_uie();
+-- 
+2.47.3
+

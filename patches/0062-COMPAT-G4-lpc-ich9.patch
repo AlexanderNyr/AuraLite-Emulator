@@ -1,0 +1,1535 @@
+From d148fa6d27fd1a9482128f512dde4ed7dcb38985 Mon Sep 17 00:00:00 2001
+From: AuraLite Auditor <auditor@local>
+Date: Sat, 17 Oct 2026 12:14:17 +0000
+Subject: [PATCH] G4 update: ACPI identity pairing, COMPAT plan and doc
+ corrections
+
+COMPAT G4.  The machine advertised the Q35 host bridge 8086:29c0 and
+implemented its seven PAM bytes, but the LPC function at 0:31.0 reported
+Panther Point 8086:1e55 -- the ID the bundled sample firmware knows.  G3
+measured that SeaBIOS rel-1.16.3 acpi_setup() recognizes only PIIX4
+8086:7113 or ICH9 LPC 8086:2918, so a stock BIOS completed POST and
+published no RSDP at all.
+
+--lpc=ich9 (machine_t.cfg_lpc_ich9, src/devices.c) reports 8086:2918, the
+identity that pairs with the advertised host bridge; the default keeps
+8086:1e55 so every historical lane stays byte-identical.
+
+Measured with the UNMODIFIED diagnostic SeaBIOS bundled in
+docs/evidence/compat-g3/ and a blank USB image, --platform=haswell,
+--max-instr=200000000, exit 0:
+  ACPI DSDT=0x07ffe4b0
+  Copying ACPI RSDP from 0x00006dfc to 0x000f6210
+and an end-of-run v2-snapshot walk finds a checksum-valid rev-0 RSDP at
+0xf6210 -> RSDT 0x7ffe470 (52 B, 4 entries) -> FACP 0x7ffff80 (116 B),
+SSDT 0x7fff720 (2073 B), APIC/MADT 0x7fff630 (110 B, LAPIC base
+0xfee00000), MCFG 0x7fff5f0 (60 B); every checksum sums to zero.
+Negative control: the same ROM under the default identity publishes
+NO RSDP.  Control: the G3 probe ROM (which adds 1e55 to the match table)
+yields RSDP 0xf6210 with a 3-entry RSDT at 0x7ffe4c0 and no MCFG -- the
+extra MCFG is the receipt that the ICH9 identity unlocks SeaBIOS's full
+Q35/PCIe path, not merely the old match table.
+
+tests/test_compat.c pins 7 vectors: both identities, class 06/01 and the
+multifunction header, the untouched host bridge and AHCI function, and
+Q35 PAM under the ICH9 identity.  make test-compat is wired into
+make test and make test-sanitize; both full gates pass (368 ok lines,
+RC 0 each).  The bundled sample firmware under the flag is unchanged:
+HALTED, executed=4837677, GUEST_OK, framebuffer marker 0x00200000.
+
+Docs and hygiene:
+  - docs/plans/COMPAT_PLAN.md: the missing G0-G6 plan, in house style,
+    with measured receipts per phase and explicit non-claims.
+  - docs/evidence/compat-g4/: README, receipt, scanner, commands, sums.
+  - ROADMAP.md ledger row + shipped 0062 queue entry; docs/STATUS.md G4
+    paragraph; CHANGELOG entry.
+  - NOTICE.md now matches the tree: Apache-2.0 at the root, MIT for
+    firmware/ only (the old text asked for a license that already exists).
+  - PROJECT_ANALYSIS.md regenerated for this HEAD (48 src files, ~15.8k
+    lines) instead of the 33e2c5c era.
+  - src/cpu.h: the merged kgs_base/XMM comment is split, and the K6 SMP
+    invariant is documented -- cpu_step() must be handed m->cpu, the
+    current context, because its helpers read m->cpu directly.
+
+Not established: no pinned-image BIOS-to-kernel boot, no shell
+acceptance, no E820/boot_info_t agreement, no SMP/IOAPIC claim.  G3
+remains open (the authoritative ISO still carries the original Stage 2);
+G5-G6 stay planned.
+---
+ CHANGELOG.md                                  |  33 ++
+ Makefile                                      |  19 +-
+ NOTICE.md                                     |  17 +-
+ PROJECT_ANALYSIS.md                           | 398 +++++++++---------
+ ROADMAP.md                                    |  15 +-
+ docs/STATUS.md                                |  32 +-
+ docs/evidence/compat-g4/README.md             |  88 ++++
+ docs/evidence/compat-g4/SHA256SUMS            |   4 +
+ .../compat-g4/acpi-identity-receipt.txt       |  66 +++
+ docs/evidence/compat-g4/commands.txt          |  52 +++
+ docs/evidence/compat-g4/scan_acpi_snapshot.py |  99 +++++
+ docs/plans/COMPAT_PLAN.md                     | 221 ++++++++++
+ src/cpu.h                                     |  24 +-
+ src/devices.c                                 |  12 +-
+ src/machine.h                                 |   7 +
+ src/main.c                                    |  13 +
+ tests/test_compat.c                           |  96 +++++
+ 17 files changed, 969 insertions(+), 227 deletions(-)
+ create mode 100644 docs/evidence/compat-g4/README.md
+ create mode 100644 docs/evidence/compat-g4/SHA256SUMS
+ create mode 100644 docs/evidence/compat-g4/acpi-identity-receipt.txt
+ create mode 100644 docs/evidence/compat-g4/commands.txt
+ create mode 100644 docs/evidence/compat-g4/scan_acpi_snapshot.py
+ create mode 100644 docs/plans/COMPAT_PLAN.md
+ create mode 100644 tests/test_compat.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 106c055..92ed448 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,39 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0062 (COMPAT G4, LPC identity pairing for ACPI)
++
++- `--lpc=ich9|pantherpoint` (`machine_t.cfg_lpc_ich9`, `src/devices.c`):
++  the LPC function at 0:31.0 can now report **ICH9 LPC `8086:2918`**, the
++  identity that belongs to the Q35 host bridge (`8086:29c0`) this machine
++  already advertises and whose seven PAM bytes it implements.  The default
++  keeps Panther Point `8086:1e55`, the ID the bundled sample firmware knows,
++  so every historical lane stays byte-identical.
++- Why it matters: G3 measured that SeaBIOS `rel-1.16.3`'s `acpi_setup()`
++  matches only PIIX4 `8086:7113` or ICH9 `8086:2918`; with `8086:1e55` stock
++  SeaBIOS publishes no RSDP at all.  With `--lpc=ich9` the **unmodified**
++  diagnostic SeaBIOS in `docs/evidence/compat-g3/` logs
++  `Copying ACPI RSDP from 0x00006dfc to 0x000f6210`, and an end-of-run
++  snapshot walk finds checksum-valid RSDP `0xf6210` → RSDT `0x7ffe470`
++  (4 entries) → FACP / SSDT / APIC(MADT, LAPIC `0xfee00000`) / **MCFG**.
++  The default identity reproduces `NO RSDP` (negative control); the G3
++  probe ROM yields RSDP `0xf6210` with a 3-entry RSDT (no MCFG), showing
++  the ICH9 identity unlocks SeaBIOS's full Q35/PCIe path.
++- Gates: `make test-compat` — 7 vectors (both identities, class/header,
++  host bridge, AHCI function, PAM under ICH9) — wired into `make test` and
++  `make test-sanitize`; the bundled sample firmware still ends `HALTED` with
++  `executed=4837677`, `GUEST_OK` and the framebuffer marker.
++- Docs: `docs/plans/COMPAT_PLAN.md` (G0–G6, measured receipts and explicit
++  non-claims), `docs/evidence/compat-g4/`, `docs/STATUS.md`, `ROADMAP.md`,
++  `NOTICE.md` (licensing now matches the tree), `PROJECT_ANALYSIS.md`
++  (regenerated for this HEAD).  `src/cpu.h` documents the K6 SMP invariant
++  that `cpu_step()` always operates on `m->cpu`, and splits the merged
++  `kgs_base`/XMM comment.
++- Not established: no pinned-image BIOS-to-kernel boot, no shell acceptance,
++  no E820/`boot_info_t` agreement, no SMP/IOAPIC claim.  G3 (authoritative
++  ISO still carries the original Stage 2) and G5–G6 remain open.
++
++
+ ### Added — patch 0061 (TOOLING T5, live WebSocket monitor)
+ 
+ - `src/ws.c`/`ws.h`: dependency-free SHA-1, RFC 6455 accept-key and
+diff --git a/Makefile b/Makefile
+index 01c23fd..e120a57 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -68,6 +68,17 @@ test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c
+ 	./test-ahci
+ 	rm -f test-cpu test-usb test-pam test-video test-net test-pic test-pit test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
+ 
++# COMPAT G4: LPC identity pairing.  SeaBIOS rel-1.16.3's acpi_setup()
++# matches only PIIX4 8086:7113 or ICH9 LPC 8086:2918, while this machine's
++# historical LPC is Panther Point 8086:1e55 -- so stock SeaBIOS publishes no
++# RSDP.  --lpc=ich9 switches the LPC function to the Q35-paired ICH9 ID.
++# Vectors pin both identities, the untouched class/header fields, the host
++# bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
++test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
++	./test-compat
++	rm -f test-compat
++
+ # KERNEL-BOOT K1: direct kernel-load lane. The fixture is a synthetic
+ # higher-half kernel linked at the real AuraLite VMA (tests/kload_fixture.ld);
+ # its flags are frozen on purpose -- the guest image must not inherit the
+@@ -271,7 +282,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
++test: test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -281,7 +292,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -330,4 +341,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
+diff --git a/NOTICE.md b/NOTICE.md
+index 866bd1c..192763d 100644
+--- a/NOTICE.md
++++ b/NOTICE.md
+@@ -2,9 +2,16 @@
+ 
+ The sample firmware source in `firmware/sample_firmware.nas` and its associated
+ sample ROM are derived from the firmware project that supplied the original
+-sample image. The applicable MIT license is included at
+-`firmware/LICENSE`.
++sample image. The applicable MIT license is included at `firmware/LICENSE`
++(Copyright (c) 2026 $yscall). That license covers the firmware directory only.
+ 
+-The emulator core and surrounding tooling are maintained separately. Choose
+-and add a repository-level license before publishing the complete project if
+-you want to grant reuse rights to the emulator core.
++The emulator core and surrounding tooling in `src/`, `tests/`, `tools/`,
++`web/`, `docs/`, the `Makefile` and `patches/` are licensed under the Apache
++License, Version 2.0 — the repository-level license in `LICENSE`.
++
++Third-party names and CPUID/PCI identifiers are used descriptively; no
++affiliation with Intel, SeaBIOS, QEMU or the AuraLite OS project is implied.
++The diagnostic ROMs under `docs/evidence/` are local builds of SeaBIOS
++(`rel-1.16.3`, distributed upstream under LGPLv3), retained only as test
++inputs for the compatibility evidence; they are not part of the emulator
++binary or of the Apache-2.0 licensed sources.
+diff --git a/PROJECT_ANALYSIS.md b/PROJECT_ANALYSIS.md
+index c56f063..0fc5812 100644
+--- a/PROJECT_ANALYSIS.md
++++ b/PROJECT_ANALYSIS.md
+@@ -1,238 +1,228 @@
+-# AuraLite-Emulator — Full Project Analysis
++# AuraLite-Emulator — Project Analysis (current tree)
+ 
+-> Prepared from a complete audit of the repository at commit `33e2c5c` (`main`).
+-> All artifacts were built and verified locally: `make test` is green, the full
+-> boot chain completes with exit code 0, and the guest payload paints the
++> Prepared from a full audit of the repository at `main` HEAD `39f83f9`
++> ("G0-G3 update", 2026-10-16) plus the local COMPAT G4 change set
++> (`--lpc=ich9`, `tests/test_compat.c`, `docs/plans/COMPAT_PLAN.md`).
++> Everything below was built and measured in this tree: `make test` is green,
++> the full boot chain completes with exit code 0, and the guest painted the
+ > framebuffer.
+ 
+ ---
+ 
+ ## 1. What this project is
+ 
+-**AuraLite-Emulator** (called "Universal x86 Emulator" in the README) is a
+-from-scratch x86 emulator written in portable C11 (~1500 lines of core code),
+-with no dependency on QEMU/KVM. Its purpose is executing raw x86 firmware
++**AuraLite-Emulator** ("Universal x86 Emulator" in the README) is a
++from-scratch x86 emulator written in portable C11 with no QEMU/KVM and no
++external libraries beyond `-lm`. Its purpose is executing raw x86 firmware
+ (BIOS/boot-firmware style): the emulator loads a ROM at the reset vector and
+ runs it from real mode through protected mode into 64-bit long mode, while
+-behaviourally emulating an Intel chipset (PCI, MMIO, EHCI/USB, GPU framebuffer,
+-DDR controllers).
++behaviourally emulating an Intel chipset (PCI/ECAM, EHCI/UHCI USB, AHCI, e1000,
++VGA + Bochs VBE, DDR controllers, PIC/PIT/RTC/KBC/LAPIC/IOAPIC).
+ 
+-Design philosophy: **the emulator is firmware-agnostic** — the CPU core contains
+-no hacks tied to a specific ROM; platform specifics live in switchable profiles
+-(`--platform=...`) and ROM compatibility belongs in the ROM images themselves.
++Design philosophy: **the emulator is firmware-agnostic** — the CPU core
++contains no hacks tied to a specific ROM; platform specifics live in
++switchable profiles (`--platform=...`) and ROM compatibility belongs in the
++ROM images themselves.
++
++Scale of the current tree:
++
++| Area | Files | Lines (approx.) |
++|---|---|---|
++| `src/` | 48 (25 `.c` + 23 `.h`) | 15,800 |
++| `tests/` (+ `integration/`) | 29 `.c`, 15 `.py`, 25 `.sh` | 10,300 |
++| `docs/` incl. 10 plans | — | 7,600 |
++| `patches/` phase artifacts | 22 `.patch` (0008–0061; 0062 pending) | — |
+ 
+ ## 2. Repository layout
+ 
+ ```
+ AuraLite-Emulator/
+ ├── src/
+-│   ├── cpu.c / cpu.h      — the x86 interpreter (780 lines, the core)
+-│   ├── mem.c              — physical address space + MMIO dispatcher
+-│   ├── io.c               — 64K I/O port space
+-│   ├── pci.c / pci.h      — PCI mechanism #1 (0xCF8/0xCFC) + ECAM/MMCONFIG
+-│   ├── devices.c / .h     — "the chipset": LPC, SATA, GPU, EHCI/USB-MSC, COM1, CAR, DDR
+-│   ├── platform.c / .h    — 5 CPUID profiles for Intel generations
+-│   ├── machine.h          — machine_t, memory map, event log ring
+-│   └── main.c             — CLI harness, register dump, PPM framebuffer export
++│   ├── cpu.c / cpu.h          — the x86 interpreter (2,971 lines), the core
++│   ├── mem.c                  — physical address space, Q35 PAM, MMIO decode
++│   ├── io.c                   — 64K I/O port space
++│   ├── pci.c / pci.h          — PCI mechanism #1 + ECAM/MMCONFIG
++│   ├── devices.c / .h         — GPU/VRAM, VGA text, Bochs VBE, EHCI+UHCI,
++│   │                            DDR/SPD, CAR, COM1 debugcon
++│   ├── platform.c / .h        — five Intel CPUID profiles
++│   ├── chipset.c              — A20, port 0x92, reset via 0xCF9
++│   ├── pic.c / pit.c / rtc.c / kbc.c — 8259A, 8254, MC146818A, 8042
++│   ├── lapic.c / ioapic.c     — xAPIC and 82093AA
++│   ├── ahci.c                 — SATA HBA: FIS/PRDT engine, two controllers
++│   ├── e1000.c                — 82540EM model + TAP-over-UDP socket
++│   ├── serial.c               — 16550 subset
++│   ├── acpi.c                 — RSDP/RSDT/XSDT/MADT set for the --kernel lane
++│   ├── kloader.c              — ELF64 kernel loader + boot_info_t fabrication
++│   ├── disasm.c               — 16/32/64-bit disassembler (NASM syntax)
++│   ├── dbg.c                  — run-control core, REPL, symbols, expressions
++│   ├── gdbstub.c              — GDB Remote Serial Protocol frontend
++│   ├── snapshot.c             — AURASNP1 whole-machine snapshots
++│   ├── ws.c / monitor.c       — SHA-1 + RFC 6455 + HTTP/WS live monitor
++│   ├── machine.h              — machine_t: memory map, devices, vCPU slots,
++│   │                            PERF caches, event log ring
++│   └── main.c                 — CLI harness, run loop, dumps
+ ├── firmware/
+-│   ├── sample_firmware.nas — sample firmware in NASM, 848 lines (GenericBootFirmware v0.2.18)
+-│   └── LICENSE             — MIT (c) 2026 $yscall — covers the firmware only
+-├── disk/test_kernel.asm   — 64-bit test payload (the guest kernel)
+-├── tests/test_cpu.c, test_usb.c — unit tests
+-├── web/monitor.html       — static web monitor mock (loads PPM + log files)
+-├── docs/STATUS.md, BUGS.md — implementation status & compatibility notes
+-├── Makefile               — build, firmware, disk, tests
+-└── .github/workflows/build.yml — CI (ubuntu + gcc + nasm + make test)
++│   ├── sample_firmware.nas    — GenericBootFirmware v0.2.18 (NASM)
++│   └── LICENSE                — MIT (c) 2026 $yscall — firmware only
++├── disk/test_kernel.asm       — 64-bit payload painted into the framebuffer
++├── tests/                     — unit suites, harness, fuzzers, integration
++├── tools/                     — x86dis, tap_responder.py
++├── web/monitor.html           — live WebSocket monitor UI (served by --monitor)
++├── docs/plans/                — CORE, CHIPSET, KERNEL_BOOT, STORE, USB,
++│   │                            VIDEO, NET, PERF, TOOLING, COMPAT
++│   └── evidence/              — compat-g2, compat-g3, compat-g4 bundles
++├── patches/                   — one format-patch per delivered phase
++├── Makefile                   — build, firmware, disk, tests, bench, fuzz
++├── CHANGELOG.md / ROADMAP.md / STATUS.md / BUGS.md
++└── .github/workflows/build.yml — CI: build, ASan+UBSan, differential fuzz
+ ```
+ 
+-Dependencies: **GCC/Clang, NASM, Python 3, GNU Make** — all installed and verified.
++Dependencies: **GCC/Clang, NASM, Python 3, GNU Make**; optional **gdb** and
++**ndisasm** for the debugging/differential lanes. Verified locally with
++gcc 14.2.0, make 4.4.1, NASM 2.16.03, Python 3.13.16, gdb 16.3.
+ 
+ ## 3. Architecture by module
+ 
+-### 3.1 `cpu.c` — the x86 interpreter (core)
++### 3.1 `cpu.c` — the x86 interpreter
+ 
+ - **Modes**: real16 → prot16/prot32 → compat32 → long64, derived from
+-  `CR0.PE`, `CR0.PG`, `EFER.LME/LMA` and the `L`/`D` bits of the CS descriptor.
+-- **Registers**: 16 GPRs (RAX–R15), RIP, RFLAGS, 6 segments (selector/base/limit/L/D),
+-  CR0/CR2/CR3/CR4, EFER, GDTR/IDTR, up to 64 MSRs.
+-- **Decoding**: a generic ModRM/SIB decoder covering all 16/32/64-bit addressing
+-  modes, prefixes (0x66/0x67/REX/segment/REP/LOCK), RIP-relative addressing via a
+-  deferred fixup (instruction length is only final after decode — see `fixup_riprel`).
+-- **Paging**: 4-level translation PML4→PDPT→PD→PT with 2 MiB and 1 GiB large pages.
+-- **Exceptions**: `raise_exception()` with a re-entrancy guard (double fault →
+-  halt), IDT gate delivery, `#PF` with read=0/write=2 error codes, `#UD` for
+-  unknown opcodes.
+-- **ISA subset** (firmware-focused):
+-  - the full ALU group ADD/OR/ADC/SBB/AND/SUB/XOR/CMP in all forms with correct
+-    CF/OF/ZF/SF/PF/AF;
+-  - MOV of all forms, MOVZX, LEA, MOV moffs, MOV CRn, RDMSR/WRMSR, CPUID;
+-  - INC/DEC, PUSH/POP, CALL/RET, JMP near/short/far, far call/jmp through memory,
+-    Jcc short+near, shift group (SHL/SHR/SAR), group3 (TEST/NOT/NEG),
+-    group5 (INC/DEC/CALL/JMP/PUSH/far), IN/OUT, REP STOS, NOP/HLT/CLI/STI/CLD/STD,
+-    LGDT/LIDT.
+-- **Two-pass decode**: fast ALU switch first; group1 restarts decoding from
+-  `d.start_pc`. `--trace` prints mode+RIP+opcode per instruction.
++  `CR0.PE`, `CR0.PG`, `EFER.LME/LMA` and the `L`/`D` bits of CS.
++- **Registers**: 16 GPRs, RIP, RFLAGS, six segments (sel/base/limit/D-B/L/P/
++  type), CR0/2/3/4, EFER, GDTR/IDTR, TR, up to 64 MSRs; SSE media file
++  (16×128-bit XMM) for the scalar/packed moves the ring-3 guest uses.
++- **Decoding**: generic ModRM/SIB over all addressing modes, 0x66/0x67/REX/
++  segment/REP/LOCK prefixes, lazy RIP-relative resolution after the trailing
++  immediate is known.
++- **Paging**: 4-level walk, 2 MiB / 1 GiB large pages, U/S + R/W + NX +
++  CR4.SMEP/SMAP enforcement, architectural `#PF` error codes, `#DF` guard.
++- **Exceptions**: IVT in real mode, IDT gates otherwise, IST stack switching
++  through the TSS (`ISTn = TSS+0x24+(n-1)*8`), ring-3 → ring-0 stack switch,
++  hardware frame order `[SS,RSP,] RFLAGS, CS, RIP, err`.
++- **Interrupt priority**: LAPIC first, then 8259; STI/MOV-SS shadow; HLT wake
++  by line level even with IF=0.
++- **ISA**: the firmware/OS integer set is closed (ALU, MOV family, Jcc/CMOVcc/
++  SETcc, shifts/rotates, MUL/DIV family, BT/BTS/BTR/BTC, BSF/BSR, BSWAP,
++  XADD, CMPXCHG, LOOP/JCXZ, string ops + REP, IN/OUT, system instructions,
++  CPUID/RDTSC/MSR, SYSCALL/SYSRET, SWAPGS); SSE is deliberately a measured
++  subset; anything else raises `#UD` instead of silently misbehaving.
++- **Performance caches** (PERF P2/P3): 256-entry success-only translation TLB
++  and a 512-slot RAM-only prefix/opcode predecode, both keyed on the full
++  security context and invalidated by one global RAM-write generation. Only
++  successful walks are cached; faults always take the original path.
+ 
+ ### 3.2 `mem.c` — physical address space
+ 
+-- 128 MiB RAM + 128 KiB ROM. The ROM is **right-aligned** in its window (last byte
+-  at the top), like a real flash part: the reset vector is always at 0xFFFFFFF0.
+-- Two ROM aliases: `0xE0000` (legacy BIOS shadow) and `0xFFFE0000` (top-of-4GB).
+-- MMIO regions are a linked list with read/write callbacks. **Smallest matching
+-  region wins** — mirroring how a real uncore decodes narrow fixed BARs ahead of
+-  the wide 256 MiB ECAM window (0xE0000000–0xF0000000).
+-- Open bus: reads return all-ones, writes are ignored.
+-- `mlog()` — a 4096-line ring log (for a future GUI), mirrored to stderr.
+-
+-### 3.3 `io.c` — I/O ports
+-
+-A 65536-entry table of {read, write, ctx, name}; unregistered ports read as
+-0xFF/0xFFFF/0xFFFFFFFF.
+-
+-### 3.4 `pci.c` — PCI
+-
+-- Mechanism #1: ports 0xCF8 (CONFIG_ADDRESS, enable bit 0x80000000) / 0xCFC.
+-- ECAM/MMCONFIG: a 256 MiB window, decoding `bus<<20|dev<<15|func<<12|reg`.
+-- Host bridge (0:0:0): writing register 0x60 (PCIEXBAR-style) with bit 0 enables
+-  the ECAM window — exactly how the sample firmware initializes MMIO config space.
+-- Config write policy: ID/class/header-type are read-only, everything else
+-  (BARs, command, status) is writable (behavioural, not bit-exact).
+-
+-### 3.5 `devices.c` — "the rest of the chipset"
+-
+-- **PCI devices** sit at the same bus:dev:func the firmware probes (confirmed by
+-  the firmware source): host-bridge 0:0:0, pci-bridge-misc 0:1:0, iGPU 0:2:0
+-  (class 0x03 mirrored at both 0x0B and 0x0C — the firmware reads the class from
+-  the non-standard offset 0x0C!), EHCI 0:3:0 (BAR0=0xFEB00000), LPC 0:31:0,
+-  SATA/AHCI 0:31:2.
+-- **EHCI/USB Mass Storage** — the most elaborate model: any write to the EHCI BAR
+-  rings a "doorbell" → reads ASYNCLISTADDR (+0x18) → walks the QH/qTD chain
+-  (up to 32 entries) → interprets genuine Bulk-Only Transport:
+-  - qTD with PID=OUT and 31 bytes = CBW → parse 'USBC' signature and SCSI opcode;
+-    READ(10)/READ(12) → remember LBA/block count (kept in static state);
+-  - qTD with PID=IN: with a pending command — copy sectors from the disk image
+-    into the guest buffer (with RAM bounds checks); otherwise — synthesize a
+-    'USBS' CSW with status OK. The qTD token is then marked complete.
+-- **GPU VRAM**: window at 0xD0000000, 800×600×32bpp; doubles as the PPM-exported
+-  framebuffer.
+-- **CAR** (cache-as-RAM) scratch at 0xFEF00000, 4 MiB — the firmware's early stack.
+-- **Per-platform DDR models** (`devices_init_platform`): Sandy/Ivy/Bay Trail get
+-  an SPD window at 0xE00FB000 (byte 0 = "ready" bit, byte 5 = density code);
+-  Haswell/Broadwell get a DDR4 controller at 0xFED10000 whose **busy bit
+-  0x80000000 auto-clears on read** — the firmware's polling loop sees an
+-  instant "training done".
+-- **COM1 (0x3F8)**: line-buffered serial output into the log (`[serial] GUEST_OK`).
+-
+-### 3.6 `platform.c` — CPUID profiles
+-
+-5 profiles with real Intel CPUID.1.EAX signatures the firmware branches on:
+-Sandy Bridge 0x206A7 (0x2A), Ivy 0x306A9 (0x3A), Haswell 0x306C3 (0x3C, default),
+-Broadwell 0x306D4 (0x3D), Bay Trail 0x30678 (0x37). CPUID.0 returns
+-"GenuineIntel", 0x80000001.EDX has the long-mode bit.
+-
+-### 3.7 `main.c` — CLI
+-
+-Options: `--rom=`, `--disk=`, `--platform=`, `--max-instr=`, `--trace`,
+-`--dump-fb=`, `--log=`. Exit codes: **0** normal/instruction-limit stop,
+-**2** CPU fault, **1** input-file error. Dumps all registers/mode, the log tail,
+-tracks "guest entered at 0x100000" and the framebuffer marker
+-`pixel[0]==0x00200000`.
+-
+-## 4. The sample firmware and the boot chain
+-
+-GenericBootFirmware v0.2.18, 128 KiB, org 0xFFFE0000. The full execution path,
+-confirmed by tracing and tests:
+-
+-1. **Reset**: CS:IP = 0xF000:0xFFF0 → physical 0xFFFFFFF0 → the last ROM bytes:
+-   `jmp far 0xE000:0` → legacy alias 0xE0000 → `startcli`.
+-2. **Real mode**: load a 3-entry GDT, set `CR0.PE`, far jump → **prot32**.
+-3. **prot32**: stack in CAR (0xFEF0FFFC), `CPUID.1` → hand-rolled family/model
+-   decode → branch to 5 init paths (Sandy/Ivy: CAR+MTRR+PCI+DDR3-SPD; Haswell:
+-   ECAM+LPC+PMBASE+CAR+DDR4-polling; Broadwell/Bay Trail: variants). Each path
+-   enables MMCONFIG via host bridge 0x60, "trains" DDR, pokes CMOS/SuperIO.
+-4. **Common tail `loff`**: SATA stubs, speaker, GPU discovery by scanning ECAM
+-   (class read at offset 0x0C!), BAR assignment 0xD0000000, HDMI MMIO writes.
+-5. **Long mode**: build 4-level page tables at 0x10000 (identity map incl. a
+-   1 GiB PDPTE covering MMIO and 2 MiB pages for APIC at 0xFEC00000/0xFEE00000),
+-   CR3, EFER.LME, CR0.PG → far jump into a 64-bit segment → **long64**.
+-6. **long64**: fill the IDT (256 gates to `fault: hlt`), LIDT, SuperIO/COM.
+-7. **USB boot**: read the EHCI BAR via PCI#1 (0x80001810), build a QH at 0x20000
+-   and a qTD chain, CBW READ(10) LBA=0, one 512-byte block into **0x00100000**,
+-   data-IN, CSW → poll the Active bit.
+-8. **Handover**: `mov rax,0x00100000; jmp rax` — the guest takes over.
+-9. **Guest (`disk/test_kernel.asm`)**: writes "GUEST_OK" to COM1, paints the
+-   800×600 framebuffer with a gradient (pixel = col | row<<8 | 0x00200000), hlt.
+-
+-`launch_mode db 3` selects the guest launch mode (0=halt, 2=32-bit, 3=64-bit);
+-default 3 — jump to 0x100000 in long mode.
+-
+-## 5. Build and verification (performed locally)
++128 MiB RAM + 128 KiB ROM, right-aligned in its window (reset vector at
++`0xFFFFFFF0`), aliases at `0xE0000` and `0xFFFE0000`. The Q35 host bridge's
++seven PAM bytes are the single source of truth for the `C0000–FFFFF` decoder;
++writes go to the RAM shadow, reads fall back to immutable flash or open bus.
++MMIO regions are a linked list where the **smallest matching region wins**,
++mirroring uncore precedence of fixed BARs over the 256 MiB ECAM window. A20
++masks bit 20 for reads, writes and fetches. `mem_debug_peek_byte()` is the
++side-effect-free, PAM-aware inspection path used by tools.
++
++### 3.3 Chipset
++
++8259A pair (full ICW/OCW, priorities, spurious IRQs, level lines, AEOI), 8254
++PIT and MC146818A RTC on a virtual instruction-count timebase (determinism),
++8042 KBC with scancode set-1 injection, A20 gate and four reset sources,
++xAPIC with 256-bit IRR/ISR and timers, 82093AA I/O APIC with remote-IRR
++feedback, and a 16550-subset COM1.
++
++### 3.4 Devices
++
++GPU VRAM at `0xD0000000` (800×600×32, doubles as the PPM framebuffer), VGA
++text mode 3 at `0xB8000` with the guest's own 8×16 PSF2 font, Bochs VBE dispi
++with QEMU's `vbe_fixup_regs` transcribed in full (the V4 heap-overflow fix),
++EHCI + UHCI with BOT/SCSI mass storage, AHCI with command-list/FIS engine and
++up to two controllers, e1000 with TAP-over-UDP ingress/egress, DDR3/DDR4
++training registers, and cache-as-RAM.
++
++### 3.5 Tooling
++
++`--trace-file` with a CPU-vs-disassembler successor self-check; `x86dis`;
++run-control REPL (`--debug`, `--debug-script`, `--symbols`); gdbstub
++(`--gdb`, target.xml, threads, hardware watchpoints); v2 snapshots with shape
++refusals; live HTTP/WebSocket monitor with framebuffer deltas. All of it is
++opt-in and non-perturbing: stdout/`--stats`/PPM/log stay byte-identical to a
++plain run, and each tool has a negative control.
++
++## 4. Boot paths
++
++1. **Firmware** (`--rom=`, default): reset → `0xE000:0` alias → protected
++   mode → CPUID dispatch across five chipset paths → ECAM/PAM setup → DDR
++   training → GPU BAR → page tables → long mode → USB READ(10) → jump to
++   `0x00100000`. Measured: `GUEST_OK`, framebuffer marker, `HALTED` at
++   4,837,677 instructions (Haswell).
++2. **Direct kernel** (`--kernel=`, K1–K8): ELF64 `ET_EXEC`, segments placed by
++   `p_paddr − KERNEL_VMA`, seven-page paging hierarchy, fabricated
++   `boot_info_t` + ACPI set, parked at `_start`. This is the lane that meets
++   the north star: AuraLite OS to its shell on 1 and 2 vCPUs.
++3. **BIOS compatibility** (COMPAT G0–G6): SeaBIOS → Stage 1 → Stage 2 →
++   flat kernel. G2 fixed the real-mode `SGDT/SIDT` store width; G3 diagnosed
++   the Stage-2 FS/GS unreal-mode assumption; G4 (this tree) makes the LPC
++   identity pair with the Q35 host bridge so **stock SeaBIOS publishes
++   RSDP/RSDT/FACP/SSDT/MADT/MCFG**. Pinned-image acceptance is G5 and still
++   open.
++
++## 5. Build and verification
+ 
+ ```
+-make          → cc -std=c11 -O2 -Wall -Wextra  (zero warnings)
+-make firmware/firmware.bin disk/disk.img
+-make test     → ✅ unit tests: ok  ✅ usb tests: ok  ✅ boot integration test: ok
+-                ✅ platform smoke tests x5
+-./x86emu --platform=haswell --max-instr=600000 --dump-fb=framebuffer.ppm
+-     exit 0; log: ECAM enabled → READ(10) LBA=0 → bulk-IN 512B → CSW OK
+-     → guest entry 0x100000 → [serial] GUEST_OK → framebuffer marker OK
+-     → mode long64, CR3=0x10000, EFER=0x500 (LME+LMA)
++make                         # -std=c11 -O2 -Wall -Wextra -Werror, zero warnings
++make firmware/firmware.bin disk/disk.img x86dis
++make test                    # full gate, ~6.5 min, green
++make test-sanitize           # ASan+UBSan as hard errors
++make fuzz                    # differential vs the host CPU via ptrace
++make test-compat             # COMPAT G4 identity vectors (7/7)
+ ```
+ 
+-Framebuffer after 600k instructions: the guest painted ~70 top rows — visual
+-proof of real guest execution (the rest is the instruction limit, not an error).
+-
+-## 6. Findings — deviations, quirks, limits
+-
+-### Notable deviations from real x86 (addressed by ROADMAP v0.3–v0.5)
+-
+-1. **Near Jcc 0F 80–83 missing → #UD**; **0F 88–8B (JS/JNS/JP/JPE/JPO) decode but
+-   never branch** (silent logic corruption). *(fixed in patch 0002)*
+-2. **Exception stack frame pushed in the wrong order** (err→CS→RIP→RFLAGS vs
+-   hardware's RFLAGS→CS→RIP→err); no IRET. *(fixed in patch 0006)*
+-3. **64-bit shifts**: count mask is 31 instead of 63. *(fixed in patch 0003)*
+-4. **group3** lacks MUL/IMUL/DIV/IDIV → #UD. *(fixed in patch 0004)*
+-5. **group2** lacks ROL/ROR/RCL/RCR and the 8-bit forms 0xC0/0xD0/0xD2.
+-   *(fixed in patch 0003)*
+-6. `PUSH imm` (0x68) always decodes imm32 — wrong for 16-bit operand size.
+-   *(fixed in patch 0005)*
+-7. No CPL/privilege checks, no segment limit checks, no TSS/IST, no IVT delivery
+-   in real mode (any real-mode exception without an IDT halts). *(IVT added in
+-   patch 0006; CPL/limits planned for v0.5)*
+-8. No CPL, APIC, PIC/PIT/RTC, FPU/SSE; paging lacks accessed/dirty/NX/U-S checks;
+-   REP STOS is atomic; no hardware interrupts at all.
+-
+-### Minor code notes
+-
+-- `main.c`: the `guest_entry_seen` check is duplicated before/after `cpu_step`;
+-  `machine_t.max_instructions` is unused (the limit is kept local in main).
+-- `devices.c`: USB state (`s_lba`/`s_blocks`/`s_have`) and `g_ehci`/`g_serial`
+-  are file/global statics → one machine per process; `superio_idx`/`cmos_idx`
+-  are dead code; CMOS/SuperIO ports aren't registered (open bus suffices for
+-  the sample firmware).
+-- In the 20000-instruction smoke test Haswell shows `prot32`: the firmware is
+-  still inside the DDR4 delay loop (~30k iterations) — expected, not a bug.
+-- `Makefile clean` has a duplicated `rm` line.
+-- **Licensing**: the core is Apache-2.0 (root LICENSE); `firmware/` is MIT and
+-  keeps its own license; `NOTICE.md`'s "no repo-level license" note is outdated.
+-- `web/monitor.html` is a static mock with hardcoded register values, but it can
+-  load a PPM framebuffer and a text log client-side.
+-
+-### Author-declared limits (docs/STATUS.md)
+-
+-The ISA grows "from execution traces and tests", the chipset is behavioural
+-(not cycle-accurate), and the CSW/descriptor path plus the web monitor are
+-still being expanded.
++Measured in this tree: `make test` green; `test-gdbstub` 30/30 and real
++`gdb -batch` lanes green; fuzz 32 programs / 384 instructions all matching,
++0 host crashes; ASan spot-runs of `test_table` and `test_snapshot` clean;
++full boot 4,837,677 steps in 270 ms median (~17.9 Msteps/s); snapshot split
++loads byte-identical; TLB 6,738,321 hits.
++
++## 6. Findings, quirks and limits
++
++### Deliberate scope
++
++- Not a drop-in QEMU replacement; ISA grows from traces and tests.
++- SSE is a measured subset, x87 has control/status state only (no data model),
++  no AVX, no SMM/VMX/SVM/NMI.
++- Segment limit/CPL checks are modelled where the guest path needed them, not
++  as a complete protection unit.
++- At most two vCPU contexts (`EM_MAX_VCPU = 2`), strict 1:1 round-robin.
++- USB is EHCI/UHCI with a BOT/SCSI subset; no xHCI.
++- Networking is IPv4-only TAP-over-UDP, DHCP stateless, DNS A/IN only, no
++  TCP window scaling/SACK/TIME_WAIT, e1000 INTx unmounted.
++- VRAM is 1.9 MB (not QEMU's 16 MiB); no display panning/`vbe_start_addr`;
++  BPP 4 is a documented divergence.
++- The live monitor has no authentication; loopback is the default bind.
++
++### Known documentation/code notes (state after this pass)
++
++- `NOTICE.md` now matches the tree: Apache-2.0 at the root (`LICENSE`), MIT
++  for `firmware/` only.
++- `PROJECT_ANALYSIS.md` (this file) is current; the earlier revision described
++  commit `33e2c5c` and a ~1,500-line core.
++- `docs/plans/COMPAT_PLAN.md` now exists and records G0–G6 with measured
++  receipts and explicit non-claims.
++- `cpu.h` documents the K6 SMP invariant that `cpu_step()` always operates on
++  `m->cpu` (the current context), which the internal helpers rely on; the
++  merged `kgs_base`/XMM comment block was split.
++- `[pci-probe]` / `[ahci-mmio-probe]` lines in the log are diagnostic
++  instrumentation from the G2 era and are part of the recorded receipts;
++  they are intentionally left in place.
++- The sample firmware's device contract (LPC `8086:1e55`) is unchanged; the
++  ICH9 identity is an explicit `--lpc=ich9` opt-in.
+ 
+ ## 7. Bottom line
+ 
+-A compact, readable, **fully working** DIY PC emulator: from the reset vector to
+-a 64-bit guest kernel with real USB mass-storage boot and graphics. The layering
+-(CPU/memory/IO/PCI/devices/profiles/CLI) is clean and the code is well annotated
+-with hardware rationale. Growth per `ROADMAP.md` and `docs/plans/CORE_PLAN.md`
+-(written in the AuraLite OS house plan style: dependency-ordered phases,
+-definition of done and test gate per phase, one `.patch` per phase): the CPU
+-correctness ledger is being closed first (C0–C6 landed), then the chipset
+-interrupt hardware (PIC/PIT/RTC/A20), real AHCI, and performance — with the
+-**north star of booting the AuraLite OS kernel to its shell** on this emulator
+-(long mode, TSS, SYSCALL, PIC/LAPIC, AHCI, e1000, framebuffer).
++A compact, readable, **fully working** DIY PC emulator: reset vector to a
++64-bit guest kernel, real USB mass-storage boot, graphics, networking, SMP and
++source-level debugging. Its distinguishing feature is the evidence discipline:
++every plan phase ships with its implementation, a regression vector and a
++negative control, and `docs/STATUS.md` records receipts rather than promises.
++The open frontier is the BIOS route (COMPAT G3/G5): the emulator side of the
++ACPI gate is now closed (G4), while the pinned ISO still carries the original
++Stage 2.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8abf267..0935436 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -33,7 +33,7 @@ maps to exactly one plan below.
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+ | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+ | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, 0056–0061) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
+-| `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
++| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | 🚧 G0–G2 ✅, G3 diagnostics complete (acceptance open), G4 ✅ (`0062`), G5–G6 planned | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -53,6 +53,19 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ ## Immediate queue (next patches)
+ 
++- ~~`0062` — COMPAT G4: LPC identity pairing.  The machine advertised the Q35
++  host bridge `8086:29c0` (and implemented its PAM registers) while the LPC
++  function reported Panther Point `8086:1e55`, an identity stock SeaBIOS's
++  `acpi_setup()` does not recognize, so no RSDP was ever published.  The new
++  opt-in `--lpc=ich9` reports `8086:2918` (the Q35-paired ICH9 LPC); the
++  default keeps every historical lane byte-identical.  Measured with the
++  bundled diagnostic SeaBIOS (ACPI match unmodified): `Copying ACPI RSDP from
++  0x00006dfc to 0x000f6210`, then a checksum-valid RSDP → RSDT (4 entries) →
++  FACP/SSDT/MADT/MCFG chain; the default identity publishes no RSDP (negative
++  control).  `tests/test_compat.c` pins 7 vectors in `make test` and
++  `make test-sanitize`.  Evidence: `docs/evidence/compat-g4/`; plan:
++  `docs/plans/COMPAT_PLAN.md`.~~ shipped.
++
+ - ~~`0056` — TOOLING T0: measured baseline + `docs/plans/TOOLING_PLAN.md`
+   (`--trace` floods the 4096-line ring: 4,095 of 4,837,677 lines kept and
+   the five boot receipts 5 → 0; trace costs ≈8–24× and switches off P3
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index ce25442..5462ebd 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -748,7 +748,7 @@
+   accept GUID: HTTP/101 pass and the client's sample-key assertion alone
+   fails.
+ 
+-## BIOS compatibility diagnostics (G2–G3, 2026-10-16)
++## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+ - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
+   SGDT/SIDT store width: the emulator now writes the six-byte pseudo-descriptor
+@@ -777,9 +777,33 @@
+   tests and full evidence are in `docs/evidence/compat-g3/` and
+   `docs/plans/TOOLING_PLAN.md`.
+ 
+-G3 remains open. These modified-image runs are diagnostic only; no pinned-image
+-BIOS-to-kernel acceptance, allocator-zone measurement, CF9-causality claim or
+-PERF P4 pass is established.
++- **G4 delivered (patch `0062`): the ACPI-LPC identity pairing.**  G3 measured
++  that SeaBIOS `rel-1.16.3`'s `acpi_setup()` recognizes only PIIX4 PM
++  `8086:7113` or ICH9 LPC `8086:2918`, while this machine advertised the Q35
++  host bridge `8086:29c0` and its PAM registers but an LPC function
++  `8086:1e55` — so stock SeaBIOS completed POST and published no RSDP.  The
++  new opt-in `--lpc=ich9` (`machine_t.cfg_lpc_ich9`, `src/devices.c`) reports
++  `8086:2918`; the default stays `8086:1e55`, so every historical lane keeps
++  its receipts.  Measured with the **unmodified** diagnostic SeaBIOS in
++  `docs/evidence/compat-g3/` and a blank USB image: the run logs
++  `ACPI DSDT=0x07ffe4b0` and `Copying ACPI RSDP from 0x00006dfc to
++  0x000f6210`, and an end-of-run v2-snapshot walk finds a checksum-valid
++  rev-0 RSDP at `0xf6210`, RSDT `0x7ffe470` (4 entries) and
++  FACP/SSDT/APIC(MADT, LAPIC base `0xfee00000`)/**MCFG**, all checksums
++  zero.  With the default identity the same ROM publishes `NO RSDP`
++  (negative control); the G3 probe ROM reproduces RSDP `0xf6210` and RSDT
++  `0x7ffe4c0` (3 entries, no MCFG), which is itself the receipt that the
++  ICH9 identity unlocks SeaBIOS's full Q35/PCIe path rather than merely
++  satisfying the old match table.  `tests/test_compat.c` pins 7 vectors
++  (both identities, class/header, host bridge, AHCI function, PAM under
++  ICH9) and runs in `make test` / `make test-sanitize`.  Evidence:
++  `docs/evidence/compat-g4/`.
++
++G3 remains open: the authoritative release ISO still contains the original
++Stage 2, and the candidate FS/GS restoration is a diagnostic build only.
++These modified-image runs are diagnostic only; no pinned-image BIOS-to-kernel
++acceptance, allocator-zone measurement, CF9-causality claim or PERF P4 pass is
++established.
+ 
+ ## Current limits
+ 
+diff --git a/docs/evidence/compat-g4/README.md b/docs/evidence/compat-g4/README.md
+new file mode 100644
+index 0000000..a0e7ee1
+--- /dev/null
++++ b/docs/evidence/compat-g4/README.md
+@@ -0,0 +1,88 @@
++# COMPAT G4 — LPC identity pairing: stock SeaBIOS publishes ACPI
++
++Captured 2026-10-17. **Scope:** one emulator-side compatibility boundary —
++the LPC bridge identity — and its measured effect on ACPI publication by an
++*unmodified* SeaBIOS. This closes the emulator half of the G3 ACPI finding
++only; it is **not** a pinned-image BIOS-to-kernel boot, not shell acceptance,
++and not an E820/`boot_info_t` agreement claim.
++
++## The boundary
++
++G3 measured that SeaBIOS `rel-1.16.3`'s `acpi_setup()` recognizes exactly two
++LPC functions as ACPI/FADT-capable: PIIX4 PM `8086:7113` and ICH9 LPC
++`8086:2918`. This machine already advertises the Q35 host bridge
++(`8086:29c0`, `src/pci.h`) and implements its seven PAM registers
++(`src/mem.c`), but the LPC function identified as Panther Point `8086:1e55`
++— the ID the bundled sample firmware knows. Result: stock SeaBIOS completes
++POST and publishes **no RSDP**, so the guest boots BSP-only with no ACPI
++surface.
++
++G4 makes the identity pairing switchable:
++
++- `machine_t.cfg_lpc_ich9` (`src/machine.h`), set by `--lpc=ich9`
++  (`src/main.c`); the default (`--lpc=pantherpoint`) leaves the historical
++  `8086:1e55` untouched, so every prior lane keeps its receipt.
++- `devices_init_common()` (`src/devices.c`) adds the LPC function with
++  `0x2918` when the flag is set. Class `06/01`, the multifunction header bit
++  and function 2 (AHCI `8086:1e03`) are unchanged.
++- `tests/test_compat.c` pins 7 vectors: both identities, class/header,
++  host bridge `8086:29c0`, AHCI function, and Q35 PAM under the ICH9 identity
++  (`make test-compat`, also inside `make test` / `make test-sanitize`).
++
++## Measured receipts
++
++Inputs are the G3 bundle's own ROMs (hashes re-checked):
++
++| Input | SHA-256 |
++|---|---|
++| `seabios-diagnostic-128k.bin` (ACPI match table **unmodified**) | `69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d` |
++| `seabios-acpi-id-probe-128k.bin` (diagnostic ROM patch adds `1e55`) | `012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5` |
++| `blank-usb-1m.img` (1 MiB zeroes) | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
++
++Run shape: `--platform=haswell --max-instr=200000000`, blank USB only, exit 0.
++
++1. **Negative control** — default identity, diagnostic ROM:
++   end-of-run snapshot scan = `NO RSDP`.
++2. **Scanner control** — probe ROM (the ROM-side patch G3 measured), default
++   identity: `RSDP @0xf6210` rev 0, checksum ok, RSDT `0x7ffe4c0`, 3 entries.
++3. **G4 lane** — `--lpc=ich9` with the **same unmodified** diagnostic ROM:
++
++   ```
++   ACPI DSDT=0x07ffe4b0
++   Copying ACPI RSDP from 0x00006dfc to 0x000f6210
++   RSDP  @0x000f6210 rev=0 checksum=ok -> RSDT @0x07ffe470
++     RSDT @0x07ffe470 len=52 checksum=ok, 4 entries
++     FACP @0x07ffff80 len=116 checksum=ok
++     SSDT @0x07fff720 len=2073 checksum=ok
++     APIC @0x07fff630 len=110 checksum=ok (local APIC base 0xfee00000)
++     MCFG @0x07fff5f0 len=60 checksum=ok
++   ```
++
++   The ICH9 identity yields one **extra** table versus the ROM-patch control:
++   `MCFG`, because SeaBIOS now follows its full Q35/PCIe path (the probe ROM
++   only taught the old match table about `1e55`; it did not change PCIe
++   capability detection).
++
++4. **Regression** — `./x86emu --lpc=ich9 --stats` on the bundled sample
++   firmware still ends `HALTED`, `executed=4837677`, `GUEST_OK`,
++   `pixel[0]=0x00200000`; the default run is unchanged.
++
++## Files
++
++- `acpi-identity-receipt.txt` — the four measured lanes above, verbatim.
++- `scan_acpi_snapshot.py` — walks RSDP → RSDT → tables in a v2 AURASNP1
++  snapshot and prints per-table checksum verdicts.
++- `commands.txt` — exact reproduction commands and caveats.
++- `SHA256SUMS` — bundle hashes.
++
++Large end-of-run snapshots (~19 MB, sparse) are intentionally not stored.
++
++## What remains open
++
++- **G3**: the authoritative release ISO still carries the original Stage 2;
++  the candidate FS/GS restoration exists only in the compatibility source
++  tree. G4 does not change that.
++- **G5**: pinned-image acceptance under a stock BIOS requires the Stage-2
++  change to land in the ISO, then E820/RSDP/`boot_info_t` field agreement
++  measured on *that* image.
++- No allocator-zone, CF9-causality or PERF P4 result is claimed here.
+diff --git a/docs/evidence/compat-g4/SHA256SUMS b/docs/evidence/compat-g4/SHA256SUMS
+new file mode 100644
+index 0000000..26b808a
+--- /dev/null
++++ b/docs/evidence/compat-g4/SHA256SUMS
+@@ -0,0 +1,4 @@
++e727954d84186e58a671fbb09260fa4453f6060329653e619010097cbd3f88b5  README.md
++7301bc2aa340b8dcec61959a6d482beb1b00757f168251b8743f508cd0abc7fe  acpi-identity-receipt.txt
++21a3612e27c718204b37c1a11b1697788abff214d6a7aaeb860334fc94662241  commands.txt
++367af73c06cc96c59b7cbb1c924418aa67cad7da089eab1297093442d071d6a8  scan_acpi_snapshot.py
+diff --git a/docs/evidence/compat-g4/acpi-identity-receipt.txt b/docs/evidence/compat-g4/acpi-identity-receipt.txt
+new file mode 100644
+index 0000000..632eb92
+--- /dev/null
++++ b/docs/evidence/compat-g4/acpi-identity-receipt.txt
+@@ -0,0 +1,66 @@
++COMPAT G4 -- measured ACPI publication receipts (2026-10-17)
++============================================================
++
++Machine: x86emu @ this tree, --platform=haswell, 128 MiB RAM, Q35 host bridge
++8086:29c0, blank 1 MiB USB image, max-instr=200000000, exit code 0.
++
++A. Default LPC identity 8086:1e55, diagnostic SeaBIOS (match table unmodified)
++   ----------------------------------------------------------------------
++   End-of-run snapshot scan of RAM 0x80000..0x100000:
++       NO RSDP
++   i.e. SeaBIOS POST completes, prints "No bootable device", and publishes no
++   ACPI tables -- the G3-identified LPC-ID gate.
++
++B. Probe ROM (adds 1e55 to SeaBIOS acpi_setup/FADT match), default identity
++   ----------------------------------------------------------------------
++   End-of-run snapshot scan: RSDP at 0xf6210 (rev 0, checksum ok), RSDT at
++   0x7ffe4c0 with 3 entries (FACP/SSDT/APIC), all checksums valid.  This
++   reproduces the G3 evidence placement exactly and validates the scanner.
++   The full walk is printed under C as the control.
++
++C. --lpc=ich9, the SAME unmodified diagnostic SeaBIOS ROM
++   -------------------------------------------------------
++   SeaBIOS debug stream:
++       ACPI DSDT=0x07ffe4b0
++       Copying ACPI RSDP from 0x00006dfc to 0x000f6210
++   End-of-run snapshot chain walk (scan_acpi_snapshot.py):
++       RSDP       @0x000f6210 rev=0 checksum=ok -> RSDT @0x07ffe470
++         RSDT       @0x07ffe470 len=52     checksum=ok
++         RSDT entries: 4
++         FACP       @0x07ffff80 len=116    checksum=ok
++         SSDT       @0x07fff720 len=2073   checksum=ok
++         APIC       @0x07fff630 len=110    checksum=ok
++           MADT local APIC base=0xfee00000
++         MCFG       @0x07fff5f0 len=60     checksum=ok
++       tables: APIC FACP MCFG SSDT
++
++   The probe-ROM control (B) walks as:
++       RSDP       @0x000f6210 rev=0 checksum=ok -> RSDT @0x07ffe4c0
++         RSDT       @0x07ffe4c0 len=48     checksum=ok
++         RSDT entries: 3
++         FACP       @0x07ffff80 len=116    checksum=ok
++         SSDT       @0x07fff720 len=2073   checksum=ok
++         APIC       @0x07fff630 len=110    checksum=ok
++           MADT local APIC base=0xfee00000
++       tables: APIC FACP SSDT
++
++   Both place FACP/SSDT/MADT at the same addresses.  The ICH9 lane publishes
++   one extra table -- MCFG -- because SeaBIOS now takes its full Q35/PCIe
++   path (the probe ROM only taught the old match table about 1e55; it did
++   not change PCIe capability detection).  Every checksum sums to zero.
++
++D. Regression check -- historical lanes untouched
++   ------------------------------------------------
++   ./x86emu --lpc=ich9 --stats  (bundled sample firmware) still prints
++       [serial] GUEST_OK
++       [guest] framebuffer marker OK: pixel[0]=0x00200000
++       [stats] executed=4837677 cap_reached=0
++   and the default (no flag) run is byte-identical to every prior receipt.
++   tests/test_compat.c pins both identities (7/7 vectors).
++
++E. What this does NOT establish
++   -----------------------------
++   No pinned-image BIOS-to-kernel boot, no shell acceptance, no E820/
++   boot_info agreement, no SMP/IOAPIC claim.  The authoritative ISO still
++   carries the original Stage 2 (G3, open); this receipt removes the
++   emulator-side ACPI identity blocker only.
+diff --git a/docs/evidence/compat-g4/commands.txt b/docs/evidence/compat-g4/commands.txt
+new file mode 100644
+index 0000000..d3343b9
+--- /dev/null
++++ b/docs/evidence/compat-g4/commands.txt
+@@ -0,0 +1,52 @@
++COMPAT G4 -- ACPI identity pairing: reproduction commands
++==========================================================
++
++Inputs (bundled in docs/evidence/compat-g3/, hashes re-checked below):
++  seabios-diagnostic-128k.bin   SHA-256 69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d
++      SeaBIOS rel-1.16.3 base + block/disk debug logging.  Its acpi_setup()
++      match table is UNCHANGED: PIIX4 8086:7113 or ICH9 LPC 8086:2918 only.
++  seabios-acpi-id-probe-128k.bin SHA-256 012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5
++      The same ROM plus a diagnostic-only patch that adds 8086:1e55 to the
++      ACPI/FADT match tables.  Used here ONLY as the positive control for the
++      snapshot scanner, not as a fix.
++  blank-usb-1m.img              1 MiB of zeroes (negative media control).
++
++Negative control -- historical LPC identity 8086:1e55, no ACPI-ID ROM patch:
++  ./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
++           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++           --platform=haswell --max-instr=200000000 \
++           --snapshot-save=/tmp/sb-diag.snap
++  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-diag.snap
++  -> "NO RSDP"
++
++Positive control -- probe ROM (1e55 added to SeaBIOS's match table), default identity
++(proves the scanner and the ROM-patch explanation):
++  ./x86emu --rom=docs/evidence/compat-g3/seabios-acpi-id-probe-128k.bin \
++           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++           --platform=haswell --max-instr=200000000 \
++           --snapshot-save=/tmp/sb-probe.snap
++  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-probe.snap
++  -> RSDP at 0xf6210, rev 0, checksum ok
++
++G4 lane -- ICH9 LPC identity with the UNMODIFIED diagnostic ROM:
++  ./x86emu --lpc=ich9 \
++           --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
++           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++           --platform=haswell --max-instr=200000000 \
++           --snapshot-save=/tmp/sb-ich9.snap
++  grep -aE 'ACPI|RSDP' /tmp/sb-ich9.err
++  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-ich9.snap
++
++Unit gate:
++  make test-compat     # 7/7 vectors, both identities + PAM + untouched functions
++
++Notes and limits:
++  * The run stops on the blank USB's "No bootable device. Retrying in 60
++    seconds" path after POST; ACPI tables are built during POST and survive in
++    RAM, which is what the snapshot scan reads.
++  * The snapshot file is ~19 MB of sparse RAM and is intentionally not stored.
++  * This lane proves RSDP/RSDT/table publication for a stock-match SeaBIOS.  It
++    is NOT a pinned-image BIOS-to-kernel boot and NOT shell acceptance; the
++    authoritative ISO still contains the original Stage 2 (see G3 README).
++  * Historical lanes are untouched: --lpc=ich9 is opt-in and the default
++    identity remains 8086:1e55 (make test keeps every prior receipt).
+diff --git a/docs/evidence/compat-g4/scan_acpi_snapshot.py b/docs/evidence/compat-g4/scan_acpi_snapshot.py
+new file mode 100644
+index 0000000..443d159
+--- /dev/null
++++ b/docs/evidence/compat-g4/scan_acpi_snapshot.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++"""COMPAT G4: walk RSDP -> RSDT/table set in an x86emu AURASNP1 snapshot.
++
++Reads only the sparse RAM record; never loads or mutates a guest.  Prints one
++line per table with its checksum verdict, and "NO RSDP" when the firmware did
++not publish a root pointer (the negative-control shape).
++"""
++from __future__ import annotations
++import argparse
++import struct
++from pathlib import Path
++
++PAGE = 4096
++
++
++def exact(f, n: int) -> bytes:
++    b = f.read(n)
++    if len(b) != n:
++        raise SystemExit(f"truncated snapshot: wanted {n} bytes, got {len(b)}")
++    return b
++
++
++def snapshot_ram(path: Path) -> bytearray:
++    with path.open("rb") as f:
++        if exact(f, 8) != b"AURASNP1":
++            raise SystemExit("not an x86emu AURASNP1 snapshot")
++        version, _machine_size, _cpu_size = struct.unpack("<III", exact(f, 12))
++        if version not in (1, 2):
++            raise SystemExit(f"unsupported snapshot version {version}")
++        while True:
++            tag = exact(f, 16).split(b"\0", 1)[0].decode("ascii", "replace")
++            (size,) = struct.unpack("<Q", exact(f, 8))
++            if tag != "ram":
++                f.seek(size, 1)
++                continue
++            pages = (size + PAGE - 1) // PAGE
++            bitmap = exact(f, (pages + 7) // 8)
++            ram = bytearray(size)
++            for p in range(pages):
++                if bitmap[p // 8] & (1 << (p % 8)):
++                    off = p * PAGE
++                    ram[off:off + min(PAGE, size - off)] = exact(f, min(PAGE, size - off))
++            return ram
++
++
++def checksum_ok(data: bytes) -> bool:
++    return (sum(data) & 0xFF) == 0
++
++
++def table(ram: bytearray, addr: int, label: str) -> bytes:
++    if addr < 0 or addr + 36 > len(ram):
++        raise SystemExit(f"{label} header outside RAM at 0x{addr:x}")
++    length = struct.unpack_from("<I", ram, addr + 4)[0]
++    if length < 36 or addr + length > len(ram):
++        raise SystemExit(f"{label} length {length} outside RAM at 0x{addr:x}")
++    body = bytes(ram[addr:addr + length])
++    print(f"  {label:<10} @0x{addr:08x} len={length:<6} "
++          f"checksum={'ok' if checksum_ok(body) else 'BAD'}")
++    return body
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("snapshot", type=Path)
++    args = ap.parse_args()
++    ram = snapshot_ram(args.snapshot)
++
++    start, end = 0x00080000, 0x00100000          # SeaBIOS RSDP search window
++    at = ram.find(b"RSD PTR ", start)
++    if at < 0 or at >= end:
++        print("NO RSDP")
++        return
++    rsdp = bytes(ram[at:at + 20])
++    if not checksum_ok(rsdp) or rsdp[15] != 0:
++        raise SystemExit(f"RSDP at 0x{at:x}: bad checksum or unexpected revision")
++    rsdt = struct.unpack_from("<I", ram, at + 16)[0]
++    print(f"RSDP       @0x{at:08x} rev={rsdp[15]} checksum=ok -> RSDT @0x{rsdt:08x}")
++
++    body = table(ram, rsdt, "RSDT")
++    if body[:4] != b"RSDT":
++        raise SystemExit(f"RSDT signature mismatch: {body[:4]!r}")
++    count = (len(body) - 36) // 4
++    print(f"  RSDT entries: {count}")
++    present = set()
++    for k in range(count):
++        entry = struct.unpack_from("<I", ram, rsdt + 36 + 4 * k)[0]
++        head = bytes(ram[entry:entry + 4])
++        length = struct.unpack_from("<I", ram, entry + 4)[0]
++        sig = head.decode("ascii", "replace")
++        got = table(ram, entry, sig)
++        present.add(sig)
++        if sig == "APIC":
++            base = struct.unpack_from("<I", got, 36)[0]
++            print(f"    MADT local APIC base=0x{base:x}")
++    print("tables:", " ".join(sorted(present)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/plans/COMPAT_PLAN.md b/docs/plans/COMPAT_PLAN.md
+new file mode 100644
+index 0000000..4b70abc
+--- /dev/null
++++ b/docs/plans/COMPAT_PLAN.md
+@@ -0,0 +1,221 @@
++# COMPAT plan — the BIOS route to the north star
++
++> **House style** (`ROADMAP.md`, `CORE_PLAN.md` §2/§5): dependency-ordered
++> phases, each with a definition of done and a test gate, shipping as **one
++> `.patch` per phase** under `patches/`. Everything below is measured against
++> the trees and the pinned inputs, and every phase names what it does **not**
++> establish. `COMPAT` is the only plan whose acceptance artifacts live partly
++> outside this repository (the AuraLite-OS release ISO and its Stage 2), so
++> absence of an artifact is recorded as a SKIP, never as a pass.
++
++## Why this plan exists
++
++`KERNEL_BOOT_PLAN` (K0–K8) proved the *direct* route: `--kernel=` loads an
++ELF64 kernel and reaches the guest shell without any firmware in between. The
++north star in `ROADMAP.md`, however, is written against the **BIOS route**:
++
++```
++  SeaBIOS → AuraLite Stage 1 (boot sector) → Stage 2 (real-mode loader)
++          → flat 64-bit kernel load → AuraLite OS shell
++```
++
++That route exposes a different class of defects — real-mode instruction
++encodings, IVT/BIOS-call ABI, unreal-mode segment caches, ACPI/E820 surfaces,
++and the handoff block the kernel actually parses. COMPAT is the plan that
++walks it.
++
++## Plan ledger
++
++| Phase | Status | Scope | Evidence |
++|---|---|---|---|
++| G0 | ✅ **measured** | Baseline and harness: pinned ISO/kernel/ROM hashes, deterministic run shape, v2 snapshot reader, PAM-aware debugger physical peek | `docs/evidence/compat-g2/`, `docs/evidence/compat-g3/` |
++| G1 | ✅ **measured** | Stage-1 boot-sector dispatch; the original Stage-2 relocation panic closes | `docs/evidence/compat-g2/commands.txt` (predecessor boundary) |
++| G2 | ✅ **measured** | Stage-2 entry gate: real-mode `SGDT/SIDT` store width fixed, `PUSHA/POPA` added, BIOS read receipts repeatable | `docs/evidence/compat-g2/README.md` |
++| G3 | 🔶 **diagnostics complete, acceptance open** | Stage-4 `ELF parse FAILED` root-caused to BIOS `call32_post` reloading FS/GS hidden caches; candidate guest-side fix built and A/B'd; ACPI-LPC-ID gate identified | `docs/evidence/compat-g3/README.md` |
++| G4 | ✅ **delivered** (patch `0062`) | ACPI identity pairing on the **emulator** side: `--lpc=ich9` makes the LPC function `8086:2918`, so stock SeaBIOS publishes RSDP/RSDT/FACP/SSDT/MADT(**MCFG**) | `docs/evidence/compat-g4/README.md` |
++| G5 | 📋 planned | Pinned-image acceptance under a stock BIOS: the Stage-2 FS/GS fix must land in the authoritative ISO, then RSDP/E820/`boot_info_t` agreement and shell-active measured on **that** image | — |
++| G6 | 📋 planned | SMP as the final rung: more than two vCPU contexts, INIT-SIPI bring-up of real APs through the BIOS route, per-AP timers | — |
++
++Ordering rationale: the CPU/bios boundary defects (G1–G2) had to close before
++the loader's own copy path could even be observed; the copy path (G3) had to
++be understood before ACPI (G4) could be attributed; ACPI had to be published
++before any handoff-field comparison on a stock BIOS is meaningful (G5); SMP
++(G6) multiplies every one of those surfaces and therefore comes last.
++
++## G0 — baseline and harness ✅
++
++**Done when:** every input is hash-pinned, the run shape is deterministic, and
++the inspection tools read the machine without changing it.
++
++Measured and recorded:
++
++- Pinned inputs: ISO 84,934,656 B SHA-256 `d2110f8b…`; `kernel.elf`
++  3,073,904 B SHA-256 `a1c5264b…`, entry `0xffffffff80191640`, `e_phnum=3`;
++  compatibility checkout `518bef07…`; SeaBIOS `rel-1.16.3` `a6ed6b70…`.
++- Two diagnostic ROMs (`69f2819d…` diagnostic, `012f5d98…` ACPI-ID probe) and
++  a 1 MiB all-zero USB image are bundled in `docs/evidence/compat-g3/`.
++- Snapshot format **v2**: PCI config and the AHCI BAR are restored before MMIO
++  validation; v1 files are refused instead of misread (this came out of a G3
++  test run — a tooling defect found by the gate, not by inspection).
++- `mem_debug_peek_byte()` follows Q35 PAM, so the debugger reads the guest's
++  RAM shadow instead of immutable flash.
++
++**Gate:** `make test` + `make test-sanitize` green; the 12-lane split-snapshot
++gate green; the bundled ROMs run to POST under `x86emu` with exit 0.
++
++## G1 — Stage-1 dispatch ✅
++
++**Done when:** the pinned ISO's boot sector is read and entered, and the
++Stage-2 relocation panic no longer terminates the loader.
++
++The G2 bundle records this as the predecessor boundary (the dispatch receipt
++`G2 basic status=0 count=1`, then Stage-2 relocation). No new claim is made
++here beyond what that bundle captured.
++
++## G2 — Stage-2 entry ✅
++
++**Done when:** the BIOS read path completes and `[BL3] AuraLite stage2 alive`
++is repeatable, with the CPU defect that blocked it fixed in `src/` and pinned
++by a unit vector.
++
++Measured root cause and fix:
++
++- `SGDT`/`SIDT` wrote an extra zero word at `addr+6` outside 64-bit mode.
++  SeaBIOS `call32_prep()` executes `SGDT [ESP+2]`; the eighth byte overwrote
++  the low half of saved `EBX` (`000eff88` → `000e0000`), so dispatch jumped to
++  the wrong address (`op=000e0000`).
++- `src/cpu.c` now writes the architectural six bytes in non-long mode and ten
++  in 64-bit mode; `tests/test_cpu.c` pins the exact real-mode encoding
++  `67 66 0F 01 44 24 02` with a stack sentinel.
++- `PUSHA/PUSHAD`/`POPA/POPAD` were added for the Stage-2 instruction path;
++  the post-entry `#UD opcode 0x60` boundary in the first replays is closed.
++
++**Receipts:** boot-sector read (`cmd=2 count=1 lba=0 buf=00007c00`), extended
++read (`count=126 lba=34 buf=00008000`), `[BL3] AuraLite stage2 alive`, twice
++repeatable; negative media lane (`--sata` omitted) prints
++`Boot failed: could not read the boot disk` and no Stage-2 marker.
++
++**Gate:** `make test-unit` (CPU + PAM + RTC vectors) green; the two positive
++replays byte-identical; no always-writable-ROM bypass in the lane.
++
++## G3 — Stage-4 FS/GS, and the ACPI gate 🔶
++
++**Done when (acceptance):** the authoritative release ISO, unchanged except
++for a reviewed Stage-2 fix, reaches `shell active` under a stock BIOS, and the
++handoff block the kernel parses matches the documented `boot_info_t` on that
++image.
++
++Diagnostics completed (measured, diagnostic-only):
++
++1. **FS/GS root cause.** SeaBIOS `call32_post()` reloads FS/GS selectors on
++   the AHCI INT 13h path: selector `0x0010`, hidden base `0x100`, limit
++   `0xffff`. Stage 2 had assumed its unreal-mode flat caches survived, so
++   `fat_load` read through `GS:[ESI]` and wrote through `FS:[EDI]` with the
++   wrong base — the ELF was copied to `0x200100` instead of `0x200000`.
++2. **Candidate guest fix.** `disk_read_lba` calls `go_unreal` on both the
++   success and the exhausted-retry exits, before restoring the saved GPR
++   frame; `go_unreal` now preserves all registers with `pushad/popad`
++   (`stage2-fs-gs-restore.patch`, Stage 2 = 6,656 B `51ecc150…`).
++3. **A/B under the same stock 128-KiB SeaBIOS:** pinned ISO → `ELF parse
++   FAILED`; candidate ISO → PT_LOAD copy, long mode, `[kernel] shell active`,
++   `fault=0`. QEMU reproduces the same split with both `if=ide` and explicit
++   AHCI + blank USB, so the defect is in the guest's assumption, not in
++   x86emu's segment model.
++4. **ACPI gate.** With an RSDP-publishing probe ROM and the *unchanged* ISO,
++   Stage 2 reports RSDP found and MADT parsed, then still fails ELF parsing:
++   the two defects are independent.
++
++**Open:** the authoritative ISO contains the original Stage 2, so no pinned
++image has booted to the shell. The candidate is a diagnostic build, not
++acceptance. **Gate for closing G3:** a reviewed Stage-2 patch in the release
++toolchain, a hash-guarded ISO rebuild, and the same receipts in QEMU and
++x86emu on that image.
++
++## G4 — ACPI identity pairing ✅ (patch `0062`)
++
++**Done when:** a stock, unpatched SeaBIOS publishes a complete and
++checksum-valid ACPI table set on this machine, with an opt-in switch that
++leaves every historical lane byte-identical.
++
++Measured boundary and fix:
++
++- SeaBIOS `rel-1.16.3` `acpi_setup()` matches only PIIX4 PM `8086:7113` or
++  ICH9 LPC `8086:2918`; this machine advertised Panther Point `8086:1e55`
++  (the ID the sample firmware knows) while already advertising the Q35 host
++  bridge `8086:29c0` and implementing its PAM registers. That inconsistency
++  suppressed ACPI entirely.
++- `--lpc=ich9` (`machine_t.cfg_lpc_ich9`, `src/devices.c`) makes the LPC
++  function `8086:2918`; the default stays `8086:1e55`.
++- `tests/test_compat.c` pins 7 vectors: both identities, class/header,
++  host bridge, AHCI function, and PAM under the ICH9 identity.
++
++**Receipts** (`docs/evidence/compat-g4/`):
++
++| Lane | Result |
++|---|---|
++| default identity + diagnostic ROM | `NO RSDP` |
++| probe ROM (ROM-side patch), default identity | RSDP `0xf6210`, RSDT `0x7ffe4c0`, 3 entries |
++| `--lpc=ich9` + **unmodified** diagnostic ROM | RSDP `0xf6210`, RSDT `0x7ffe470`, **4** entries: FACP, SSDT, APIC (MADT, LAPIC base `0xfee00000`), **MCFG** — all checksums 0 |
++| bundled sample firmware with the flag | unchanged: `HALTED`, `executed=4837677`, `GUEST_OK`, framebuffer marker |
++
++The extra `MCFG` versus the ROM-patch lane is itself a receipt: SeaBIOS now
++follows its full Q35/PCIe path, which the old match-table patch alone did not
++enable.
++
++**Gate:** `make test-compat` 7/7 in `make test` and `make test-sanitize`;
++historical lanes unchanged (flag is opt-in).
++
++**Not established by G4:** any pinned-image boot, any E820/`boot_info_t`
++agreement, any SMP/IOAPIC claim. G4 removes the emulator-side ACPI blocker
++only.
++
++## G5 — pinned-image acceptance under a stock BIOS 📋
++
++**Done when:** the authoritative ISO with the reviewed Stage-2 fix boots to
++`shell active` on x86emu under a stock SeaBIOS, and:
++
++- the RSDP/RSDT/MADT set matches the G4 placement and checksums;
++- the E820 map and the `boot_info_t` block parsed by the kernel match the
++  documented layout (`docs/evidence/compat-g3/bootinfo-layout.txt`), field by
++  field;
++- the run is repeatable (two byte-identical serial logs) and the full
++  `make test` / `make test-sanitize` stay green;
++- the QEMU same-ROM control agrees on the stable fields, with firmware
++  differences (E820 count, RSDP address) recorded rather than smoothed over.
++
++**Known inputs to reconcile:** QEMU's stock 128-KiB SeaBIOS reports eight E820
++entries and RSDP `0xf67b0`; x86emu's G3-era run reported seven and none. G4
++removes the RSDP half of that difference; the E820 difference has no
++established cause yet and must be either explained or recorded as a
++divergence with a reproduction.
++
++**Gate:** a new `tests/integration/g5_pinned_boot.sh` (SKIP without
++`AURAISO`) that hashes the ISO, runs the lane twice, asserts the shell marker,
++and dumps the handoff block for the comparator.
++
++## G6 — SMP as the final rung 📋
++
++**Done when:** the BIOS route boots a kernel with **more than two** executing
++contexts, real APs answer INIT-SIPI-SIPI through the IOAPIC/LAPIC path, and
++per-AP timers tick on the shared virtual clock without changing UP receipts.
++
++Current state: `EM_MAX_VCPU = 2` (`src/machine.h`), strict 1:1 round-robin,
++`--smp=2` proven through the K6/K8/KERNEL_BOOT lanes. G6 must decide between
++extending the context array and a scheduler, keep the K6 identity
++(`vtime_instr == instr_count` when one context runs), and re-run every
++historical lane for byte identity.
++
++**Gate:** `--smp=4` boots the guest, `[smp] AP #k online` for every AP, the
++guest's own `smpstress`/`irqapwake` tests pass, and `make test` +
++`make test-sanitize` stay green.
++
++## Non-claims
++
++- No pinned-image x86emu BIOS-to-kernel/shell result exists yet (G3 open).
++- The temporary candidate ISO is a diagnostic artifact; it is not stored in
++  the tree and is not acceptance evidence.
++- No allocator-zone measurement, CF9-causality claim, or PERF P4 pass is
++  established by any G phase.
++- G4's ROM-side control (`seabios-acpi-id-probe-128k.bin`) exists only to
++  validate the scanner and the root cause; the shipped fix is the emulator
++  identity switch, not a BIOS patch.
+diff --git a/src/cpu.h b/src/cpu.h
+index 002caa5..1dc2df6 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -45,7 +45,11 @@ typedef struct cpu {
+     segment_t seg[6];
+     uint64_t cr0, cr2, cr3, cr4;
+     uint64_t efer;
+-    uint64_t kgs_base;
++    uint64_t kgs_base;   /* IA32_KERNEL_GS_BASE (0xC0000102) -- the SWAPGS
++                          * partner of seg[SEG_GS].base which shadows
++                          * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
++                          * long mode flows through these MSRs (measured:
++                          * AuraLite's cpu_local/scheduler init). */
+     uint16_t fcw;    /* K3: x87 control word tracked for FLDCW/FNSTCW;
+                           * no x87 data model behind it (deliberate). */
+     uint32_t mxcsr;    /* K3: SSE control/status; FXSAVE/FXRSTOR/LDMXCSR/
+@@ -54,11 +58,7 @@ typedef struct cpu {
+                         * measured ring-3 lane (userspace memset/memcpy and
+                         * the AuraLite context switch) runs MOVAPS/UPS, MOVDQA/
+                         * U, scalar moves and PXOR through it. SIMD arithmetic
+-                        * is still deliberately out of scope. */   /* IA32_KERNEL_GS_BASE (0xC0000102) -- the SWAPGS
+-                          * partner of seg[SEG_GS].base which shadows
+-                          * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
+-                          * long mode flows through these MSRs (measured:
+-                          * AuraLite's cpu_local/scheduler init). */
++                        * is still deliberately out of scope. */
+     uint64_t gdtr_base; uint16_t gdtr_limit;
+     uint64_t idtr_base; uint16_t idtr_limit;
+     uint64_t tr_base;  uint16_t tr_limit;     /* H6: cached by LTR (0F 00 /3) */
+@@ -112,7 +112,17 @@ typedef struct cpu {
+ } cpu_t;
+ 
+ void cpu_reset(cpu_t *c);
+-/* executes exactly one instruction; returns 0 normally, -1 on fault/halt-without-progress */
++/* Executes exactly one instruction; returns 0 normally, -1 on fault or on a
++ * hlt+cli halt without progress.
++ *
++ * SMP INVARIANT (K6): `c` MUST be the machine's CURRENT context -- the value
++ * in m->cpu, not a parked vcpu slot.  cpu_step() passes m->cpu to every
++ * internal helper (translate, raise_exception, page_fault, descriptor reads),
++ * and the run loop swaps a slot into m->cpu with vcpu_load() before stepping
++ * it.  Calling cpu_step() on a slot copy would execute "one instruction" and
++ * deliver any exception into the live BSP context instead, so the swap is not
++ * an optimization but part of the interface.  Unit harnesses satisfy this by
++ * stepping the machine's own m->cpu. */
+ int  cpu_step(cpu_t *c);
+ 
+ uint64_t cpu_get_msr(cpu_t *c, uint32_t idx, int *found);
+diff --git a/src/devices.c b/src/devices.c
+index dceedf7..e02e774 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -1247,8 +1247,16 @@ void devices_init_common(machine_t *m) {
+     /* LPC bridge: real Intel convention dev31/func0. This chipset device
+      * shares device 31 with the AHCI function at 0:31.2, so advertise the
+      * multifunction header bit or PCI enumerators (including SeaBIOS) stop
+-     * after function 0 and never discover the SATA controller. */
+-    pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086, 0x1E55, 0x06, 0x01, 0);
++     * after function 0 and never discover the SATA controller.
++     * COMPAT G4: the identity is switchable.  The historical receipt (the
++     * sample firmware's own probe) expects 8086:1e55 (Panther Point);
++     * stock SeaBIOS's acpi_setup() instead recognizes only ICH9 LPC
++     * 8086:2918 -- the function that actually pairs with the Q35 host
++     * bridge this machine advertises -- and publishes no RSDP for 1e55.
++     * --lpc=ich9 selects that consistent pairing; the default keeps every
++     * historical lane byte-identical. */
++    pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086,
++                    m->cfg_lpc_ich9 ? 0x2918 : 0x1E55, 0x06, 0x01, 0);
+     lpc_pci->cfg[0x0E] = 0x80;                    /* multifunction, type 0 */
+ 
+     /* SATA/AHCI: real Intel convention dev31/func2.  STORE S1: BAR5 is a
+diff --git a/src/machine.h b/src/machine.h
+index 386ee14..2ed22d3 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -182,6 +182,13 @@ struct machine {
+      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
+     int cfg_cpus;
+     int cfg_no_fb;        /* VIDEO V1: --no-fb -- publish no linear fb (VGA text box) */
++    /* COMPAT G4: --lpc=ich9 identifies the LPC bridge as 8086:2918 (the
++     * ICH9 LPC function that belongs to the Q35 host bridge this machine
++     * already advertises).  SeaBIOS rel-1.16.3's acpi_setup() matches only
++     * PIIX4 8086:7113 or ICH9 8086:2918, so the default Panther Point
++     * identity (8086:1e55, the ID the sample firmware knows) makes stock
++     * SeaBIOS skip RSDP publication entirely.  0 = historical identity. */
++    int cfg_lpc_ich9;
+ 
+     /* USB U5 (--no-usb-uhci): omit the UHCI companion entirely so the
+      * EHCI-only machine shape of the guest's test_usb_ehci.sh QEMU lane
+diff --git a/src/main.c b/src/main.c
+index fc3411b..9ea627c 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -160,6 +160,9 @@ int main(int argc, char **argv) {
+                                      * runs one vCPU (0/1 = historical UP) */
+     int cfg_smp = 0;                /* --smp=N: K6 real execution contexts
+                                      * (currently max 2; 0/1 = one vCPU) */
++    int cfg_lpc_ich9 = 0;           /* --lpc=ich9: COMPAT G4 -- LPC bridge
++                                     * reports 8086:2918 (ICH9, the Q35 pair)
++                                     * so stock SeaBIOS publishes RSDP */
+     int smp_probe = 0;              /* EMU_DBG_SMP: vcpu1 vital-signs probe */
+     uint64_t watch_phys = 0;        /* --watch-phys=addr: store probe */
+     uint64_t max_instr = 50ull*1000*1000;
+@@ -220,6 +223,12 @@ int main(int argc, char **argv) {
+         else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
+         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
+         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
++        else if (!strncmp(argv[i], "--lpc=", 6)) {   /* COMPAT G4 */
++            const char *v = argv[i]+6;
++            if (!strcmp(v, "ich9")) cfg_lpc_ich9 = 1;
++            else if (!strcmp(v, "pantherpoint") || !strcmp(v, "default")) cfg_lpc_ich9 = 0;
++            else { fprintf(stderr, "--lpc: expected ich9|pantherpoint, got '%s'\n", v); return EXIT_INPUT_ERROR; }
++        }
+         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
+         else if (!strncmp(argv[i], "--watch-phys=", 13))
+             watch_phys = strtoull(argv[i]+13, NULL, 0);
+@@ -249,6 +258,9 @@ int main(int argc, char **argv) {
+                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
++                  "          [--lpc=ich9|pantherpoint] LPC bridge identity (COMPAT G4): ich9 =\n"
++                  "                      8086:2918 (pairs with the Q35 host bridge and lets stock\n"
++                  "                      SeaBIOS publish RSDP); pantherpoint = historical 8086:1e55\n"
+                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
+                    "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n"
+                   "          [--trace-file=path] disassembled trace, one line per instruction, with a\n"
+@@ -294,6 +306,7 @@ int main(int argc, char **argv) {
+     machine_t *m = calloc(1, sizeof *m);
+     m->cpu.mach = m;
+     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
++    m->cfg_lpc_ich9 = cfg_lpc_ich9;  /* COMPAT G4: consumed by devices_init_common */
+     m->cfg_no_uhci = cfg_no_uhci; /* USB U5: EHCI-only machine shape */
+     m->cfg_no_fb = cfg_no_fb; /* VIDEO V1: VGA text box, no published fb */
+     m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
+diff --git a/tests/test_compat.c b/tests/test_compat.c
+new file mode 100644
+index 0000000..1df74e6
+--- /dev/null
++++ b/tests/test_compat.c
+@@ -0,0 +1,96 @@
++/* tests/test_compat.c -- COMPAT G4: LPC identity pairing vectors.
++ *
++ * SeaBIOS rel-1.16.3's acpi_setup() recognizes only two LPC functions as
++ * ACPI-capable: PIIX4 PM 8086:7113 and ICH9 LPC 8086:2918.  This machine
++ * advertises a Q35 host bridge (8086:29c0) but the historical LPC identity
++ * is Panther Point 8086:1e55 (the ID the bundled sample firmware knows), so
++ * stock SeaBIOS skips RSDP publication.  --lpc=ich9 switches the LPC
++ * function to the ICH9 identity that pairs with the advertised host bridge;
++ * the default must stay byte-identical for every historical lane.
++ *
++ * Vectors:
++ *  1. default: LPC 0:31.0 is 8086:1e55
++ *  2. default: class 06/01 and the multifunction header bit are intact
++ *  3. ich9:    LPC is 8086:2918
++ *  4. ich9:    class/subclass/header are unchanged by the switch
++ *  5. both:    the host bridge stays 8086:29c0 (PAM ownership)
++ *  6. both:    AHCI 0:31.2 stays 8086:1e03 (function 2 untouched)
++ *  7. ich9:    Q35 PAM decode still works under the ICH9 LPC identity
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++#include "harness.h"
++#include "pci.h"
++#include "ahci.h"
++
++#define PCI_CFG_ADDR 0xCF8
++#define PCI_CFG_DATA 0xCFC
++
++typedef struct { machine_t m; } fx_t;
++
++static void fx_init(fx_t *f, int lpc_ich9) {
++    setup_machine(&f->m);
++    f->m.cfg_lpc_ich9 = lpc_ich9;      /* consumed by devices_init_common */
++    devices_init_common(&f->m);
++}
++
++static void fx_done(fx_t *f) {
++    devices_done(&f->m);
++}
++
++static uint32_t cfg32(machine_t *m, unsigned bus, unsigned dev, unsigned func,
++                      unsigned reg) {
++    io_write(m, PCI_CFG_ADDR, 4,
++             0x80000000u | (bus << 16) | (dev << 11) | (func << 8) | (reg & 0xFCu));
++    return io_read(m, PCI_CFG_DATA, 4);
++}
++
++static void test_lpc_identity(void) {
++    fx_t f;
++    fx_init(&f, 0);
++    uint32_t id = cfg32(&f.m, 0, 31, 0, 0x00);
++    assert((id & 0xFFFF) == 0x8086);            /* vector 1 */
++    assert((id >> 16) == 0x1E55);
++    uint32_t cls = cfg32(&f.m, 0, 31, 0, 0x08);
++    assert(((cls >> 16) & 0xFF) == 0x01);       /* subclass: ISA bridge  */
++    assert(((cls >> 24) & 0xFF) == 0x06);       /* class: bridge         */
++    uint32_t hdr = cfg32(&f.m, 0, 31, 0, 0x0C);
++    assert(((hdr >> 16) & 0xFF) == 0x80);       /* vector 2: multifunction */
++    assert(cfg32(&f.m, 0, 0, 0, 0x00) == 0x29C08086u);  /* vector 5 */
++    assert(cfg32(&f.m, 0, 31, 2, 0x00) == 0x1E038086u); /* vector 6 */
++    fx_done(&f);
++
++    fx_init(&f, 1);
++    id = cfg32(&f.m, 0, 31, 0, 0x00);
++    assert((id & 0xFFFF) == 0x8086);            /* vector 3 */
++    assert((id >> 16) == 0x2918);
++    cls = cfg32(&f.m, 0, 31, 0, 0x08);
++    assert(((cls >> 16) & 0xFF) == 0x01);       /* vector 4 */
++    assert(((cls >> 24) & 0xFF) == 0x06);
++    hdr = cfg32(&f.m, 0, 31, 0, 0x0C);
++    assert(((hdr >> 16) & 0xFF) == 0x80);
++    assert(cfg32(&f.m, 0, 0, 0, 0x00) == 0x29C08086u);
++    assert(cfg32(&f.m, 0, 31, 2, 0x00) == 0x1E038086u);
++
++    /* vector 7: PAM is owned by the host bridge, so the LPC identity must
++     * not disturb it.  Open the F0000-FFFFF window for RAM reads/writes,
++     * store through the bus, read back; then close it and observe flash. */
++    f.m.rom[0x10000] = 0x5A;                    /* ROM byte at 0xF0000 */
++    io_write(&f.m, PCI_CFG_ADDR, 4, 0x80000000u | PCI_Q35_PAM0);
++    io_write(&f.m, PCI_CFG_DATA, 1, 0x30);      /* PAM0 bits 5:4 = 11 */
++    mem_write(&f.m, 0xF0000, 1, 0x77);
++    assert(mem_read(&f.m, 0xF0000, 1) == 0x77);
++    io_write(&f.m, PCI_CFG_DATA, 1, 0x00);      /* back to flash */
++    assert(mem_read(&f.m, 0xF0000, 1) == 0x5A);
++    fx_done(&f);
++    puts("ok: lpc_identity_pairing");
++}
++
++int main(void) {
++    test_lpc_identity();
++    puts("compat vectors: 7/7 ok");
++    return 0;
++}
+-- 
+2.47.3
+

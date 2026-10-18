@@ -1,0 +1,563 @@
+[ahci] ABAR registered at 0xfeb10000 (6 ports, S1: registers+presence)
+
+[boot] platform=Haswell (LGA1150, model 0x3C) rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin (131072 bytes) disk=disk/disk.img (1048576 bytes)
+[smp] G6: 4 vCPU contexts live; vcpu1..3 parked in wait-for-SIPI (LAPIC ids 1..3), strict 1:1 round-robin
+SeaBIOS (version ?-20261016_123815-e2b.local)
+BUILD: gcc: (Debian 14.2.0-19) 14.2.0 binutils: (GNU Binutils for Debian) 2.44
+Running on QEMU (q35)
+physbits: signature="GenuineIntel", pae=no, lm=yes, phys-bits=32, valid=yes
+cpuid 0x40000000: eax 40000000, signature 'AuraLite HV '
+RamSize: 0x08000000 [cmos]
+Relocating init from 0x000e1d80 to 0x06ff2ce0 (size 53888)
+=== PCI bus & bridge init ===
+PCI: pci_bios_init_bus_rec bus = 0x0
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=47811
+[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=ef2e9 vt=47842
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=47872
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=47927
+[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=ef2e9 vt=47958
+PCI: pci_bios_init_bus_rec bdf = 0x8
+PCI: primary bus = 0x0
+PCI: secondary bus = 0xff -> 0x1
+PCI: pci_bios_init_bus_rec bus = 0x1
+PCI: subordinate bus = 0x0 -> 0x1
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=55083
+[pci-probe] io-read fn=0 reg=0x0a size=2 val=0x00000601 rip=ef2e9 vt=55113
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=55143
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=55198
+[pci-probe] io-read fn=2 reg=0x0a size=2 val=0x00000106 rip=ef2e9 vt=55228
+=== PCI device probing ===
+[pci-probe] io-read fn=0 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=64932
+[pci-probe] io-read fn=0 reg=0x00 size=4 val=0x29188086 rip=ef2ac vt=65687
+[pci-probe] io-read fn=0 reg=0x08 size=4 val=0x06010000 rip=ef2ac vt=65704
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=65728
+[pci-probe] io-read fn=0 reg=0x0e size=1 val=0x00000080 rip=ef326 vt=65761
+[pci-probe] io-read fn=2 reg=0x00 size=2 val=0x00008086 rip=ef2e9 vt=65816
+[pci-probe] io-read fn=2 reg=0x00 size=4 val=0x1e038086 rip=ef2ac vt=66619
+[pci-probe] io-read fn=2 reg=0x08 size=4 val=0x01060100 rip=ef2ac vt=66636
+[pci-probe] io-read fn=2 reg=0x0e size=1 val=0x00000000 rip=ef326 vt=66660
+Found 6 PCI devices (max PCI bus is 00)
+[pci] host bridge: MMCONFIG (ECAM) window enabled at 0xb0000000
+PCIe: using q35 mmconfig at 0xb0000000
+=== PCI new allocation pass #1 ===
+PCI: check devices
+[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=116340
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xffffffff rip=ef1cf vt=116376
+[pci-probe] ecam-read fn=0 reg=0x010 size=4 val=0xffffffff rip=ef28e vt=116391
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0x00000000 rip=ef1cf vt=116410
+[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=119083
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xffffffff rip=ef1cf vt=119119
+[pci-probe] ecam-read fn=0 reg=0x014 size=4 val=0xffffffff rip=ef28e vt=119134
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0x00000000 rip=ef1cf vt=119153
+[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=121896
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xffffffff rip=ef1cf vt=121932
+[pci-probe] ecam-read fn=0 reg=0x018 size=4 val=0xffffffff rip=ef28e vt=121947
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0x00000000 rip=ef1cf vt=121966
+[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=124779
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xffffffff rip=ef1cf vt=124815
+[pci-probe] ecam-read fn=0 reg=0x01c size=4 val=0xffffffff rip=ef28e vt=124830
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0x00000000 rip=ef1cf vt=124849
+[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=127732
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xffffffff rip=ef1cf vt=127768
+[pci-probe] ecam-read fn=0 reg=0x020 size=4 val=0xffffffff rip=ef28e vt=127783
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0x00000000 rip=ef1cf vt=127802
+[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0x00000000 rip=ef28e vt=130755
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xffffffff rip=ef1cf vt=130791
+[pci-probe] ecam-read fn=0 reg=0x024 size=4 val=0xffffffff rip=ef28e vt=130806
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0x00000000 rip=ef1cf vt=130825
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=133851
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfffff800 rip=ef1cf vt=133870
+[pci-probe] ecam-read fn=0 reg=0x030 size=4 val=0xfffff800 rip=ef28e vt=133892
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0x00000000 rip=ef1cf vt=133911
+[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=137020
+[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0xffffffff rip=ef1cf vt=137056
+[pci-probe] ecam-read fn=2 reg=0x010 size=4 val=0x00000000 rip=ef28e vt=137071
+[pci-probe] ecam-write fn=2 reg=0x010 size=4 val=0x00000000 rip=ef1cf vt=137090
+[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=137125
+[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0xffffffff rip=ef1cf vt=137161
+[pci-probe] ecam-read fn=2 reg=0x014 size=4 val=0x00000000 rip=ef28e vt=137176
+[pci-probe] ecam-write fn=2 reg=0x014 size=4 val=0x00000000 rip=ef1cf vt=137195
+[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=137230
+[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0xffffffff rip=ef1cf vt=137266
+[pci-probe] ecam-read fn=2 reg=0x018 size=4 val=0x00000000 rip=ef28e vt=137281
+[pci-probe] ecam-write fn=2 reg=0x018 size=4 val=0x00000000 rip=ef1cf vt=137300
+[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=137335
+[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0xffffffff rip=ef1cf vt=137371
+[pci-probe] ecam-read fn=2 reg=0x01c size=4 val=0x00000000 rip=ef28e vt=137386
+[pci-probe] ecam-write fn=2 reg=0x01c size=4 val=0x00000000 rip=ef1cf vt=137405
+[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=137440
+[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0xffffffff rip=ef1cf vt=137476
+[pci-probe] ecam-read fn=2 reg=0x020 size=4 val=0x00000000 rip=ef28e vt=137491
+[pci-probe] ecam-write fn=2 reg=0x020 size=4 val=0x00000000 rip=ef1cf vt=137510
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfeb10000 rip=ef28e vt=137545
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xffffffff rip=ef1cf vt=137581
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfffff000 rip=ef28e vt=137596
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfeb10000 rip=ef1cf vt=137615
+[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=140777
+[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0xfffff800 rip=ef1cf vt=140796
+[pci-probe] ecam-read fn=2 reg=0x030 size=4 val=0x00000000 rip=ef28e vt=140818
+[pci-probe] ecam-write fn=2 reg=0x030 size=4 val=0x00000000 rip=ef1cf vt=140837
+=== PCI new allocation pass #2 ===
+PCI: IO: c000 - bfff
+PCI: 32: 00000000c0000000 - 00000000fec00000
+PCI: map device bdf=00:00.0  bar 0, addr febe0000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 1, addr febe1000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 2, addr febe2000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 3, addr febe3000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 4, addr febe4000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 5, addr febe5000, size 00001000 [mem]
+PCI: map device bdf=00:00.0  bar 6, addr febe6000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 0, addr febe7000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 1, addr febe8000, size 00001000 [mem]
+PCI: map device bdf=00:01.0  bar 6, addr febe9000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 0, addr febea000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 1, addr febeb000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 2, addr febec000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 3, addr febed000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 4, addr febee000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 5, addr febef000, size 00001000 [mem]
+PCI: map device bdf=00:02.0  bar 6, addr febf0000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 0, addr febf1000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 1, addr febf2000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 2, addr febf3000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 3, addr febf4000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 4, addr febf5000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 5, addr febf6000, size 00001000 [mem]
+PCI: map device bdf=00:03.0  bar 6, addr febf7000, size 00001000 [mem]
+PCI: map device bdf=00:1f.0  bar 0, addr febf8000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x010 size=4 val=0xfebf8000 rip=ef1cf vt=197213
+PCI: map device bdf=00:1f.0  bar 1, addr febf9000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x014 size=4 val=0xfebf9000 rip=ef1cf vt=199356
+PCI: map device bdf=00:1f.0  bar 2, addr febfa000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x018 size=4 val=0xfebfa000 rip=ef1cf vt=201502
+PCI: map device bdf=00:1f.0  bar 3, addr febfb000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x01c size=4 val=0xfebfb000 rip=ef1cf vt=203648
+PCI: map device bdf=00:1f.0  bar 4, addr febfc000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x020 size=4 val=0xfebfc000 rip=ef1cf vt=205794
+PCI: map device bdf=00:1f.0  bar 5, addr febfd000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x024 size=4 val=0xfebfd000 rip=ef1cf vt=207940
+PCI: map device bdf=00:1f.0  bar 6, addr febfe000, size 00001000 [mem]
+[pci-probe] ecam-write fn=0 reg=0x030 size=4 val=0xfebfe000 rip=ef1cf vt=210089
+PCI: map device bdf=00:1f.2  bar 5, addr febff000, size 00001000 [mem]
+[pci-probe] ecam-write fn=2 reg=0x024 size=4 val=0xfebff000 rip=ef1cf vt=212235
+PCI: init bdf=00:00.0 id=8086:29c0
+PCI: init bdf=00:01.0 id=8086:0101
+PCI: init bdf=00:02.0 id=8086:0412
+PCI: init bdf=00:03.0 id=8086:1e26
+PCI: init bdf=00:1f.0 id=8086:2918
+[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=219029
+[pci-probe] ecam-write fn=0 reg=0x060 size=1 val=0x0000000a rip=ef251 vt=219127
+[pci-probe] ecam-write fn=0 reg=0x068 size=1 val=0x0000000a rip=ef251 vt=219145
+[pci-probe] ecam-write fn=0 reg=0x061 size=1 val=0x0000000a rip=ef251 vt=219175
+[pci-probe] ecam-write fn=0 reg=0x069 size=1 val=0x0000000a rip=ef251 vt=219193
+[pci-probe] ecam-write fn=0 reg=0x062 size=1 val=0x0000000b rip=ef251 vt=219223
+[pci-probe] ecam-write fn=0 reg=0x06a size=1 val=0x0000000b rip=ef251 vt=219241
+[pci-probe] ecam-write fn=0 reg=0x063 size=1 val=0x0000000b rip=ef251 vt=219271
+[pci-probe] ecam-write fn=0 reg=0x06b size=1 val=0x0000000b rip=ef251 vt=219289
+Q35 LPC init: elcr=00 0c
+[pci-probe] ecam-write fn=0 reg=0x040 size=4 val=0x0000b001 rip=ef1cf vt=220051
+[pci-probe] ecam-write fn=0 reg=0x044 size=1 val=0x00000080 rip=ef251 vt=220070
+[pci-probe] ecam-write fn=0 reg=0x0f0 size=4 val=0xfed1c001 rip=ef1cf vt=220090
+Using pmtimer, ioport 0xb008
+[pci-probe] ecam-read fn=0 reg=0x004 size=2 val=0x00000000 rip=ef2c4 vt=221167
+[pci-probe] ecam-write fn=0 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=221187
+PCI: init bdf=00:1f.2 id=8086:1e03
+[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=222262
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000000 rip=ef2c4 vt=222487
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=222507
+PCI: Using 00:02.0 for primary VGA
+[lapic] software ENABLED (spurious vector 0xff)
+[lapic] vcpu1 took INIT: state reset, parked in wait-for-SIPI
+[lapic] vcpu2 took INIT: state reset, parked in wait-for-SIPI
+[lapic] vcpu3 took INIT: state reset, parked in wait-for-SIPI
+[lapic] vcpu1 took SIPI: entering real mode at 0x10000:0
+[lapic] vcpu2 took SIPI: entering real mode at 0x10000:0
+[lapic] vcpu3 took SIPI: entering real mode at 0x10000:0
+handle_smp: apic_id=0x1
+[smp] vcpu1 stopped (rc=-1) -- parked; 3 context(s) still live
+handle_smp: apic_id=0x2
+[smp] vcpu2 stopped (rc=-1) -- parked; 2 context(s) still live
+handle_smp: apic_id=0x3
+[smp] vcpu3 stopped (rc=-1) -- parked; 1 context(s) still live
+Found 4 cpu(s) max supported 4 cpu(s)
+Copying PIR from 0x06fffce0 to 0x000f6440
+[pci-probe] ecam-read fn=0 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=235772
+[pci-probe] ecam-read fn=0 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=235788
+[pci-probe] ecam-read fn=2 reg=0x03d size=1 val=0x00000000 rip=ef302 vt=235819
+[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=235835
+Copying MPTABLE from 0x00006e20/6feaa40 to 0x000f6320
+Copying SMBIOS from 0x00006e20 to 0x000f6170
+ACPI DSDT=0x07ffe380
+Copying ACPI RSDP from 0x00006dfc to 0x000f6150
+Scan for VGA option rom
+Turning on vga text mode console
+[cpu] real-mode vector 16 (#??) -> f000:f065 via IVT
+SeaBIOS (version ?-20261016_123815-e2b.local)
+EHCI init on dev 00:03.0 (regs=0xfebf10ff)
+[kbd-probe] status=0x00 rip=6ff48e6 vt=1615892
+[kbd-probe] status=0x00 rip=f05e2 vt=1615914
+[kbd-probe] status=0x18 rip=f05e2 vt=1615952
+[kbd-probe] status=0x18 rip=6ff48e6 vt=1615979
+[kbd-probe] status=0x18 rip=f05e2 vt=1616003
+[kbd-probe] status=0x1d rip=6ff48ac vt=1616020
+[kbd-probe] read=0x55 status=0x1d rip=6ff48d0 vt=1616023
+[kbd-probe] status=0x1c rip=f05e2 vt=1616051
+[kbd-probe] status=0x1d rip=6ff48ac vt=1616068
+[kbd-probe] read=0x00 status=0x1d rip=6ff48d0 vt=1616071
+[kbd-probe] status=0x1c rip=f05e2 vt=1616277
+[kbd-probe] status=0x1c rip=f05e2 vt=1616293
+[pci-probe] ecam-read fn=2 reg=0x024 size=4 val=0xfebff000 rip=ef28e vt=1617623
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=ef2c4 vt=1617654
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000103 rip=ef20e vt=1617674
+[pci-probe] ecam-read fn=2 reg=0x03c size=1 val=0x00000000 rip=ef302 vt=1618349
+AHCI controller at 00:1f.2, iobase 0xfebff000, irq 0
+[pci-probe] ecam-read fn=2 reg=0x004 size=2 val=0x00000103 rip=ef2c4 vt=1619622
+[pci-probe] ecam-write fn=2 reg=0x004 size=2 val=0x00000107 rip=ef20e vt=1619642
+[ahci-mmio-probe] read off=0x4 size=4 rip=6ffb991 vt=1619651
+[ahci-mmio-probe] write off=0x4 size=4 val=0x80000000 rip=6ffb99c vt=1619654
+[ahci-mmio-probe] read off=0x0 size=4 rip=6ffb9a2 vt=1619656
+[ahci-mmio-probe] read off=0xc size=4 rip=6ffb9aa vt=1619659
+[ahci-mmio-probe] write off=0x100 size=4 val=0x6ff2000 rip=efa19 vt=1632216
+[ahci-mmio-probe] write off=0x108 size=4 val=0x6ff2500 rip=efa19 vt=1632227
+[ahci-mmio-probe] write off=0x104 size=4 val=0x0 rip=efa19 vt=1632242
+[ahci-mmio-probe] write off=0x10c size=4 val=0x0 rip=efa19 vt=1632253
+[ahci-mmio-probe] read off=0x118 size=4 rip=efa28 vt=1633632
+[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=1633646
+[ahci-mmio-probe] read off=0x110 size=4 rip=efa28 vt=1633655
+[ahci-mmio-probe] read off=0x118 size=4 rip=efa28 vt=1633683
+[ahci-mmio-probe] write off=0x118 size=4 val=0x10 rip=efa19 vt=1633696
+[ahci-mmio-probe] write off=0x118 size=4 val=0x12 rip=efa19 vt=1633708
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1633743
+[kbd-probe] status=0x1c rip=f05e2 vt=1633825
+[kbd-probe] status=0x1c rip=f05e2 vt=1633841
+[kbd-probe] status=0x0c rip=f05e2 vt=1633873
+[kbd-probe] write=0xff pending=0x00 status=0x04 rip=6ff729e vt=1633882
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1633882
+[kbd-probe] reply=0xaa status=0x04 rip=6ff729e vt=1633882
+[kbd-probe] status=0x05 rip=6ff7216 vt=1633913
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1633917
+[kbd-probe] status=0x05 rip=6ff7216 vt=1633968
+[kbd-probe] read=0xaa status=0x05 rip=6ff7220 vt=1633972
+[kbd-probe] status=0x04 rip=f05e2 vt=1634001
+[kbd-probe] status=0x0c rip=f05e2 vt=1634017
+[kbd-probe] status=0x1c rip=f05e2 vt=1634079
+[kbd-probe] status=0x1c rip=f05e2 vt=1634095
+[ahci-mmio-probe] write off=0x180 size=4 val=0x6fee800 rip=efa19 vt=1648135
+[ahci-mmio-probe] write off=0x188 size=4 val=0x6feee00 rip=efa19 vt=1648146
+[ahci-mmio-probe] write off=0x184 size=4 val=0x0 rip=efa19 vt=1648161
+[ahci-mmio-probe] write off=0x18c size=4 val=0x0 rip=efa19 vt=1648172
+[ahci-mmio-probe] read off=0x198 size=4 rip=efa28 vt=1649755
+[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=1649769
+[ahci-mmio-probe] read off=0x190 size=4 rip=efa28 vt=1649778
+[ahci-mmio-probe] read off=0x198 size=4 rip=efa28 vt=1649806
+[ahci-mmio-probe] write off=0x198 size=4 val=0x10 rip=efa19 vt=1649819
+[ahci-mmio-probe] write off=0x198 size=4 val=0x12 rip=efa19 vt=1649831
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1649866
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1649938
+[kbd-probe] status=0x1c rip=f05e2 vt=1650020
+[kbd-probe] status=0x1c rip=f05e2 vt=1650036
+[kbd-probe] status=0x0c rip=f05e2 vt=1650068
+[kbd-probe] write=0xf5 pending=0x00 status=0x04 rip=6ff729e vt=1650077
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1650077
+[kbd-probe] status=0x05 rip=6ff7216 vt=1650108
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1650112
+[kbd-probe] status=0x04 rip=f05e2 vt=1650156
+[kbd-probe] status=0x0c rip=f05e2 vt=1650172
+[kbd-probe] status=0x1c rip=f05e2 vt=1650232
+[kbd-probe] status=0x1c rip=f05e2 vt=1650248
+[ahci-mmio-probe] write off=0x200 size=4 val=0x6fee000 rip=efa19 vt=1665104
+[ahci-mmio-probe] write off=0x208 size=4 val=0x6fee600 rip=efa19 vt=1665115
+[ahci-mmio-probe] write off=0x204 size=4 val=0x0 rip=efa19 vt=1665130
+[ahci-mmio-probe] write off=0x20c size=4 val=0x0 rip=efa19 vt=1665141
+[ahci-mmio-probe] read off=0x218 size=4 rip=efa28 vt=1666940
+[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=1666954
+[ahci-mmio-probe] read off=0x210 size=4 rip=efa28 vt=1666963
+[ahci-mmio-probe] read off=0x218 size=4 rip=efa28 vt=1666991
+[ahci-mmio-probe] write off=0x218 size=4 val=0x10 rip=efa19 vt=1667004
+[ahci-mmio-probe] write off=0x218 size=4 val=0x12 rip=efa19 vt=1667016
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1667051
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1667123
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1667195
+[kbd-probe] status=0x1c rip=f05e2 vt=1667277
+[kbd-probe] status=0x1c rip=f05e2 vt=1667293
+[kbd-probe] status=0x0c rip=f05e2 vt=1667325
+[kbd-probe] write=0xf0 pending=0x00 status=0x04 rip=6ff729e vt=1667334
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1667334
+[kbd-probe] status=0x05 rip=6ff7216 vt=1667365
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1667369
+[kbd-probe] status=0x04 rip=f05e2 vt=1667404
+[kbd-probe] write=0x02 pending=0xf0 status=0x04 rip=6ff729e vt=1667413
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1667413
+[kbd-probe] status=0x05 rip=6ff7216 vt=1667444
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1667448
+[kbd-probe] status=0x04 rip=f05e2 vt=1667486
+[kbd-probe] status=0x0c rip=f05e2 vt=1667502
+[kbd-probe] status=0x1c rip=f05e2 vt=1667562
+[kbd-probe] status=0x1c rip=f05e2 vt=1667578
+[ahci-mmio-probe] write off=0x280 size=4 val=0x6febc00 rip=efa19 vt=1683430
+[ahci-mmio-probe] write off=0x288 size=4 val=0x6febb00 rip=efa19 vt=1683441
+[ahci-mmio-probe] write off=0x284 size=4 val=0x0 rip=efa19 vt=1683456
+[ahci-mmio-probe] write off=0x28c size=4 val=0x0 rip=efa19 vt=1683467
+[ahci-mmio-probe] read off=0x298 size=4 rip=efa28 vt=1685590
+[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=1685604
+[ahci-mmio-probe] read off=0x290 size=4 rip=efa28 vt=1685613
+[ahci-mmio-probe] read off=0x298 size=4 rip=efa28 vt=1685641
+[ahci-mmio-probe] write off=0x298 size=4 val=0x10 rip=efa19 vt=1685654
+[ahci-mmio-probe] write off=0x298 size=4 val=0x12 rip=efa19 vt=1685666
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1685701
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1685773
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1685845
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1685917
+[kbd-probe] status=0x1c rip=f05e2 vt=1685999
+[kbd-probe] status=0x1c rip=f05e2 vt=1686015
+[kbd-probe] status=0x0c rip=f05e2 vt=1686047
+[kbd-probe] write=0xf4 pending=0x00 status=0x04 rip=6ff729e vt=1686056
+[kbd-probe] reply=0xfa status=0x04 rip=6ff729e vt=1686056
+[kbd-probe] status=0x05 rip=6ff7216 vt=1686087
+[kbd-probe] read=0xfa status=0x05 rip=6ff7220 vt=1686091
+[kbd-probe] status=0x04 rip=f05e2 vt=1686135
+[kbd-probe] status=0x0c rip=f05e2 vt=1686151
+PS2 keyboard initialized
+[ahci-mmio-probe] write off=0x300 size=4 val=0x6ff0800 rip=efa19 vt=1700522
+[ahci-mmio-probe] write off=0x308 size=4 val=0x6ff0e00 rip=efa19 vt=1700533
+[ahci-mmio-probe] write off=0x304 size=4 val=0x0 rip=efa19 vt=1700548
+[ahci-mmio-probe] write off=0x30c size=4 val=0x0 rip=efa19 vt=1700559
+[ahci-mmio-probe] read off=0x318 size=4 rip=efa28 vt=1702478
+[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=1702492
+[ahci-mmio-probe] read off=0x310 size=4 rip=efa28 vt=1702501
+[ahci-mmio-probe] read off=0x318 size=4 rip=efa28 vt=1702529
+[ahci-mmio-probe] write off=0x318 size=4 val=0x10 rip=efa19 vt=1702542
+[ahci-mmio-probe] write off=0x318 size=4 val=0x12 rip=efa19 vt=1702554
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1702589
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1702661
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1702733
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1702805
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1702877
+[ahci-mmio-probe] write off=0x380 size=4 val=0x6ff0400 rip=efa19 vt=1717423
+[ahci-mmio-probe] write off=0x388 size=4 val=0x6ff0300 rip=efa19 vt=1717434
+[ahci-mmio-probe] write off=0x384 size=4 val=0x0 rip=efa19 vt=1717449
+[ahci-mmio-probe] write off=0x38c size=4 val=0x0 rip=efa19 vt=1717460
+[ahci-mmio-probe] read off=0x398 size=4 rip=efa28 vt=1719607
+[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=1719621
+[ahci-mmio-probe] read off=0x390 size=4 rip=efa28 vt=1719630
+[ahci-mmio-probe] read off=0x398 size=4 rip=efa28 vt=1719658
+[ahci-mmio-probe] write off=0x398 size=4 val=0x10 rip=efa19 vt=1719671
+[ahci-mmio-probe] write off=0x398 size=4 val=0x12 rip=efa19 vt=1719683
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1719718
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1719790
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1719862
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1719934
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1720006
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1720078
+Searching bootorder for: HALT
+Found 0 lpt ports
+Found 0 serial ports
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1722485
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1722557
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1722629
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1722701
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1722773
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1722845
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1723208
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1723280
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1723352
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1723424
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1723496
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1723568
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1723931
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1724003
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1724075
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1724147
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1724219
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1724291
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1724654
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1724726
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1724798
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1724870
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1724942
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1725014
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1725377
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1725449
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1725521
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1725593
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1725665
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1725737
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1726100
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1726172
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1726244
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1726316
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1726388
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1726460
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1726823
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1726895
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1726967
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1727039
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1727111
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1727183
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1727546
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1727618
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1727690
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1727762
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1727834
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1727906
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1728269
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1728341
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1728413
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1728485
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1728557
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1728629
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1728992
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1729064
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1729136
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1729208
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1729280
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1729352
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1729715
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1729787
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1729859
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1729931
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730003
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730075
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1730438
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1730510
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1730582
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1730654
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730726
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730798
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731161
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731233
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1731305
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1731377
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1731449
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1731521
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731884
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731956
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732028
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732100
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732172
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732244
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1732607
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1732679
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732751
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732823
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732895
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732967
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1733330
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1733402
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1733474
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1733546
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1733618
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1733690
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734053
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734125
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734197
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734269
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1734341
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1734413
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734776
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734848
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734920
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734992
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735064
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735136
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1735499
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1735571
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1735643
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1735715
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735787
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735859
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1736222
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1736294
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1736366
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1736438
+[ahci-mmio-probe] write off=0x118 size=4 val=0x4000 rip=efa19 vt=6216395
+[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=6217129
+[ahci-mmio-probe] write off=0x198 size=4 val=0x4000 rip=efa19 vt=6232679
+[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=6233341
+[ahci-mmio-probe] write off=0x218 size=4 val=0x4000 rip=efa19 vt=6250135
+[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=6250725
+[ahci-mmio-probe] write off=0x298 size=4 val=0x4000 rip=efa19 vt=6268741
+[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=6269259
+[ahci-mmio-probe] write off=0x318 size=4 val=0x4000 rip=efa19 vt=6285413
+[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=6285859
+[ahci-mmio-probe] write off=0x398 size=4 val=0x4000 rip=efa19 vt=6302621
+[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=6302995
+---- CPU state (mode=real16, instr=9995839) ----
+RAX=0000000000000000 RBX=0000000000009301 RCX=000000000000930c RDX=0000000000000000
+RSI=000000000000df00 RDI=0000000000000000 RBP=000000000000018e RSP=0000000000006e48
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=0000000000007e04 RFLAGS=0000000000000012 CR0=0000000000000010 CR3=0000000000000000 CR4=0000000000000000 EFER=0000000000000000
+CS=f000 base=00000000000f0000 L=0 D=0   SS=0000 base=0000000000000000
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=9995839 instr_count=9995839 halted=0 fault=0
+[stats] vcpu=1 executed_steps=736 instr_count=736 halted=1 fault=0
+[stats] vcpu=2 executed_steps=1387 instr_count=1387 halted=1 fault=0
+[stats] vcpu=3 executed_steps=2038 instr_count=2038 halted=1 fault=0
+[stats] executed=10000000 idle_quantum=0 instr_count_bsp=9995839 vtime=10000000
+[stats] cap=10000000 cap_reached=1 n_vcpus=4
+[stats] tlb_hits=0 tlb_misses=0 tlb_flushes=2159106
+[stats] decode_hits=0 decode_misses=0
+
+---- last log lines ----
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1730726
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1730798
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731161
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731233
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1731305
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1731377
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1731449
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1731521
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1731884
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1731956
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732028
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732100
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732172
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732244
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1732607
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1732679
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1732751
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1732823
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1732895
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1732967
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1733330
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1733402
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1733474
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1733546
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1733618
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1733690
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734053
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734125
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734197
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734269
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1734341
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1734413
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1734776
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1734848
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1734920
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1734992
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735064
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735136
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1735499
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1735571
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1735643
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1735715
+[ahci-mmio-probe] read off=0x1a8 size=4 rip=efa28 vt=1735787
+[ahci-mmio-probe] read off=0x128 size=4 rip=efa28 vt=1735859
+[ahci-mmio-probe] read off=0x3a8 size=4 rip=efa28 vt=1736222
+[ahci-mmio-probe] read off=0x328 size=4 rip=efa28 vt=1736294
+[ahci-mmio-probe] read off=0x2a8 size=4 rip=efa28 vt=1736366
+[ahci-mmio-probe] read off=0x228 size=4 rip=efa28 vt=1736438
+[ahci-mmio-probe] write off=0x118 size=4 val=0x4000 rip=efa19 vt=6216395
+[ahci-mmio-probe] write off=0x114 size=4 val=0x0 rip=efa19 vt=6217129
+[ahci-mmio-probe] write off=0x198 size=4 val=0x4000 rip=efa19 vt=6232679
+[ahci-mmio-probe] write off=0x194 size=4 val=0x0 rip=efa19 vt=6233341
+[ahci-mmio-probe] write off=0x218 size=4 val=0x4000 rip=efa19 vt=6250135
+[ahci-mmio-probe] write off=0x214 size=4 val=0x0 rip=efa19 vt=6250725
+[ahci-mmio-probe] write off=0x298 size=4 val=0x4000 rip=efa19 vt=6268741
+[ahci-mmio-probe] write off=0x294 size=4 val=0x0 rip=efa19 vt=6269259
+[ahci-mmio-probe] write off=0x318 size=4 val=0x4000 rip=efa19 vt=6285413
+[ahci-mmio-probe] write off=0x314 size=4 val=0x0 rip=efa19 vt=6285859
+[ahci-mmio-probe] write off=0x398 size=4 val=0x4000 rip=efa19 vt=6302621
+[ahci-mmio-probe] write off=0x394 size=4 val=0x0 rip=efa19 vt=6302995

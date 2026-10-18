@@ -1,0 +1,2459 @@
+From d9d821ceb069e96d94b24e426f43060bb69b674a Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sat, 17 Oct 2026 16:10:30 +0000
+Subject: [PATCH] COMPAT G5: model the ACPI PM block so the ICH9 lane boots
+
+The --lpc=ich9 blocker was recorded as a POST reset loop at RIP 0xefa1f.
+It was not: with the ICH9 LPC identity stock SeaBIOS builds ACPI, publishes
+the RSDP and points its own timer at PMBASE+8 (TimerPort=0xb008).  The
+emulated chipset had no ACPI PM block, so that port read 0xFFFFFFFF forever
+and no timer_check() deadline could expire.  The visible stall is the AHCI
+probe waiting for DET==3 on an empty port (PxSSTS 0x1a8) while port 0 is
+accepted (0x123); the 718-instruction loop around f0068 with 'in eax,dx' at
+f010b is the wait, not the cause.
+
+src/pm.{h,c} model the 0x40-byte ACPI PM register block: PMBASE (default
+0xB000, bits 15:7 of LPC config 0x40..0x43 applied through the LPC cfg_write
+hook) and a 24-bit read-only TMR at +8 counting three counts per PIT tick
+(3.579545 MHz vs 1.193182 MHz = one count per 128 retired instructions,
+remainder carried).  Every other byte reads zero and writes are swallowed;
+ports outside the window still float high.  pm_init() runs in
+devices_init_common next to the PIT.
+
+Measured on the G3 accepted image with the unmodified Debian SeaBIOS
+1.16.3-2: [kernel] shell active; kmain idling., executed_steps=829920364,
+fault=0, RC 0 in 158 s; the marker first appears between 435M and 445M
+instructions.  boot_info_t now carries rsdp_phys=0xf6830 and eight E820
+entries; a post-marker snapshot walks RSDP 0xf6830 -> RSDT 0x7ffe3a0 with
+four checksum-valid tables (FACP, SSDT, APIC/MADT, MCFG) whose I/O APIC
+entry 0xfec00000 matches the guest's '(MADT agree)' line.
+
+The E820 7-vs-8 question closes with the same fix: the eighth entry
+0xfed1c000+0x4000 is the ICH9 RCRB that SeaBIOS reserves only on the ICH9
+path.  QEMU's q35 map with the same ROM has the identical eight-entry shape;
+the only numeric difference left is the firmware ACPI/NVS slab size
+(16 KiB vs 132 KiB), both ending at 0x08000000.
+
+Recorded, not fixed (guest side): AuraLite-OS madt_walk() accepts a type-2
+ISO entry only when elen >= 12, while the ACPI structure is 10 bytes, so the
+kernel prints 'overrides: none in the MADT' despite four ISOs; QEMU prints
+the same line with the same BIOS.
+
+Tests: tests/test_pm.c (6 vectors, in make test-unit; src/pm.c is linked
+wherever src/pit.c is), make test-g5 (58 bundle checks, in make test),
+make test-g5-nc (four tampered bundles), make test-g5-live (the frozen-timer
+replay: no [BL3] in 300M vs 297585739 for the fixed tree).
+
+Docs: docs/evidence/compat-g5/ (README, receipt, ACPI receipt, boot info,
+bisect, negative control, inputs, commands), PROJECT_ANALYSIS 25 patches,
+STATUS/COMPAT_PLAN/CHANGELOG/ROADMAP mark G5 delivered.
+---
+ CHANGELOG.md                                  |  36 +++
+ Makefile                                      |  97 ++++---
+ PROJECT_ANALYSIS.md                           |  11 +-
+ ROADMAP.md                                    |   2 +-
+ docs/STATUS.md                                |  46 +++-
+ docs/evidence/compat-g5/README.md             | 142 ++++++++++
+ docs/evidence/compat-g5/SHA256SUMS            |  11 +
+ docs/evidence/compat-g5/acpi-receipt.txt      |  12 +
+ docs/evidence/compat-g5/bootinfo-ich9.bin     | Bin 0 -> 7776 bytes
+ docs/evidence/compat-g5/bootinfo-parse.txt    |  25 ++
+ docs/evidence/compat-g5/commands.txt          |  46 ++++
+ docs/evidence/compat-g5/inputs.txt            |   6 +
+ docs/evidence/compat-g5/nc-pm.txt             |   5 +
+ .../compat-g5/shell-active-bisect.txt         |  13 +
+ docs/evidence/compat-g5/x86emu-ich9.receipt   |   1 +
+ .../compat-g5/x86emu-ich9.serial.log.gz       | Bin 0 -> 27965 bytes
+ .../evidence/compat-g5/x86emu-ich9.stdout.txt |  76 ++++++
+ docs/plans/COMPAT_PLAN.md                     | 102 ++++---
+ src/devices.c                                 |  21 ++
+ src/machine.h                                 |   2 +
+ src/pm.c                                      | 100 +++++++
+ src/pm.h                                      |  45 ++++
+ tests/g5_acpi_receipt.py                      | 248 ++++++++++++++++++
+ tests/integration/g5_acceptance_nc.sh         |  85 ++++++
+ tests/integration/g5_pm_nc.sh                 |  93 +++++++
+ tests/test_g5_acceptance.py                   | 217 +++++++++++++++
+ tests/test_pm.c                               | 160 +++++++++++
+ 27 files changed, 1515 insertions(+), 87 deletions(-)
+ create mode 100644 docs/evidence/compat-g5/README.md
+ create mode 100644 docs/evidence/compat-g5/SHA256SUMS
+ create mode 100644 docs/evidence/compat-g5/acpi-receipt.txt
+ create mode 100644 docs/evidence/compat-g5/bootinfo-ich9.bin
+ create mode 100644 docs/evidence/compat-g5/bootinfo-parse.txt
+ create mode 100644 docs/evidence/compat-g5/commands.txt
+ create mode 100644 docs/evidence/compat-g5/inputs.txt
+ create mode 100644 docs/evidence/compat-g5/nc-pm.txt
+ create mode 100644 docs/evidence/compat-g5/shell-active-bisect.txt
+ create mode 100644 docs/evidence/compat-g5/x86emu-ich9.receipt
+ create mode 100644 docs/evidence/compat-g5/x86emu-ich9.serial.log.gz
+ create mode 100644 docs/evidence/compat-g5/x86emu-ich9.stdout.txt
+ create mode 100644 src/pm.c
+ create mode 100644 src/pm.h
+ create mode 100644 tests/g5_acpi_receipt.py
+ create mode 100755 tests/integration/g5_acceptance_nc.sh
+ create mode 100755 tests/integration/g5_pm_nc.sh
+ create mode 100644 tests/test_g5_acceptance.py
+ create mode 100644 tests/test_pm.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f4f5bba..a7bffcd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,42 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0064 (COMPAT G5, the ICH9 lane boots)
++
++- **Root cause of the `--lpc=ich9` blocker.**  With the ICH9 LPC identity
++  (`8086:2918`) stock SeaBIOS builds ACPI, publishes the RSDP and points its
++  timer at `PMBASE+8` (`TimerPort=0xb008`).  The emulated chipset had no ACPI
++  PM block, so that port read `0xFFFFFFFF` and every `timer_check()` deadline
++  silently never expired — the AHCI probe then waits forever for `DET==3` on
++  an empty port.  The previously recorded RIP `0xefa1f` was a debugger stop
++  inside a `call` in `ich9_lpc_setup`, not a reset loop.
++- `src/pm.{h,c}`: 0x40-byte ACPI PM block at PMBASE (default `0xB000`, bits
++  15:7 of LPC config `0x40..0x43` via the LPC `cfg_write` hook), a 24-bit
++  read-only TMR at +8 counting three counts per PIT tick (one per 128 retired
++  instructions, remainder carried), zero elsewhere, writes swallowed.
++- Measured on the G3 accepted image with the unmodified Debian SeaBIOS
++  1.16.3-2: `[kernel] shell active; kmain idling.`, `executed_steps=829920364`,
++  `fault=0`, RC 0 in 158 s; the marker first appears between 435 M and 445 M
++  instructions.  `boot_info_t` now carries `rsdp_phys=0xf6830` and eight E820
++  entries; the post-marker snapshot walk finds RSDP `0xf6830` → RSDT
++  `0x7ffe3a0` with four checksum-valid tables (FACP, SSDT, APIC/MADT, MCFG).
++- E820 7 vs 8 explained: the eighth entry `0xfed1c000+0x4000` is the ICH9
++  RCRB that SeaBIOS reserves only on the ICH9 path; QEMU's q35 map with the
++  same ROM has the same eight-entry shape, differing only in the firmware
++  ACPI/NVS slab size (16 KiB vs 132 KiB, both ending at `0x08000000`).
++- Negative control: `pm_timer_now()` restored to the frozen `0xFFFFFFFF` never
++  prints `[BL3]` in 300 M instructions; the fixed tree prints it at
++  297,585,739.
++- Tests: `tests/test_pm.c` (6 vectors in `make test-unit`), `make test-g5`
++  (bundle re-check, inside `make test`), `make test-g5-nc` (four tampered
++  bundles), `make test-g5-live` (`g5_pm_nc.sh`).  `src/pm.c` is linked into
++  every unit test that links `src/pit.c`.
++- Recorded, not fixed (guest side): AuraLite-OS `madt_walk()` requires
++  `elen >= 12` for the 10-byte type-2 ISO structure, so the kernel prints
++  `[ioapic] overrides: none in the MADT` although four ISOs exist; QEMU prints
++  the same line with the same BIOS.
++
++
+ ### Added — patch 0063 (COMPAT G3, accepted BIOS-to-kernel boot)
+ 
+ - Acceptance for the Stage-2 FS/GS fix.  The pinned AuraLite-OS source
+diff --git a/Makefile b/Makefile
+index 8623f95..b7ae3f2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -35,38 +35,40 @@ disk/disk.img: disk/test_kernel.bin
+ demo: x86emu firmware/firmware.bin disk/disk.img
+ 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
+ 
+-test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
++test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
+ 	./test-cpu
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+ 	./test-usb
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
+ 	./test-pam
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
+ 	./test-video
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
+ 	./test-net
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
+ 	./test-pic
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pit.c src/pit.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pit -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pit.c src/pit.c src/pm.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pit -lm
+ 	./test-pit
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_rtc.c src/rtc.c src/pit.c src/pic.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-rtc -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pm.c src/pm.c src/pit.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c -o test-pm -lm
++	./test-pm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_rtc.c src/rtc.c src/pit.c src/pm.c src/pic.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-rtc -lm
+ 	./test-rtc
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kbc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-kbc -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kbc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-kbc -lm
+ 	./test-kbc
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_serial.c src/serial.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-serial -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_serial.c src/serial.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-serial -lm
+ 	./test-serial
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_chipset.c src/chipset.c src/lapic.c src/ioapic.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-chipset -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_chipset.c src/chipset.c src/lapic.c src/ioapic.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-chipset -lm
+ 	./test-chipset
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_lapic.c src/lapic.c src/ioapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-lapic -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_lapic.c src/lapic.c src/ioapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-lapic -lm
+ 	./test-lapic
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ioapic.c src/ioapic.c src/lapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-ioapic -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ioapic.c src/ioapic.c src/lapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-ioapic -lm
+ 	./test-ioapic
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_acpi.c src/acpi.c -o test-acpi
+ 	./test-acpi
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ahci.c src/ahci.c src/pci.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c -o test-ahci -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ahci.c src/ahci.c src/pci.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c -o test-ahci -lm
+ 	./test-ahci
+-	rm -f test-cpu test-usb test-pam test-video test-net test-pic test-pit test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
++	rm -f test-cpu test-usb test-pam test-video test-net test-pic test-pit test-pm test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
+ 
+ # COMPAT G4: LPC identity pairing.  SeaBIOS rel-1.16.3's acpi_setup()
+ # matches only PIIX4 8086:7113 or ICH9 LPC 8086:2918, while this machine's
+@@ -74,8 +76,8 @@ test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c
+ # RSDP.  --lpc=ich9 switches the LPC function to the Q35-paired ICH9 ID.
+ # Vectors pin both identities, the untouched class/header fields, the host
+ # bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
+-test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
++test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
+ 	./test-compat
+ 	rm -f test-compat
+ 
+@@ -90,6 +92,21 @@ test-g3: tests/test_g3_acceptance.py docs/evidence/compat-g3/acceptance/SHA256SU
+ test-g3-nc: tests/test_g3_acceptance.py tests/integration/g3_acceptance_nc.sh
+ 	sh tests/integration/g3_acceptance_nc.sh
+ 
++# COMPAT G5: the ICH9 lane.  The gate re-checks the recorded receipts (serial
++# markers, PERF P0 stats, the 8-entry E820 + live RSDP in boot_info_t, the
++# RSDP/RSDT/MADT receipt) and runs the ACPI cross-check against the serial log;
++# it needs only python3, so it lives in `make test`.  `test-g5-nc` replays the
++# frozen-PM-timer stall (2 x 300 M instructions, ~55 s).  `test-g5-live` re-runs
++# the full 2 G acceptance boot (~160 s) and is opt-in.
++test-g5: tests/test_g5_acceptance.py tests/g5_acpi_receipt.py docs/evidence/compat-g5/SHA256SUMS
++	python3 tests/test_g5_acceptance.py
++
++test-g5-nc: tests/integration/g5_acceptance_nc.sh
++	sh tests/integration/g5_acceptance_nc.sh
++
++test-g5-live: x86emu tests/integration/g5_pm_nc.sh
++	sh tests/integration/g5_pm_nc.sh
++
+ # KERNEL-BOOT K1: direct kernel-load lane. The fixture is a synthetic
+ # higher-half kernel linked at the real AuraLite VMA (tests/kload_fixture.ld);
+ # its flags are frozen on purpose -- the guest image must not inherit the
+@@ -101,32 +118,32 @@ tests/kload_fixture.elf: tests/kload_fixture.c tests/kload_fixture.ld
+ 	    tests/kload_fixture.c -o $@
+ 
+ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kload.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-kload -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kload.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-kload -lm
+ 	./test-kload
+ 	rm -f test-kload
+ 
+ test-ring3: tests/test_ring3.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
+ 	./test-ring3
+ 	rm -f test-ring3
+ 
+ # C10: table-driven ISA vectors (>=300 rows; row count printed by the runner)
+-test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-table -lm
++test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-table -lm
+ 	./test-table
+ 	rm -f test-table
+ 
+ # PERF P0: the honest work counter (cpu.executed_steps) and machine_executed_total().
+ # Deterministic -- no vector here reads a clock; wall time is bench's job.
+-test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
++test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
+ 	./test-perf
+ 	rm -f test-perf
+ 
+ # PERF P1: measured-hot 8-byte RAM read fast path.  Six deterministic
+ # bus/alias/endian/width vectors; the NC mutates a scratch source copy.
+-test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf_mem.c src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf-mem -lm
++test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf_mem.c src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf-mem -lm
+ 	./test-perf-mem
+ 	rm -f test-perf-mem
+ 
+@@ -137,8 +154,8 @@ test-perf-mem-nc: tests/test_perf_mem.c tests/integration/p1_mem_nc.sh src/mem.c
+ 
+ # PERF P2: successful-translation TLB under page-table writes, CR3/
+ # INVLPG, fault error/RIP/CR2, mode/permission keys, PS leaves and SMP.
+-test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tlb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-tlb -lm
++test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tlb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-tlb -lm
+ 	./test-tlb
+ 	rm -f test-tlb
+ 
+@@ -148,8 +165,8 @@ test-tlb-nc: tests/test_tlb.c tests/integration/p2_tlb_nc.sh src/mem.c
+ 	sh tests/integration/p2_tlb_nc.sh
+ 
+ # PERF P3: narrow RAM-backed prefix/opcode predecode, live ModRM and #PF.
+-test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_decode.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-decode -lm
++test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_decode.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-decode -lm
+ 	./test-decode
+ 	rm -f test-decode
+ 
+@@ -164,8 +181,8 @@ test-decode-nc: tests/test_decode.c tests/integration/p3_decode_nc.sh src/cpu.c
+ x86dis: tools/x86dis.c src/disasm.c src/disasm.h
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tools/x86dis.c src/disasm.c -o $@
+ 
+-test-disasm: tests/test_disasm.c tests/harness.h src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_disasm.c src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-disasm -lm
++test-disasm: tests/test_disasm.c tests/harness.h src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_disasm.c src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-disasm -lm
+ 	./test-disasm
+ 	rm -f test-disasm
+ 
+@@ -188,8 +205,8 @@ test-disasm-nc: tests/integration/t1_disasm_nc.sh tests/test_disasm.c src/disasm
+ # between-instruction steps, watchpoints, quit/pause, expressions) and the
+ # REPL lanes (transcripts + non-perturbation on five platforms; the frozen
+ # guest lane SKIPs unless KERNEL/INITRD are set).
+-test-dbg: tests/test_dbg.c tests/harness.h src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dbg.c src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-dbg -lm
++test-dbg: tests/test_dbg.c tests/harness.h src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dbg.c src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-dbg -lm
+ 	./test-dbg
+ 	rm -f test-dbg
+ 
+@@ -217,8 +234,8 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
+ # (split identity, determinism, sparse RAM, refusals; sanitizer lane too).
+ # test-snapshot: split-run identity lanes on real workloads (the frozen
+ # guest lanes SKIP unless KERNEL/INITRD are set).
+-test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
++test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+ 	./test-snap
+ 	rm -f test-snap
+ 
+@@ -293,7 +310,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
++test: test-unit test-compat test-g3 test-g5 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -346,8 +363,8 @@ bench-nc: bench-binary firmware/firmware.bin disk/disk.img
+ 
+ # C11 differential fuzzer vs the host CPU (ptrace single-step) + crash
+ # invariant sweep. Deliberately NOT part of 'make test': needs ptrace.
+-fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o diff_fuzz -lm
++fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o diff_fuzz -lm
+ 	./diff_fuzz $(FUZZ_PROGRAMS) $(FUZZ_INSTR)
+ 	rm -f diff_fuzz
+ 
+diff --git a/PROJECT_ANALYSIS.md b/PROJECT_ANALYSIS.md
+index c1504c3..2788846 100644
+--- a/PROJECT_ANALYSIS.md
++++ b/PROJECT_ANALYSIS.md
+@@ -28,10 +28,10 @@ Scale of the current tree:
+ 
+ | Area | Files | Lines (approx.) |
+ |---|---|---|
+-| `src/` | 48 (25 `.c` + 23 `.h`) | 15,800 |
+-| `tests/` (+ `integration/`) | 29 `.c`, 16 `.py`, 26 `.sh` | 10,600 |
+-| `docs/` incl. 10 plans | — | 7,600 |
+-| `patches/` phase artifacts | 24 `.patch` (0008–0063) | — |
++| `src/` | 50 (26 `.c` + 24 `.h`) | 16028 |
++| `tests/` (+ `integration/`) | 31 `.c`, 10 `.py`, 26 `.sh` | 10,600 |
++| `docs/` incl. 10 plans | — | 11,000 |
++| `patches/` phase artifacts | 25 `.patch` (0008–0064) | — |
+ 
+ ## 2. Repository layout
+ 
+@@ -46,7 +46,8 @@ AuraLite-Emulator/
+ │   │                            DDR/SPD, CAR, COM1 debugcon
+ │   ├── platform.c / .h        — five Intel CPUID profiles
+ │   ├── chipset.c              — A20, port 0x92, reset via 0xCF9
+-│   ├── pic.c / pit.c / rtc.c / kbc.c — 8259A, 8254, MC146818A, 8042
++│   ├── pic.c / pit.c / pm.c / rtc.c / kbc.c — 8259A, 8254, ACPI PM
++│   │                          block (PMBASE TMR, G5), MC146818A, 8042
+ │   ├── lapic.c / ioapic.c     — xAPIC and 82093AA
+ │   ├── ahci.c                 — SATA HBA: FIS/PRDT engine, two controllers
+ │   ├── e1000.c                — 82540EM model + TAP-over-UDP socket
+diff --git a/ROADMAP.md b/ROADMAP.md
+index bf3ec22..af78aa6 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -33,7 +33,7 @@ maps to exactly one plan below.
+ | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
+ | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+ | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, 0056–0061) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
+-| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | 🚧 G0–G4 ✅ (`0062`, `0063`), G5–G6 planned | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
++| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | 🚧 G0–G5 ✅ (`0062`, `0063`, `0064`), G6 planned | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 360b96b..4376d46 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -811,6 +811,41 @@
+   ICH9) and runs in `make test` / `make test-sanitize`.  Evidence:
+   `docs/evidence/compat-g4/`.
+ 
++- **G5 delivered (patch `0064`): the ICH9 lane boots, because the ACPI PM
++  timer now exists.**  The recorded blocker ("`--lpc=ich9` never reaches
++  Stage 2", CPU parked near RIP `0xefa1f`) was a misread symptom.  Under the
++  ICH9 identity stock SeaBIOS programs `TimerPort=0xb008` and waits on
++  `timer_check()` deadlines; the emulated chipset had no ACPI PM block, so the
++  port floated high (`0xFFFFFFFF`) and no deadline ever expired.  The visible
++  stall — a 718-instruction loop reading AHCI `PxSSTS` at `f0068` with
++  `in eax,dx` at `f010b`, port 0 accepted (`0x123`) and the empty port 1 never
++  reaching `DET==3` (`0x1a8`) — is the wait itself, not a reset loop.  The new
++  `src/pm.{h,c}` model a 0x40-byte PM block at PMBASE (default `0xB000`, bits
++  15:7 of LPC config `0x40..0x43`, applied through the LPC `cfg_write` hook)
++  with a 24-bit read-only TMR at +8 counting three counts per PIT tick (one
++  count per 128 retired instructions).  Measured on the G3 accepted image with
++  the unmodified Debian SeaBIOS: `[kernel] shell active; kmain idling.`,
++  `executed_steps=829920364`, `fault=0`, RC 0, 158 s; the marker first appears
++  between 435 M and 445 M instructions.  `boot_info_t` now carries
++  `rsdp_phys=0xf6830`; a post-marker snapshot walk confirms RSDP `0xf6830`
++  (rev 0) → RSDT `0x7ffe3a0` with four checksum-valid tables (FACP, SSDT,
++  APIC/MADT, MCFG) whose I/O APIC entry (`0xfec00000`) matches the guest's
++  `(MADT agree)` line.  Negative control: the frozen pre-fix read never prints
++  `[BL3]` in 300 M instructions while the fixed tree prints it at
++  297,585,739.  Gates: `make test-g5` (58 re-checked conditions, inside
++  `make test`), `make test-g5-nc` (four tampered bundles), `make test-g5-live`
++  (frozen-timer replay) and `tests/test_pm.c` in `make test-unit`.
++  Evidence: `docs/evidence/compat-g5/`.
++- **G5 also settles the E820 7-vs-8 question.**  Under `--lpc=ich9` the map
++  gains `0xfed1c000+0x4000`, the ICH9 Root Complex Register Block that SeaBIOS
++  reserves once it takes the ICH9 path; QEMU's q35 map with the same ROM has
++  the identical eight-entry shape.  The only remaining numeric difference is
++  the firmware's own ACPI/NVS slab at the top of low RAM (16 KiB vs 132 KiB),
++  both ending at `0x08000000`.  Recorded divergence, guest-side: the kernel
++  prints `[ioapic] overrides: none in the MADT` although four ISOs exist,
++  because `madt_walk()` requires `elen >= 12` for a 10-byte ACPI structure;
++  QEMU prints the same line, so the emulator is not the difference.
++
+ G3 is closed by a behavioural acceptance: the published ISO `d2110f8b…` is
+ not bit-reproducible (its `kernel.elf` embeds build timestamps), so the
+ accepted image is a hash-recorded rebuild from the same pinned source whose
+@@ -827,8 +862,9 @@ blocks are behavioral models rather than cycle-accurate implementations.
+ The live monitor is unauthenticated and defaults to loopback; non-loopback
+ binding is an explicit operator choice. Existing frozen-guest integration
+ lanes still require the separate AuraLite-OS KERNEL/INITRD artifacts.
+-With `--lpc=ich9`, the ACPI tables are published (G4), but a BIOS boot does
+-not reach Stage 2: at caps of 300M and 1.5G instructions the CPU state sits at
+-the same mid-call RIP `0xefa1f` inside SeaBIOS `ich9_lpc_setup`, and PCI
+-enumeration repeats.  This is recorded as an open G5 blocker; the G3
+-acceptance lane uses the default LPC identity, where the boot is clean.
++With `--lpc=ich9`, the ACPI tables are published (G4) and the BIOS boot now
++reaches `[kernel] shell active` (G5).  The default `8086:1e55` identity still
++publishes no RSDP and reports seven E820 entries; that lane is historical and
++deliberately unchanged.  The ACPI PM block models only the Timer register
++(PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
++so no power-management transition is claimed.
+diff --git a/docs/evidence/compat-g5/README.md b/docs/evidence/compat-g5/README.md
+new file mode 100644
+index 0000000..23073f3
+--- /dev/null
++++ b/docs/evidence/compat-g5/README.md
+@@ -0,0 +1,142 @@
++# COMPAT G5 — ICH9 boot, the ACPI PM timer, and the E820 delta
++
++Patch **0064**. The G5 blocker was recorded as "`--lpc=ich9` never reaches
++Stage 2". This bundle contains the measurement that located the cause, the
++receipt for the fix, and the two acceptance extensions G5 owed: RSDP/MADT on
++the accepted image, and an explanation of the E820 7-vs-8 difference.
++
++## What was broken
++
++`--lpc=ich9` reports LPC `8086:2918`. Stock SeaBIOS then takes its full
++Q35/ICH9 path: it builds the ACPI tables, publishes the RSDP, and tells its
++own timer code to use PMBASE+8 (`TimerPort=0xb008`). Our chipset model had no
++ACPI PM block at all, so that port read `0xFFFFFFFF` forever and SeaBIOS's
++`timer_check()` never timed out.
++
++The stall that follows is in the AHCI probe: port 0 answers `PxSSTS=0x123`
++(DET=3, device present) and is accepted, while the empty port 1 answers
++`0x1a8`. SeaBIOS waits for DET==3 on port 1 with a deadline measured on the
++PM timer; with the timer frozen the wait never ends. The 718-instruction loop
++`6ff4c94 → … → f0792 → … → f0068` (PxSSTS read) with `in eax,dx` at `f010b`
++was the whole symptom, not the cause: the RIP `0xefa1f` reported earlier was
++just where the debugger happened to stop inside a `call`.
++
++**Root cause: the emulated ICH9 LPC has no ACPI PM block, so no timeout that
++depends on the ACPI timer can expire.**
++
++## The fix
++
++`src/pm.{h,c}` — a 0x40-byte ACPI PM register block:
++
++- base `PMBASE` (default `0xB000`, bit 7 forced per the ICH9 spec), moved by
++  LPC config bits 15:7 of registers `0x40..0x43`;
++- a 24-bit Timer at PMBASE+8 counting at 3.579545 MHz, i.e. **three counts per
++  PIT tick** (the PIT model retires 384 instructions per tick, so one TMR count
++  per 128 retired instructions, plus the remainder carried);
++- every other byte of the block reads zero; all writes are swallowed; the TMR
++  is read-only. Ports outside the window still float high, as before.
++
++`devices_init_common` now calls `pm_init(m)` right after `pit_io_register`, and
++the LPC device carries `cfg_write=lpc_cfg_write` with `ctx=m` so a PMBASE
++programmed in config space moves the window.
++
++## Result
++
++`--lpc=ich9` + stock SeaBIOS 1.16.3-2 + the accepted candidate ISO:
++
++    [serial] [BL9] ACPI RSDP found
++    [serial] [BL9] ACPI MADT parsed
++    [serial] [BL4] ELF PT_LOAD segments copied to phys
++    [serial] [ioapic] base 0xfec00000 (MADT agree)
++    [serial] [kernel] shell active; kmain idling.
++    [stats] executed_steps=829920364 instr_count=599910693996 halted=0 fault=0
++
++RC 0, 158 s wall, budget 2 G not the binding constraint. `shell-active-bisect.txt`
++bounds the first `shell active` line between 435 M and 445 M instructions
++(no marker at 435 M, marker at 445 M); the run then idles in HLT until the cap,
++which is why `cap_reached=1` and why `executed_steps` keeps growing after the
++marker.
++
++Negative control (`nc-pm.txt`, `tests/integration/g5_pm_nc.sh`): the same tree
++with `pm_timer_now()` restored to the pre-fix `0xFFFFFFFF` never prints `[BL3]`
++in 300 M instructions and burns the entire budget; the unmodified tree prints
++it at 297,585,739.
++
++## Acceptance extension 1 — RSDP and MADT on the accepted image
++
++`acpi-receipt.txt` is produced by `tests/g5_acpi_receipt.py` from a snapshot
++taken after `shell active`, and is checked against the serial log:
++
++    rsdp addr=0x000f6830 rev=0 checksum=ok rsdt=0x07ffe3a0
++    rsdt sig=RSDT entries=4 checksum=ok
++    table sig=FACP ... SSDT ... APIC ... MCFG ...   (all checksums ok)
++    madt lapic_base=0xfee00000 cpus=1 ioapics=1 isos=4
++    madt_ioapic id=0 addr=0xfec00000 gsi_base=0x0
++
++`boot_info_t` now carries `rsdp_phys=0xf6830` — the same pointer the walk
++found — instead of the `0` the default identity reported.
++
++**One divergence, measured and attributed:** the guest prints
++
++    [ioapic] overrides: none in the MADT; PC-standard defaults programmed
++
++although this MADT has four Interrupt Source Overrides (ISA IRQ 5/9/10/11 →
++same GSI, flags `0x000d` = level, active-low). The cause is guest-side:
++`kernel/arch/x86_64/ioapic.c` accepts a type-2 entry only when
++`elen >= 12`, while the ACPI spec defines the ISO structure as 10 bytes. On a
++10-byte entry the walk stops and `madt_iso_count` stays 0. QEMU with the same
++BIOS prints the identical line (`docs/evidence/compat-g3/acceptance/qemu-stock-candidate.serial.log.gz`),
++so this is not an emulator divergence and not a boot-behavior change here:
++none of the four overrides touches IRQ0, and the PC-default route it falls back
++to (IRQ0→GSI2) is what the FADT/ISO set describes anyway. The emulator-side
++MADT is spec-conformant; the kernel's guard is recorded, not fixed, because
++AuraLite-OS is not ours to change in this phase.
++
++## Acceptance extension 2 — E820: 7 vs 8
++
++`bootinfo-parse.txt` compares the block captured under `--lpc=ich9` with the
++QEMU block from G3 (same 128-KiB `bios.bin`, candidate ISO, AHCI + blank USB):
++
++| # | x86emu `--lpc=ich9` | QEMU q35 |
++|---|---|---|
++| 0 | `0x0 + 0x9fc00` t1 | same |
++| 1 | `0x9fc00 + 0x400` t2 | same |
++| 2 | `0xf0000 + 0x10000` t2 | same |
++| 3 | `0x100000 + 0x7efc000` t1 | `0x100000 + 0x7edf000` t1 |
++| 4 | `0x7ffc000 + 0x4000` t2 | `0x7fdf000 + 0x21000` t2 |
++| 5 | `0xb0000000 + 0x10000000` t2 | same |
++| 6 | `0xfed1c000 + 0x4000` t2 | same |
++| 7 | `0xfffc0000 + 0x40000` t2 | same |
++
++The default `8086:1e55` lane reports **7** entries because it never reaches
++the ICH9 path: no RSDP and no RCRB reservation. Under `--lpc=ich9` the eighth
++entry `0xfed1c000+0x4000` (the ICH9 Root Complex Register Block) appears,
++exactly as in QEMU. The E820 count therefore tracked the same identity fix as
++the timer, and the only remaining numeric difference is the size of the
++firmware's own ACPI/NVS slab at the top of low RAM (16 KiB here, 132 KiB in
++QEMU), with both slabs ending at `0x08000000`. No allocator-zone conclusion is
++drawn from this.
++
++## Files
++
++- `x86emu-ich9.receipt` — RC and wall time of the acceptance run.
++- `x86emu-ich9.stdout.txt` — final CPU state and the PERF P0 stats block.
++- `x86emu-ich9.serial.log.gz` — the full serial log (compressed with `gzip -n`).
++- `bootinfo-ich9.bin` / `bootinfo-parse.txt` — the 7,776-byte handoff block and
++  its decoded map.
++- `acpi-receipt.txt` — RSDP → RSDT → tables, MADT decoded, from the snapshot.
++- `nc-pm.txt` — the negative control's two lines of proof.
++- `shell-active-bisect.txt` — instruction-bound bisect for the `shell active` marker.
++- `commands.txt`, `inputs.txt` — exact reproduction and input identities.
++- `SHA256SUMS` — bundle hashes.
++
++The 30 MB end-of-run snapshot and the 1.7 MB raw serial log are not stored.
++
++## What remains open
++
++- The AuraLite-OS ISO type-2 length guard above is a guest-side finding, not
++  fixed here.
++- No HPET, SMM, or PCIe hotplug claim is made. `MCFG` is published but the
++  emulator still serves ECAM itself, as in G4.
++- The default `8086:1e55` identity keeps its 7-entry E820 and absent RSDP;
++  nothing in this patch changes that lane.
+diff --git a/docs/evidence/compat-g5/SHA256SUMS b/docs/evidence/compat-g5/SHA256SUMS
+new file mode 100644
+index 0000000..4d0d5ed
+--- /dev/null
++++ b/docs/evidence/compat-g5/SHA256SUMS
+@@ -0,0 +1,11 @@
++878f12b43d8b1309ef67964468d985cb6e5ea2fce8a6ac75a124d744b654491b  README.md
++3b353f1d5bf611b216c84d2a7e87f6cd2f8167f8e98cc2d600004d3bc9cddeed  acpi-receipt.txt
++31e6652af910a74124d605fcb8fbe11b7d26d15f034c3a0f89ef3f227b6a9b59  bootinfo-ich9.bin
++a9263a027a12f9757cb15550ce88b2dd732b1b1c07d3b5f24835de0d811fce5a  bootinfo-parse.txt
++0828ec8791d90f023b97c82719ae4209bb644dda8558413debe7f6fbbe97a74b  commands.txt
++a53f97784cd9576037be57050a79dbf5bfd4cc4ee3e4e0f91b752e2b419349c5  inputs.txt
++4c368ebb4b84e2d087156da66fc39c11cd4d94a180a48847d9fef6036985f7e8  nc-pm.txt
++9ce869f50abf2d0cb4987e34fe945727f7cfa0ce02a864f4fbf7cb98421b4a0f  shell-active-bisect.txt
++cdd46b7dcbee088201d529db9f5ac40a7b9e42bff9f9bb838163b765755e5910  x86emu-ich9.receipt
++64a602144aae77fa71c3389a64569cb8402bc17071f58cae5d545ea0bf59adb0  x86emu-ich9.serial.log.gz
++69df9963e4e177305224b64f169fafa45802ec76f1d3084f9477bb37010d9af9  x86emu-ich9.stdout.txt
+diff --git a/docs/evidence/compat-g5/acpi-receipt.txt b/docs/evidence/compat-g5/acpi-receipt.txt
+new file mode 100644
+index 0000000..a403d62
+--- /dev/null
++++ b/docs/evidence/compat-g5/acpi-receipt.txt
+@@ -0,0 +1,12 @@
++rsdp addr=0x000f6830 rev=0 checksum=ok rsdt=0x07ffe3a0
++rsdt sig=RSDT entries=4 checksum=ok
++table sig=FACP addr=0x07ffff80 len=116 checksum=ok
++table sig=SSDT addr=0x07fff700 len=2107 checksum=ok
++table sig=APIC addr=0x07fff610 len=110 checksum=ok
++table sig=MCFG addr=0x07fff5d0 len=60 checksum=ok
++madt lapic_base=0xfee00000 cpus=1 ioapics=1 isos=4
++madt_ioapic id=0 addr=0xfec00000 gsi_base=0x0
++madt_iso bus=0 source=5 gsi=5 flags=0x000d
++madt_iso bus=0 source=9 gsi=9 flags=0x000d
++madt_iso bus=0 source=10 gsi=10 flags=0x000d
++madt_iso bus=0 source=11 gsi=11 flags=0x000d
+diff --git a/docs/evidence/compat-g5/bootinfo-ich9.bin b/docs/evidence/compat-g5/bootinfo-ich9.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ee61211d8d27a109cee1258b676455dbd3689bf
+GIT binary patch
+literal 7776
+zcmeI$xlS8F9LMpo#aRXA3AUv}zyq)mAVqS8Y{Vnb(@>fl62g&i-wF4Ta6?D}F_3VC
+z`$)Lq0VvW^SS(-f*ak#HiNxR5$2;?%zelT|TzDtd<$h&mcue)!mp|6-bcFhYa}}Wr
+z&QM*w2#$2;Z9PucegC5agYZ5+%bu$gy?ooRMs!8lUkulMJJ)voLBHS9{rZN&{lQJ-
+zA_+(Wl7J*22}lBxfFvLZNCJ|8Bp?Yq#{@33s!UIY>3Z!>Q%;AW?C0exr3~Ko!@1X~
+z9FaPiz?wrv=}GX@tKxGrlV67RFbpHzbSEWpz1Jp_Cz*g}ATLL$d=#J%MJPrIN>PS4
+zc#CqpLj@{Pg=)OV2h^Yzb*M)J8qtJiw4fDjXh#P=;uAX2g>Lkq7k%i*00uFH&-j92
+zj9?UF7{>%AF@<S-#SFgTJAPmmbNC4#=COc9{K9W6VHqn}#UHF;9UIuh7Phg2UF=~W
+zfAJ3oIK&Z-ae`Bv;T#vREGu+K_9TBDa#NCkBp?X{5{S7QgV*AW-K&r8jWK&gPwqC!
+USQ3x~Bmqg_IVF&geg7}*4a}&Hi~s-t
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/evidence/compat-g5/bootinfo-parse.txt b/docs/evidence/compat-g5/bootinfo-parse.txt
+new file mode 100644
+index 0000000..60f63b0
+--- /dev/null
++++ b/docs/evidence/compat-g5/bootinfo-parse.txt
+@@ -0,0 +1,25 @@
++COMPAT G5: boot_info_t captured under --lpc=ich9 + stock SeaBIOS 1.16.3-2
++source: --max-instr=850000000 --snapshot-save (post-`shell active`), phys 0x10000, 7776 bytes
++sha256=31e6652af910a74124d605fcb8fbe11b7d26d15f034c3a0f89ef3f227b6a9b59
++magic=0x4155524142544c44 OK
++mmap_count=8; hhdm_offset=0xffff800000000000
++  mmap[0] base=0x0000000000 length=0x0009fc00 type=1
++  mmap[1] base=0x000009fc00 length=0x00000400 type=2
++  mmap[2] base=0x00000f0000 length=0x00010000 type=2
++  mmap[3] base=0x0000100000 length=0x07efc000 type=1
++  mmap[4] base=0x0007ffc000 length=0x00004000 type=2
++  mmap[5] base=0x00b0000000 length=0x10000000 type=2
++  mmap[6] base=0x00fed1c000 length=0x00004000 type=2
++  mmap[7] base=0x00fffc0000 length=0x00040000 type=2
++initrd phys=0x1800000 size=0xb22000 (11673600 bytes)
++cpu_count=1; bsp_lapic_id=0
++rsdp_phys=0xf6830 (present)
++boot_from_uefi=0
++
++Delta vs QEMU (same 128-KiB bios.bin, q35/TCG, AHCI + blank USB, candidate ISO):
++  QEMU: 0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7edf000:t1;
++        0x7fdf000+0x21000:t2; 0xb0000000+0x10000000:t2; 0xfed1c000+0x4000:t2; 0xfffc0000+0x40000:t2
++  -> same 8-entry shape; the 0xfed1c000 ICH9 RCRB reservation appears only under the
++     ICH9 identity (it is absent in the default 8086:1e55 lane, which reports 7 entries).
++  -> the only numeric difference is the size of the firmware ACPI/NVS slab at the top
++     of low RAM: 0x4000 here vs 0x21000 in QEMU; both slabs end at 0x08000000.
+diff --git a/docs/evidence/compat-g5/commands.txt b/docs/evidence/compat-g5/commands.txt
+new file mode 100644
+index 0000000..3124cff
+--- /dev/null
++++ b/docs/evidence/compat-g5/commands.txt
+@@ -0,0 +1,46 @@
++COMPAT G5 — exact reproduction
++
++1. Acceptance run (158 s, RC 0).  Budget 2 G is not the binding constraint:
++   the guest reaches `shell active` then idles in HLT.
++
++   ./x86emu --lpc=ich9 --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
++       --platform=haswell \
++       --disk=docs/evidence/compat-g3/blank-usb-1m.img \
++       --sata=/tmp/iso-candidate.iso --max-instr=2000000000 --stats \
++       >x86emu-ich9.stdout.txt 2>x86emu-ich9.serial.log
++
++   The serial log was gzipped with `gzip -9n` (no timestamp) to 1.7 MB -> 250 KB.
++
++2. ACPI receipt and handoff block.  Run again to 850 M with a snapshot, then
++   walk it; the kernel is already idle and boot_info_t at 0x10000 is intact.
++
++   ./x86emu ... --max-instr=850000000 --stats --snapshot-save=/tmp/g5-acpi.snap
++   python3 tests/g5_acpi_receipt.py --snapshot /tmp/g5-acpi.snap \
++       --serial <(gzip -dc docs/evidence/compat-g5/x86emu-ich9.serial.log.gz) \
++       --out docs/evidence/compat-g5/acpi-receipt.txt
++   python3 tests/g5_acpi_receipt.py --check \
++       docs/evidence/compat-g5/acpi-receipt.txt --serial <serial>
++   dd if=/tmp/g5-acpi.snap ...   # boot_info_t 0x10000 + 7776 bytes, decoded in
++                                # bootinfo-parse.txt
++
++3. Instruction bound for the first `shell active` line:
++   `shell-active-bisect.txt` (0 at 435 M, 1 at 445 M).  Same lane, only
++   --max-instr changes.
++
++4. Negative control (55 s):
++
++   make test-g5-live     # sh tests/integration/g5_pm_nc.sh
++
++   builds a copy of the tree with pm_timer_now() restored to the pre-fix
++   `0xFFFFFFFF`; that copy prints no `[BL3]` in 300 M instructions, the
++   unmodified tree prints it at 297,585,739.
++
++5. Bundle gates:
++
++   make test-g5          # 54 re-checked conditions, inside `make test`
++   make test-g5-nc       # four tampered bundles must be rejected
++   make test-unit        # includes tests/test_pm.c (6 vectors)
++
++Caveat: the ISO and the SeaBIOS ROM live outside the tree; `inputs.txt`
++records their hashes.  No end-of-run snapshot or raw (uncompressed) serial log
++is stored.
+diff --git a/docs/evidence/compat-g5/inputs.txt b/docs/evidence/compat-g5/inputs.txt
+new file mode 100644
+index 0000000..6f58970
+--- /dev/null
++++ b/docs/evidence/compat-g5/inputs.txt
+@@ -0,0 +1,6 @@
++4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca  /tmp/sbpkg/usr/share/seabios/bios.bin
++30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  docs/evidence/compat-g3/blank-usb-1m.img
++f249d47a4a79da8893bbac2744859d2f75cb6546fb1db8aa9fe42d0c10536a21  /tmp/iso-candidate.iso
++da182c22133e1b0ac2f6d5ddb6d7c28e7165cdc36d77a3042831e275d43071d5  x86emu
++# x86emu build: gcc -std=c11 -O2 -Wall -Wextra -Werror (default CFLAGS), x86_64
++# The binary is reproducible: two clean builds produce the same hash above.
+diff --git a/docs/evidence/compat-g5/nc-pm.txt b/docs/evidence/compat-g5/nc-pm.txt
+new file mode 100644
+index 0000000..6d59708
+--- /dev/null
++++ b/docs/evidence/compat-g5/nc-pm.txt
+@@ -0,0 +1,5 @@
++# COMPAT G5 PM-timer negative control
++# rom=/tmp/sbpkg/usr/share/seabios/bios.bin iso=/tmp/iso-candidate.iso
++# md5=4098ea41c4576565791c08770f15a5ca
++frozen:  BL3=absent steps=300000000
++control: BL3=present steps=297585739
+diff --git a/docs/evidence/compat-g5/shell-active-bisect.txt b/docs/evidence/compat-g5/shell-active-bisect.txt
+new file mode 100644
+index 0000000..653e0c1
+--- /dev/null
++++ b/docs/evidence/compat-g5/shell-active-bisect.txt
+@@ -0,0 +1,13 @@
++# COMPAT G5: where does `[kernel] shell active` first appear?
++# Same lane each time: --lpc=ich9, stock SeaBIOS 1.16.3-2 bios.bin,
++# Haswell, candidate ISO on AHCI, blank USB on xHCI, varying --max-instr.
++# "shell" = count of `shell active` lines in the serial stream at that budget.
++max_instr=300000000 shell=0
++max_instr=400000000 shell=0
++max_instr=420000000 shell=0
++max_instr=435000000 shell=0
++max_instr=445000000 shell=1
++max_instr=500000000 shell=1
++max_instr=650000000 shell=1
++max_instr=750000000 shell=1
++max_instr=800000000 shell=1
+diff --git a/docs/evidence/compat-g5/x86emu-ich9.receipt b/docs/evidence/compat-g5/x86emu-ich9.receipt
+new file mode 100644
+index 0000000..5839839
+--- /dev/null
++++ b/docs/evidence/compat-g5/x86emu-ich9.receipt
+@@ -0,0 +1 @@
++RUN RC=0 elapsed=158s
+diff --git a/docs/evidence/compat-g5/x86emu-ich9.serial.log.gz b/docs/evidence/compat-g5/x86emu-ich9.serial.log.gz
+new file mode 100644
+index 0000000000000000000000000000000000000000..c48f4764e00326aaaf29aaa121e256ae46277d59
+GIT binary patch
+literal 27965
+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
+bFp<C9qw_LxrX}vDw@!TVgrX)d=!yRTYBB)G
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/evidence/compat-g5/x86emu-ich9.stdout.txt b/docs/evidence/compat-g5/x86emu-ich9.stdout.txt
+new file mode 100644
+index 0000000..2e140e9
+--- /dev/null
++++ b/docs/evidence/compat-g5/x86emu-ich9.stdout.txt
+@@ -0,0 +1,76 @@
++---- CPU state (mode=long64, instr=599910693996) ----
++RAX=0000000000000000 RBX=ffffffff8813c770 RCX=0000000000000082 RDX=0000000000000001
++RSI=ffffffff8813c770 RDI=ffffffff803ac610 RBP=ffffffff8c025cd0 RSP=ffffffff8c025cd0
++R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000001 R11=00000000fffff801
++R12=ffffffff803ac5f0 R13=0000000000000046 R14=ffffffff8813c770 R15=ffffffff803ac610
++RIP=ffffffff8012fe02 RFLAGS=0000000000000046 CR0=0000000080010033 CR3=00000000038c7000 CR4=0000000000000620 EFER=0000000000000d01
++CS=0008 base=0000000000000000 L=1 D=0   SS=0010 base=0000000000000000
++
++---- stats (PERF P0) ----
++[stats] vcpu=0 executed_steps=829920364 instr_count=599910693996 halted=0 fault=0
++[stats] executed=829920364 idle_quantum=599080773632 instr_count_bsp=599910693996 vtime=599910693996
++[stats] cap=2000000000 cap_reached=1 n_vcpus=1
++[stats] tlb_hits=1305532774 tlb_misses=326437385 tlb_flushes=235702860
++[stats] decode_hits=225343252 decode_misses=358072570
++
++---- last log lines ----
++[serial] [bc] writeback stores=3721 flushed=3090 coalesced=631
++[serial] [bc] writeback stores=3723 flushed=3092 coalesced=631
++[serial] [bc] writeback stores=3725 flushed=3094 coalesced=631
++[serial] [bc] writeback stores=3727 flushed=3096 coalesced=631
++[serial] [bc] writeback stores=3736 flushed=3102 coalesced=634
++[serial] [bc] writeback stores=3738 flushed=3104 coalesced=634
++[serial] [bc] writeback stores=3740 flushed=3106 coalesced=634
++[serial] [bc] writeback stores=3742 flushed=3108 coalesced=634
++[serial] [bc] writeback stores=3744 flushed=3110 coalesced=634
++[serial] [bc] writeback stores=3746 flushed=3112 coalesced=634
++[serial] [bc] writeback stores=3748 flushed=3114 coalesced=634
++[serial] [bc] writeback stores=3750 flushed=3116 coalesced=634
++[serial] [bc] writeback stores=3752 flushed=3118 coalesced=634
++[serial] [bc] writeback stores=3754 flushed=3120 coalesced=634
++[serial] [bc] writeback stores=3763 flushed=3126 coalesced=637
++[serial] [bc] writeback stores=3765 flushed=3128 coalesced=637
++[serial] [bc] writeback stores=3767 flushed=3130 coalesced=637
++[serial] [bc] writeback stores=3769 flushed=3132 coalesced=637
++[serial] [bc] writeback stores=3771 flushed=3134 coalesced=637
++[serial] [bc] writeback stores=3773 flushed=3136 coalesced=637
++[serial] [bc] writeback stores=3775 flushed=3138 coalesced=637
++[serial] [bc] writeback stores=3777 flushed=3140 coalesced=637
++[serial] [bc] writeback stores=3779 flushed=3142 coalesced=637
++[serial] [bc] writeback stores=3788 flushed=3148 coalesced=640
++[serial] [bc] writeback stores=3790 flushed=3150 coalesced=640
++[serial] [bc] writeback stores=3792 flushed=3152 coalesced=640
++[serial] [bc] writeback stores=3794 flushed=3154 coalesced=640
++[serial] [bc] writeback stores=3796 flushed=3156 coalesced=640
++[serial] [bc] writeback stores=3798 flushed=3158 coalesced=640
++[serial] [bc] writeback stores=3800 flushed=3160 coalesced=640
++[serial] [bc] writeback stores=3802 flushed=3162 coalesced=640
++[serial] [bc] writeback stores=3804 flushed=3164 coalesced=640
++[serial] [bc] writeback stores=3806 flushed=3166 coalesced=640
++[serial] [bc] writeback stores=3815 flushed=3172 coalesced=643
++[serial] [bc] writeback stores=3817 flushed=3174 coalesced=643
++[serial] [bc] writeback stores=3819 flushed=3176 coalesced=643
++[serial] [bc] writeback stores=3821 flushed=3178 coalesced=643
++[serial] [bc] writeback stores=3823 flushed=3180 coalesced=643
++[serial] [bc] writeback stores=3825 flushed=3182 coalesced=643
++[serial] [bc] writeback stores=3827 flushed=3184 coalesced=643
++[serial] [bc] writeback stores=3829 flushed=3186 coalesced=643
++[serial] [bc] writeback stores=3831 flushed=3188 coalesced=643
++[serial] [bc] writeback stores=3840 flushed=3194 coalesced=646
++[serial] [bc] writeback stores=3842 flushed=3196 coalesced=646
++[serial] [bc] writeback stores=3844 flushed=3198 coalesced=646
++[serial] [bc] writeback stores=3846 flushed=3200 coalesced=646
++[serial] [bc] writeback stores=3848 flushed=3202 coalesced=646
++[serial] [bc] writeback stores=3850 flushed=3204 coalesced=646
++[serial] [bc] writeback stores=3852 flushed=3206 coalesced=646
++[serial] [bc] writeback stores=3854 flushed=3208 coalesced=646
++[serial] [bc] writeback stores=3856 flushed=3210 coalesced=646
++[serial] [bc] writeback stores=3858 flushed=3212 coalesced=646
++[serial] [bc] writeback stores=3867 flushed=3218 coalesced=649
++[serial] [bc] writeback stores=3869 flushed=3220 coalesced=649
++[serial] [bc] writeback stores=3871 flushed=3222 coalesced=649
++[serial] [bc] writeback stores=3873 flushed=3224 coalesced=649
++[serial] [bc] writeback stores=3875 flushed=3226 coalesced=649
++[serial] [bc] writeback stores=3877 flushed=3228 coalesced=649
++[serial] [bc] writeback stores=3879 flushed=3230 coalesced=649
++[serial] [bc] writeback stores=3881 flushed=3232 coalesced=649
+diff --git a/docs/plans/COMPAT_PLAN.md b/docs/plans/COMPAT_PLAN.md
+index d330962..b5e67c0 100644
+--- a/docs/plans/COMPAT_PLAN.md
++++ b/docs/plans/COMPAT_PLAN.md
+@@ -33,7 +33,7 @@ walks it.
+ | G2 | ✅ **measured** | Stage-2 entry gate: real-mode `SGDT/SIDT` store width fixed, `PUSHA/POPA` added, BIOS read receipts repeatable | `docs/evidence/compat-g2/README.md` |
+ | G3 | ✅ **delivered** (patch `0063`) | authoritative ISO (pinned `518bef0` + reviewed Stage-2 FS/GS fix, 10-of-166,272-sector diff) boots to `[kernel] shell active` under a **stock** SeaBIOS in x86emu and QEMU; `boot_info_t` at `0x10000` validates | `docs/evidence/compat-g3/acceptance/` |
+ | G4 | ✅ **delivered** (patch `0062`) | ACPI identity pairing on the **emulator** side: `--lpc=ich9` makes the LPC function `8086:2918`, so stock SeaBIOS publishes RSDP/RSDT/FACP/SSDT/MADT(**MCFG**) | `docs/evidence/compat-g4/README.md` |
+-| G5 | 📋 planned | Post-G3: the RSDP/RSDT/MADT set on the **accepted image** via `--lpc=ich9`, field-by-field E820/`boot_info_t` agreement with QEMU, and the xemu/QEMU E820 divergence explained or recorded | — |
++| G5 | ✅ **delivered** (patch `0064`) | ICH9 boot completed: the missing ACPI PM block (PMBASE+8, 24-bit TMR at 3×PIT) was the real blocker, not the `0xefa1f` RIP; `--lpc=ich9` now boots the accepted image to `[kernel] shell active` with `fault=0`, `rsdp_phys=0xf6830`, 8-entry E820 including the ICH9 RCRB, and an RSDP→RSDT→MADT receipt | `docs/evidence/compat-g5/` |
+ | G6 | 📋 planned | SMP as the final rung: more than two vCPU contexts, INIT-SIPI bring-up of real APs through the BIOS route, per-AP timers | — |
+ 
+ Ordering rationale: the CPU/bios boundary defects (G1–G2) had to close before
+@@ -193,41 +193,71 @@ historical lanes unchanged (flag is opt-in).
+ agreement, any SMP/IOAPIC claim. G4 removes the emulator-side ACPI blocker
+ only.
+ 
+-## G5 — post-acceptance ACPI/E820 agreement 📋
+-
+-G3 already delivered the shell-active acceptance: the authoritative rebuild
+-with the reviewed Stage-2 fix boots under a stock BIOS to `[kernel] shell
+-active` in x86emu and QEMU, twice with byte-identical serial receipts, and the
+-7,776-byte `boot_info_t` validates (see `docs/evidence/compat-g3/acceptance/`).
+-G5 extends that accepted image rather than re-establishing it:
+-
+-**Done when, on the G3 accepted image:**
+-
+-- the RSDP/RSDT/MADT set matches the G4 placement and checksums under
+-  `--lpc=ich9` (G3's stock lane deliberately keeps the default LPC identity,
+-  where `rsdp_phys=0`);
+-- the E820 map and the `boot_info_t` block match QEMU field by field, or each
+-  divergence is recorded with a reproduction;
+-- the ACPI lane is repeatable with byte-identical serial receipts, as G3's
+-  BIOS lane already is;
+-- `make test` / `make test-sanitize` stay green.
+-
+-**Known input to reconcile:** QEMU's stock 128-KiB SeaBIOS reports eight E820
+-entries and RSDP `0xf67b0`; x86emu's default-identity lane reports seven and
+-none.  G4 removes the RSDP half of that difference; the E820 difference still
+-has no established cause and must be explained or recorded as a divergence.
+-
+-**Measured open blocker (2026-10-17):** with `--lpc=ich9`, boot does not reach
+-Stage 2 within 1.5G instructions.  At caps of 300M and 1.5G the CPU state
+-shows the same mid-call RIP `0xefa1f` inside SeaBIOS `ich9_lpc_setup` (first
+-hit at step 202,767) with repeated PCI enumeration in the log, which is
+-consistent with a POST restart loop; no root cause or fix is claimed yet.
+-G4's table-publication receipts are unaffected — they inspect the published
+-tables, not the boot outcome.
+-
+-**Gate:** a new `tests/integration/g5_pinned_boot.sh` (SKIP without
+-`AURAISO`) that hashes the ISO, runs the ACPI lane twice, asserts the shell
+-marker, and dumps the handoff block for the comparator.
++## G5 — post-acceptance ACPI/E820 agreement ✅ (patch `0064`)
++
++G3 delivered the shell-active acceptance on the **default** LPC identity.  G5
++had to extend it to `--lpc=ich9`, where G4 publishes the ACPI tables.  The
++phase turned into a real boot fix, because that lane never reached Stage 2.
++
++**The blocker and its root cause.** `--lpc=ich9` makes the LPC function
++`8086:2918`, so stock SeaBIOS takes its full Q35/ICH9 path: it builds ACPI,
++publishes the RSDP and points its own timer at `PMBASE+8` (`TimerPort=0xb008`).
++The emulated chipset had no ACPI PM block, so that port read `0xFFFFFFFF`
++forever and no `timer_check()` deadline could expire.  The visible stall is
++the AHCI probe waiting for `DET==3` on an empty port 1 (`PxSSTS=0x1a8`) while
++port 0 is accepted (`0x123`); the 718-instruction loop around `f0068`
++(PxSSTS) and `in eax,dx` at `f010b` is the symptom.  The RIP `0xefa1f`
++recorded earlier was only a debugger stop inside a `call` in
++`ich9_lpc_setup` — **the boot was never reset-looping; it was waiting on a
++timer that did not exist.**
++
++**Fix (patch `0064`).** `src/pm.{h,c}` model the 0x40-byte ACPI PM block: a
++default base of `0xB000` moved by LPC config bits 15:7 of `0x40..0x43`, a
++24-bit read-only TMR at PMBASE+8 counting **three counts per PIT tick**
++(3.579545 MHz vs 1.193182 MHz, i.e. one count per 128 retired instructions
++with the remainder carried), every other byte reading zero and every write
++swallowed.  `pm_init()` runs in `devices_init_common`, and the LPC device's
++`cfg_write` hook applies PMBASE changes.  Ports outside the window still
++float high.
++
++**Measured on the G3 accepted image** (`docs/evidence/compat-g5/`):
++`--lpc=ich9` + unmodified Debian SeaBIOS 1.16.3-2 reaches `[kernel] shell
++active; kmain idling.` with `executed_steps=829920364`, `fault=0`, RC 0 in
++158 s; the marker first appears between 435 M and 445 M instructions.
++`boot_info_t` now carries `rsdp_phys=0xf6830`, and a snapshot walk after the
++marker finds RSDP `0xf6830` (rev 0, checksum ok) → RSDT `0x7ffe3a0` with four
++checksum-valid tables (FACP, SSDT, APIC/MADT, MCFG) and a MADT whose I/O APIC
++entry (`0xfec00000`, GSI base 0) matches the guest's `[ioapic] ... (MADT
++agree)` line.  Negative control: restoring the frozen `0xFFFFFFFF` read never
++prints `[BL3]` in 300 M instructions, while the fixed tree prints it at
++297,585,739.
++
++**E820 7 vs 8 — explained.** The default `8086:1e55` identity reports seven
++entries and no RSDP.  Under `--lpc=ich9` the eighth entry is
++`0xfed1c000+0x4000` — the ICH9 Root Complex Register Block that SeaBIOS
++reserves once it takes the ICH9 path.  QEMU's q35 map with the same 128-KiB
++ROM has the identical eight-entry shape; the only numeric difference left is
++the size of the firmware's own ACPI/NVS slab at the top of low RAM (16 KiB vs
++132 KiB), with both ending at `0x08000000`.  The E820 count tracked the same
++identity fix as the timer, not any memory-sizing divergence.
++
++**One divergence recorded, not fixed (guest side).** The kernel prints
++`[ioapic] overrides: none in the MADT` although the MADT carries four
++Interrupt Source Overrides (ISA IRQ 5/9/10/11, flags `0x000d`).  AuraLite-OS's
++`madt_walk()` accepts a type-2 entry only when `elen >= 12`, while the ACPI
++spec defines that structure as 10 bytes.  QEMU with the same BIOS prints the
++same line, so this is a guest bug, not an emulator divergence; the fallback
++routing it produces is correct for this machine.
++
++**Gates:** `make test-g5` (in `make test`) re-checks the bundle — manifest,
++ordered boot markers, `fault=0`/long-mode/budget in the stats block, the
++8-entry E820 with the RCRB reservation, `boot_info_t.rsdp` equal to the RSDP
++the memory walk found, the ACPI receipt against the serial log, and the
++negative-control numbers.  `make test-g5-nc` tampers four bundle copies and
++requires each to be rejected; `make test-g5-live` replays the frozen-timer
++stall (`g5_pm_nc.sh`, ~55 s).  `tests/test_pm.c` pins the block itself in
++`make test-unit`: 3 counts per PIT tick, 24-bit wrap, byte/word/dword reads,
++zero elsewhere, swallowed writes, PMBASE moves, and the LPC config hook.
+ 
+ ## G6 — SMP as the final rung 📋
+ 
+diff --git a/src/devices.c b/src/devices.c
+index e02e774..f1afef5 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -1196,6 +1196,17 @@ static void gpu_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
+         vga_set_display_mode(g_vga.m, 0);
+ }
+ 
++/* COMPAT G5: LPC config hook.  Only PMBASE (0x40..0x43) is acted on: the
++ * generic store keeps the bytes, and the ACPI PM block follows the base. */
++static void lpc_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
++    pci_default_cfg_write(d, reg, size, val);
++    if (reg <= 0x40 && reg + size > 0x40) {
++        machine_t *m = d->ctx;
++        uint32_t v = (uint32_t)d->cfg[0x40] | ((uint32_t)d->cfg[0x41] << 8);
++        pm_set_base(m, (uint16_t)(v & 0xFF80u));
++    }
++}
++
+ /* =========================== public init entry points ====================== */
+ void devices_init_common(machine_t *m) {
+     pci_init(m);
+@@ -1206,6 +1217,10 @@ void devices_init_common(machine_t *m) {
+     pic_io_register(m);
+     pit_init(m);
+     pit_io_register(m);
++    /* COMPAT G5: the ACPI PM block at PMBASE.  SeaBIOS programs PMBASE on
++     * the ICH9 LPC and then, with ACPI published, switches its own timer to
++     * PMBASE+8; without this decode every timer_check() poll spun forever. */
++    pm_init(m);
+     /* CHIPSET H3: 0x70/0x71 are a real MC146818A now -- long gone as the
+      * silent sinks they were at baseline. The Super I/O config ports
+      * (0x2E/0x2F) stay unclaimed: reads float high, and the sample
+@@ -1258,6 +1273,12 @@ void devices_init_common(machine_t *m) {
+     pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086,
+                     m->cfg_lpc_ich9 ? 0x2918 : 0x1E55, 0x06, 0x01, 0);
+     lpc_pci->cfg[0x0E] = 0x80;                    /* multifunction, type 0 */
++    /* COMPAT G5: PMBASE (dword at 0x40, base in bits 15:7) moves the ACPI
++     * PM block.  SeaBIOS writes 0xb000|1 here when it adopts the ICH9 LPC;
++     * the config store is the generic one, the hook only mirrors the base
++     * into the I/O decoder. */
++    lpc_pci->ctx = m;                             /* PMBASE hook needs it */
++    lpc_pci->cfg_write = lpc_cfg_write;
+ 
+     /* SATA/AHCI: real Intel convention dev31/func2.  STORE S1: BAR5 is a
+      * real MMIO window now (was an empty stub -- the guest's own boot
+diff --git a/src/machine.h b/src/machine.h
+index 2ed22d3..38cb8f2 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -6,6 +6,7 @@
+ #include "cpu.h"
+ #include "pic.h"
+ #include "pit.h"
++#include "pm.h"
+ #include "rtc.h"
+ #include "kbc.h"
+ #include "chipset.h"
+@@ -138,6 +139,7 @@ struct machine {
+     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
+     pic_t pic;
+     pit_t pit;
++    pm_t pm;             /* COMPAT G5: ACPI PM block (TMR at PMBASE+8) */
+     rtc_t rtc;
+     kbc_t kbc;
+     chipset_t chipset;   /* CHIPSET H5: A20 gate + reset plumbing */
+diff --git a/src/pm.c b/src/pm.c
+new file mode 100644
+index 0000000..32555c5
+--- /dev/null
++++ b/src/pm.c
+@@ -0,0 +1,100 @@
++/* pm.c -- ACPI PM register block (COMPAT G5).  Contract in pm.h. */
++#include <string.h>
++#include "machine.h"
++#include "pit.h"
++#include "pm.h"
++
++#define PM_BLOCK_LEN   0x40      /* PMBASE..PMBASE+0x3f                    */
++#define PM_TMR_OFF     0x08      /* PM1a_EVT_BLK (4) + PM1a_CNT_BLK (2) .. */
++#define PM_TMR_MASK    0x00FFFFFFu
++#define PM_TMR_RATIO   3u        /* 3.579545 MHz / 1.193182 MHz, exactly 3 */
++
++/* Advance the 24-bit counter to "now".  Called on every read, so the value
++ * a guest sees never depends on how often the block was polled; the whole
++ * cadence is derived from vtime_instr, like pit_tick(). */
++static void pm_advance(machine_t *m) {
++    pm_t *p = &m->pm;
++    uint64_t ipt = m->pit.instr_per_tick ? m->pit.instr_per_tick
++                                         : PIT_DEFAULT_IPT;
++    uint64_t now = m->vtime_instr;
++    uint64_t delta = now - p->last_instr;
++    p->last_instr = now;
++    if (!delta) return;
++    p->accum += delta * PM_TMR_RATIO;
++    uint64_t ticks = p->accum / ipt;
++    p->accum %= ipt;
++    if (ticks) p->count = (uint32_t)((p->count + ticks) & PM_TMR_MASK);
++}
++
++uint32_t pm_timer_now(machine_t *m) {
++    pm_advance(m);
++    return m->pm.count & PM_TMR_MASK;
++}
++
++/* Does [off, off+size) touch the Timer register's three live bytes? */
++static int pm_hits_tmr(uint16_t off, int size) {
++    return off < PM_TMR_OFF + 3 && (uint32_t)off + (uint32_t)size > PM_TMR_OFF;
++}
++
++static uint32_t pm_read_byte_stream(machine_t *m, uint16_t off, int size) {
++    /* Assemble the Timer register from its three live bytes.  Bits 31:24
++     * are reserved and read as zero (ICH9: TMR is a 24-bit counter). */
++    uint32_t tmr = pm_hits_tmr(off, size) ? pm_timer_now(m) : 0;
++    uint32_t v = 0;
++    for (int i = 0; i < size; i++) {
++        unsigned a = off + (unsigned)i;
++        uint8_t b = 0;
++        if (a >= PM_TMR_OFF && a < PM_TMR_OFF + 3)
++            b = (uint8_t)(tmr >> (8 * (a - PM_TMR_OFF)));
++        v |= (uint32_t)b << (8 * i);
++    }
++    return v;
++}
++
++static uint32_t pm_io_read(void *ctx, uint16_t port, int size) {
++    machine_t *m = ctx;
++    uint16_t off = (uint16_t)(port - m->pm.base);
++    /* Only the Timer register has state; the rest of the block reads 0.
++     * A read that straddles the Timer keeps its live bytes (see above). */
++    if (port >= m->pm.base && off < PM_BLOCK_LEN) {
++        if (pm_hits_tmr(off, size)) m->pm.reads++;
++        return pm_read_byte_stream(m, off, size);
++    }
++    return size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
++}
++
++static void pm_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
++    machine_t *m = ctx;
++    (void)size; (void)val;
++    uint16_t off = (uint16_t)(port - m->pm.base);
++    if (port < m->pm.base || off >= PM_BLOCK_LEN) return;
++    /* The Timer is read-only; PM1_STS would be W1C and PM1_CNT a sleep
++     * transition, neither of which this behavioural model implements.
++     * Swallowing the write is the honest option: nothing is fabricated. */
++}
++
++static void pm_register_block(machine_t *m, uint16_t base) {
++    io_register(m, base, PM_BLOCK_LEN, pm_io_read, pm_io_write, m,
++                "ACPI PM block");
++}
++
++static void pm_unregister_block(machine_t *m, uint16_t base) {
++    io_register(m, base, PM_BLOCK_LEN, NULL, NULL, NULL, NULL);
++}
++
++void pm_set_base(machine_t *m, uint16_t base) {
++    base = (uint16_t)(base & 0xFF80u);          /* PMBASE bits 15:7 */
++    if (base == m->pm.base) return;
++    pm_unregister_block(m, m->pm.base);
++    m->pm.base = base;
++    pm_register_block(m, base);
++}
++
++void pm_init(machine_t *m) {
++    uint16_t old = m->pm.base;
++    if (old) pm_unregister_block(m, old);
++    memset(&m->pm, 0, sizeof m->pm);
++    m->pm.base = 0xB000;                        /* Q35 / SeaBIOS default */
++    m->pm.last_instr = m->vtime_instr;
++    pm_register_block(m, m->pm.base);
++}
+diff --git a/src/pm.h b/src/pm.h
+new file mode 100644
+index 0000000..1324354
+--- /dev/null
++++ b/src/pm.h
+@@ -0,0 +1,45 @@
++/* pm.h -- ACPI PM timer block (COMPAT G5).
++ *
++ * The ICH9/Q35 LPC function owns an ACPI PM register block at PMBASE.
++ * SeaBIOS programs PMBASE (`pci config 0:31.0 0x40 = 0xb000|1`) and then,
++ * once the FADT is published, switches its own timer to the 24-bit PM Timer
++ * at PMBASE+8 -- `timer_setup()` logs "Using pmtimer".  Before this module
++ * existed the port was unconnected, so it read 0xFFFFFFFF forever and every
++ * `timer_check()` poll spun without a timeout: with `--lpc=ich9` the AHCI
++ * port scan never expired and the BIOS never reached the boot path.
++ *
++ * Time base is the same deterministic one the PIT uses (pit.h, D6/K7): the
++ * PM timer runs at 3.579545 MHz, exactly three PIT ticks (1.193182 MHz),
++ * so it advances three counts per PIT tick.  There is no wall clock and no
++ * host timing anywhere in this file.
++ *
++ * Scope: the Timer register (offset 0x08, 24 bits, read-only) is modelled;
++ * every other byte of the 0x40-byte block reads as zero and ignores writes.
++ * PM1_CNT sleep transitions, PM1_STS/EN, GPE and SMBus are not modelled --
++ * a guest that writes them sees no effect instead of a fabricated one.
++ */
++#ifndef PM_H
++#define PM_H
++
++#include <stdint.h>
++
++struct machine;
++
++typedef struct pm {
++    uint16_t base;      /* PMBASE as programmed (bits 15:7), default 0xb000 */
++    uint32_t count;     /* 24-bit TMR counter                              */
++    uint64_t last_instr;/* vtime_instr at the last advance                  */
++    uint64_t accum;     /* fractional PIT-tick accumulator (TMR runs 3x)   */
++    uint64_t reads;     /* TMR reads (diagnostic)                          */
++} pm_t;
++
++/* Reset the block and decode it at the Q35/SeaBIOS default base 0xb000. */
++void pm_init(struct machine *m);
++
++/* Move the 0x40-byte register block; the old window stops decoding. */
++void pm_set_base(struct machine *m, uint16_t base);
++
++/* Current 24-bit Timer value, advanced from vtime_instr. */
++uint32_t pm_timer_now(struct machine *m);
++
++#endif
+diff --git a/tests/g5_acpi_receipt.py b/tests/g5_acpi_receipt.py
+new file mode 100644
+index 0000000..7b0d315
+--- /dev/null
++++ b/tests/g5_acpi_receipt.py
+@@ -0,0 +1,248 @@
++#!/usr/bin/env python3
++"""COMPAT G5: ACPI acceptance on the accepted image.
++
++Walks the live ACPI tree inside an x86emu AURASNP1 snapshot and decodes the
++MADT far enough to check the two claims the guest makes on the serial line:
++
++  * `[BL9] ACPI RSDP found` / `[BL9] ACPI MADT parsed` -- the guest found a
++    root pointer and parsed one MADT;
++  * `[ioapic] base 0xfec00000 (MADT agree)` and `24 redirection entries` --
++    the I/O APIC the kernel programmed is the one the MADT describes.
++
++Usage:
++  g5_acpi_receipt.py --snapshot s.snap --serial run.serial.log   # print
++  g5_acpi_receipt.py --check receipt.txt --serial run.serial.log # gate
++
++Exit: 0 pass, 1 mismatch, 2 usage/IO.
++"""
++from __future__ import annotations
++
++import argparse
++import re
++import struct
++import sys
++from pathlib import Path
++
++PAGE = 4096
++RSDP_START, RSDP_END = 0x00080000, 0x00100000     # SeaBIOS search window
++
++
++def exact(f, n: int) -> bytes:
++    b = f.read(n)
++    if len(b) != n:
++        raise SystemExit(f"truncated snapshot: wanted {n} bytes, got {len(b)}")
++    return b
++
++
++def snapshot_ram(path: Path) -> bytearray:
++    with path.open("rb") as f:
++        if exact(f, 8) != b"AURASNP1":
++            raise SystemExit("not an x86emu AURASNP1 snapshot")
++        version, _ms, _cs = struct.unpack("<III", exact(f, 12))
++        if version not in (1, 2):
++            raise SystemExit(f"unsupported snapshot version {version}")
++        while True:
++            tag = exact(f, 16).split(b"\0", 1)[0].decode("ascii", "replace")
++            (size,) = struct.unpack("<Q", exact(f, 8))
++            if tag != "ram":
++                f.seek(size, 1)
++                continue
++            pages = (size + PAGE - 1) // PAGE
++            bitmap = exact(f, (pages + 7) // 8)
++            ram = bytearray(size)
++            for p in range(pages):
++                if bitmap[p // 8] & (1 << (p % 8)):
++                    off = p * PAGE
++                    ram[off:off + min(PAGE, size - off)] = exact(f, min(PAGE, size - off))
++            return ram
++
++
++def checksum_ok(data: bytes) -> bool:
++    return (sum(data) & 0xFF) == 0
++
++
++def read_table(ram: bytearray, addr: int) -> bytes:
++    if addr < 0 or addr + 36 > len(ram):
++        raise SystemExit(f"table header outside RAM at 0x{addr:x}")
++    length = struct.unpack_from("<I", ram, addr + 4)[0]
++    if length < 36 or addr + length > len(ram):
++        raise SystemExit(f"table length {length} outside RAM at 0x{addr:x}")
++    return bytes(ram[addr:addr + length])
++
++
++def decode_madt(body: bytes) -> dict:
++    lapic_base = struct.unpack_from("<I", body, 36)[0]
++    out = {"lapic_base": lapic_base, "cpus": [], "ioapics": [], "overrides": []}
++    off = 44
++    while off + 2 <= len(body):
++        etype, elen = body[off], body[off + 1]
++        if elen < 2 or off + elen > len(body):
++            break
++        if etype == 0 and elen >= 8:                       # Processor Local APIC
++            out["cpus"].append({"uid": body[off + 2], "apic_id": body[off + 3],
++                                "flags": struct.unpack_from("<I", body, off + 4)[0]})
++        elif etype == 1 and elen >= 12:                    # I/O APIC
++            out["ioapics"].append({"id": body[off + 2],
++                                   "addr": struct.unpack_from("<I", body, off + 4)[0],
++                                   "gsi_base": struct.unpack_from("<I", body, off + 8)[0]})
++        elif etype == 2 and elen >= 10:                    # Interrupt Source Override
++            out["overrides"].append({"bus": body[off + 2], "source": body[off + 3],
++                                     "gsi": struct.unpack_from("<I", body, off + 4)[0],
++                                     "flags": struct.unpack_from("<H", body, off + 8)[0]})
++        off += elen
++    return out
++
++
++SERIAL_PATTERNS = {
++    "rsdp": re.compile(r"\[BL9\] ACPI RSDP found"),
++    "madt": re.compile(r"\[BL9\] ACPI MADT parsed"),
++    "ioapic_agree": re.compile(r"\[ioapic\] base (0x[0-9a-f]+) \(MADT agree\)"),
++    "ioapic_entries": re.compile(r"I/O APIC @(0x[0-9a-f]+) ver 0x[0-9a-f]+, "
++                                 r"(\d+) redirection entries"),
++    "overrides": re.compile(r"\[ioapic\] overrides: (.+)$"),
++}
++
++
++def serial_facts(path: Path) -> dict:
++    text = path.read_text(errors="replace")
++    facts = {k: None for k in SERIAL_PATTERNS}
++    facts["order"] = []
++    for name, rx in SERIAL_PATTERNS.items():
++        m = rx.search(text)
++        if not m:
++            continue
++        if name in ("ioapic_agree", "ioapic_entries"):
++            facts["order"].append(name)
++        facts[name] = m.groups()
++    for marker in ("rsdp", "madt"):
++        if SERIAL_PATTERNS[marker].search(text):
++            pos = SERIAL_PATTERNS[marker].search(text).start()
++            facts["order"].append((pos, marker))
++    return facts
++
++
++def render(ram: bytearray) -> tuple[list[str], dict]:
++    lines: list[str] = []
++    at = ram.find(b"RSD PTR ", RSDP_START)
++    if at < 0 or at >= RSDP_END:
++        raise SystemExit("NO RSDP in the SeaBIOS window")
++    rsdp = bytes(ram[at:at + 20])
++    if not checksum_ok(rsdp):
++        raise SystemExit(f"RSDP at 0x{at:x}: bad checksum")
++    rsdt = struct.unpack_from("<I", ram, at + 16)[0]
++    lines.append(f"rsdp addr=0x{at:08x} rev={rsdp[15]} checksum=ok rsdt=0x{rsdt:08x}")
++
++    body = read_table(ram, rsdt)
++    if body[:4] != b"RSDT":
++        raise SystemExit(f"RSDT signature mismatch: {body[:4]!r}")
++    if not checksum_ok(body):
++        raise SystemExit("RSDT checksum bad")
++    count = (len(body) - 36) // 4
++    lines.append(f"rsdt sig=RSDT entries={count} checksum=ok")
++    facts = {"rsdp": at, "rsdt": rsdt, "entries": count, "tables": {}, "madt": None}
++    for k in range(count):
++        entry = struct.unpack_from("<I", ram, rsdt + 36 + 4 * k)[0]
++        tbl = read_table(ram, entry)
++        sig = tbl[:4].decode("ascii", "replace")
++        ok = checksum_ok(tbl)
++        facts["tables"][sig] = {"addr": entry, "len": len(tbl), "checksum_ok": ok}
++        lines.append(f"table sig={sig} addr=0x{entry:08x} len={len(tbl)} "
++                     f"checksum={'ok' if ok else 'BAD'}")
++        if sig == "APIC":
++            madt = decode_madt(tbl)
++            madt["len"] = len(tbl)
++            madt["checksum_ok"] = ok
++            facts["madt"] = madt
++    if facts["madt"] is None:
++        raise SystemExit("no MADT in the RSDT")
++    m = facts["madt"]
++    lines.append(f"madt lapic_base=0x{m['lapic_base']:08x} cpus={len(m['cpus'])} "
++                 f"ioapics={len(m['ioapics'])} isos={len(m['overrides'])}")
++    for io in m["ioapics"]:
++        lines.append(f"madt_ioapic id={io['id']} addr=0x{io['addr']:08x} "
++                     f"gsi_base=0x{io['gsi_base']:x}")
++    for ov in m["overrides"]:
++        lines.append(f"madt_iso bus={ov['bus']} source={ov['source']} "
++                     f"gsi={ov['gsi']} flags=0x{ov['flags']:04x}")
++    return lines, facts
++
++
++def check(receipt: Path, serial: Path) -> int:
++    kv: dict[str, str] = {}
++    for line in receipt.read_text().splitlines():
++        if not line.strip() or line.startswith("#"):
++            continue
++        parts = line.split()
++        kv[parts[0]] = line
++    fails = []
++
++    def need(cond: bool, msg: str) -> None:
++        if not cond:
++            fails.append(msg)
++
++    need("rsdp" in kv and "checksum=ok" in kv["rsdp"], "receipt: RSDP missing/bad")
++    need("rsdt" in kv and "checksum=ok" in kv["rsdt"], "receipt: RSDT missing/bad")
++    entries = int(re.search(r"entries=(\d+)", kv.get("rsdt", "")).group(1)) \
++        if "rsdt" in kv else 0
++    tables = [l for l in receipt.read_text().splitlines() if l.startswith("table sig=")]
++    need(len(tables) == entries, f"receipt: {len(tables)} table lines for {entries} RSDT entries")
++    need(all("checksum=ok" in t for t in tables), "receipt: a table checksum is BAD")
++    need(any("sig=APIC " in l for l in tables), "receipt: no MADT/APIC table")
++    madt_line = kv.get("madt", "")
++    need("lapic_base=0x" in madt_line, "receipt: MADT line missing")
++    ioapic_lines = [l for l in receipt.read_text().splitlines() if l.startswith("madt_ioapic ")]
++    need(len(ioapic_lines) >= 1, "receipt: MADT has no I/O APIC")
++
++    s = serial.read_text(errors="replace")
++    for key, rx in (("rsdp", SERIAL_PATTERNS["rsdp"]), ("madt", SERIAL_PATTERNS["madt"])):
++        need(rx.search(s) is not None, f"serial: missing {key} marker")
++    ioa = SERIAL_PATTERNS["ioapic_agree"].search(s)
++    need(ioa is not None, "serial: missing '[ioapic] base ... (MADT agree)'")
++    if ioa and ioapic_lines:
++        receipt_addr = re.search(r"addr=(0x[0-9a-f]+)", ioapic_lines[0]).group(1)
++        need(int(ioa.group(1), 16) == int(receipt_addr, 16),
++             f"serial ioapic {ioa.group(1)} != MADT {receipt_addr}")
++    ent = SERIAL_PATTERNS["ioapic_entries"].search(s)
++    need(ent is not None, "serial: missing I/O APIC redirection-entry count")
++    if ent and ioapic_lines:
++        need(ent.group(1) == ioapic_lines[0].split("addr=")[1].split()[0],
++             "serial: I/O APIC address differs from MADT")
++        madt_line = kv.get("madt", "")
++        isos = int(re.search(r"isos=(\d+)", madt_line).group(1)) if "isos=" in madt_line else 0
++        need(isos > 0, "receipt: MADT carries no ISO entries")
++    # Marker order: RSDP before MADT before the ioapic programming line.
++    pos = [s.find(m) for m in ("[BL9] ACPI RSDP found", "[BL9] ACPI MADT parsed",
++                               "[ioapic] base")]
++    need(all(p >= 0 for p in pos) and pos == sorted(pos),
++         "serial: RSDP/MADT/ioapic markers out of order")
++
++    for f in fails:
++        print("FAIL:", f, file=sys.stderr)
++    if fails:
++        return 1
++    print(f"g5 acpi: PASS ({len(tables)} tables, MADT ioapic "
++          f"{ioapic_lines[0].split('addr=')[1].split()[0]})")
++    return 0
++
++
++def main(argv: list[str]) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--snapshot", type=Path)
++    ap.add_argument("--serial", type=Path, required=True)
++    ap.add_argument("--check", type=Path)
++    ap.add_argument("--out", type=Path)
++    a = ap.parse_args(argv)
++    if a.check:
++        return check(a.check, a.serial)
++    if not a.snapshot:
++        ap.error("need --snapshot (or --check RECEIPT)")
++    lines, _facts = render(snapshot_ram(a.snapshot))
++    text = "\n".join(lines) + "\n"
++    if a.out:
++        a.out.write_text(text)
++    sys.stdout.write(text)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv[1:]))
+diff --git a/tests/integration/g5_acceptance_nc.sh b/tests/integration/g5_acceptance_nc.sh
+new file mode 100755
+index 0000000..c04dde6
+--- /dev/null
++++ b/tests/integration/g5_acceptance_nc.sh
+@@ -0,0 +1,85 @@
++#!/bin/sh
++# COMPAT G5 acceptance gate — negative control (patch 0064).
++#
++# Each case copies the bundle, applies one tampering, and requires
++# tests/test_g5_acceptance.py to reject it.  Cases 1-3 re-sign SHA256SUMS, so
++# the manifest cannot be what fails: the semantic checks must catch each
++# mutation themselves.  Case 4 leaves the manifest stale to prove the digest
++# check works.
++set -eu
++
++HERE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++BUNDLE="$HERE/docs/evidence/compat-g5"
++GATE="$HERE/tests/test_g5_acceptance.py"
++TMP=${TMPDIR:-/tmp}/g5-acceptance-nc.$$
++mkdir -p "$TMP"
++trap 'rm -rf "$TMP"' EXIT INT TERM
++
++[ -d "$BUNDLE" ] || { echo "NC setup: missing $BUNDLE" >&2; exit 1; }
++[ -f "$GATE" ] || { echo "NC setup: missing $GATE" >&2; exit 1; }
++
++resign() {
++    ( cd "$1" && sha256sum $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS )
++}
++
++expect_reject() {
++    case_name=$1
++    dir=$2
++    if python3 "$GATE" --evidence "$dir" >"$dir.gate.log" 2>&1; then
++        echo "NC FAIL: $case_name — gate accepted a tampered bundle"
++        cat "$dir.gate.log"
++        exit 1
++    fi
++    echo "NC PASS: $case_name (${dir}.gate.log)"
++}
++
++# Case 1: shell-active marker removed; manifest re-signed.
++C1="$TMP/1-no-shell"
++cp -a "$BUNDLE" "$C1"
++gzip -dc "$C1/x86emu-ich9.serial.log.gz" \
++    | grep -v 'shell active; kmain idling' \
++    | gzip -9n > "$C1/x86emu-ich9.serial.log.gz.new"
++mv "$C1/x86emu-ich9.serial.log.gz.new" "$C1/x86emu-ich9.serial.log.gz"
++resign "$C1"
++expect_reject "serial log without the shell-active marker" "$C1"
++
++# Case 2: the ICH9 RCRB reservation dropped from boot_info_t; manifest re-signed.
++C2="$TMP/2-no-rcrb"
++cp -a "$BUNDLE" "$C2"
++python3 - "$C2/bootinfo-ich9.bin" <<'PY'
++import struct, sys
++path = sys.argv[1]
++raw = bytearray(open(path, "rb").read())
++count = struct.unpack_from("<I", raw, 6184)[0]
++assert count == 8, count
++# Drop entry 6 (0xfed1c000+0x4000) by shifting entry 7 down and counting 7.
++base = 40
++raw[base + 6 * 24: base + 7 * 24] = raw[base + 7 * 24: base + 8 * 24]
++raw[base + 7 * 24: base + 8 * 24] = b"\0" * 24
++struct.pack_into("<I", raw, 6184, 7)
++open(path, "wb").write(raw)
++PY
++resign "$C2"
++expect_reject "E820 without the ICH9 RCRB reservation" "$C2"
++
++# Case 3: the PM-timer negative control edited to claim the mutant boots.
++C3="$TMP/3-nc-claims-pass"
++cp -a "$BUNDLE" "$C3"
++sed -i 's/^frozen:  BL3=absent steps=300000000/frozen:  BL3=present steps=297585739/' \
++    "$C3/nc-pm.txt"
++resign "$C3"
++expect_reject "negative control claims the frozen timer boots" "$C3"
++
++# Case 4: RSDP zeroed in boot_info_t, manifest left stale.
++C4="$TMP/4-stale-manifest"
++cp -a "$BUNDLE" "$C4"
++python3 - "$C4/bootinfo-ich9.bin" <<'PY'
++import sys
++path = sys.argv[1]
++raw = bytearray(open(path, "rb").read())
++raw[7760:7768] = b"\0" * 8
++open(path, "wb").write(raw)
++PY
++expect_reject "RSDP zeroed with a stale manifest" "$C4"
++
++echo "g5 acceptance NC: all four cases rejected"
+diff --git a/tests/integration/g5_pm_nc.sh b/tests/integration/g5_pm_nc.sh
+new file mode 100755
+index 0000000..c2dbb23
+--- /dev/null
++++ b/tests/integration/g5_pm_nc.sh
+@@ -0,0 +1,93 @@
++#!/bin/sh
++# COMPAT G5 — negative control for the ACPI PM timer (patch 0064).
++#
++# The fix claims one thing: the ICH9 boot hangs because PMBASE+8 has no state.
++# This script restores exactly that defect in a throw-away copy and requires the
++# boot to stall again, while the unmodified tree reaches Stage 2 on the same
++# image and the same instruction budget.
++#
++#   case "frozen": pm_timer_now() returns 0xFFFFFFFF (the pre-fix port float).
++#     -> must NOT reach [BL3], must burn the whole budget.
++#   case "control": unmodified sources, same budget.
++#     -> must reach [BL3].
++#
++# The 300M budget is measured, not guessed: the fixed boot prints [BL3] at
++# executed_steps=297,585,739 and the frozen one prints nothing in 300M.
++set -eu
++
++HERE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++TMP=${TMPDIR:-/tmp}/g5-pm-nc.$$
++BUDGET=300000000
++mkdir -p "$TMP"
++trap 'rm -rf "$TMP"' EXIT INT TERM
++
++ROM=${G5_ROM:-/tmp/sbpkg/usr/share/seabios/bios.bin}
++ISO=${G5_ISO:-/tmp/iso-candidate.iso}
++DISK="$HERE/docs/evidence/compat-g3/blank-usb-1m.img"
++
++for f in "$ROM" "$ISO" "$DISK"; do
++    [ -f "$f" ] || { echo "NC setup: missing $f" >&2; exit 2; }
++done
++
++run_boot() {   # $1 = tree, $2 = tag
++    ( cd "$1" && ./x86emu --lpc=ich9 --rom="$ROM" --platform=haswell \
++        --disk="$DISK" --sata="$ISO" --max-instr="$BUDGET" --stats ) \
++        >"$TMP/$2.out" 2>"$TMP/$2.serial.log"
++}
++
++# --- case 1: the defect, restored ------------------------------------------
++cp -a "$HERE" "$TMP/mutant"
++python3 - "$TMP/mutant/src/pm.c" <<'PY'
++import sys
++path = sys.argv[1]
++src = open(path).read()
++old = """uint32_t pm_timer_now(machine_t *m) {
++    pm_advance(m);
++    return m->pm.count & PM_TMR_MASK;
++}"""
++new = """uint32_t pm_timer_now(machine_t *m) {
++    /* G5 NC: pre-fix behaviour -- unconnected port floats high. */
++    (void)m;
++    return 0xFFFFFFFFu;
++}"""
++assert old in src, "NC setup: pm_timer_now() shape changed; update the mutation"
++src = src.replace(old, new, 1)
++src = src.replace("static void pm_advance(machine_t *m) {",
++                  "__attribute__((unused)) static void pm_advance(machine_t *m) {", 1)
++open(path, "w").write(src)
++PY
++( cd "$TMP/mutant" && make -j4 x86emu >"$TMP/mutant.build.log" 2>&1 ) || {
++    echo "NC setup: mutant build failed; see $TMP/mutant.build.log" >&2; exit 2; }
++
++run_boot "$TMP/mutant" frozen
++steps=$(sed -n 's/.*executed_steps=\([0-9]*\).*/\1/p' "$TMP/frozen.out" | head -1)
++if grep -qa '\[BL3\]' "$TMP/frozen.serial.log"; then
++    echo "NC FAIL: frozen TMR still reached Stage 2 (steps=$steps)"
++    exit 1
++fi
++[ "${steps:-0}" = "$BUDGET" ] || {
++    echo "NC FAIL: frozen run stopped early at steps=$steps, expected $BUDGET"
++    exit 1; }
++echo "NC PASS: frozen TMR never reaches [BL3] (steps=$steps)"
++
++# --- case 2: control --------------------------------------------------------
++run_boot "$HERE" control
++csteps=$(sed -n 's/.*executed_steps=\([0-9]*\).*/\1/p' "$TMP/control.out" | head -1)
++if ! grep -qa '\[BL3\]' "$TMP/control.serial.log"; then
++    echo "NC FAIL: control did not reach [BL3] within $BUDGET"
++    exit 1
++fi
++[ "${csteps:-0}" -lt "$BUDGET" ] || {
++    echo "NC FAIL: control only reached [BL3] by exhausting the budget"
++    exit 1; }
++echo "NC PASS: control reaches [BL3] at steps=$csteps (< $BUDGET)"
++
++diff_log="$HERE/docs/evidence/compat-g5/nc-pm.txt"
++{
++    echo "# COMPAT G5 PM-timer negative control"
++    echo "# rom=$ROM iso=$ISO"
++    echo "# md5=$(md5sum <"$ROM" | cut -d' ' -f1)"
++    echo "frozen:  BL3=absent steps=$steps"
++    echo "control: BL3=present steps=$csteps"
++} > "$diff_log" 2>/dev/null || true
++echo "NC: log -> ${diff_log#$HERE/}"
+diff --git a/tests/test_g5_acceptance.py b/tests/test_g5_acceptance.py
+new file mode 100644
+index 0000000..9e786db
+--- /dev/null
++++ b/tests/test_g5_acceptance.py
+@@ -0,0 +1,217 @@
++#!/usr/bin/env python3
++"""COMPAT G5 acceptance gate (patch 0064).
++
++Re-checks the recorded receipts for the ICH9 lane: the boot reaches
++`[kernel] shell active` with `fault=0` inside the instruction budget, the
++handoff block reports eight E820 entries including the ICH9 RCRB window and a
++live RSDP, the ACPI receipt agrees with the serial log, and the negative
++control shows that a frozen PM timer reproduces the stall.
++
++File-based like the G3 gate: no emulator, no ISO, no snapshot needed, so it
++runs inside `make test`.
++
++Exit: 0 pass, 1 any check fails, 2 usage/IO.
++"""
++from __future__ import annotations
++
++import argparse
++import gzip
++import hashlib
++import re
++import struct
++import sys
++from pathlib import Path
++
++BOOT_INFO_SIZE = 7776
++BOOT_MAGIC = 0x4155524142544C44
++MMAP_OFF, MMAP_ENTRY_SIZE, MMAP_COUNT_OFF = 40, 24, 6184
++HHDM_OFF, INITRD_PHYS_OFF, INITRD_SIZE_OFF = 6192, 6200, 6208
++CPU_COUNT_OFF, BSP_LAPIC_OFF, RSDP_OFF, UEFI_OFF = 6216, 6220, 7760, 7768
++HHDM_VALUE = 0xFFFF800000000000
++RCRB = (0xFED1C000, 0x4000)
++SHELL_MARKER = "[kernel] shell active; kmain idling."
++
++FAILS: list[str] = []
++
++
++def check(ok: bool, label: str, detail: str = "") -> bool:
++    if ok:
++        print(f"ok   {label}" + (f" ({detail})" if detail else ""))
++    else:
++        print(f"FAIL {label}" + (f" ({detail})" if detail else ""), file=sys.stderr)
++        FAILS.append(label)
++    return ok
++
++
++def verify_manifest(directory: Path) -> None:
++    manifest = directory / "SHA256SUMS"
++    if not check(manifest.is_file(), "SHA256SUMS present"):
++        return
++    listed = 0
++    for line in manifest.read_text().splitlines():
++        if not line.strip():
++            continue
++        digest, name = line.split(None, 1)
++        name = name.lstrip("*")
++        target = directory / name
++        if not check(target.is_file(), f"bundle file {name}"):
++            continue
++        got = hashlib.sha256(target.read_bytes()).hexdigest()
++        check(got == digest, f"sha256 {name}", got[:16])
++        listed += 1
++    present = {p.name for p in directory.iterdir() if p.is_file()} - {"SHA256SUMS"}
++    check(listed == len(present), "manifest covers every file",
++          f"{listed}/{len(present)}")
++
++
++def read_serial(directory: Path) -> str:
++    plain = directory / "x86emu-ich9.serial.log"
++    if plain.is_file():
++        return plain.read_text(errors="replace")
++    gz = directory / "x86emu-ich9.serial.log.gz"
++    if gz.is_file():
++        return gzip.decompress(gz.read_bytes()).decode("utf-8", "replace")
++    return ""
++
++
++def verify_serial(directory: Path) -> str:
++    text = read_serial(directory)
++    if not check(bool(text), "serial log present"):
++        return ""
++    order = [
++        "[BL3] AuraLite stage2 alive",
++        "[BL3] unreal mode OK",
++        "[BL10] CPU supports long mode",
++        "[BL9] ACPI RSDP found",
++        "[BL9] ACPI MADT parsed",
++        "[BL4] ELF PT_LOAD segments copied to phys",
++        "[BL4] entering long mode; jumping to kernel _start",
++        SHELL_MARKER,
++    ]
++    pos = [text.find(m) for m in order]
++    missing = [m for m, p in zip(order, pos) if p < 0]
++    check(not missing, "every boot marker present", str(missing))
++    if not missing:
++        check(pos == sorted(pos), "boot markers in order")
++    check("panic" not in text.lower(), "no kernel panic in the serial log")
++    check("[ioapic] base 0xfec00000 (MADT agree)" in text,
++          "guest agrees with the MADT's I/O APIC base")
++    return text
++
++
++def verify_stats(directory: Path) -> None:
++    path = directory / "x86emu-ich9.stdout.txt"
++    if not check(path.is_file(), "stats stdout present"):
++        return
++    text = path.read_text(errors="replace")
++    m = re.search(r"\[stats\] vcpu=0 executed_steps=(\d+) instr_count=(\d+) "
++                  r"halted=(\d+) fault=(\d+)", text)
++    if not check(m is not None, "stats line parses"):
++        return
++    steps, _instr, _halted, fault = (int(x) for x in m.groups())
++    check(fault == 0, "fault=0", str(fault))
++    cap = re.search(r"\[stats\] cap=(\d+) cap_reached=(\d+)", text)
++    check(cap is not None, "cap line present")
++    if cap:
++        cap_n, reached = int(cap.group(1)), int(cap.group(2))
++        check(cap_n == 2_000_000_000, "budget is 2 G", str(cap_n))
++        check(reached == 1, "run ended by the cap, not by a fault", str(reached))
++    check("mode=long64" in text, "CPU finished in long mode")
++    check(steps > 0, "executed_steps recorded", str(steps))
++
++
++def verify_bootinfo(directory: Path) -> None:
++    block = directory / "bootinfo-ich9.bin"
++    if not check(block.is_file(), "bootinfo-ich9.bin present"):
++        return
++    raw = block.read_bytes()
++    if not check(len(raw) == BOOT_INFO_SIZE, "boot_info_t size", str(len(raw))):
++        return
++    check(struct.unpack_from("<Q", raw, 0)[0] == BOOT_MAGIC, "BOOT_MAGIC")
++    count = struct.unpack_from("<I", raw, MMAP_COUNT_OFF)[0]
++    check(count == 8, "E820 has 8 entries under --lpc=ich9", str(count))
++    entries = [struct.unpack_from("<QQII", raw, MMAP_OFF + i * MMAP_ENTRY_SIZE)
++               for i in range(min(count, 256))]
++    check(all(length > 0 and typ in (1, 2) for _, length, typ, _ in entries),
++          "E820 entries are non-empty RAM/reserved")
++    check(all(pad == 0 for *_, pad in entries), "E820 entry padding is zero")
++    ordered = all(entries[i][0] + entries[i][1] <= entries[i + 1][0]
++                  for i in range(len(entries) - 1))
++    check(ordered, "E820 entries sorted and non-overlapping")
++    check(any((base, length) == RCRB and typ == 2
++              for base, length, typ, _ in entries),
++          "ICH9 RCRB 0xfed1c000+0x4000 is reserved")
++    check(struct.unpack_from("<Q", raw, HHDM_OFF)[0] == HHDM_VALUE, "HHDM offset")
++    ip = struct.unpack_from("<Q", raw, INITRD_PHYS_OFF)[0]
++    isz = struct.unpack_from("<Q", raw, INITRD_SIZE_OFF)[0]
++    check(ip == 0x1800000 and isz == 0xB22000, "initrd address and size")
++    check(struct.unpack_from("<I", raw, CPU_COUNT_OFF)[0] == 1, "one CPU")
++    check(struct.unpack_from("<I", raw, BSP_LAPIC_OFF)[0] == 0, "BSP APIC id 0")
++    rsdp = struct.unpack_from("<Q", raw, RSDP_OFF)[0]
++    check(rsdp != 0, "boot_info_t carries a live RSDP", f"{rsdp:#x}")
++    check(raw[UEFI_OFF] == 0, "boot_from_uefi is 0")
++    check(not any(raw[UEFI_OFF + 1:]), "reserved padding is zero")
++    # The RSDP the handoff carries must be the one the ACPI walk found.
++    receipt = (directory / "acpi-receipt.txt").read_text().splitlines()
++    at = int(re.search(r"rsdp addr=0x([0-9a-f]+)", receipt[0]).group(1), 16)
++    check(rsdp == at, "handoff RSDP == RSDP found in memory",
++          f"{rsdp:#x} vs {at:#x}")
++
++
++def verify_acpi(directory: Path, tool: Path) -> None:
++    receipt = directory / "acpi-receipt.txt"
++    if not check(receipt.is_file(), "acpi-receipt.txt present"):
++        return
++    import subprocess
++    import tempfile
++    text = read_serial(directory)
++    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tmp:
++        tmp.write(text)
++        tmp_path = Path(tmp.name)
++    try:
++        proc = subprocess.run([sys.executable, str(tool), "--check", str(receipt),
++                               "--serial", str(tmp_path)], capture_output=True, text=True)
++        check(proc.returncode == 0, "ACPI receipt agrees with the serial log",
++              (proc.stdout or proc.stderr).strip()[:120])
++    finally:
++        tmp_path.unlink(missing_ok=True)
++
++
++def verify_negative_control(directory: Path) -> None:
++    path = directory / "nc-pm.txt"
++    if not check(path.is_file(), "nc-pm.txt present"):
++        return
++    text = path.read_text()
++    frozen = re.search(r"frozen:\s+BL3=absent steps=(\d+)", text)
++    control = re.search(r"control:\s+BL3=present steps=(\d+)", text)
++    check(frozen is not None and int(frozen.group(1)) == 300_000_000,
++          "frozen PM timer burns the whole 300 M budget")
++    check(control is not None and int(control.group(1)) < 300_000_000,
++          "control reaches Stage 2 before the budget")
++
++
++def main(argv: list[str]) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--evidence", type=Path,
++                    default=Path(__file__).resolve().parent.parent /
++                    "docs/evidence/compat-g5")
++    args = ap.parse_args(argv)
++    d = args.evidence
++    if not d.is_dir():
++        print(f"no such evidence directory: {d}", file=sys.stderr)
++        return 2
++    verify_manifest(d)
++    verify_serial(d)
++    verify_stats(d)
++    verify_bootinfo(d)
++    verify_acpi(d, Path(__file__).resolve().parent / "g5_acpi_receipt.py")
++    verify_negative_control(d)
++    if FAILS:
++        print(f"\n{len(FAILS)} check(s) failed", file=sys.stderr)
++        return 1
++    print("\nG5 acceptance: PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv[1:]))
+diff --git a/tests/test_pm.c b/tests/test_pm.c
+new file mode 100644
+index 0000000..6d98f9c
+--- /dev/null
++++ b/tests/test_pm.c
+@@ -0,0 +1,160 @@
++/* tests/test_pm.c -- COMPAT G5 vectors: ACPI PM block and its 24-bit Timer.
++ *
++ * The measured defect: with the ICH9 LPC identity stock SeaBIOS publishes the
++ * FADT, programs PMBASE (0:31.0 config 0x40 = 0xb000|1) and switches its own
++ * timer to PMBASE+8.  The port was unconnected, read 0xFFFFFFFF forever, and
++ * every timer_check() poll spun without a timeout -- the --lpc=ich9 boot never
++ * reached Stage 2.  These vectors pin the replacement:
++ *
++ *   1. TMR advances exactly three counts per PIT tick (3.579545/1.193182 MHz),
++ *      so 384 instructions/PIT-tick means one count per 128 retired steps.
++ *   2. The counter is 24 bits and wraps at 0x1000000.
++ *   3. Reads compose byte / word / dword at PMBASE+8; bits 31:24 read zero.
++ *   4. The rest of the 0x40-byte block reads zero, and TMR is read-only.
++ *   5. PMBASE moves the block: the old window stops decoding, the new one
++ *      answers, and the LPC config hook drives the move.
++ */
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "platform.h"
++#include "pci.h"
++#include "pit.h"
++#include "pm.h"
++#include "harness.h"
++
++#define PM_DEFAULT_BASE 0xB000
++#define STEPS_PER_TMR   128u   /* 384 instructions per PIT tick / 3 */
++
++static void step(machine_t *m, uint64_t n) {
++    for (uint64_t i = 0; i < n; i++) m->vtime_instr++;   /* the K6 clock */
++}
++
++static void test_default_window_and_rate(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    assert(m.pm.base == PM_DEFAULT_BASE);
++
++    uint32_t t0 = io_read(&m, PM_DEFAULT_BASE + 8, 4);
++    assert(t0 == 0);
++
++    step(&m, STEPS_PER_TMR);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 1);
++
++    step(&m, STEPS_PER_TMR * 10);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 11);
++
++    /* Sub-count steps accumulate instead of being dropped. */
++    step(&m, STEPS_PER_TMR / 2);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 11);
++    step(&m, STEPS_PER_TMR - STEPS_PER_TMR / 2);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 12);
++
++    /* Three counts per PIT tick is the exact ratio the PIT model uses. */
++    machine_t p; setup_machine(&p);
++    pit_init(&p); pm_init(&p);
++    p.pit.instr_per_tick = 384;
++    step(&p, 384);
++    assert(pm_timer_now(&p) == 3);
++    puts("ok   pm: default window, 3 counts per PIT tick");
++}
++
++static void test_24bit_wrap(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    m.pm.count = 0x00FFFFFEu;
++    m.pm.last_instr = m.vtime_instr;
++    step(&m, STEPS_PER_TMR * 3);
++    assert(pm_timer_now(&m) == 1);          /* 0xFFFFFE + 3 -> 1 */
++    machine_t n; setup_machine(&n);
++    pit_init(&n); pm_init(&n);
++    step(&n, (uint64_t)STEPS_PER_TMR * 0x1000000u);
++    assert(pm_timer_now(&n) == 0);          /* full 2^24 wrap */
++    puts("ok   pm: 24-bit counter wraps at 0x1000000");
++}
++
++static void test_read_sizes_and_reserved_bits(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    m.pm.count = 0x00ABCDEFu;
++    m.pm.last_instr = m.vtime_instr;
++
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 0x00ABCDEFu);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 1) == 0xEFu);
++    assert(io_read(&m, PM_DEFAULT_BASE + 9, 1) == 0xCDu);
++    assert(io_read(&m, PM_DEFAULT_BASE + 10, 1) == 0xABu);
++    assert(io_read(&m, PM_DEFAULT_BASE + 11, 1) == 0x00u);   /* reserved */
++    assert(io_read(&m, PM_DEFAULT_BASE + 10, 2) == 0x00ABu);
++    /* A read that starts inside the counter and runs past it keeps the live
++     * bytes and reads the modelled zero for the reserved ones. */
++    assert(io_read(&m, PM_DEFAULT_BASE + 10, 4) == 0x000000ABu);
++    puts("ok   pm: byte/word/dword reads, reserved bits read zero");
++}
++
++static void test_other_registers_and_write_ignore(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    m.pm.count = 0x00000010u;
++    m.pm.last_instr = m.vtime_instr;
++
++    /* PM1_STS/EN (0x00..0x07), PM1_CNT (0x04), GPE, etc. read zero. */
++    for (uint16_t off = 0; off < 8; off++) assert(io_read(&m, PM_DEFAULT_BASE + off, 1) == 0);
++    assert(io_read(&m, PM_DEFAULT_BASE + 0x0C, 4) == 0);
++
++    /* Writes are swallowed: the Timer does not move, nothing appears. */
++    io_write(&m, PM_DEFAULT_BASE + 8, 4, 0xDEADBEEF);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 0x10);
++    io_write(&m, PM_DEFAULT_BASE + 4, 2, 0x0000);
++    assert(io_read(&m, PM_DEFAULT_BASE + 4, 2) == 0);
++
++    /* Outside the block the port still floats high, as before this module. */
++    assert(io_read(&m, PM_DEFAULT_BASE + 0x40, 1) == 0xFF);
++    puts("ok   pm: only TMR has state; writes are swallowed");
++}
++
++static void test_rebase(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    m.pm.count = 0x00000FF0u;
++    m.pm.last_instr = m.vtime_instr;
++
++    pm_set_base(&m, 0x0900 | 0x0001);       /* low bits are not part of base */
++    assert(m.pm.base == 0x0900);
++    assert(io_read(&m, 0x0908, 4) == 0xFF0u);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 0xFFFFFFFFu);  /* old gone */
++
++    pm_set_base(&m, 0xB000);
++    assert(io_read(&m, PM_DEFAULT_BASE + 8, 4) == 0xFF0u);
++    assert(io_read(&m, 0x0908, 4) == 0xFFFFFFFFu);
++    puts("ok   pm: PMBASE moves the block and clears the old window");
++}
++
++static void test_lpc_config_hook_moves_base(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    pci_init(&m);
++    pci_dev_t *lpc = pci_add_device(&m, 0, 31, 0, "lpc", 0x8086, 0x2918, 0x06, 0x01, 0);
++
++    /* What SeaBIOS's ich9_lpc_setup does: PMBASE = 0xb000 | 1. */
++    lpc->ctx = &m;
++    pci_default_cfg_write(lpc, 0x40, 4, 0x0000B001u);
++    pm_set_base(&m, (uint16_t)((lpc->cfg[0x40] | (lpc->cfg[0x41] << 8)) & 0xFF80u));
++    assert(m.pm.base == 0xB000);
++    m.pm.count = 0x0000002Au;
++    m.pm.last_instr = m.vtime_instr;
++    assert(io_read(&m, 0xB008, 4) == 0x2Au);
++    pci_done(&m);
++    puts("ok   pm: LPC PMBASE (0x40 = 0xb000|1) lands on 0xb000");
++}
++
++int main(void) {
++    test_default_window_and_rate();
++    test_24bit_wrap();
++    test_read_sizes_and_reserved_bits();
++    test_other_registers_and_write_ignore();
++    test_rebase();
++    test_lpc_config_hook_moves_base();
++    puts("pm tests: ok");
++    return 0;
++}
+-- 
+2.47.3
+

@@ -1196,6 +1196,17 @@ static void gpu_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
         vga_set_display_mode(g_vga.m, 0);
 }
 
+/* COMPAT G5: LPC config hook.  Only PMBASE (0x40..0x43) is acted on: the
+ * generic store keeps the bytes, and the ACPI PM block follows the base. */
+static void lpc_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
+    pci_default_cfg_write(d, reg, size, val);
+    if (reg <= 0x40 && reg + size > 0x40) {
+        machine_t *m = d->ctx;
+        uint32_t v = (uint32_t)d->cfg[0x40] | ((uint32_t)d->cfg[0x41] << 8);
+        pm_set_base(m, (uint16_t)(v & 0xFF80u));
+    }
+}
+
 /* =========================== public init entry points ====================== */
 void devices_init_common(machine_t *m) {
     pci_init(m);
@@ -1206,6 +1217,10 @@ void devices_init_common(machine_t *m) {
     pic_io_register(m);
     pit_init(m);
     pit_io_register(m);
+    /* COMPAT G5: the ACPI PM block at PMBASE.  SeaBIOS programs PMBASE on
+     * the ICH9 LPC and then, with ACPI published, switches its own timer to
+     * PMBASE+8; without this decode every timer_check() poll spun forever. */
+    pm_init(m);
     /* CHIPSET H3: 0x70/0x71 are a real MC146818A now -- long gone as the
      * silent sinks they were at baseline. The Super I/O config ports
      * (0x2E/0x2F) stay unclaimed: reads float high, and the sample
@@ -1247,9 +1262,23 @@ void devices_init_common(machine_t *m) {
     /* LPC bridge: real Intel convention dev31/func0. This chipset device
      * shares device 31 with the AHCI function at 0:31.2, so advertise the
      * multifunction header bit or PCI enumerators (including SeaBIOS) stop
-     * after function 0 and never discover the SATA controller. */
-    pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086, 0x1E55, 0x06, 0x01, 0);
+     * after function 0 and never discover the SATA controller.
+     * COMPAT G4: the identity is switchable.  The historical receipt (the
+     * sample firmware's own probe) expects 8086:1e55 (Panther Point);
+     * stock SeaBIOS's acpi_setup() instead recognizes only ICH9 LPC
+     * 8086:2918 -- the function that actually pairs with the Q35 host
+     * bridge this machine advertises -- and publishes no RSDP for 1e55.
+     * --lpc=ich9 selects that consistent pairing; the default keeps every
+     * historical lane byte-identical. */
+    pci_dev_t *lpc_pci = pci_add_device(m, 0,31,0, "lpc-bridge", 0x8086,
+                    m->cfg_lpc_ich9 ? 0x2918 : 0x1E55, 0x06, 0x01, 0);
     lpc_pci->cfg[0x0E] = 0x80;                    /* multifunction, type 0 */
+    /* COMPAT G5: PMBASE (dword at 0x40, base in bits 15:7) moves the ACPI
+     * PM block.  SeaBIOS writes 0xb000|1 here when it adopts the ICH9 LPC;
+     * the config store is the generic one, the hook only mirrors the base
+     * into the I/O decoder. */
+    lpc_pci->ctx = m;                             /* PMBASE hook needs it */
+    lpc_pci->cfg_write = lpc_cfg_write;
 
     /* SATA/AHCI: real Intel convention dev31/func2.  STORE S1: BAR5 is a
      * real MMIO window now (was an empty stub -- the guest's own boot

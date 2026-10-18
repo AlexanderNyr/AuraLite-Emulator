@@ -31,9 +31,9 @@ maps to exactly one plan below.
 | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V4 |
 | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK`) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N3 |
-| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | 🚧 P0 ✅ (0051), P1 ✅ (0052), P2 ✅ (0053), P3 ✅ (0054), P4 NO-GO (measured), P5 ✅ (0055) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
-| [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, 0056–0061) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
-| `docs/plans/COMPAT_PLAN.md` | 📋 planned | the north-star integration: flat kernel load → AuraLite OS stage2 → shell; ACPI/e820 surfaces; SMP (multi-vCPU) as the final rung | G0–G6 |
+| [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | ✅ **CLOSED** (P0 ✅ `0051`, P1 ✅ `0052`, P2 ✅ `0053`, P3 ✅ `0054`, P4 NO-GO measured, P5 ✅ `0055`) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
+| [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
+| [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -52,6 +52,52 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
    plan + `docs/STATUS.md` evidence, same patch.
 
 ## Immediate queue (next patches)
+
+All ten plans in the ledger above are **CLOSED**. Recent COMPAT phase patches:
+
+- ~~`0065` — COMPAT G6: 4-vCPU BIOS SMP bring-up, MADT publication, and guest
+  SMP test suite (`EM_MAX_VCPU = 8`, `CMOS[0x5F] = nv - 1`, broadcast INIT/SIPI
+  `shorthand=2/3`, `CPUID(1).EBX[31:24]` initial APIC ID, AP work-counter
+  preservation across second-stage `INIT`).  Measured on `--lpc=ich9 --smp=4`
+  with stock Debian SeaBIOS 1.16.3-2 + the accepted ISO: 134-byte MADT
+  (`cpus=4`), `boot_info_t.cpu_count=4`, `[smp] AP #0..#2 online`,
+  `[smp] 4 CPU(s) online (3 AP(s) woken)`, `[sched] R5 receipt: user thread
+  pid=6 on AP cpu=3`, `[kernel] shell active; kmain idling.`, and typed
+  `/tests/irqapwake` (`RES-16 receipt`, `IRQAPWAKE PASS`) + `/tests/smpstress`
+  (`SMPSTRESS PASS`) with `fault=0` on all 4 vCPUs and exact work-counter
+  identities.  Gates: `make test-g6` (73 checks), `make test-g6-nc` (5 tampered
+  bundles), `make test-g6-live` (`g6_smp_nc.sh`), plus unit vectors in
+  `tests/test_rtc.c` and `tests/test_lapic.c`.  Evidence:
+  `docs/evidence/compat-g6/`.~~ shipped — **COMPAT plan complete G0–G6**.
+- ~~`0064` — COMPAT G5: ACPI PM timer block (`src/pm.{h,c}`, `PMBASE+8`, 24-bit
+  TMR at 3 counts per PIT tick, movable via LPC config `0x40..0x43`) resolves
+  the `--lpc=ich9` AHCI probe timeout stall.  Stock SeaBIOS + the accepted ISO
+  boots under `--lpc=ich9` to `[kernel] shell active; kmain idling.` with
+  `fault=0`, `rsdp_phys=0xf6830`, an 8-entry E820 map (including the ICH9 RCRB
+  `0xfed1c000+0x4000`), and a validated RSDP → RSDT → FACP/SSDT/APIC/MCFG tree.
+  Gates: `tests/test_pm.c` (6 vectors), `make test-g5` (58 checks),
+  `make test-g5-nc` (4 tampered bundles), `make test-g5-live` (`g5_pm_nc.sh`).
+  Evidence: `docs/evidence/compat-g5/`.~~ shipped.
+- ~~`0063` — COMPAT G3: authoritative rebuild from pinned `AuraLite-OS@518bef0`
+  with the 6-instruction Stage-2 FS/GS unreal-mode fix (`boot/bios/stage2/acpi.inc`,
+  10-of-166,272-sector diff) boots under stock Debian SeaBIOS 1.16.3-2 to
+  `[kernel] shell active; kmain idling.` in both `x86emu` (twice, byte-identical
+  serial + stats) and QEMU, while the unpatched pinned ISO fails at `ELF parse
+  FAILED` in both (negative control).  Gates: `make test-g3` (54 checks),
+  `make test-g3-nc` (4 tampered bundles).  Evidence:
+  `docs/evidence/compat-g3/acceptance/`.~~ shipped.
+- ~~`0062` — COMPAT G4: LPC identity pairing.  The machine advertised the Q35
+  host bridge `8086:29c0` (and implemented its PAM registers) while the LPC
+  function reported Panther Point `8086:1e55`, an identity stock SeaBIOS's
+  `acpi_setup()` does not recognize, so no RSDP was ever published.  The new
+  opt-in `--lpc=ich9` reports `8086:2918` (the Q35-paired ICH9 LPC); the
+  default keeps every historical lane byte-identical.  Measured with the
+  bundled diagnostic SeaBIOS (ACPI match unmodified): `Copying ACPI RSDP from
+  0x00006dfc to 0x000f6210`, then a checksum-valid RSDP → RSDT (4 entries) →
+  FACP/SSDT/MADT/MCFG chain; the default identity publishes no RSDP (negative
+  control).  `tests/test_compat.c` pins 7 vectors in `make test` and
+  `make test-sanitize`.  Evidence: `docs/evidence/compat-g4/`; plan:
+  `docs/plans/COMPAT_PLAN.md`.~~ shipped.
 
 - ~~`0056` — TOOLING T0: measured baseline + `docs/plans/TOOLING_PLAN.md`
   (`--trace` floods the 4096-line ring: 4,095 of 4,837,677 lines kept and

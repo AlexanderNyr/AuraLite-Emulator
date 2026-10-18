@@ -1,0 +1,52 @@
+COMPAT G4 -- ACPI identity pairing: reproduction commands
+==========================================================
+
+Inputs (bundled in docs/evidence/compat-g3/, hashes re-checked below):
+  seabios-diagnostic-128k.bin   SHA-256 69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d
+      SeaBIOS rel-1.16.3 base + block/disk debug logging.  Its acpi_setup()
+      match table is UNCHANGED: PIIX4 8086:7113 or ICH9 LPC 8086:2918 only.
+  seabios-acpi-id-probe-128k.bin SHA-256 012f5d983b4768bbd463cafa4350933469b32ee822a3872f8acefe98775b97c5
+      The same ROM plus a diagnostic-only patch that adds 8086:1e55 to the
+      ACPI/FADT match tables.  Used here ONLY as the positive control for the
+      snapshot scanner, not as a fix.
+  blank-usb-1m.img              1 MiB of zeroes (negative media control).
+
+Negative control -- historical LPC identity 8086:1e55, no ACPI-ID ROM patch:
+  ./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+           --platform=haswell --max-instr=200000000 \
+           --snapshot-save=/tmp/sb-diag.snap
+  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-diag.snap
+  -> "NO RSDP"
+
+Positive control -- probe ROM (1e55 added to SeaBIOS's match table), default identity
+(proves the scanner and the ROM-patch explanation):
+  ./x86emu --rom=docs/evidence/compat-g3/seabios-acpi-id-probe-128k.bin \
+           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+           --platform=haswell --max-instr=200000000 \
+           --snapshot-save=/tmp/sb-probe.snap
+  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-probe.snap
+  -> RSDP at 0xf6210, rev 0, checksum ok
+
+G4 lane -- ICH9 LPC identity with the UNMODIFIED diagnostic ROM:
+  ./x86emu --lpc=ich9 \
+           --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+           --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+           --platform=haswell --max-instr=200000000 \
+           --snapshot-save=/tmp/sb-ich9.snap
+  grep -aE 'ACPI|RSDP' /tmp/sb-ich9.err
+  python3 docs/evidence/compat-g4/scan_acpi_snapshot.py /tmp/sb-ich9.snap
+
+Unit gate:
+  make test-compat     # 7/7 vectors, both identities + PAM + untouched functions
+
+Notes and limits:
+  * The run stops on the blank USB's "No bootable device. Retrying in 60
+    seconds" path after POST; ACPI tables are built during POST and survive in
+    RAM, which is what the snapshot scan reads.
+  * The snapshot file is ~19 MB of sparse RAM and is intentionally not stored.
+  * This lane proves RSDP/RSDT/table publication for a stock-match SeaBIOS.  It
+    is NOT a pinned-image BIOS-to-kernel boot and NOT shell acceptance; the
+    authoritative ISO still contains the original Stage 2 (see G3 README).
+  * Historical lanes are untouched: --lpc=ich9 is opt-in and the default
+    identity remains 8086:1e55 (make test keeps every prior receipt).

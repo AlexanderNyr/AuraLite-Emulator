@@ -1,0 +1,4 @@
+# COMPAT G6 SMP broadcast INIT/SIPI negative control
+# rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin budget=10000000
+mutant:  woken=0 found=absent ap_steps=0,0,0
+control: woken=3 found=4/4 ap_steps=736,1387,2038

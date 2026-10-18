@@ -1,238 +1,232 @@
-# AuraLite-Emulator — Full Project Analysis
+# AuraLite-Emulator — Project Analysis (current tree)
 
-> Prepared from a complete audit of the repository at commit `33e2c5c` (`main`).
-> All artifacts were built and verified locally: `make test` is green, the full
-> boot chain completes with exit code 0, and the guest payload paints the
+> Prepared from a full audit of the repository at `main` HEAD `39f83f9`
+> ("G0-G3 update", 2026-10-16) plus the local COMPAT G4 change set
+> (`--lpc=ich9`, `tests/test_compat.c`, `docs/plans/COMPAT_PLAN.md`).
+> Everything below was built and measured in this tree: `make test` is green,
+> the full boot chain completes with exit code 0, and the guest painted the
 > framebuffer.
 
 ---
 
 ## 1. What this project is
 
-**AuraLite-Emulator** (called "Universal x86 Emulator" in the README) is a
-from-scratch x86 emulator written in portable C11 (~1500 lines of core code),
-with no dependency on QEMU/KVM. Its purpose is executing raw x86 firmware
+**AuraLite-Emulator** ("Universal x86 Emulator" in the README) is a
+from-scratch x86 emulator written in portable C11 with no QEMU/KVM and no
+external libraries beyond `-lm`. Its purpose is executing raw x86 firmware
 (BIOS/boot-firmware style): the emulator loads a ROM at the reset vector and
 runs it from real mode through protected mode into 64-bit long mode, while
-behaviourally emulating an Intel chipset (PCI, MMIO, EHCI/USB, GPU framebuffer,
-DDR controllers).
+behaviourally emulating an Intel chipset (PCI/ECAM, EHCI/UHCI USB, AHCI, e1000,
+VGA + Bochs VBE, DDR controllers, PIC/PIT/RTC/KBC/LAPIC/IOAPIC).
 
-Design philosophy: **the emulator is firmware-agnostic** — the CPU core contains
-no hacks tied to a specific ROM; platform specifics live in switchable profiles
-(`--platform=...`) and ROM compatibility belongs in the ROM images themselves.
+Design philosophy: **the emulator is firmware-agnostic** — the CPU core
+contains no hacks tied to a specific ROM; platform specifics live in
+switchable profiles (`--platform=...`) and ROM compatibility belongs in the
+ROM images themselves.
+
+Scale of the current tree:
+
+| Area | Files | Lines (approx.) |
+|---|---|---|
+| `src/` | 50 (26 `.c` + 24 `.h`) | 16,065 |
+| `tests/` (+ `integration/`) | 31 `.c`, 11 `.py`, 28 `.sh` | 11,000 |
+| `docs/` incl. 10 plans | — | 11,400 |
+| `patches/` phase artifacts | 26 `.patch` (0008–0065) | — |
 
 ## 2. Repository layout
 
 ```
 AuraLite-Emulator/
 ├── src/
-│   ├── cpu.c / cpu.h      — the x86 interpreter (780 lines, the core)
-│   ├── mem.c              — physical address space + MMIO dispatcher
-│   ├── io.c               — 64K I/O port space
-│   ├── pci.c / pci.h      — PCI mechanism #1 (0xCF8/0xCFC) + ECAM/MMCONFIG
-│   ├── devices.c / .h     — "the chipset": LPC, SATA, GPU, EHCI/USB-MSC, COM1, CAR, DDR
-│   ├── platform.c / .h    — 5 CPUID profiles for Intel generations
-│   ├── machine.h          — machine_t, memory map, event log ring
-│   └── main.c             — CLI harness, register dump, PPM framebuffer export
+│   ├── cpu.c / cpu.h          — the x86 interpreter (2,971 lines), the core
+│   ├── mem.c                  — physical address space, Q35 PAM, MMIO decode
+│   ├── io.c                   — 64K I/O port space
+│   ├── pci.c / pci.h          — PCI mechanism #1 + ECAM/MMCONFIG
+│   ├── devices.c / .h         — GPU/VRAM, VGA text, Bochs VBE, EHCI+UHCI,
+│   │                            DDR/SPD, CAR, COM1 debugcon
+│   ├── platform.c / .h        — five Intel CPUID profiles
+│   ├── chipset.c              — A20, port 0x92, reset via 0xCF9
+│   ├── pic.c / pit.c / pm.c / rtc.c / kbc.c — 8259A, 8254, ACPI PM
+│   │                          block (PMBASE TMR, G5), MC146818A, 8042
+│   ├── lapic.c / ioapic.c     — xAPIC and 82093AA
+│   ├── ahci.c                 — SATA HBA: FIS/PRDT engine, two controllers
+│   ├── e1000.c                — 82540EM model + TAP-over-UDP socket
+│   ├── serial.c               — 16550 subset
+│   ├── acpi.c                 — RSDP/RSDT/XSDT/MADT set for the --kernel lane
+│   ├── kloader.c              — ELF64 kernel loader + boot_info_t fabrication
+│   ├── disasm.c               — 16/32/64-bit disassembler (NASM syntax)
+│   ├── dbg.c                  — run-control core, REPL, symbols, expressions
+│   ├── gdbstub.c              — GDB Remote Serial Protocol frontend
+│   ├── snapshot.c             — AURASNP1 whole-machine snapshots
+│   ├── ws.c / monitor.c       — SHA-1 + RFC 6455 + HTTP/WS live monitor
+│   ├── machine.h              — machine_t: memory map, devices, vCPU slots,
+│   │                            PERF caches, event log ring
+│   └── main.c                 — CLI harness, run loop, dumps
 ├── firmware/
-│   ├── sample_firmware.nas — sample firmware in NASM, 848 lines (GenericBootFirmware v0.2.18)
-│   └── LICENSE             — MIT (c) 2026 $yscall — covers the firmware only
-├── disk/test_kernel.asm   — 64-bit test payload (the guest kernel)
-├── tests/test_cpu.c, test_usb.c — unit tests
-├── web/monitor.html       — static web monitor mock (loads PPM + log files)
-├── docs/STATUS.md, BUGS.md — implementation status & compatibility notes
-├── Makefile               — build, firmware, disk, tests
-└── .github/workflows/build.yml — CI (ubuntu + gcc + nasm + make test)
+│   ├── sample_firmware.nas    — GenericBootFirmware v0.2.18 (NASM)
+│   └── LICENSE                — MIT (c) 2026 $yscall — firmware only
+├── disk/test_kernel.asm       — 64-bit payload painted into the framebuffer
+├── tests/                     — unit suites, harness, fuzzers, integration
+├── tools/                     — x86dis, tap_responder.py
+├── web/monitor.html           — live WebSocket monitor UI (served by --monitor)
+├── docs/plans/                — CORE, CHIPSET, KERNEL_BOOT, STORE, USB,
+│   │                            VIDEO, NET, PERF, TOOLING, COMPAT
+│   └── evidence/              — compat-g2, compat-g3, compat-g4, compat-g5, compat-g6 bundles
+├── patches/                   — one format-patch per delivered phase
+├── Makefile                   — build, firmware, disk, tests, bench, fuzz
+├── CHANGELOG.md / ROADMAP.md / STATUS.md / BUGS.md
+└── .github/workflows/build.yml — CI: build, ASan+UBSan, differential fuzz
 ```
 
-Dependencies: **GCC/Clang, NASM, Python 3, GNU Make** — all installed and verified.
+Dependencies: **GCC/Clang, NASM, Python 3, GNU Make**; optional **gdb** and
+**ndisasm** for the debugging/differential lanes. Verified locally with
+gcc 14.2.0, make 4.4.1, NASM 2.16.03, Python 3.13.16, gdb 16.3.
 
 ## 3. Architecture by module
 
-### 3.1 `cpu.c` — the x86 interpreter (core)
+### 3.1 `cpu.c` — the x86 interpreter
 
 - **Modes**: real16 → prot16/prot32 → compat32 → long64, derived from
-  `CR0.PE`, `CR0.PG`, `EFER.LME/LMA` and the `L`/`D` bits of the CS descriptor.
-- **Registers**: 16 GPRs (RAX–R15), RIP, RFLAGS, 6 segments (selector/base/limit/L/D),
-  CR0/CR2/CR3/CR4, EFER, GDTR/IDTR, up to 64 MSRs.
-- **Decoding**: a generic ModRM/SIB decoder covering all 16/32/64-bit addressing
-  modes, prefixes (0x66/0x67/REX/segment/REP/LOCK), RIP-relative addressing via a
-  deferred fixup (instruction length is only final after decode — see `fixup_riprel`).
-- **Paging**: 4-level translation PML4→PDPT→PD→PT with 2 MiB and 1 GiB large pages.
-- **Exceptions**: `raise_exception()` with a re-entrancy guard (double fault →
-  halt), IDT gate delivery, `#PF` with read=0/write=2 error codes, `#UD` for
-  unknown opcodes.
-- **ISA subset** (firmware-focused):
-  - the full ALU group ADD/OR/ADC/SBB/AND/SUB/XOR/CMP in all forms with correct
-    CF/OF/ZF/SF/PF/AF;
-  - MOV of all forms, MOVZX, LEA, MOV moffs, MOV CRn, RDMSR/WRMSR, CPUID;
-  - INC/DEC, PUSH/POP, CALL/RET, JMP near/short/far, far call/jmp through memory,
-    Jcc short+near, shift group (SHL/SHR/SAR), group3 (TEST/NOT/NEG),
-    group5 (INC/DEC/CALL/JMP/PUSH/far), IN/OUT, REP STOS, NOP/HLT/CLI/STI/CLD/STD,
-    LGDT/LIDT.
-- **Two-pass decode**: fast ALU switch first; group1 restarts decoding from
-  `d.start_pc`. `--trace` prints mode+RIP+opcode per instruction.
+  `CR0.PE`, `CR0.PG`, `EFER.LME/LMA` and the `L`/`D` bits of CS.
+- **Registers**: 16 GPRs, RIP, RFLAGS, six segments (sel/base/limit/D-B/L/P/
+  type), CR0/2/3/4, EFER, GDTR/IDTR, TR, up to 64 MSRs; SSE media file
+  (16×128-bit XMM) for the scalar/packed moves the ring-3 guest uses.
+- **Decoding**: generic ModRM/SIB over all addressing modes, 0x66/0x67/REX/
+  segment/REP/LOCK prefixes, lazy RIP-relative resolution after the trailing
+  immediate is known.
+- **Paging**: 4-level walk, 2 MiB / 1 GiB large pages, U/S + R/W + NX +
+  CR4.SMEP/SMAP enforcement, architectural `#PF` error codes, `#DF` guard.
+- **Exceptions**: IVT in real mode, IDT gates otherwise, IST stack switching
+  through the TSS (`ISTn = TSS+0x24+(n-1)*8`), ring-3 → ring-0 stack switch,
+  hardware frame order `[SS,RSP,] RFLAGS, CS, RIP, err`.
+- **Interrupt priority**: LAPIC first, then 8259; STI/MOV-SS shadow; HLT wake
+  by line level even with IF=0.
+- **ISA**: the firmware/OS integer set is closed (ALU, MOV family, Jcc/CMOVcc/
+  SETcc, shifts/rotates, MUL/DIV family, BT/BTS/BTR/BTC, BSF/BSR, BSWAP,
+  XADD, CMPXCHG, LOOP/JCXZ, string ops + REP, IN/OUT, system instructions,
+  CPUID/RDTSC/MSR, SYSCALL/SYSRET, SWAPGS); SSE is deliberately a measured
+  subset; anything else raises `#UD` instead of silently misbehaving.
+- **Performance caches** (PERF P2/P3): 256-entry success-only translation TLB
+  and a 512-slot RAM-only prefix/opcode predecode, both keyed on the full
+  security context and invalidated by one global RAM-write generation. Only
+  successful walks are cached; faults always take the original path.
 
 ### 3.2 `mem.c` — physical address space
 
-- 128 MiB RAM + 128 KiB ROM. The ROM is **right-aligned** in its window (last byte
-  at the top), like a real flash part: the reset vector is always at 0xFFFFFFF0.
-- Two ROM aliases: `0xE0000` (legacy BIOS shadow) and `0xFFFE0000` (top-of-4GB).
-- MMIO regions are a linked list with read/write callbacks. **Smallest matching
-  region wins** — mirroring how a real uncore decodes narrow fixed BARs ahead of
-  the wide 256 MiB ECAM window (0xE0000000–0xF0000000).
-- Open bus: reads return all-ones, writes are ignored.
-- `mlog()` — a 4096-line ring log (for a future GUI), mirrored to stderr.
+128 MiB RAM + 128 KiB ROM, right-aligned in its window (reset vector at
+`0xFFFFFFF0`), aliases at `0xE0000` and `0xFFFE0000`. The Q35 host bridge's
+seven PAM bytes are the single source of truth for the `C0000–FFFFF` decoder;
+writes go to the RAM shadow, reads fall back to immutable flash or open bus.
+MMIO regions are a linked list where the **smallest matching region wins**,
+mirroring uncore precedence of fixed BARs over the 256 MiB ECAM window. A20
+masks bit 20 for reads, writes and fetches. `mem_debug_peek_byte()` is the
+side-effect-free, PAM-aware inspection path used by tools.
 
-### 3.3 `io.c` — I/O ports
+### 3.3 Chipset
 
-A 65536-entry table of {read, write, ctx, name}; unregistered ports read as
-0xFF/0xFFFF/0xFFFFFFFF.
+8259A pair (full ICW/OCW, priorities, spurious IRQs, level lines, AEOI), 8254
+PIT and MC146818A RTC on a virtual instruction-count timebase (determinism),
+8042 KBC with scancode set-1 injection, A20 gate and four reset sources,
+xAPIC with 256-bit IRR/ISR and timers, 82093AA I/O APIC with remote-IRR
+feedback, and a 16550-subset COM1.
 
-### 3.4 `pci.c` — PCI
+### 3.4 Devices
 
-- Mechanism #1: ports 0xCF8 (CONFIG_ADDRESS, enable bit 0x80000000) / 0xCFC.
-- ECAM/MMCONFIG: a 256 MiB window, decoding `bus<<20|dev<<15|func<<12|reg`.
-- Host bridge (0:0:0): writing register 0x60 (PCIEXBAR-style) with bit 0 enables
-  the ECAM window — exactly how the sample firmware initializes MMIO config space.
-- Config write policy: ID/class/header-type are read-only, everything else
-  (BARs, command, status) is writable (behavioural, not bit-exact).
+GPU VRAM at `0xD0000000` (800×600×32, doubles as the PPM framebuffer), VGA
+text mode 3 at `0xB8000` with the guest's own 8×16 PSF2 font, Bochs VBE dispi
+with QEMU's `vbe_fixup_regs` transcribed in full (the V4 heap-overflow fix),
+EHCI + UHCI with BOT/SCSI mass storage, AHCI with command-list/FIS engine and
+up to two controllers, e1000 with TAP-over-UDP ingress/egress, DDR3/DDR4
+training registers, and cache-as-RAM.
 
-### 3.5 `devices.c` — "the rest of the chipset"
+### 3.5 Tooling
 
-- **PCI devices** sit at the same bus:dev:func the firmware probes (confirmed by
-  the firmware source): host-bridge 0:0:0, pci-bridge-misc 0:1:0, iGPU 0:2:0
-  (class 0x03 mirrored at both 0x0B and 0x0C — the firmware reads the class from
-  the non-standard offset 0x0C!), EHCI 0:3:0 (BAR0=0xFEB00000), LPC 0:31:0,
-  SATA/AHCI 0:31:2.
-- **EHCI/USB Mass Storage** — the most elaborate model: any write to the EHCI BAR
-  rings a "doorbell" → reads ASYNCLISTADDR (+0x18) → walks the QH/qTD chain
-  (up to 32 entries) → interprets genuine Bulk-Only Transport:
-  - qTD with PID=OUT and 31 bytes = CBW → parse 'USBC' signature and SCSI opcode;
-    READ(10)/READ(12) → remember LBA/block count (kept in static state);
-  - qTD with PID=IN: with a pending command — copy sectors from the disk image
-    into the guest buffer (with RAM bounds checks); otherwise — synthesize a
-    'USBS' CSW with status OK. The qTD token is then marked complete.
-- **GPU VRAM**: window at 0xD0000000, 800×600×32bpp; doubles as the PPM-exported
-  framebuffer.
-- **CAR** (cache-as-RAM) scratch at 0xFEF00000, 4 MiB — the firmware's early stack.
-- **Per-platform DDR models** (`devices_init_platform`): Sandy/Ivy/Bay Trail get
-  an SPD window at 0xE00FB000 (byte 0 = "ready" bit, byte 5 = density code);
-  Haswell/Broadwell get a DDR4 controller at 0xFED10000 whose **busy bit
-  0x80000000 auto-clears on read** — the firmware's polling loop sees an
-  instant "training done".
-- **COM1 (0x3F8)**: line-buffered serial output into the log (`[serial] GUEST_OK`).
+`--trace-file` with a CPU-vs-disassembler successor self-check; `x86dis`;
+run-control REPL (`--debug`, `--debug-script`, `--symbols`); gdbstub
+(`--gdb`, target.xml, threads, hardware watchpoints); v2 snapshots with shape
+refusals; live HTTP/WebSocket monitor with framebuffer deltas. All of it is
+opt-in and non-perturbing: stdout/`--stats`/PPM/log stay byte-identical to a
+plain run, and each tool has a negative control.
 
-### 3.6 `platform.c` — CPUID profiles
+## 4. Boot paths
 
-5 profiles with real Intel CPUID.1.EAX signatures the firmware branches on:
-Sandy Bridge 0x206A7 (0x2A), Ivy 0x306A9 (0x3A), Haswell 0x306C3 (0x3C, default),
-Broadwell 0x306D4 (0x3D), Bay Trail 0x30678 (0x37). CPUID.0 returns
-"GenuineIntel", 0x80000001.EDX has the long-mode bit.
+1. **Firmware** (`--rom=`, default): reset → `0xE000:0` alias → protected
+   mode → CPUID dispatch across five chipset paths → ECAM/PAM setup → DDR
+   training → GPU BAR → page tables → long mode → USB READ(10) → jump to
+   `0x00100000`. Measured: `GUEST_OK`, framebuffer marker, `HALTED` at
+   4,837,677 instructions (Haswell).
+2. **Direct kernel** (`--kernel=`, K1–K8): ELF64 `ET_EXEC`, segments placed by
+   `p_paddr − KERNEL_VMA`, seven-page paging hierarchy, fabricated
+   `boot_info_t` + ACPI set, parked at `_start`. This is the lane that meets
+   the north star: AuraLite OS to its shell on 1 and 2 vCPUs.
+3. **BIOS compatibility** (COMPAT G0–G6, closed): SeaBIOS → Stage 1 → Stage 2 →
+   flat kernel. G2 fixed the real-mode `SGDT/SIDT` store width; G3 diagnosed
+   and closed the Stage-2 FS/GS unreal-mode assumption; G4 makes the LPC
+   identity pair with the Q35 host bridge (`--lpc=ich9`) so stock SeaBIOS
+   publishes `RSDP/RSDT/FACP/SSDT/MADT/MCFG`; G5 models the ACPI PM timer at
+   `PMBASE+8` so the ICH9 lane boots to `shell active` with an 8-entry E820 and
+   live RSDP; G6 scales `--smp=N` up to 8 vCPUs (`CMOS[0x5F]`, broadcast
+   INIT/SIPI, `CPUID(1).EBX[31:24]` APIC ID, AP counter preservation across
+   second-stage INIT) and boots `--lpc=ich9 --smp=4` through `irqapwake` and
+   `smpstress`.
 
-### 3.7 `main.c` — CLI
-
-Options: `--rom=`, `--disk=`, `--platform=`, `--max-instr=`, `--trace`,
-`--dump-fb=`, `--log=`. Exit codes: **0** normal/instruction-limit stop,
-**2** CPU fault, **1** input-file error. Dumps all registers/mode, the log tail,
-tracks "guest entered at 0x100000" and the framebuffer marker
-`pixel[0]==0x00200000`.
-
-## 4. The sample firmware and the boot chain
-
-GenericBootFirmware v0.2.18, 128 KiB, org 0xFFFE0000. The full execution path,
-confirmed by tracing and tests:
-
-1. **Reset**: CS:IP = 0xF000:0xFFF0 → physical 0xFFFFFFF0 → the last ROM bytes:
-   `jmp far 0xE000:0` → legacy alias 0xE0000 → `startcli`.
-2. **Real mode**: load a 3-entry GDT, set `CR0.PE`, far jump → **prot32**.
-3. **prot32**: stack in CAR (0xFEF0FFFC), `CPUID.1` → hand-rolled family/model
-   decode → branch to 5 init paths (Sandy/Ivy: CAR+MTRR+PCI+DDR3-SPD; Haswell:
-   ECAM+LPC+PMBASE+CAR+DDR4-polling; Broadwell/Bay Trail: variants). Each path
-   enables MMCONFIG via host bridge 0x60, "trains" DDR, pokes CMOS/SuperIO.
-4. **Common tail `loff`**: SATA stubs, speaker, GPU discovery by scanning ECAM
-   (class read at offset 0x0C!), BAR assignment 0xD0000000, HDMI MMIO writes.
-5. **Long mode**: build 4-level page tables at 0x10000 (identity map incl. a
-   1 GiB PDPTE covering MMIO and 2 MiB pages for APIC at 0xFEC00000/0xFEE00000),
-   CR3, EFER.LME, CR0.PG → far jump into a 64-bit segment → **long64**.
-6. **long64**: fill the IDT (256 gates to `fault: hlt`), LIDT, SuperIO/COM.
-7. **USB boot**: read the EHCI BAR via PCI#1 (0x80001810), build a QH at 0x20000
-   and a qTD chain, CBW READ(10) LBA=0, one 512-byte block into **0x00100000**,
-   data-IN, CSW → poll the Active bit.
-8. **Handover**: `mov rax,0x00100000; jmp rax` — the guest takes over.
-9. **Guest (`disk/test_kernel.asm`)**: writes "GUEST_OK" to COM1, paints the
-   800×600 framebuffer with a gradient (pixel = col | row<<8 | 0x00200000), hlt.
-
-`launch_mode db 3` selects the guest launch mode (0=halt, 2=32-bit, 3=64-bit);
-default 3 — jump to 0x100000 in long mode.
-
-## 5. Build and verification (performed locally)
+## 5. Build and verification
 
 ```
-make          → cc -std=c11 -O2 -Wall -Wextra  (zero warnings)
-make firmware/firmware.bin disk/disk.img
-make test     → ✅ unit tests: ok  ✅ usb tests: ok  ✅ boot integration test: ok
-                ✅ platform smoke tests x5
-./x86emu --platform=haswell --max-instr=600000 --dump-fb=framebuffer.ppm
-     exit 0; log: ECAM enabled → READ(10) LBA=0 → bulk-IN 512B → CSW OK
-     → guest entry 0x100000 → [serial] GUEST_OK → framebuffer marker OK
-     → mode long64, CR3=0x10000, EFER=0x500 (LME+LMA)
+make                         # -std=c11 -O2 -Wall -Wextra -Werror, zero warnings
+make firmware/firmware.bin disk/disk.img x86dis
+make test                    # full gate, ~6.5 min, green
+make test-sanitize           # ASan+UBSan as hard errors
+make fuzz                    # differential vs the host CPU via ptrace
+make test-compat             # COMPAT G4 identity vectors (7/7)
 ```
 
-Framebuffer after 600k instructions: the guest painted ~70 top rows — visual
-proof of real guest execution (the rest is the instruction limit, not an error).
+Measured in this tree: `make test` green; `test-gdbstub` 30/30 and real
+`gdb -batch` lanes green; fuzz 32 programs / 384 instructions all matching,
+0 host crashes; ASan spot-runs of `test_table` and `test_snapshot` clean;
+full boot 4,837,677 steps in 270 ms median (~17.9 Msteps/s); snapshot split
+loads byte-identical; TLB 6,738,321 hits.
 
-## 6. Findings — deviations, quirks, limits
+## 6. Findings, quirks and limits
 
-### Notable deviations from real x86 (addressed by ROADMAP v0.3–v0.5)
+### Deliberate scope
 
-1. **Near Jcc 0F 80–83 missing → #UD**; **0F 88–8B (JS/JNS/JP/JPE/JPO) decode but
-   never branch** (silent logic corruption). *(fixed in patch 0002)*
-2. **Exception stack frame pushed in the wrong order** (err→CS→RIP→RFLAGS vs
-   hardware's RFLAGS→CS→RIP→err); no IRET. *(fixed in patch 0006)*
-3. **64-bit shifts**: count mask is 31 instead of 63. *(fixed in patch 0003)*
-4. **group3** lacks MUL/IMUL/DIV/IDIV → #UD. *(fixed in patch 0004)*
-5. **group2** lacks ROL/ROR/RCL/RCR and the 8-bit forms 0xC0/0xD0/0xD2.
-   *(fixed in patch 0003)*
-6. `PUSH imm` (0x68) always decodes imm32 — wrong for 16-bit operand size.
-   *(fixed in patch 0005)*
-7. No CPL/privilege checks, no segment limit checks, no TSS/IST, no IVT delivery
-   in real mode (any real-mode exception without an IDT halts). *(IVT added in
-   patch 0006; CPL/limits planned for v0.5)*
-8. No CPL, APIC, PIC/PIT/RTC, FPU/SSE; paging lacks accessed/dirty/NX/U-S checks;
-   REP STOS is atomic; no hardware interrupts at all.
+- Not a drop-in QEMU replacement; ISA grows from traces and tests.
+- SSE is a measured subset, x87 has control/status state only (no data model),
+  no AVX, no SMM/VMX/SVM/NMI.
+- Segment limit/CPL checks are modelled where the guest path needed them, not
+  as a complete protection unit.
+- Up to eight vCPU contexts (`EM_MAX_VCPU = 8`), strict 1:1 round-robin.
+- USB is EHCI/UHCI with a BOT/SCSI subset; no xHCI.
+- Networking is IPv4-only TAP-over-UDP, DHCP stateless, DNS A/IN only, no
+  TCP window scaling/SACK/TIME_WAIT, e1000 INTx unmounted.
+- VRAM is 1.9 MB (not QEMU's 16 MiB); no display panning/`vbe_start_addr`;
+  BPP 4 is a documented divergence.
+- The live monitor has no authentication; loopback is the default bind.
 
-### Minor code notes
+### Known documentation/code notes (state after this pass)
 
-- `main.c`: the `guest_entry_seen` check is duplicated before/after `cpu_step`;
-  `machine_t.max_instructions` is unused (the limit is kept local in main).
-- `devices.c`: USB state (`s_lba`/`s_blocks`/`s_have`) and `g_ehci`/`g_serial`
-  are file/global statics → one machine per process; `superio_idx`/`cmos_idx`
-  are dead code; CMOS/SuperIO ports aren't registered (open bus suffices for
-  the sample firmware).
-- In the 20000-instruction smoke test Haswell shows `prot32`: the firmware is
-  still inside the DDR4 delay loop (~30k iterations) — expected, not a bug.
-- `Makefile clean` has a duplicated `rm` line.
-- **Licensing**: the core is Apache-2.0 (root LICENSE); `firmware/` is MIT and
-  keeps its own license; `NOTICE.md`'s "no repo-level license" note is outdated.
-- `web/monitor.html` is a static mock with hardcoded register values, but it can
-  load a PPM framebuffer and a text log client-side.
-
-### Author-declared limits (docs/STATUS.md)
-
-The ISA grows "from execution traces and tests", the chipset is behavioural
-(not cycle-accurate), and the CSW/descriptor path plus the web monitor are
-still being expanded.
+- `NOTICE.md` now matches the tree: Apache-2.0 at the root (`LICENSE`), MIT
+  for `firmware/` only.
+- `PROJECT_ANALYSIS.md` (this file) is current; the earlier revision described
+  commit `33e2c5c` and a ~1,500-line core.
+- `docs/plans/COMPAT_PLAN.md` now exists and records G0–G6 with measured
+  receipts and explicit non-claims.
+- `cpu.h` documents the K6 SMP invariant that `cpu_step()` always operates on
+  `m->cpu` (the current context), which the internal helpers rely on; the
+  merged `kgs_base`/XMM comment block was split.
+- `[pci-probe]` / `[ahci-mmio-probe]` lines in the log are diagnostic
+  instrumentation from the G2 era and are part of the recorded receipts;
+  they are intentionally left in place.
+- The sample firmware's device contract (LPC `8086:1e55`) is unchanged; the
+  ICH9 identity is an explicit `--lpc=ich9` opt-in.
 
 ## 7. Bottom line
 
-A compact, readable, **fully working** DIY PC emulator: from the reset vector to
-a 64-bit guest kernel with real USB mass-storage boot and graphics. The layering
-(CPU/memory/IO/PCI/devices/profiles/CLI) is clean and the code is well annotated
-with hardware rationale. Growth per `ROADMAP.md` and `docs/plans/CORE_PLAN.md`
-(written in the AuraLite OS house plan style: dependency-ordered phases,
-definition of done and test gate per phase, one `.patch` per phase): the CPU
-correctness ledger is being closed first (C0–C6 landed), then the chipset
-interrupt hardware (PIC/PIT/RTC/A20), real AHCI, and performance — with the
-**north star of booting the AuraLite OS kernel to its shell** on this emulator
-(long mode, TSS, SYSCALL, PIC/LAPIC, AHCI, e1000, framebuffer).
+A compact, readable, **fully working** DIY PC emulator: reset vector to a
+64-bit guest kernel, real USB mass-storage boot, graphics, networking, SMP and
+source-level debugging. Its distinguishing feature is the evidence discipline:
+every plan phase ships with its implementation, a regression vector and a
+negative control, and `docs/STATUS.md` records receipts rather than promises.
+All ten plans in `ROADMAP.md` (CORE, CHIPSET, KERNEL_BOOT, STORE, USB, VIDEO,
+NET, PERF, TOOLING, COMPAT G0–G6) are delivered and gated by `make test`.

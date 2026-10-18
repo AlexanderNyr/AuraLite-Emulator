@@ -1,0 +1,25 @@
+COMPAT G5: boot_info_t captured under --lpc=ich9 + stock SeaBIOS 1.16.3-2
+source: --max-instr=850000000 --snapshot-save (post-`shell active`), phys 0x10000, 7776 bytes
+sha256=31e6652af910a74124d605fcb8fbe11b7d26d15f034c3a0f89ef3f227b6a9b59
+magic=0x4155524142544c44 OK
+mmap_count=8; hhdm_offset=0xffff800000000000
+  mmap[0] base=0x0000000000 length=0x0009fc00 type=1
+  mmap[1] base=0x000009fc00 length=0x00000400 type=2
+  mmap[2] base=0x00000f0000 length=0x00010000 type=2
+  mmap[3] base=0x0000100000 length=0x07efc000 type=1
+  mmap[4] base=0x0007ffc000 length=0x00004000 type=2
+  mmap[5] base=0x00b0000000 length=0x10000000 type=2
+  mmap[6] base=0x00fed1c000 length=0x00004000 type=2
+  mmap[7] base=0x00fffc0000 length=0x00040000 type=2
+initrd phys=0x1800000 size=0xb22000 (11673600 bytes)
+cpu_count=1; bsp_lapic_id=0
+rsdp_phys=0xf6830 (present)
+boot_from_uefi=0
+
+Delta vs QEMU (same 128-KiB bios.bin, q35/TCG, AHCI + blank USB, candidate ISO):
+  QEMU: 0x0+0x9fc00:t1; 0x9fc00+0x400:t2; 0xf0000+0x10000:t2; 0x100000+0x7edf000:t1;
+        0x7fdf000+0x21000:t2; 0xb0000000+0x10000000:t2; 0xfed1c000+0x4000:t2; 0xfffc0000+0x40000:t2
+  -> same 8-entry shape; the 0xfed1c000 ICH9 RCRB reservation appears only under the
+     ICH9 identity (it is absent in the default 8086:1e55 lane, which reports 7 entries).
+  -> the only numeric difference is the size of the firmware ACPI/NVS slab at the top
+     of low RAM: 0x4000 here vs 0x21000 in QEMU; both slabs end at 0x08000000.

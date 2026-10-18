@@ -1,0 +1,46 @@
+COMPAT G6 — exact reproduction
+
+1. SeaBIOS diagnostic SMP POST check (1.5 s, RC 0).  Confirms CMOS 0x5F,
+   broadcast INIT+SIPI (shorthand=3), CPUID(1).EBX[31:24] APIC ID reporting,
+   and 4-CPU MP/MADT publication:
+
+   ./x86emu --rom=docs/evidence/compat-g3/seabios-diagnostic-128k.bin \
+       --lpc=ich9 --smp=4 --max-instr=10000000 --stats \
+       >docs/evidence/compat-g6/seabios-diag-smp4.stdout.txt 2>&1
+
+   Prints `handle_smp: apic_id=0x1..0x3` and
+   `Found 4 cpu(s) max supported 4 cpu(s)`.
+
+2. Full 4-vCPU BIOS acceptance run + guest `/tests/irqapwake` + `/tests/smpstress`
+   (442 s, RC 0):
+
+   KEYS_BOTH="35,B5,14,94,12,92,1F,9F,14,94,1F,9F,35,B5,17,97,13,93,10,90,1E,9E,19,99,11,91,1E,9E,25,A5,12,92,1C,9C,35,B5,14,94,12,92,1F,9F,14,94,1F,9F,35,B5,1F,9F,32,B2,19,99,1F,9F,14,94,13,93,12,92,1F,9F,1F,9F,1C,9C"
+   ./x86emu --rom=/home/user/g3-artifacts/bios.bin \
+       --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+       --sata=/tmp/iso-candidate.iso \
+       --lpc=ich9 --smp=4 \
+       --keys-at=prompt --keys="$KEYS_BOTH" \
+       --max-instr=4000000000 --stats \
+       >x86emu-smp4.stdout.txt 2>x86emu-smp4.serial.log
+   gzip -9n x86emu-smp4.serial.log
+
+3. ACPI receipt and `boot_info_t` handoff block under `--smp=4`:
+
+   ./x86emu ... --lpc=ich9 --smp=4 --max-instr=1700000000 --stats \
+       --snapshot-save=/tmp/g6-smp4.snap
+   python3 docs/evidence/compat-g3/inspect_bootinfo_snapshot.py \
+       /tmp/g6-smp4.snap --write-raw docs/evidence/compat-g6/bootinfo-smp4.bin \
+       > docs/evidence/compat-g6/bootinfo-smp4-parse.txt
+   python3 tests/g5_acpi_receipt.py --snapshot=/tmp/g6-smp4.snap \
+       --serial=<(gzip -dc docs/evidence/compat-g6/x86emu-smp4.serial.log.gz) \
+       --out=docs/evidence/compat-g6/acpi-receipt-smp4.txt
+
+4. Negative control (~9 s, no external ISO required):
+
+   make test-g6-live     # sh tests/integration/g6_smp_nc.sh
+
+5. Bundle and unit gates:
+
+   make test-g6          # 78 re-checked conditions, inside `make test`
+   make test-g6-nc       # five tampered bundles must be rejected
+   make test-unit        # includes test_rtc.c (CMOS 0x5F) and test_lapic.c (4-vCPU INIT/SIPI)

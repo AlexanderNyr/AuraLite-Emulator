@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -35,38 +35,93 @@ disk/disk.img: disk/test_kernel.bin
 demo: x86emu firmware/firmware.bin disk/disk.img
 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
 
-test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
+test-unit: tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
 	./test-cpu
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
 	./test-usb
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
 	./test-pam
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
 	./test-video
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
 	./test-net
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
 	./test-pic
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pit.c src/pit.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pit -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pit.c src/pit.c src/pm.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pit -lm
 	./test-pit
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_rtc.c src/rtc.c src/pit.c src/pic.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-rtc -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pm.c src/pm.c src/pit.c src/pic.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c -o test-pm -lm
+	./test-pm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_rtc.c src/rtc.c src/pit.c src/pm.c src/pic.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-rtc -lm
 	./test-rtc
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kbc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-kbc -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kbc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-kbc -lm
 	./test-kbc
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_serial.c src/serial.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-serial -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_serial.c src/serial.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-serial -lm
 	./test-serial
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_chipset.c src/chipset.c src/lapic.c src/ioapic.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-chipset -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_chipset.c src/chipset.c src/lapic.c src/ioapic.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-chipset -lm
 	./test-chipset
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_lapic.c src/lapic.c src/ioapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-lapic -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_lapic.c src/lapic.c src/ioapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-lapic -lm
 	./test-lapic
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ioapic.c src/ioapic.c src/lapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-ioapic -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ioapic.c src/ioapic.c src/lapic.c src/chipset.c src/kbc.c src/pic.c src/pit.c src/pm.c src/rtc.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-ioapic -lm
 	./test-ioapic
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_acpi.c src/acpi.c -o test-acpi
 	./test-acpi
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ahci.c src/ahci.c src/pci.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c -o test-ahci -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ahci.c src/ahci.c src/pci.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c -o test-ahci -lm
 	./test-ahci
-	rm -f test-cpu test-usb test-pam test-video test-net test-pic test-pit test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
+	rm -f test-cpu test-usb test-pam test-video test-net test-pic test-pit test-pm test-rtc test-kbc test-serial test-chipset test-lapic test-ioapic test-acpi test-ahci
+
+# COMPAT G4: LPC identity pairing.  SeaBIOS rel-1.16.3's acpi_setup()
+# matches only PIIX4 8086:7113 or ICH9 LPC 8086:2918, while this machine's
+# historical LPC is Panther Point 8086:1e55 -- so stock SeaBIOS publishes no
+# RSDP.  --lpc=ich9 switches the LPC function to the Q35-paired ICH9 ID.
+# Vectors pin both identities, the untouched class/header fields, the host
+# bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
+test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
+	./test-compat
+	rm -f test-compat
+
+# COMPAT G3 (patch 0063): the acceptance bundle is static evidence, so this
+# gate re-checks the hash manifest, the pinned/candidate serial receipts and
+# the 7,776-byte boot_info_t block instead of re-running an 81-MiB image.
+# It needs only python3 and runs inside `make test`; the negative control
+# tampers four copies of the bundle and requires each to be rejected.
+test-g3: tests/test_g3_acceptance.py docs/evidence/compat-g3/acceptance/SHA256SUMS
+	python3 tests/test_g3_acceptance.py
+
+test-g3-nc: tests/test_g3_acceptance.py tests/integration/g3_acceptance_nc.sh
+	sh tests/integration/g3_acceptance_nc.sh
+
+# COMPAT G5: the ICH9 lane.  The gate re-checks the recorded receipts (serial
+# markers, PERF P0 stats, the 8-entry E820 + live RSDP in boot_info_t, the
+# RSDP/RSDT/MADT receipt) and runs the ACPI cross-check against the serial log;
+# it needs only python3, so it lives in `make test`.  `test-g5-nc` replays the
+# frozen-PM-timer stall (2 x 300 M instructions, ~55 s).  `test-g5-live` re-runs
+# the full 2 G acceptance boot (~160 s) and is opt-in.
+test-g5: tests/test_g5_acceptance.py tests/g5_acpi_receipt.py docs/evidence/compat-g5/SHA256SUMS
+	python3 tests/test_g5_acceptance.py
+
+test-g5-nc: tests/integration/g5_acceptance_nc.sh
+	sh tests/integration/g5_acceptance_nc.sh
+
+test-g5-live: x86emu tests/integration/g5_pm_nc.sh
+	sh tests/integration/g5_pm_nc.sh
+
+# COMPAT G6 (patch 0065): the 4-vCPU BIOS SMP lane (`--lpc=ich9 --smp=4`).
+# `test-g6` re-checks the recorded bundle (manifest, 4-CPU diagnostic POST,
+# ordered boot + AP wake + irqapwake + smpstress markers, 4-vCPU stats and work
+# invariants, 4-CPU boot_info_t handoff, 134-byte MADT receipt, and negative
+# control) inside `make test`.  `test-g6-nc` tampers five copies of the bundle
+# and requires each to be rejected.  `test-g6-live` replays the broadcast
+# INIT/SIPI negative control on the in-tree diagnostic SeaBIOS ROM (~9 s).
+test-g6: tests/test_g6_acceptance.py tests/g5_acpi_receipt.py docs/evidence/compat-g6/SHA256SUMS
+	python3 tests/test_g6_acceptance.py
+
+test-g6-nc: tests/test_g6_acceptance.py tests/integration/g6_acceptance_nc.sh
+	sh tests/integration/g6_acceptance_nc.sh
+
+test-g6-live: x86emu tests/integration/g6_smp_nc.sh
+	sh tests/integration/g6_smp_nc.sh
 
 # KERNEL-BOOT K1: direct kernel-load lane. The fixture is a synthetic
 # higher-half kernel linked at the real AuraLite VMA (tests/kload_fixture.ld);
@@ -79,32 +134,32 @@ tests/kload_fixture.elf: tests/kload_fixture.c tests/kload_fixture.ld
 	    tests/kload_fixture.c -o $@
 
 test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kload.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-kload -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kload.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-kload -lm
 	./test-kload
 	rm -f test-kload
 
 test-ring3: tests/test_ring3.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
 	./test-ring3
 	rm -f test-ring3
 
 # C10: table-driven ISA vectors (>=300 rows; row count printed by the runner)
-test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-table -lm
+test-table: tests/test_table.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_table.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-table -lm
 	./test-table
 	rm -f test-table
 
 # PERF P0: the honest work counter (cpu.executed_steps) and machine_executed_total().
 # Deterministic -- no vector here reads a clock; wall time is bench's job.
-test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
+test-perf: tests/test_perf.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf -lm
 	./test-perf
 	rm -f test-perf
 
 # PERF P1: measured-hot 8-byte RAM read fast path.  Six deterministic
 # bus/alias/endian/width vectors; the NC mutates a scratch source copy.
-test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf_mem.c src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf-mem -lm
+test-perf-mem: tests/test_perf_mem.c tests/harness.h src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_perf_mem.c src/mem.c src/cpu.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-perf-mem -lm
 	./test-perf-mem
 	rm -f test-perf-mem
 
@@ -115,8 +170,8 @@ test-perf-mem-nc: tests/test_perf_mem.c tests/integration/p1_mem_nc.sh src/mem.c
 
 # PERF P2: successful-translation TLB under page-table writes, CR3/
 # INVLPG, fault error/RIP/CR2, mode/permission keys, PS leaves and SMP.
-test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tlb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-tlb -lm
+test-tlb: tests/test_tlb.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tlb.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-tlb -lm
 	./test-tlb
 	rm -f test-tlb
 
@@ -126,8 +181,8 @@ test-tlb-nc: tests/test_tlb.c tests/integration/p2_tlb_nc.sh src/mem.c
 	sh tests/integration/p2_tlb_nc.sh
 
 # PERF P3: narrow RAM-backed prefix/opcode predecode, live ModRM and #PF.
-test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_decode.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-decode -lm
+test-decode: tests/test_decode.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_decode.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-decode -lm
 	./test-decode
 	rm -f test-decode
 
@@ -142,8 +197,8 @@ test-decode-nc: tests/test_decode.c tests/integration/p3_decode_nc.sh src/cpu.c
 x86dis: tools/x86dis.c src/disasm.c src/disasm.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) tools/x86dis.c src/disasm.c -o $@
 
-test-disasm: tests/test_disasm.c tests/harness.h src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_disasm.c src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-disasm -lm
+test-disasm: tests/test_disasm.c tests/harness.h src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_disasm.c src/disasm.c src/dbg.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-disasm -lm
 	./test-disasm
 	rm -f test-disasm
 
@@ -166,8 +221,8 @@ test-disasm-nc: tests/integration/t1_disasm_nc.sh tests/test_disasm.c src/disasm
 # between-instruction steps, watchpoints, quit/pause, expressions) and the
 # REPL lanes (transcripts + non-perturbation on five platforms; the frozen
 # guest lane SKIPs unless KERNEL/INITRD are set).
-test-dbg: tests/test_dbg.c tests/harness.h src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dbg.c src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-dbg -lm
+test-dbg: tests/test_dbg.c tests/harness.h src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dbg.c src/dbg.c src/disasm.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-dbg -lm
 	./test-dbg
 	rm -f test-dbg
 
@@ -195,8 +250,8 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
 # (split identity, determinism, sparse RAM, refusals; sanitizer lane too).
 # test-snapshot: split-run identity lanes on real workloads (the frozen
 # guest lanes SKIP unless KERNEL/INITRD are set).
-test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
 	./test-snap
 	rm -f test-snap
 
@@ -271,7 +326,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
+test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -281,7 +336,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
@@ -324,10 +379,10 @@ bench-nc: bench-binary firmware/firmware.bin disk/disk.img
 
 # C11 differential fuzzer vs the host CPU (ptrace single-step) + crash
 # invariant sweep. Deliberately NOT part of 'make test': needs ptrace.
-fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o diff_fuzz -lm
+fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/diff_fuzz.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o diff_fuzz -lm
 	./diff_fuzz $(FUZZ_PROGRAMS) $(FUZZ_INSTR)
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
+	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf

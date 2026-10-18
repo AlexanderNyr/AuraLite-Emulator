@@ -6,6 +6,7 @@
 #include "cpu.h"
 #include "pic.h"
 #include "pit.h"
+#include "pm.h"
 #include "rtc.h"
 #include "kbc.h"
 #include "chipset.h"
@@ -107,7 +108,7 @@ void mlog(logring_t *lr, const char *fmt, ...);
  * never touches this machinery: vcpu_load/store are no-ops and
  * vtime_instr advances exactly like the old cpu.instr_count time base,
  * which keeps every UP behavior bit-exact. */
-#define EM_MAX_VCPU   2
+#define EM_MAX_VCPU   8
 #define VCPU_OFF      0               /* slot unused entirely         */
 #define VCPU_WAIT_SIPI 1              /* parked after INIT, waits SIPI */
 #define VCPU_RUN      2               /* executing in the round-robin  */
@@ -138,6 +139,7 @@ struct machine {
     /* CHIPSET H0: 8259A master+slave pair (see pic.h) */
     pic_t pic;
     pit_t pit;
+    pm_t pm;             /* COMPAT G5: ACPI PM block (TMR at PMBASE+8) */
     rtc_t rtc;
     kbc_t kbc;
     chipset_t chipset;   /* CHIPSET H5: A20 gate + reset plumbing */
@@ -182,6 +184,13 @@ struct machine {
      * exist only to meter the kernel's SMP bring-up path.  0/1 = UP. */
     int cfg_cpus;
     int cfg_no_fb;        /* VIDEO V1: --no-fb -- publish no linear fb (VGA text box) */
+    /* COMPAT G4: --lpc=ich9 identifies the LPC bridge as 8086:2918 (the
+     * ICH9 LPC function that belongs to the Q35 host bridge this machine
+     * already advertises).  SeaBIOS rel-1.16.3's acpi_setup() matches only
+     * PIIX4 8086:7113 or ICH9 8086:2918, so the default Panther Point
+     * identity (8086:1e55, the ID the sample firmware knows) makes stock
+     * SeaBIOS skip RSDP publication entirely.  0 = historical identity. */
+    int cfg_lpc_ich9;
 
     /* USB U5 (--no-usb-uhci): omit the UHCI companion entirely so the
      * EHCI-only machine shape of the guest's test_usb_ehci.sh QEMU lane

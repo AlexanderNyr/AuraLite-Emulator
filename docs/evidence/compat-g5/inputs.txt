@@ -1,0 +1,6 @@
+4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca  /tmp/sbpkg/usr/share/seabios/bios.bin
+30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  docs/evidence/compat-g3/blank-usb-1m.img
+f249d47a4a79da8893bbac2744859d2f75cb6546fb1db8aa9fe42d0c10536a21  /tmp/iso-candidate.iso
+da182c22133e1b0ac2f6d5ddb6d7c28e7165cdc36d77a3042831e275d43071d5  x86emu
+# x86emu build: gcc -std=c11 -O2 -Wall -Wextra -Werror (default CFLAGS), x86_64
+# The binary is reproducible: two clean builds produce the same hash above.

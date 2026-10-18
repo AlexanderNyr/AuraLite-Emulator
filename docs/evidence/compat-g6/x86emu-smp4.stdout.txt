@@ -1,0 +1,79 @@
+---- CPU state (mode=long64, instr=46810588237) ----
+RAX=0000000000000001 RBX=ffffffff8c026f38 RCX=0000000000000063 RDX=000000000000001f
+RSI=0000000000000086 RDI=ffffffff803ff410 RBP=ffffffff8c026ec0 RSP=ffffffff8c026eb0
+R8 =ffffffff88154b30 R9 =0000000000000000 R10=0000000000000002 R11=00000000345c0601
+R12=0000000000000020 R13=ffffffff8c026f38 R14=0000000000000000 R15=0000000000000000
+RIP=ffffffff8017bea9 RFLAGS=0000000000000002 CR0=0000000080010033 CR3=0000000001000000 CR4=0000000000000620 EFER=0000000000000d01
+CS=0008 base=0000000000000000 L=1 D=0   SS=0010 base=0000000000000000
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=935101005 instr_count=46810588237 halted=0 fault=0
+[stats] vcpu=1 executed_steps=82923322 instr_count=44799802170 halted=1 fault=0
+[stats] vcpu=2 executed_steps=77538628 instr_count=44794425668 halted=1 fault=0
+[stats] vcpu=3 executed_steps=91904984 instr_count=44808793560 halted=1 fault=0
+[stats] executed=1187467939 idle_quantum=180026141696 instr_count_bsp=46810588237 vtime=181213609635
+[stats] cap=4000000000 cap_reached=1 n_vcpus=4
+[stats] tlb_hits=2124127917 tlb_misses=540885068 tlb_flushes=333898402
+[stats] decode_hits=277527053 decode_misses=663406545
+
+---- last log lines ----
+[serial] [bc] writeback stores=1764 flushed=939 coalesced=825
+[serial] [bc] writeback stores=1766 flushed=941 coalesced=825
+[serial] [bc] writeback stores=1768 flushed=943 coalesced=825
+[serial] [bc] writeback stores=1770 flushed=945 coalesced=825
+[serial] [bc] writeback stores=1772 flushed=947 coalesced=825
+[serial] [bc] writeback stores=1774 flushed=949 coalesced=825
+[serial] [bc] writeback stores=1783 flushed=955 coalesced=828
+[serial] [bc] writeback stores=1785 flushed=957 coalesced=828
+[serial] [bc] writeback stores=1787 flushed=959 coalesced=828
+[serial] [bc] writeback stores=1789 flushed=961 coalesced=828
+[serial] [bc] writeback stores=1791 flushed=963 coalesced=828
+[serial] [bc] writeback stores=1793 flushed=965 coalesced=828
+[serial] [bc] writeback stores=1795 flushed=967 coalesced=828
+[serial] [bc] writeback stores=1797 flushed=969 coalesced=828
+[serial] [bc] writeback stores=1799 flushed=971 coalesced=828
+[serial] [bc] writeback stores=1801 flushed=973 coalesced=828
+[serial] [bc] writeback stores=1810 flushed=979 coalesced=831
+[serial] [bc] writeback stores=1812 flushed=981 coalesced=831
+[serial] [bc] writeback stores=1814 flushed=983 coalesced=831
+[serial] [bc] writeback stores=1816 flushed=985 coalesced=831
+[serial] [bc] writeback stores=1818 flushed=987 coalesced=831
+[serial] [bc] writeback stores=1820 flushed=989 coalesced=831
+[serial] [bc] writeback stores=1822 flushed=991 coalesced=831
+[serial] [bc] writeback stores=1824 flushed=993 coalesced=831
+[serial] [bc] writeback stores=1826 flushed=995 coalesced=831
+[serial] [bc] writeback stores=1828 flushed=997 coalesced=831
+[serial] [bc] writeback stores=1837 flushed=1003 coalesced=834
+[serial] [bc] writeback stores=1839 flushed=1005 coalesced=834
+[serial] [bc] writeback stores=1841 flushed=1007 coalesced=834
+[serial] [bc] writeback stores=1843 flushed=1009 coalesced=834
+[serial] [bc] writeback stores=1845 flushed=1011 coalesced=834
+[serial] [bc] writeback stores=1847 flushed=1013 coalesced=834
+[serial] [bc] writeback stores=1849 flushed=1015 coalesced=834
+[serial] [bc] writeback stores=1851 flushed=1017 coalesced=834
+[serial] [bc] writeback stores=1853 flushed=1019 coalesced=834
+[serial] [bc] writeback stores=1862 flushed=1025 coalesced=837
+[serial] [bc] writeback stores=1864 flushed=1027 coalesced=837
+[serial] [bc] writeback stores=1866 flushed=1029 coalesced=837
+[serial] [bc] writeback stores=1868 flushed=1031 coalesced=837
+[serial] [bc] writeback stores=1870 flushed=1033 coalesced=837
+[serial] [bc] writeback stores=1872 flushed=1035 coalesced=837
+[serial] [bc] writeback stores=1874 flushed=1037 coalesced=837
+[serial] [bc] writeback stores=1876 flushed=1039 coalesced=837
+[serial] [bc] writeback stores=1878 flushed=1041 coalesced=837
+[serial] [bc] writeback stores=1880 flushed=1043 coalesced=837
+[serial] [bc] writeback stores=1889 flushed=1049 coalesced=840
+[serial] [bc] writeback stores=1891 flushed=1051 coalesced=840
+[serial] [bc] writeback stores=1893 flushed=1053 coalesced=840
+[serial] [bc] writeback stores=1895 flushed=1055 coalesced=840
+[serial] [bc] writeback stores=1897 flushed=1057 coalesced=840
+[serial] [bc] writeback stores=1899 flushed=1059 coalesced=840
+[serial] [bc] writeback stores=1901 flushed=1061 coalesced=840
+[serial] [bc] writeback stores=1903 flushed=1063 coalesced=840
+[serial] [bc] writeback stores=1905 flushed=1065 coalesced=840
+[serial] [bc] writeback stores=1914 flushed=1071 coalesced=843
+[serial] [bc] writeback stores=1916 flushed=1073 coalesced=843
+[serial] [bc] writeback stores=1918 flushed=1075 coalesced=843
+[serial] [bc] writeback stores=1920 flushed=1077 coalesced=843
+[serial] [bc] writeback stores=1922 flushed=1079 coalesced=843
+[serial] [bc] writeback stores=1924 flushed=1081 coalesced=843

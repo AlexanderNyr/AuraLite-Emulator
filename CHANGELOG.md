@@ -7,6 +7,150 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0065 (COMPAT G6, 4-vCPU BIOS SMP bring-up and guest SMP test suite)
+
+- **Multi-AP BIOS SMP bring-up (`--lpc=ich9 --smp=4`, up to `EM_MAX_VCPU = 8`).**
+  Tracing SeaBIOS 1.16.3-2's `smp_setup()`, `smp_probe()`, `handle_smp()`, and
+  `build_madt()` identified five requirements beyond K6's `--kernel` SMP path:
+  1. `src/machine.h`, `src/main.c`: raise `EM_MAX_VCPU` from `2` to `8`, wire
+     `nv = min(cfg_smp, EM_MAX_VCPU)` contexts with `l.id = i << 24`, and count
+     remaining `VCPU_RUN` slots when an AP parks in `VCPU_OFF`.
+  2. `src/rtc.c`, `src/main.c`: set `CMOS[0x5F] = nv - 1` when `nv > 1` (`0` in
+     UP) so SeaBIOS `smp_probe()` sets `MaxCountCPUs = nv`.
+  3. `src/lapic.c`: handle broadcast destination shorthands `2` (all incl. self)
+     and `3` (all excl. self) on the `dm == 5` (INIT) and `dm == 6` (SIPI) path
+     used by SeaBIOS `smp_setup()` (`0x000C4500` / `0x000C4610`).
+  4. `src/cpu.c`: report `m->lapic.id & 0xFF000000u` in `CPUID(1).EBX[31:24]`
+     (`0` on BSP/UP, `i << 24` on `vcpu_i`) so SeaBIOS `smp_write_msr()` sets
+     bit `(1 << apic_id)` in `FoundAPICIDs` and `build_madt()` marks all 4
+     Processor Local APIC entries enabled (`flags=1`).
+  5. `src/lapic.c`: preserve `executed_steps`, `instr_count`, `idle_quantum`,
+     and `last_vtime` across `cpu_reset(&s->c)` in `vcpu_take_init()` so the
+     kernel's second-stage targeted `INIT` does not wipe an AP's SeaBIOS POST
+     work counters.
+- Measured on `--lpc=ich9 --smp=4` (`docs/evidence/compat-g6/`): diagnostic
+  SeaBIOS prints `handle_smp: apic_id=0x1..0x3` and `Found 4 cpu(s) max
+  supported 4 cpu(s)`; full BIOS boot with stock Debian SeaBIOS 1.16.3-2 + the
+  accepted ISO publishes a 134-byte MADT (`cpus=4`) and `boot_info_t.cpu_count=4`,
+  wakes all 3 APs (`[smp] AP #0..#2 online`, `[smp] 4 CPU(s) online (3 AP(s)
+  woken)`), logs `[sched] R5 receipt: user thread pid=6 on AP cpu=3`, reaches
+  `[kernel] shell active; kmain idling.`, and passes typed `/tests/irqapwake`
+  (`RES-16 receipt`, `IRQAPWAKE PASS`) and `/tests/smpstress` (`SMPSTRESS PASS`)
+  with `fault=0` on all 4 vCPUs and exact work-counter identities.
+- Historical lanes (`p5_history.sh` 9/9 plus 40 M `--kernel` UP and
+  `--cpus=2 --smp=2`) are byte-identical against the G5 binary.
+- Tests: `test_cmos_smp_extra_cpus` in `tests/test_rtc.c`,
+  `test_smp_broadcast_init_sipi_and_counter_preservation` in `tests/test_lapic.c`,
+  `make test-g6` (73 bundle checks, inside `make test`), `make test-g6-nc`
+  (five tampered bundles), and `make test-g6-live` (`g6_smp_nc.sh`).
+
+### Fixed — patch 0064 (COMPAT G5, the ICH9 lane boots)
+
+- **Root cause of the `--lpc=ich9` blocker.**  With the ICH9 LPC identity
+  (`8086:2918`) stock SeaBIOS builds ACPI, publishes the RSDP and points its
+  timer at `PMBASE+8` (`TimerPort=0xb008`).  The emulated chipset had no ACPI
+  PM block, so that port read `0xFFFFFFFF` and every `timer_check()` deadline
+  silently never expired — the AHCI probe then waits forever for `DET==3` on
+  an empty port.  The previously recorded RIP `0xefa1f` was a debugger stop
+  inside a `call` in `ich9_lpc_setup`, not a reset loop.
+- `src/pm.{h,c}`: 0x40-byte ACPI PM block at PMBASE (default `0xB000`, bits
+  15:7 of LPC config `0x40..0x43` via the LPC `cfg_write` hook), a 24-bit
+  read-only TMR at +8 counting three counts per PIT tick (one per 128 retired
+  instructions, remainder carried), zero elsewhere, writes swallowed.
+- Measured on the G3 accepted image with the unmodified Debian SeaBIOS
+  1.16.3-2: `[kernel] shell active; kmain idling.`, `executed_steps=829920364`,
+  `fault=0`, RC 0 in 158 s; the marker first appears between 435 M and 445 M
+  instructions.  `boot_info_t` now carries `rsdp_phys=0xf6830` and eight E820
+  entries; the post-marker snapshot walk finds RSDP `0xf6830` → RSDT
+  `0x7ffe3a0` with four checksum-valid tables (FACP, SSDT, APIC/MADT, MCFG).
+- E820 7 vs 8 explained: the eighth entry `0xfed1c000+0x4000` is the ICH9
+  RCRB that SeaBIOS reserves only on the ICH9 path; QEMU's q35 map with the
+  same ROM has the same eight-entry shape, differing only in the firmware
+  ACPI/NVS slab size (16 KiB vs 132 KiB, both ending at `0x08000000`).
+- Negative control: `pm_timer_now()` restored to the frozen `0xFFFFFFFF` never
+  prints `[BL3]` in 300 M instructions; the fixed tree prints it at
+  297,585,739.
+- Tests: `tests/test_pm.c` (6 vectors in `make test-unit`), `make test-g5`
+  (bundle re-check, inside `make test`), `make test-g5-nc` (four tampered
+  bundles), `make test-g5-live` (`g5_pm_nc.sh`).  `src/pm.c` is linked into
+  every unit test that links `src/pit.c`.
+- Recorded, not fixed (guest side): AuraLite-OS `madt_walk()` requires
+  `elen >= 12` for the 10-byte type-2 ISO structure, so the kernel prints
+  `[ioapic] overrides: none in the MADT` although four ISOs exist; QEMU prints
+  the same line with the same BIOS.
+
+
+### Added — patch 0063 (COMPAT G3, accepted BIOS-to-kernel boot)
+
+- Acceptance for the Stage-2 FS/GS fix.  The pinned AuraLite-OS source
+  `518bef0` was rebuilt with the release toolchain, and a second worktree
+  applied only the reviewed `stage2-fs-gs-restore.patch`; both 81-MiB ISOs
+  came from the release `mkiso` and differ in exactly **10 of 166,272
+  sectors**, all inside the Stage-2 staging area at LBA 34..46 (boot sector,
+  GPT, FAT metadata, kernel, initrd and UEFI payload are byte-identical).
+  The patched Stage 2 reassembles byte for byte to the diagnostic blob
+  `51ecc150…`.
+- Under an **unmodified** Debian SeaBIOS 1.16.3-2 `bios.bin` (`4ee65f3d…`)
+  x86emu boots the candidate ISO to `[kernel] shell active; kmain idling.`
+  with `fault=0` and `cap_reached=1`, twice with a byte-identical serial
+  stream and stats block; the pinned ISO stops at
+  `[BL4] ELF parse FAILED` in the identical lane (negative control).  QEMU
+  10.0.13 with the same ROM reproduces both outcomes and additionally boots
+  through `ACPI RSDP found` / `ACPI MADT parsed`.
+- Handoff receipt: a temporary breakpoint at `_start`
+  (`0xffffffff80191640`) records `rdi=0x10000` and `BOOT_MAGIC` at `0x10000`;
+  the 7,776-byte `boot_info_t` validates against the generated offsets with
+  7 sorted E820 entries, HHDM `0xffff800000000000`, initrd
+  `0x1800000/0xb22000`, `cpu_count=1`, `bsp_lapic_id=0` and `rsdp=0`.
+- Gate: `make test-g3` re-checks the evidence bundle (54 conditions: SHA-256
+  manifest and completeness, ordered serial receipts for both lanes in both
+  emulators, the handoff layout/magic/E820/CPU/RSDP contract, and the
+  deterministic Stage-2 blob, and a second byte-identical candidate replay)
+  and runs inside `make test`.  `make test-g3-nc` tampers five copies (missing
+  marker, corrupted magic, swapped receipts, stale manifest, diverging replay)
+  and requires each to be rejected.
+- Docs: `docs/evidence/compat-g3/acceptance/` (receipt, inputs, iso-layout,
+  commands, logs, `bootinfo.bin`), COMPAT_PLAN G3 ✅, STATUS, ROADMAP,
+  PROJECT_ANALYSIS.  The 2026-10-16 diagnostic bundle is marked as the
+  root-cause trail.
+- Not established: no claim that the published `d2110f8b…` ISO itself boots
+  — `kernel.elf` embeds `__DATE__`/`__TIME__`, so bit identity is impossible;
+  no allocator-zone, CF9-causality or PERF P4 claim; ACPI on x86emu's default
+  LPC identity remains G4's opt-in `--lpc=ich9` lane.
+
+### Added — patch 0062 (COMPAT G4, LPC identity pairing for ACPI)
+
+- `--lpc=ich9|pantherpoint` (`machine_t.cfg_lpc_ich9`, `src/devices.c`):
+  the LPC function at 0:31.0 can now report **ICH9 LPC `8086:2918`**, the
+  identity that belongs to the Q35 host bridge (`8086:29c0`) this machine
+  already advertises and whose seven PAM bytes it implements.  The default
+  keeps Panther Point `8086:1e55`, the ID the bundled sample firmware knows,
+  so every historical lane stays byte-identical.
+- Why it matters: G3 measured that SeaBIOS `rel-1.16.3`'s `acpi_setup()`
+  matches only PIIX4 `8086:7113` or ICH9 `8086:2918`; with `8086:1e55` stock
+  SeaBIOS publishes no RSDP at all.  With `--lpc=ich9` the **unmodified**
+  diagnostic SeaBIOS in `docs/evidence/compat-g3/` logs
+  `Copying ACPI RSDP from 0x00006dfc to 0x000f6210`, and an end-of-run
+  snapshot walk finds checksum-valid RSDP `0xf6210` → RSDT `0x7ffe470`
+  (4 entries) → FACP / SSDT / APIC(MADT, LAPIC `0xfee00000`) / **MCFG**.
+  The default identity reproduces `NO RSDP` (negative control); the G3
+  probe ROM yields RSDP `0xf6210` with a 3-entry RSDT (no MCFG), showing
+  the ICH9 identity unlocks SeaBIOS's full Q35/PCIe path.
+- Gates: `make test-compat` — 7 vectors (both identities, class/header,
+  host bridge, AHCI function, PAM under ICH9) — wired into `make test` and
+  `make test-sanitize`; the bundled sample firmware still ends `HALTED` with
+  `executed=4837677`, `GUEST_OK` and the framebuffer marker.
+- Docs: `docs/plans/COMPAT_PLAN.md` (G0–G6, measured receipts and explicit
+  non-claims), `docs/evidence/compat-g4/`, `docs/STATUS.md`, `ROADMAP.md`,
+  `NOTICE.md` (licensing now matches the tree), `PROJECT_ANALYSIS.md`
+  (regenerated for this HEAD).  `src/cpu.h` documents the K6 SMP invariant
+  that `cpu_step()` always operates on `m->cpu`, and splits the merged
+  `kgs_base`/XMM comment.
+- Not established: no pinned-image BIOS-to-kernel boot, no shell acceptance,
+  no E820/`boot_info_t` agreement, no SMP/IOAPIC claim.  G3 (authoritative
+  ISO still carries the original Stage 2) and G5–G6 remain open.
+
+
 ### Added — patch 0061 (TOOLING T5, live WebSocket monitor)
 
 - `src/ws.c`/`ws.h`: dependency-free SHA-1, RFC 6455 accept-key and

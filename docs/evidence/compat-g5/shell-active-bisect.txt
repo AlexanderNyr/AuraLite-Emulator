@@ -1,0 +1,13 @@
+# COMPAT G5: where does `[kernel] shell active` first appear?
+# Same lane each time: --lpc=ich9, stock SeaBIOS 1.16.3-2 bios.bin,
+# Haswell, candidate ISO on AHCI, blank USB on xHCI, varying --max-instr.
+# "shell" = count of `shell active` lines in the serial stream at that budget.
+max_instr=300000000 shell=0
+max_instr=400000000 shell=0
+max_instr=420000000 shell=0
+max_instr=435000000 shell=0
+max_instr=445000000 shell=1
+max_instr=500000000 shell=1
+max_instr=650000000 shell=1
+max_instr=750000000 shell=1
+max_instr=800000000 shell=1

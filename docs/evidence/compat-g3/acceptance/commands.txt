@@ -1,0 +1,140 @@
+COMPAT G3 acceptance — reproduction commands
+Recorded 2026-10-17.  Paths are the ones actually used; substitute as needed.
+All hashes quoted in receipt.md / inputs.txt.
+
+=== 0. Toolchain (Debian 13) =================================================
+sudo apt-get install -y clang lld llvm nasm mtools xorriso qemu-system-x86 python3
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup target add x86_64-unknown-none riscv64gc-unknown-none-elf aarch64-unknown-none
+
+=== 1. Guest source at the pinned commit =====================================
+git clone https://github.com/AlexanderNyr/AuraLite-OS.git /home/user/AuraLite-OS
+git -C /home/user/AuraLite-OS fetch --depth 50 origin \
+    518bef075f0eed2b24c5cac8ce3f8a741dfd7cfe
+git -C /home/user/AuraLite-OS worktree add /home/user/AuraLite-OS-pinned \
+    518bef075f0eed2b24c5cac8ce3f8a741dfd7cfe
+
+cd /home/user/AuraLite-OS-pinned
+export PATH="$HOME/.cargo/bin:$PATH"
+make -j kernel build/initrd.tar build/boot/mbr_dual.bin build/boot/stage2.bin \
+     build/mkiso
+make build/boot/BOOTX64.EFI
+make build/kernel32.elf
+# Recorded build products (inputs.txt):
+sha256sum build/kernel.elf build/kernel32.elf build/initrd.tar \
+          build/boot/mbr_dual.bin build/boot/BOOTX64.EFI build/mkiso \
+          build/boot/stage2.bin
+
+=== 2. Reviewed Stage-2 fix, separate worktree ===============================
+git -C /home/user/AuraLite-OS worktree add /home/user/AuraLite-OS-candidate \
+    518bef075f0eed2b24c5cac8ce3f8a741dfd7cfe
+cd /home/user/AuraLite-OS-candidate
+git apply /home/user/AuraLite-Emulator/docs/evidence/compat-g3/stage2-fs-gs-restore.patch
+export PATH="$HOME/.cargo/bin:$PATH"
+make build/boot/stage2.bin
+sha256sum build/boot/stage2.bin
+# MUST print 51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963
+# (equals ../stage2-fs-gs-restore.bin byte for byte)
+
+=== 3. Build both 81-MiB ISOs ================================================
+cd /home/user/AuraLite-OS-pinned
+./build/mkiso --esp-mb 80 \
+  --mbr build/boot/mbr_dual.bin --stage2 build/boot/stage2.bin \
+  --kernel build/kernel.elf --efi build/boot/BOOTX64.EFI \
+  --initrd build/initrd.tar --kernel32 build/kernel32.elf \
+  /tmp/auralite-pinned.iso
+
+./build/mkiso --esp-mb 80 \
+  --mbr build/boot/mbr_dual.bin \
+  --stage2 /home/user/AuraLite-OS-candidate/build/boot/stage2.bin \
+  --kernel build/kernel.elf --efi build/boot/BOOTX64.EFI \
+  --initrd build/initrd.tar --kernel32 build/kernel32.elf \
+  /tmp/auralite-candidate.iso
+
+sha256sum /tmp/auralite-pinned.iso /tmp/auralite-candidate.iso
+# 3bf633dc... and 57381825...; sizes 84,934,656 B each.
+
+# Sector-level "only Stage 2 differs" receipt (iso-layout.txt):
+python3 - <<'PY'
+import hashlib
+c=open('/tmp/auralite-candidate.iso','rb').read()
+p=open('/tmp/auralite-pinned.iso','rb').read()
+diff=[i//512 for i in range(0,len(c),512) if c[i:i+512]!=p[i:i+512]]
+print('sectors:', diff)
+print('stage2 pinned   ', hashlib.sha256(p[34*512:34*512+6656]).hexdigest())
+print('stage2 candidate', hashlib.sha256(c[34*512:34*512+6656]).hexdigest())
+PY
+
+=== 4. Stock SeaBIOS (unmodified) ============================================
+apt-get download seabios                       # 1.16.3-2, all
+dpkg-deb -x seabios_1.16.3-2_all.deb /tmp/sbpkg
+sha256sum /tmp/sbpkg/usr/share/seabios/bios.bin
+# MUST print 4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca
+
+=== 5. x86emu lanes (primary receipt) =======================================
+cd /home/user/AuraLite-Emulator          # HEAD 590847f, clean
+./x86emu --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/auralite-pinned.iso --max-instr=1300000000 --stats \
+  >x86emu-stock-pinned.stdout 2>pinned.stderr      # -> ELF parse FAILED
+
+./x86emu --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/auralite-candidate.iso --max-instr=2000000000 --stats \
+  >x86emu-stock-candidate.stdout 2>candidate.stderr # -> shell active
+
+gzip -9 -c pinned.stderr    > x86emu-stock-pinned.serial.log.gz
+gzip -9 -c candidate.stderr > x86emu-stock-candidate.serial.log.gz
+
+# Repeat the candidate lane unchanged; this must be byte-identical:
+./x86emu --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/auralite-candidate.iso --max-instr=2000000000 --stats \
+  >x86emu-stock-candidate-replay.stdout 2>replay.stderr
+cmp replay.stderr <(gzip -dc x86emu-stock-candidate.serial.log.gz)
+gzip -n -9 -c replay.stderr > x86emu-stock-candidate-replay.serial.log.gz
+
+=== 6. Handoff capture at kernel entry ======================================
+./x86emu --rom=/tmp/sbpkg/usr/share/seabios/bios.bin \
+  --platform=haswell --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=/tmp/auralite-candidate.iso --max-instr=2000000000 --stats \
+  --debug-script=docs/evidence/compat-g3/stage2-bootinfo-candidate-entry.dbg \
+  --snapshot-save=/tmp/g3-acceptance.snap \
+  --log=/tmp/g3-acceptance-cpu.log \
+  >/tmp/g3-acceptance.stdout 2>/tmp/g3-acceptance.stderr
+# stderr around "[dbg] stopped: breakpoint 1" shows
+#   rip 0xffffffff80191640   rdi 0x0000000000010000
+#   0x10000: 0x4155524142544c44
+gzip -9 -c <(awk '/\[dbg\] stopped: breakpoint 1/{f=1} f{print} \
+                 /\[dbg\] detached/{exit}' /tmp/g3-acceptance.stderr) \
+  > x86emu-kernel-entry.log.gz
+
+python3 docs/evidence/compat-g3/inspect_bootinfo_snapshot.py \
+  /tmp/g3-acceptance.snap \
+  --scope 'G3 acceptance run: authoritative release ISO rebuilt from pinned
+    AuraLite-OS 518bef0 with only the reviewed Stage-2 FS/GS fix; stock
+    Debian SeaBIOS 1.16.3-2 bios.bin 4ee65f3d; x86emu stock-ROM lane, BIOS
+    path, RSDP absent (G4 identity remains opt-in)' \
+  --write-raw bootinfo.bin > bootinfo-parse.txt
+
+=== 7. QEMU cross-check (same stock ROM) ====================================
+timeout 100 qemu-system-x86_64 \
+  -machine q35,accel=tcg,sata=off,usb=off -cpu Haswell -m 128M \
+  -bios /tmp/sbpkg/usr/share/seabios/bios.bin \
+  -display none -serial file:qemu-stock-pinned.serial.log \
+  -monitor none -no-reboot -snapshot \
+  -device ich9-ahci,id=ahci -device qemu-xhci,id=xhci \
+  -drive if=none,id=iso,format=raw,file=/tmp/auralite-pinned.iso \
+  -device ide-hd,drive=iso,bus=ahci.0,bootindex=1 \
+  -drive if=none,id=blank,format=raw,file=docs/evidence/compat-g3/blank-usb-1m.img \
+  -device usb-storage,drive=blank,bus=xhci.0
+# repeat with /tmp/auralite-candidate.iso -> qemu-stock-candidate.serial.log
+# RC 124 (timeout) is expected: the guest idles in its shell after boot.
+# QEMU's serial stream is CRLF; store it gzipped (gzip -n) so `git am` cannot
+# normalize the bytes while applying this evidence patch.
+gzip -n -9 qemu-stock-pinned.serial.log qemu-stock-candidate.serial.log
+
+=== 8. In-repo gate =========================================================
+make test-g3        # verifies this bundle (hashes, markers, handoff block)
+make test-g3-nc     # tampering negative control: each mutation must fail

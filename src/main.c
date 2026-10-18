@@ -160,6 +160,9 @@ int main(int argc, char **argv) {
                                      * runs one vCPU (0/1 = historical UP) */
     int cfg_smp = 0;                /* --smp=N: K6 real execution contexts
                                      * (currently max 2; 0/1 = one vCPU) */
+    int cfg_lpc_ich9 = 0;           /* --lpc=ich9: COMPAT G4 -- LPC bridge
+                                     * reports 8086:2918 (ICH9, the Q35 pair)
+                                     * so stock SeaBIOS publishes RSDP */
     int smp_probe = 0;              /* EMU_DBG_SMP: vcpu1 vital-signs probe */
     uint64_t watch_phys = 0;        /* --watch-phys=addr: store probe */
     uint64_t max_instr = 50ull*1000*1000;
@@ -220,6 +223,12 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
+        else if (!strncmp(argv[i], "--lpc=", 6)) {   /* COMPAT G4 */
+            const char *v = argv[i]+6;
+            if (!strcmp(v, "ich9")) cfg_lpc_ich9 = 1;
+            else if (!strcmp(v, "pantherpoint") || !strcmp(v, "default")) cfg_lpc_ich9 = 0;
+            else { fprintf(stderr, "--lpc: expected ich9|pantherpoint, got '%s'\n", v); return EXIT_INPUT_ERROR; }
+        }
         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
         else if (!strncmp(argv[i], "--watch-phys=", 13))
             watch_phys = strtoull(argv[i]+13, NULL, 0);
@@ -244,11 +253,14 @@ int main(int argc, char **argv) {
                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
                    "          [--cpus=N] publish N CPUs in boot_info/MADT with ONE vCPU (KERNEL-BOOT K5 metering)\n"
-                   "          [--smp=N] run N real vCPUs (max 2; use with --cpus=N for kernel SMP bring-up, K6)\n"
+                   "          [--smp=N] run N real vCPUs (max 8; use with --cpus=N for --kernel or --lpc=ich9 for BIOS SMP, K6/G6)\n"
                    "                      skips --rom entirely and starts at the ELF entry\n"
                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
+                  "          [--lpc=ich9|pantherpoint] LPC bridge identity (COMPAT G4): ich9 =\n"
+                  "                      8086:2918 (pairs with the Q35 host bridge and lets stock\n"
+                  "                      SeaBIOS publish RSDP); pantherpoint = historical 8086:1e55\n"
                    "          [--sata2=img|--sata2-portN=img] image on the --ahci2 controller (STORE S4)\n"
                    "          [--sata-writethrough] guest writes land in the host image files too (STORE S5)\n"
                   "          [--trace-file=path] disassembled trace, one line per instruction, with a\n"
@@ -294,6 +306,7 @@ int main(int argc, char **argv) {
     machine_t *m = calloc(1, sizeof *m);
     m->cpu.mach = m;
     m->cfg_cpus = cfg_cpus;   /* K5: read by kload_boot's boot_info fill */
+    m->cfg_lpc_ich9 = cfg_lpc_ich9;  /* COMPAT G4: consumed by devices_init_common */
     m->cfg_no_uhci = cfg_no_uhci; /* USB U5: EHCI-only machine shape */
     m->cfg_no_fb = cfg_no_fb; /* VIDEO V1: VGA text box, no published fb */
     m->cfg_smp  = cfg_smp;    /* K6: vcpu contexts; wired after devices_init */
@@ -403,22 +416,31 @@ int main(int argc, char **argv) {
         mlog(&m->log, "[boot] platform=%s rom=%s (%zu bytes) disk=%s (%zu bytes)",
              platform_by_name(platform_name)->name, rom_path, rom_len, disk_path, disk_len);
 
-    /* K6 (--smp=2): wire the second execution context BEFORE the run.
-     * Pristine power-on CPU image + the H6-reset LAPIC image with ID 1
-     * (matching --cpus=2 kload/MADT metadata); parked in wait-for-SIPI,
-     * exactly the MP spec's boot-time AP state. */
+    /* K6/G6 (--smp=N): wire the AP execution contexts BEFORE the run.
+     * Pristine power-on CPU image + the H6-reset LAPIC image with ID i
+     * (matching --cpus=N kload/MADT metadata and SeaBIOS CMOS 0x5F); parked in
+     * wait-for-SIPI, exactly the MP spec's boot-time AP state. */
     if (cfg_smp >= 2) {
-        m->n_vcpus = 2;
+        int nv = cfg_smp > EM_MAX_VCPU ? EM_MAX_VCPU : cfg_smp;
+        m->n_vcpus = nv;
+        m->rtc.ram[0x5F] = (uint8_t)(nv - 1);
         m->vcpu[0].c = m->cpu; m->vcpu[0].l = m->lapic;
         m->vcpu[0].state = VCPU_RUN;
-        m->vcpu[1].c.mach = m;
-        cpu_reset(&m->vcpu[1].c);
-        m->vcpu[1].l = m->lapic;
-        m->vcpu[1].l.id = 1u << 24;
-        m->vcpu[1].state = VCPU_WAIT_SIPI;
+        for (int i = 1; i < nv; i++) {
+            m->vcpu[i].c.mach = m;
+            cpu_reset(&m->vcpu[i].c);
+            m->vcpu[i].l = m->lapic;
+            m->vcpu[i].l.id = (uint32_t)i << 24;
+            m->vcpu[i].state = VCPU_WAIT_SIPI;
+        }
         m->cur_vcpu = 0;
-        mlog(&m->log, "[smp] K6: 2 vCPU contexts live; vcpu1 parked in "
-             "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
+        if (nv == 2)
+            mlog(&m->log, "[smp] K6: 2 vCPU contexts live; vcpu1 parked in "
+                 "wait-for-SIPI (LAPIC id 1), strict 1:1 round-robin");
+        else
+            mlog(&m->log, "[smp] G6: %d vCPU contexts live; vcpu1..%d parked in "
+                 "wait-for-SIPI (LAPIC ids 1..%d), strict 1:1 round-robin",
+                 nv, nv - 1, nv - 1);
     }
 
     /* TOOLING T4: restore a saved machine before any tool attaches, so the
@@ -520,10 +542,12 @@ int main(int argc, char **argv) {
             n++;
             ran = 1;
             if (step_result != 0) {
-                mlog(&m->log, "[smp] vcpu%d stopped (rc=%d) -- parked; "
-                     "%d context(s) still live", i, step_result,
-                     m->vcpu[1-i].state == VCPU_RUN ? 1 : 0);
                 m->vcpu[i].state = VCPU_OFF;
+                int live = 0;
+                for (int j = 0; j < m->n_vcpus; j++)
+                    if (m->vcpu[j].state == VCPU_RUN) live++;
+                mlog(&m->log, "[smp] vcpu%d stopped (rc=%d) -- parked; "
+                     "%d context(s) still live", i, step_result, live);
             }
             if (keys.keys_list && ((keys.keys_at && m->vtime_instr >= keys.keys_at) ||
                               (keys.keys_at_prompt && m->shell_prompt_seen))) {

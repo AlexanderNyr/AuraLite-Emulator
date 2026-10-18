@@ -841,6 +841,12 @@ static void do_cpuid(machine_t *m) {
     uint32_t leaf = (uint32_t)c->gpr[RAX];
     uint32_t a=0,b=0,cc=0,dd=0;
     platform_cpuid(m->plat, leaf, (uint32_t)c->gpr[RCX], &a,&b,&cc,&dd);
+    /* COMPAT G6: leaf 1 EBX[31:24] reports this logical processor's initial
+     * APIC ID (m->lapic.id[31:24]); 0 on the BSP and in UP, so single-vCPU
+     * and BSP receipts stay bit-identical while APs identify themselves to
+     * SeaBIOS smp_write_msr(). */
+    if (leaf == 1)
+        b = (b & 0x00FFFFFFu) | (m->lapic.id & 0xFF000000u);
     c->gpr[RAX] = a; c->gpr[RBX] = b; c->gpr[RCX] = cc; c->gpr[RDX] = dd;
 }
 

@@ -1,12 +1,23 @@
 # COMPAT G3 — Stage-4 FS/GS and ACPI boundary diagnostics
 
-**Date:** 2026-10-16. **Status:** G3 remains open; diagnostic-only follow-up. The compatibility checkout now has a candidate Stage-2 FS/GS restoration change, but it has not been inserted into the authoritative release ISO.
+**Date:** 2026-10-16 (diagnostics). **Status:** superseded by **acceptance** —
+see [`acceptance/`](acceptance/README.md) (2026-10-17, patch `0063`).  This
+directory keeps the diagnostic trail that root-caused the failure; the runs
+below are mechanism tests and are not acceptance evidence.
+
+> **G3 acceptance (2026-10-17):** the pinned AuraLite-OS source `518bef0`
+> rebuilt with the release toolchain, with only the reviewed Stage-2 patch
+> applied, boots under an unmodified Debian SeaBIOS 1.16.3-2 `bios.bin` to
+> `[kernel] shell active; kmain idling.` in x86emu (`fault=0`) and QEMU, with
+> a validated 7,776-byte `boot_info_t` at `0x10000`.  The pinned ISO fails at
+> `[BL4] ELF parse FAILED` in the identical lane.  Receipts, hashes and the
+> sector-diff proof: [`acceptance/`](acceptance/README.md).
 
 ## Authority / limits
 
 The authoritative input remains `/home/user/AuraLite-OS-compat/release/auralite.iso`, SHA-256 `d2110f8ba93f739a0ffe1180540fe456a5b2396c3fad375cb7504cb11d8144e7`, with unchanged `kernel.elf` SHA-256 `a1c5264bcf6fbed66a75e0a4a54f3deb6d713842fa64a812cb1a0a05cb647bb3`. The unmodified Stage 2 in that ISO still reaches `ELF parse FAILED`. The historical G3 ROM (`3267c5e4…`) is unavailable; the recreated diagnostic ROM is `69f2819d…`, and the ACPI-ID probe ROM is `012f5d98…`. Neither is a same-ROM historical comparison.
 
-No accepted pinned-image x86emu BIOS-to-kernel/shell result is claimed. The temporary ISO runs below—including runs under the unmodified stock SeaBIOS—are mechanism tests only. A bounded `boot_info_t` layout/field check was captured at kernel entry on the candidate image; it does not validate the authoritative image or constitute acceptance. A limited independent QEMU reference comparison is now recorded below, with firmware/transport caveats. No allocator-zone measurement, CF9-causality claim, or PERF P4 pass is established. PERF P4 remains **NO-GO**.
+At the time of these diagnostics no accepted pinned-image x86emu BIOS-to-kernel/shell result existed; the 2026-10-17 acceptance closes that gap.  The temporary ISO runs below—including runs under the unmodified stock SeaBIOS—remain mechanism tests only.  A bounded `boot_info_t` layout/field check was captured at kernel entry on the candidate image; the accepted capture is in `acceptance/`.  A limited independent QEMU reference comparison is recorded below, with firmware/transport caveats. No allocator-zone measurement, CF9-causality claim, or PERF P4 pass is established. PERF P4 remains **NO-GO**.
 
 ## Stage-4 diagnosis and candidate source fix
 

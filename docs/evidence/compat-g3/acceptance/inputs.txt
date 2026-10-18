@@ -1,0 +1,54 @@
+# G3 acceptance inputs and build products (measured 2026-10-17)
+
+## Guest source (authoritative)
+AuraLite-OS repository         https://github.com/AlexanderNyr/AuraLite-OS.git
+Pinned commit                  518bef075f0eed2b24c5cac8ce3f8a741dfd7cfe
+Worktree used                 /home/user/AuraLite-OS-pinned   (pristine pin)
+Candidate worktree            /home/user/AuraLite-OS-candidate (pin + stage2 patch)
+Toolchain                     clang 19.1.7 / ld.lld 19.1.7, rustc 1.99.1,
+                              targets x86_64-unknown-none, riscv64gc-unknown-none-elf,
+                              aarch64-unknown-none; NASM 2.16.03; xorriso; mtools
+
+Build products of the pinned tree (same bytes reused for both ISOs):
+d0d735de4110ef2b725b9d85167bd2be63403e686e5ed7b08c5875926603c9b1  build/kernel.elf   3073904 B
+f699e4b8e59c840faa0112887eb236262cb423f1476ccd1d30ec25d9424e98c7  build/kernel32.elf  427348 B
+8ca31e41040a6b4d6caad693638c7d3acb4e0c3d72c769d2fb468803151df342  build/initrd.tar  11673600 B
+d10c759f60a136ea4358397339975925c957d1a28dd5ead02e2afd74f219b7a0  build/boot/mbr_dual.bin       512 B
+8732cd8a6c1557f5c7bc814d18b47ff27a46e3ca92f3410da98f7cfb463d603d  build/boot/BOOTX64.EFI      10240 B
+3f22daf37a27e5714e970ad96570737fb1b091e11aa4a9f479b707b919e18216  build/mkiso                  21160 B
+
+kernel.elf is not bit-reproducible: the pinned reference is
+a1c5264b... at the same 3,073,904-byte size; this rebuild differs only in
+the __DATE__/__TIME__ strings, so the ISO hash cannot equal the published
+d2110f8b....  Acceptance is therefore behavioural (serial receipt + handoff
+block), with hashes recorded as build facts.
+
+## Stage 2
+3018fcd50629ceccb45a256e199192ce140a45b5dbe5f8f806b5077ff91ecfac  build/boot/stage2.bin (pinned, 6656 B)
+51ecc150f6eefd84f570f2fbdc808c4f3edd7ac7bf342559c19f652638b85963  build/boot/stage2.bin (pin + stage2-fs-gs-restore.patch, 6656 B)
+
+The candidate hash equals the diagnostic blob in ../stage2-fs-gs-restore.bin
+byte for byte: the reviewed patch is deterministic and reassembles exactly.
+
+## Bootable ISOs (not stored in this bundle: 81 MiB each)
+3bf633dc127acfd445bc5ceb5178cec138a8c780ad07e3cc4f25c1af76cd25f3  auralite-pinned.iso
+573818257ff30001fa3980ffdd23964ff02390c74c4bbaeebaea1f9c2a8e7fea  auralite-candidate.iso
+
+Only difference between the two images: 10 changed 512-byte sectors out of
+166,272, all inside the Stage-2 staging area at LBA 34..46 (13 sectors).
+No other sector of the ISO differs.
+
+## Firmware (stock, unmodified)
+Package                        seabios 1.16.3-2 (Debian trixie, all)
+File                           /usr/share/seabios/bios.bin
+Size                           131072 B
+SHA-256                        4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca
+
+This is the same binary the diagnostic bundle used; it is NOT the modified
+seabios-diagnostic-128k.bin / seabios-acpi-id-probe-128k.bin ROMs.
+
+## Emulator
+AuraLite-Emulator HEAD         590847f11177df8d25043f0af0520c48ae5ec150 (clean)
+Binary SHA-256                 d87947408bb85936993c47817581251afe0ded3084ff875b4634f2d8985d4c0e
+Build                          make, CFLAGS = -std=c11 -O2 -Wall -Wextra -Werror
+Commit after this evidence     0063 (COMPAT G3 acceptance)

@@ -1,0 +1,77 @@
+---- CPU state (mode=long64, instr=599696820567) ----
+RAX=ffffffff88018310 RBX=0000000000000000 RCX=00000000c0000102 RDX=0000000000000000
+RSI=ffffffff88018310 RDI=0000000000000000 RBP=ffffffff8c008fd8 RSP=ffffffff8c008fd8
+R8 =ffffffff8801a5f0 R9 =0000000000000000 R10=0000000000000001 R11=00000000fffff801
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=ffffffff80153792 RFLAGS=0000000000000286 CR0=0000000080010033 CR3=0000000001000000 CR4=0000000000000620 EFER=0000000000000d01
+CS=0008 base=0000000000000000 L=1 D=0   SS=0010 base=0000000000000000
+STATE: HALTED (HLT executed)
+
+---- stats (PERF P0) ----
+[stats] vcpu=0 executed_steps=830338903 instr_count=599696820567 halted=1 fault=0
+[stats] executed=830338903 idle_quantum=598866481664 instr_count_bsp=599696820567 vtime=599696820567
+[stats] cap=2000000000 cap_reached=1 n_vcpus=1
+[stats] tlb_hits=1305110204 tlb_misses=326329583 tlb_flushes=235514459
+[stats] decode_hits=225279364 decode_misses=357958455
+
+---- last log lines ----
+[serial] [bc] writeback stores=3719 flushed=3088 coalesced=631
+[serial] [bc] writeback stores=3721 flushed=3090 coalesced=631
+[serial] [bc] writeback stores=3723 flushed=3092 coalesced=631
+[serial] [bc] writeback stores=3725 flushed=3094 coalesced=631
+[serial] [bc] writeback stores=3727 flushed=3096 coalesced=631
+[serial] [bc] writeback stores=3736 flushed=3102 coalesced=634
+[serial] [bc] writeback stores=3738 flushed=3104 coalesced=634
+[serial] [bc] writeback stores=3740 flushed=3106 coalesced=634
+[serial] [bc] writeback stores=3742 flushed=3108 coalesced=634
+[serial] [bc] writeback stores=3744 flushed=3110 coalesced=634
+[serial] [bc] writeback stores=3746 flushed=3112 coalesced=634
+[serial] [bc] writeback stores=3748 flushed=3114 coalesced=634
+[serial] [bc] writeback stores=3750 flushed=3116 coalesced=634
+[serial] [bc] writeback stores=3752 flushed=3118 coalesced=634
+[serial] [bc] writeback stores=3754 flushed=3120 coalesced=634
+[serial] [bc] writeback stores=3763 flushed=3126 coalesced=637
+[serial] [bc] writeback stores=3765 flushed=3128 coalesced=637
+[serial] [bc] writeback stores=3767 flushed=3130 coalesced=637
+[serial] [bc] writeback stores=3769 flushed=3132 coalesced=637
+[serial] [bc] writeback stores=3771 flushed=3134 coalesced=637
+[serial] [bc] writeback stores=3773 flushed=3136 coalesced=637
+[serial] [bc] writeback stores=3775 flushed=3138 coalesced=637
+[serial] [bc] writeback stores=3777 flushed=3140 coalesced=637
+[serial] [bc] writeback stores=3779 flushed=3142 coalesced=637
+[serial] [bc] writeback stores=3788 flushed=3148 coalesced=640
+[serial] [bc] writeback stores=3790 flushed=3150 coalesced=640
+[serial] [bc] writeback stores=3792 flushed=3152 coalesced=640
+[serial] [bc] writeback stores=3794 flushed=3154 coalesced=640
+[serial] [bc] writeback stores=3796 flushed=3156 coalesced=640
+[serial] [bc] writeback stores=3798 flushed=3158 coalesced=640
+[serial] [bc] writeback stores=3800 flushed=3160 coalesced=640
+[serial] [bc] writeback stores=3802 flushed=3162 coalesced=640
+[serial] [bc] writeback stores=3804 flushed=3164 coalesced=640
+[serial] [bc] writeback stores=3806 flushed=3166 coalesced=640
+[serial] [bc] writeback stores=3815 flushed=3172 coalesced=643
+[serial] [bc] writeback stores=3817 flushed=3174 coalesced=643
+[serial] [bc] writeback stores=3819 flushed=3176 coalesced=643
+[serial] [bc] writeback stores=3821 flushed=3178 coalesced=643
+[serial] [bc] writeback stores=3823 flushed=3180 coalesced=643
+[serial] [bc] writeback stores=3825 flushed=3182 coalesced=643
+[serial] [bc] writeback stores=3827 flushed=3184 coalesced=643
+[serial] [bc] writeback stores=3829 flushed=3186 coalesced=643
+[serial] [bc] writeback stores=3831 flushed=3188 coalesced=643
+[serial] [bc] writeback stores=3840 flushed=3194 coalesced=646
+[serial] [bc] writeback stores=3842 flushed=3196 coalesced=646
+[serial] [bc] writeback stores=3844 flushed=3198 coalesced=646
+[serial] [bc] writeback stores=3846 flushed=3200 coalesced=646
+[serial] [bc] writeback stores=3848 flushed=3202 coalesced=646
+[serial] [bc] writeback stores=3850 flushed=3204 coalesced=646
+[serial] [bc] writeback stores=3852 flushed=3206 coalesced=646
+[serial] [bc] writeback stores=3854 flushed=3208 coalesced=646
+[serial] [bc] writeback stores=3856 flushed=3210 coalesced=646
+[serial] [bc] writeback stores=3865 flushed=3216 coalesced=649
+[serial] [bc] writeback stores=3867 flushed=3218 coalesced=649
+[serial] [bc] writeback stores=3869 flushed=3220 coalesced=649
+[serial] [bc] writeback stores=3871 flushed=3222 coalesced=649
+[serial] [bc] writeback stores=3873 flushed=3224 coalesced=649
+[serial] [bc] writeback stores=3875 flushed=3226 coalesced=649
+[serial] [bc] writeback stores=3877 flushed=3228 coalesced=649
+[serial] [bc] writeback stores=3879 flushed=3230 coalesced=649

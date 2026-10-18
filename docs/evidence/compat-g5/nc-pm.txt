@@ -1,0 +1,5 @@
+# COMPAT G5 PM-timer negative control
+# rom=/tmp/sbpkg/usr/share/seabios/bios.bin iso=/tmp/iso-candidate.iso
+# md5=4098ea41c4576565791c08770f15a5ca
+frozen:  BL3=absent steps=300000000
+control: BL3=present steps=297585739

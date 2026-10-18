@@ -748,38 +748,136 @@
   accept GUID: HTTP/101 pass and the client's sample-key assertion alone
   fails.
 
-## BIOS compatibility diagnostics (G2–G3, 2026-10-16)
+## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
 
 - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
   SGDT/SIDT store width: the emulator now writes the six-byte pseudo-descriptor
   outside long mode. PUSHA/PUSHAD and POPA/POPAD support was subsequently added
   for the Stage-2 instruction path. The captured commands and receipts are in
   `docs/evidence/compat-g2/`.
-- G3's Stage-4 `ELF parse FAILED` boundary is traced to BIOS INT 13h return
-  resetting Stage 2's unreal-mode FS/GS caches before the FAT copy. A candidate
-  Stage-2 source change restores unreal mode after successful and final-error
-  disk-read returns while preserving caller registers. This is a diagnostic
-  candidate; the pinned ISO was not changed.
-- Same-stock 128-KiB Debian SeaBIOS A/Bs in xemu and QEMU reproduce the split:
-  the pinned ISO fails ELF parsing, while the modified candidate reaches
-  shell-active. QEMU reproduces it with AHCI + blank USB and with `if=ide`.
-  The separate xemu candidate-entry capture records RDI=`0x10000`, seven E820
-  entries and no RSDP; it does not validate the pinned image's handoff.
-- QEMU and xemu candidate blocks match selected stable fields but differ in
-  RSDP (QEMU `0xf67b0`, xemu absent) and E820 count (8 vs. 7). The SeaBIOS
-  LPC-ID allowlist establishes the RSDP-presence mismatch; the remaining E820
-  differences have no established cause. Each 128-KiB QEMU pinned/candidate
-  pair has 362 differing raw bytes: 358 beyond the declared eight E820 entries
-  and four in initrd fields. The separate 256-KiB QEMU reference, where both
-  images reached shell and blocks matched, is a different firmware setup.
+- **G3 delivered (patch `0063`): the authoritative image boots the BIOS route
+  to the kernel shell.**  The Stage-4 `ELF parse FAILED` boundary was root-
+  caused to BIOS INT 13h returning through `call32_post()`, which reloads
+  FS/GS with 64-KiB real-mode limits, so Stage 2's unreal-mode flat caches
+  were gone before the FAT copy.  The reviewed
+  `stage2-fs-gs-restore.patch` restores unreal mode on both disk-read exits
+  and preserves the caller frame with `pushad/popad`.  The pinned AuraLite-OS
+  source `518bef0` was rebuilt with the release toolchain; the accepted
+  candidate ISO differs from the pinned ISO in exactly 10 of 166,272 sectors,
+  all inside the Stage-2 staging area at LBA 34..46.  Under an **unmodified**
+  Debian SeaBIOS 1.16.3-2 `bios.bin` (`4ee65f3d…`), x86emu reaches
+  `[kernel] shell active; kmain idling.` with `fault=0`, while the pinned ISO
+  stops at `ELF parse FAILED` in the identical lane (negative control); QEMU
+  10.0.13 with the same ROM reproduces both outcomes and additionally boots
+  through `ACPI RSDP found` / `ACPI MADT parsed`.  A temporary breakpoint at
+  `_start` (`0xffffffff80191640`) records `rdi=0x10000` and `BOOT_MAGIC` at
+  `0x10000`; the 7,776-byte `boot_info_t` block validates (7 sorted E820
+  entries, HHDM `0xffff800000000000`, initrd `0x1800000/0xb22000`,
+  `cpu_count=1`, `rsdp=0`).  A second candidate run at the same cap produced a
+  byte-identical serial stream and stats block.  `make test-g3` re-checks 54
+  conditions and `make test-g3-nc` requires five tampered bundle copies to be
+  rejected.
+  Evidence: `docs/evidence/compat-g3/acceptance/`.
+- Pre-acceptance diagnostics (kept for the root-cause trail): same-stock
+  128-KiB SeaBIOS A/Bs in xemu and QEMU, the xemu candidate-entry capture
+  (`RDI=0x10000`, seven E820 entries, no RSDP), and the QEMU/xemu block
+  comparison whose RSDP difference is explained by the SeaBIOS LPC-ID
+  allowlist.  The residual E820/initrd byte differences in those diagnostic
+  captures have no established cause and are not acceptance evidence.
 - Snapshot restore-order testing also led to format v2: PCI config and the AHCI
   BAR are restored before MMIO validation; v1 snapshots are refused. Recorded
   tests and full evidence are in `docs/evidence/compat-g3/` and
   `docs/plans/TOOLING_PLAN.md`.
 
-G3 remains open. These modified-image runs are diagnostic only; no pinned-image
-BIOS-to-kernel acceptance, allocator-zone measurement, CF9-causality claim or
-PERF P4 pass is established.
+- **G4 delivered (patch `0062`): the ACPI-LPC identity pairing.**  G3 measured
+  that SeaBIOS `rel-1.16.3`'s `acpi_setup()` recognizes only PIIX4 PM
+  `8086:7113` or ICH9 LPC `8086:2918`, while this machine advertised the Q35
+  host bridge `8086:29c0` and its PAM registers but an LPC function
+  `8086:1e55` — so stock SeaBIOS completed POST and published no RSDP.  The
+  new opt-in `--lpc=ich9` (`machine_t.cfg_lpc_ich9`, `src/devices.c`) reports
+  `8086:2918`; the default stays `8086:1e55`, so every historical lane keeps
+  its receipts.  Measured with the **unmodified** diagnostic SeaBIOS in
+  `docs/evidence/compat-g3/` and a blank USB image: the run logs
+  `ACPI DSDT=0x07ffe4b0` and `Copying ACPI RSDP from 0x00006dfc to
+  0x000f6210`, and an end-of-run v2-snapshot walk finds a checksum-valid
+  rev-0 RSDP at `0xf6210`, RSDT `0x7ffe470` (4 entries) and
+  FACP/SSDT/APIC(MADT, LAPIC base `0xfee00000`)/**MCFG**, all checksums
+  zero.  With the default identity the same ROM publishes `NO RSDP`
+  (negative control); the G3 probe ROM reproduces RSDP `0xf6210` and RSDT
+  `0x7ffe4c0` (3 entries, no MCFG), which is itself the receipt that the
+  ICH9 identity unlocks SeaBIOS's full Q35/PCIe path rather than merely
+  satisfying the old match table.  `tests/test_compat.c` pins 7 vectors
+  (both identities, class/header, host bridge, AHCI function, PAM under
+  ICH9) and runs in `make test` / `make test-sanitize`.  Evidence:
+  `docs/evidence/compat-g4/`.
+
+- **G5 delivered (patch `0064`): the ICH9 lane boots, because the ACPI PM
+  timer now exists.**  The recorded blocker ("`--lpc=ich9` never reaches
+  Stage 2", CPU parked near RIP `0xefa1f`) was a misread symptom.  Under the
+  ICH9 identity stock SeaBIOS programs `TimerPort=0xb008` and waits on
+  `timer_check()` deadlines; the emulated chipset had no ACPI PM block, so the
+  port floated high (`0xFFFFFFFF`) and no deadline ever expired.  The visible
+  stall — a 718-instruction loop reading AHCI `PxSSTS` at `f0068` with
+  `in eax,dx` at `f010b`, port 0 accepted (`0x123`) and the empty port 1 never
+  reaching `DET==3` (`0x1a8`) — is the wait itself, not a reset loop.  The new
+  `src/pm.{h,c}` model a 0x40-byte PM block at PMBASE (default `0xB000`, bits
+  15:7 of LPC config `0x40..0x43`, applied through the LPC `cfg_write` hook)
+  with a 24-bit read-only TMR at +8 counting three counts per PIT tick (one
+  count per 128 retired instructions).  Measured on the G3 accepted image with
+  the unmodified Debian SeaBIOS: `[kernel] shell active; kmain idling.`,
+  `executed_steps=829920364`, `fault=0`, RC 0, 158 s; the marker first appears
+  between 435 M and 445 M instructions.  `boot_info_t` now carries
+  `rsdp_phys=0xf6830`; a post-marker snapshot walk confirms RSDP `0xf6830`
+  (rev 0) → RSDT `0x7ffe3a0` with four checksum-valid tables (FACP, SSDT,
+  APIC/MADT, MCFG) whose I/O APIC entry (`0xfec00000`) matches the guest's
+  `(MADT agree)` line.  Negative control: the frozen pre-fix read never prints
+  `[BL3]` in 300 M instructions while the fixed tree prints it at
+  297,585,739.  Gates: `make test-g5` (58 re-checked conditions, inside
+  `make test`), `make test-g5-nc` (four tampered bundles), `make test-g5-live`
+  (frozen-timer replay) and `tests/test_pm.c` in `make test-unit`.
+  Evidence: `docs/evidence/compat-g5/`.
+- **G5 also settles the E820 7-vs-8 question.**  Under `--lpc=ich9` the map
+  gains `0xfed1c000+0x4000`, the ICH9 Root Complex Register Block that SeaBIOS
+  reserves once it takes the ICH9 path; QEMU's q35 map with the same ROM has
+  the identical eight-entry shape.  The only remaining numeric difference is
+  the firmware's own ACPI/NVS slab at the top of low RAM (16 KiB vs 132 KiB),
+  both ending at `0x08000000`.  Recorded divergence, guest-side: the kernel
+  prints `[ioapic] overrides: none in the MADT` although four ISOs exist,
+  because `madt_walk()` requires `elen >= 12` for a 10-byte ACPI structure;
+  QEMU prints the same line, so the emulator is not the difference.
+- **G6 delivered (patch `0065`): 4-vCPU BIOS SMP bring-up and guest SMP test
+  suite close COMPAT.**  `EM_MAX_VCPU` is raised from 2 to 8 (`src/machine.h`,
+  `src/main.c`), `CMOS[0x5F]` reports `nv - 1` extra processors to SeaBIOS
+  `smp_probe()` (`src/rtc.c`), `lapic_icr_write()` handles broadcast
+  destination shorthands `2` and `3` for `INIT` (`dm=5`) and `SIPI` (`dm=6`)
+  (`src/lapic.c`), `do_cpuid()` leaf 1 reports `m->lapic.id & 0xFF000000u` in
+  `EBX[31:24]` so SeaBIOS `handle_smp()` populates `FoundAPICIDs` and marks all
+  4 MADT Type-0 Local APIC entries enabled (`src/cpu.c`), and `vcpu_take_init()`
+  preserves per-AP work counters across the kernel's second-stage `INIT` reset
+  (`src/lapic.c`).  Measured on `--lpc=ich9 --smp=4`: diagnostic SeaBIOS prints
+  `handle_smp: apic_id=0x1..0x3` and `Found 4 cpu(s) max supported 4 cpu(s)`;
+  full BIOS boot with stock Debian SeaBIOS 1.16.3-2 + the accepted ISO publishes
+  a 134-byte MADT (`cpus=4 ioapics=1 isos=4`) and `boot_info_t.cpu_count=4`,
+  wakes all 3 APs (`[smp] AP #0..#2 online`, `[smp] 4 CPU(s) online (3 AP(s)
+  woken)`), prints `[sched] R5 receipt: user thread pid=6 on AP cpu=3`, reaches
+  `[kernel] shell active; kmain idling.`, and passes typed `/tests/irqapwake`
+  (`RES-16 receipt`, `IRQAPWAKE PASS`) and `/tests/smpstress` (`O_APPEND`,
+  `100 fork/wait`, `8 x 10 signal deliveries`, `SMPSTRESS PASS`) with `fault=0`
+  on all 4 vCPUs and exact work-counter identities (`executed=1187467939`,
+  `idle_quantum=180026141696`, `vtime=181213609635`).  All 9 `p5_history.sh`
+  lanes plus 40 M `--kernel` UP and `--cpus=2 --smp=2` runs are byte-identical
+  against the G5 binary.  Gates: `make test-g6` (73 checks, inside `make test`),
+  `make test-g6-nc` (five tampered bundles), `make test-g6-live`
+  (`g6_smp_nc.sh`), and unit vectors in `tests/test_rtc.c` and
+  `tests/test_lapic.c`.  Evidence: `docs/evidence/compat-g6/`.
+
+G3 is closed by a behavioural acceptance: the published ISO `d2110f8b…` is
+not bit-reproducible (its `kernel.elf` embeds build timestamps), so the
+accepted image is a hash-recorded rebuild from the same pinned source whose
+only guest change is the reviewed Stage-2 patch.  No allocator-zone
+measurement, CF9-causality claim or PERF P4 pass is established, and no ACPI
+claim is made for x86emu's default LPC identity (ACPI is G4's opt-in
+`--lpc=ich9`).
 
 ## Current limits
 
@@ -789,3 +887,11 @@ blocks are behavioral models rather than cycle-accurate implementations.
 The live monitor is unauthenticated and defaults to loopback; non-loopback
 binding is an explicit operator choice. Existing frozen-guest integration
 lanes still require the separate AuraLite-OS KERNEL/INITRD artifacts.
+With `--lpc=ich9`, the ACPI tables are published (G4), the BIOS boot reaches
+`[kernel] shell active` on 1 vCPU (G5), and `--lpc=ich9 --smp=4` boots all 4
+vCPUs through the BIOS route and passes `irqapwake` + `smpstress` (G6, up to
+`EM_MAX_VCPU = 8`).  The default `8086:1e55` identity still
+publishes no RSDP and reports seven E820 entries; that lane is historical and
+deliberately unchanged.  The ACPI PM block models only the Timer register
+(PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
+so no power-management transition is claimed.

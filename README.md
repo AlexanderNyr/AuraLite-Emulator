@@ -4,15 +4,19 @@ A from-scratch C emulator for raw x86 firmware, with a switchable Intel platform
 
 ## Current scope
 
-- x86 interpreter starting in real mode and transitioning through protected mode, compatibility mode and long mode.
-- 16/32/64-bit general registers, ModRM/SIB addressing, segmentation, GDT/IDT loading, CR0/CR3/CR4, EFER/MSR, CPUID, paging (4-level, 2 MiB/1 GiB pages), I/O instructions, PCI config-space access and firmware-oriented integer instructions.
-- Integer ISA per `docs/plans/CORE_PLAN.md`: all conditional branches (short and near, all 16 conditions), the full shift/rotate group with correct count masks and CF/OF, MUL/IMUL/DIV/IDIV with `#DE`, SMSW/LMSW, SGDT/SIDT, PUSHF/POPF, software interrupts `INT n`/`INT3`/`INTO` delivered through the real-mode IVT or the protected/long-mode IDT, and `IRET`/`IRETQ` returning through the hardware-ordered exception frame.
-- Physical address space with 128 MiB RAM, 128 KiB ROM and ROM aliases at `0xE0000` and `0xFFFE0000`.
-- PCI mechanism #1 and ECAM/MMCONFIG.
-- Platform profiles for Sandy Bridge, Ivy Bridge, Haswell, Broadwell and Bay Trail.
-- Behavioural DDR3/DDR3L/DDR4 training register models, CAR scratch, GPU framebuffer, SATA/LPC stubs, and an EHCI/USB mass-storage model that walks guest queue descriptors and reads a disk image.
-- A 64-bit test kernel and a PPM framebuffer dump path.
-- Circular event log and optional instruction trace.
+- x86 interpreter starting in real mode (`0xFFFFFFF0` reset vector) and transitioning through 16/32-bit protected mode, compatibility mode and 64-bit long mode, with a 256-entry success-only translation TLB (PERF P2) and a 512-slot RAM-only prefix/opcode predecode cache (PERF P3).
+- 16/32/64-bit general registers, ModRM/SIB addressing, segmentation, GDT/IDT/TSS (`LTR`, IST stack switching, Ring-3 ↔ Ring-0 transitions), CR0/CR2/CR3/CR4 (`SMEP`/`SMAP`), EFER/MSR, CPUID, RDTSC, paging (4-level, 4 KiB / 2 MiB / 1 GiB pages), `SYSCALL`/`SYSRET`, `SWAPGS`, SSE media subset (16×128-bit `XMM0..XMM15`), I/O instructions, and the full firmware/OS integer ISA per `docs/plans/CORE_PLAN.md`.
+- Physical address space with 128 MiB RAM, 128 KiB ROM, ROM aliases at `0xE0000` and `0xFFFE0000`, Q35 PAM (`0x90..0x96`) shadow RAM decode for `0xC0000–0xFFFFF`, and A20 gate masking.
+- PCI mechanism #1 (`0xCF8`/`0xCFC`) and 256 MiB ECAM/MMCONFIG (`0xE0000000`), Q35 host bridge (`8086:29c0`), switchable LPC identity (`8086:1e55` default or `--lpc=ich9` `8086:2918` for stock SeaBIOS ACPI table publication, COMPAT G4).
+- Full PC/AT + APIC chipset (`docs/plans/CHIPSET_PLAN.md`, `docs/plans/COMPAT_PLAN.md`): dual 8259A PIC, 8254 PIT, 24-bit ACPI PM timer at `PMBASE+8` (3.579545 MHz = 3×PIT, COMPAT G5), MC146818A RTC/CMOS (including `0x34`/`0x35` high-RAM and `0x5F` SMP CPU count), 8042 KBC with Set-1 scancode injection (`--keys`, `--keys-at`), port `0x92`/`0xCF9` warm reset, xAPIC (`0xFEE00000`, timer, self/peer/broadcast IPI, INIT/SIPI) and 82093AA I/O APIC (`0xFEC00000`, 24 RTEs).
+- Up to 8 vCPU execution contexts (`--smp=N`, `EM_MAX_VCPU = 8`) in deterministic 1:1 round-robin with shared virtual time (`vtime_instr`) and HLT-idle clock yield (`docs/plans/KERNEL_BOOT_PLAN.md` K6–K8, `docs/plans/COMPAT_PLAN.md` G6).
+- Storage, USB, video, and networking:
+  - **AHCI SATA** (`src/ahci.c`, `docs/plans/STORE_PLAN.md` S0–S5): command-list/FIS/PRDT engine, `IDENTIFY`, `READ/WRITE DMA EXT`, 128 KiB transfers, up to 2 controllers (`--sata=`, `--sata-portN=`, `--ahci2`, `--sata2=`, `--sata-writethrough`), INTx delivery.
+  - **USB** (`src/devices.c`, `docs/plans/USB_PLAN.md` U0–U5): EHCI (`0:29.0`) + UHCI companion (`0:1.2`, `--no-usb-uhci`) with control/bulk schedules and BOT/SCSI mass storage (`INQUIRY`, `READ CAPACITY(10)`, `TEST UNIT READY`, `REQUEST SENSE`, `READ(10)`).
+  - **Video** (`src/devices.c`, `docs/plans/VIDEO_PLAN.md` V0–V4): 800×600×32 linear framebuffer (`0xD0000000`), VGA text mode 3 (`0xB8000` + CRTC cursor + 8×16 PSF2 font, `--no-fb`, `--dump-text`), and Bochs VBE dispi (`0x1CE`/`0x1CF`, `--vbe=WxHxBPP|off`).
+  - **Networking** (`src/e1000.c`, `tools/tap_responder.py`, `docs/plans/NET_PLAN.md` N0–N3): Intel 82540EM (`e1000`) with TAP-over-UDP (`--tap=host:port`) and a host responder speaking ARP, DHCP, ICMP, UDP/TCP DNS and 16-way concurrent TCP.
+- Direct ELF64 kernel loader (`--kernel=`, `--initrd=`, `--cpus=`) and full BIOS boot route (`SeaBIOS → Stage 1 → Stage 2 → kernel.elf → init` on 1 to 4 vCPUs).
+- Non-perturbing tooling (`docs/plans/TOOLING_PLAN.md` T0–T5): standalone disassembler (`x86dis`), instruction trace with CPU-vs-disassembler self-check (`--trace-file=`), interactive debugger REPL (`--debug`, `--debug-script=`, `--symbols=`), GDB RSP server (`--gdb=`), whole-machine `AURASNP1` v2 snapshots (`--snapshot-save=`, `--snapshot-load=`), and live HTTP/WebSocket browser monitor (`--monitor=`).
 
 This is intentionally a firmware-focused, multi-purpose emulator, not yet a drop-in replacement for QEMU: the CPU and devices are implemented locally rather than delegated to an existing virtualization library.
 
@@ -106,6 +110,20 @@ Run any compatible ROM directly; the emulator does not rewrite the guest image. 
 
 Select other profiles with `--platform=sandybridge`, `ivybridge`, `broadwell`, or `baytrail`. `--disk=...` supplies the virtual USB storage image. `--rom=...` supplies another firmware image.
 
+For a full stock-SeaBIOS boot with ACPI tables (`--lpc=ich9`), AHCI ISO attachment, and 4-vCPU SMP (`--smp=4`):
+
+```sh
+./x86emu --rom=bios.bin --lpc=ich9 --smp=4 \
+  --disk=docs/evidence/compat-g3/blank-usb-1m.img \
+  --sata=auralite.iso --max-instr=1000000000 --stats
+```
+
+For direct ELF64 kernel boot without firmware (`--kernel=`):
+
+```sh
+./x86emu --kernel=kernel.elf --initrd=initrd.tar --cpus=4 --smp=4 --max-instr=500000000 --stats
+```
+
 ## Testing
 
 Run the CPU unit tests and the platform smoke tests with:
@@ -169,12 +187,16 @@ published convention but could not be measured here).
 
 ## Architecture
 
-`src/cpu.c` is the instruction interpreter. `src/mem.c` and `src/io.c` implement the physical and port address spaces. `src/pci.c` implements PCI config mechanisms. `src/devices.c` contains the platform models and EHCI/USB storage behaviour. `src/main.c` is the CLI harness.
-
-The next GUI layer can consume the machine event ring and framebuffer without changing the emulation core; the framebuffer export is currently PPM so it works without external graphics dependencies.
+- `src/cpu.c` / `src/cpu.h` — x86/x86-64 interpreter, paging, exceptions/interrupts, P2 translation TLB and P3 prefix/opcode predecode cache.
+- `src/mem.c` / `src/io.c` — physical RAM/ROM/MMIO address space (with Q35 PAM and A20) and 64K I/O port space.
+- `src/pci.c` / `src/platform.c` / `src/chipset.c` — PCI config #1 + ECAM, five Intel CPUID profiles, A20 and warm-reset control.
+- `src/pic.c` / `src/pit.c` / `src/pm.c` / `src/rtc.c` / `src/kbc.c` / `src/serial.c` — 8259A PIC, 8254 PIT, ACPI PM timer (`PMBASE+8`), MC146818A RTC/CMOS, 8042 KBC, 16550 UART.
+- `src/lapic.c` / `src/ioapic.c` — Local APIC (xAPIC, timer, IPIs, INIT/SIPI) and 82093AA I/O APIC.
+- `src/devices.c` / `src/ahci.c` / `src/e1000.c` — GPU framebuffer, VGA text mode 3, Bochs VBE dispi, EHCI + UHCI USB mass storage, dual-controller AHCI SATA, Intel 82540EM NIC.
+- `src/kloader.c` / `src/acpi.c` — direct ELF64 loader, `boot_info_t` builder, and RSDP/RSDT/XSDT/MADT generator.
+- `src/disasm.c` / `src/dbg.c` / `src/gdbstub.c` / `src/snapshot.c` / `src/ws.c` / `src/monitor.c` — disassembler, debugger REPL, GDB RSP stub, `AURASNP1` v2 snapshots, RFC 6455 WebSocket + live browser monitor.
+- `src/machine.h` / `src/main.c` — machine state (`machine_t`, up to 8 `vcpu_slot_t` contexts) and CLI harness.
 
 ## License
 
-The sample firmware carries its applicable license in `firmware/LICENSE`.
-The emulator core does not currently declare a repository-level license; add
-one before publishing if you want to grant redistribution and reuse rights.
+The emulator core is licensed under the Apache License, Version 2.0 (see `LICENSE` and `NOTICE.md`). The bundled sample firmware under `firmware/` carries its own MIT license in `firmware/LICENSE`.

@@ -1,0 +1,8 @@
+4ee65f3d02c5e37c3c358618334de65c5b161fac6504aaacd39675eb4ecb80ca  /home/user/g3-artifacts/bios.bin
+69f2819d10c6ea27506462e2d1ecafcd8d0a30e7e377d45f3f99a1996e8a544d  docs/evidence/compat-g3/seabios-diagnostic-128k.bin
+30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  docs/evidence/compat-g3/blank-usb-1m.img
+0b10727ce02eb5de5da9f61d39a71ffaec0742d041a1bbfcd7e4d99a25a0469b  /tmp/iso-candidate.iso
+99c03a15de9294ba68351ceb7b5d25e2ade358f9b42d1ef37bb96f2a2d2aada0  x86emu
+# x86emu build: gcc -std=c11 -O2 -Wall -Wextra -Werror (default CFLAGS), x86_64
+# bios.bin: unmodified Debian trixie seabios 1.16.3-2 (131072 bytes)
+# iso-candidate.iso: AuraLite-OS pinned 518bef0 + G3 Stage-2 acpi.inc fix (84934656 bytes)

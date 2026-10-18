@@ -158,9 +158,35 @@ static void test_irq8_update_ended(void) {
     assert(mem_read(&f.m, 0x2000, 1) == 3);        /* two more seconds */
 }
 
+static void test_cmos_smp_extra_cpus(void) {
+    /* COMPAT G6: SeaBIOS smp_probe() reads CMOS 0x5F for extra CPUs (N - 1).
+     * UP leaves it 0; --smp=N sets N - 1, clamped to EM_MAX_VCPU - 1. */
+    fx_t f;
+    setup_machine(&f.m);
+    rtc_init(&f.m); rtc_io_register(&f.m);
+    assert(cmos(&f, 0x5F) == 0);
+
+    setup_machine(&f.m);
+    f.m.cfg_smp = 2;
+    rtc_init(&f.m); rtc_io_register(&f.m);
+    assert(cmos(&f, 0x5F) == 1);
+
+    setup_machine(&f.m);
+    f.m.cfg_smp = 4;
+    rtc_init(&f.m); rtc_io_register(&f.m);
+    assert(cmos(&f, 0x5F) == 3);
+
+    setup_machine(&f.m);
+    f.m.cfg_smp = 99;
+    rtc_init(&f.m); rtc_io_register(&f.m);
+    assert(cmos(&f, 0x5F) == EM_MAX_VCPU - 1);
+    printf("ok: cmos_smp_extra_cpus\n");
+}
+
 int main(void) {
     test_cmos_content_and_ports();
     test_cmos_extended_memory_above_16m();
+    test_cmos_smp_extra_cpus();
     test_time_advances_bcd_exact();
     test_uip_freeze_then_commit();
     test_regc_flags_no_uie();
