@@ -74,6 +74,7 @@ SCHEMA = {
     "sata2_port1":    {"flag": "--sata2-port1=",   "type": "path"},
     "sata_writethrough": {"flag": "--sata-writethrough", "type": "bool"},
     # video
+    "cdrom":          {"flag": "--cdrom=",         "type": "path"},   # STORE S6
     "vbe":            {"flag": "--vbe=",           "type": "str", "regex": r"^(\d{1,5}x\d{1,5}x(4|8|15|16|24|32)|off)$"},
     "no_fb":          {"flag": "--no-fb",          "type": "bool"},
     # network

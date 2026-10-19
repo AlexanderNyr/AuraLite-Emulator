@@ -27,13 +27,15 @@ maps to exactly one plan below.
 | [`docs/plans/CORE_PLAN.md`](docs/plans/CORE_PLAN.md) | ✅ **CLOSED** (C0–C11 done ✅) | CPU correctness: measured defect ledger, ISA completeness, test rig | C0–C11 |
 | [`docs/plans/CHIPSET_PLAN.md`](docs/plans/CHIPSET_PLAN.md) | ✅ **CLOSED** (H0–H7 done ✅) | IRQ delivery at instruction boundaries, PIC 8259, PIT 8254, RTC/CMOS, KBC 8042, **A20 gate**, port 0x92/0xCF9 reset; LAPIC+IOAPIC (SMP stretch) | H0–H7 |
 | [`docs/plans/KERNEL_BOOT_PLAN.md`](docs/plans/KERNEL_BOOT_PLAN.md) | ✅ **CLOSED** (K0–K8 done ✅; north star met) | `--kernel=` lane boots AuraLite-OS `kernel.elf` to its shell on 1 and 2 vCPUs; guest receipts measured end-to-end: `(1 AP(s) woken)`, R5 cross-CPU scheduling receipt, `SMPSTRESS PASS` + `IRQAPWAKE PASS` (parity with the OS repo's QEMU -smp 2 gate) | K0–K8 |
-| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S5 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx | S0–S5 |
+| [`docs/plans/STORE_PLAN.md`](docs/plans/STORE_PLAN.md) | ✅ **CLOSED** (S0–S6 done ✅; measured receipts in the plan + `docs/STATUS.md`) | real AHCI HBA: ABAR/ports/presence, command-list+FIS engine, IDENTIFY, READ/WRITE DMA EXT, up to 4 disks, second controller, 128-KiB transfers, writethrough, honest INTx, **ATAPI + El Torito** (`--cdrom=`, any ISO boots) | S0–S6 |
 | [`docs/plans/USB_PLAN.md`](docs/plans/USB_PLAN.md) | ✅ **CLOSED** (U0–U5 done ✅; both sticks through the guest's MSC path with byte-identical lane pairs) | BOT/CSW correctness (tag echo, residue, status byte), INQUIRY/READ CAPACITY/TEST UNIT READY, doorbell on USBCMD only, UHCI controller model for AuraLite OS parity | U0–U5 |
 | `docs/plans/VIDEO_PLAN.md` | ✅ **CLOSED** (V0–V3 done ✅, plus V4 ✅ — a post-closure heap-overflow fix: the dispi mode registers were not clamped to VRAM, so `--vbe=1024x768x32` wrote 3145728 bytes out of a 1920000-byte window, ASan RC=1 / unsanitized RC=134; QEMU's `vbe_fixup_regs` transcribed in full, historical video artifacts proved byte-identical pre/post — and V5 ✅: the window is the full 16 MiB std-VGA aperture with `vbe_start_addr` display panning, the display contract 800x600x32 unmoved) | VGA text mode 3 (`0xB8000` + CRTC cursor), Bochs VBE (dispi 0x1CE/0x1CF), mode switching | V0–V5 |
 | `docs/plans/NET_PLAN.md` | ✅ **CLOSED** (N0–N3 done ✅; the guest's whole online boot path is measured on the real wire — DHCP lease, ARP, ICMP echo, DNS over UDP **and** over the RFC 1035 TCP carriage, and 16 concurrent TCP connections held and closed: 76 frames, byte-identical twice, `N3OK` — plus N4 ✅: the deferred D4 INTx line, cfg `0x3C`/`0x3D` seeded and `((ICR & IMS) != 0)` driven onto IRQ 11/INTA# the AHCI S5 way) | e1000 model (the OS's primary NIC) + host TAP backend + host responder | N0–N4 |
 | [`docs/plans/PERF_PLAN.md`](docs/plans/PERF_PLAN.md) | ✅ **CLOSED** (P0 ✅ `0051`, P1 ✅ `0052`, P2 ✅ `0053`, P3 ✅ `0054`, P4 NO-GO measured, P5 ✅ `0055`) | honest bench, profile-guided RAM read, success-only translation TLB and RAM-only prefix/opcode predecode; P4 dispatch rejected by measurement; P5 paired CI / work-clock close-out | P0–P5 |
 | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
 | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+| [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+| GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -51,9 +53,90 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 5. Docs sync is part of each phase's definition of done: phase row in its
    plan + `docs/STATUS.md` evidence, same patch.
 
-## Immediate queue (next patches)
+## Audit 2026-10-19 — state of the tree and the next-block queue
 
-All ten plans in the ledger above are **CLOSED**. Recent patches:
+### Inventory (measured against the tree, not assumed)
+
+- 36 patches under `patches/` (`0066`–`0075` verified with format-patch
+  reverse-check + parent-check tree hash) on `feature/roadmap-next`. The
+  deliverable diff `AuraLite-all-vs-github.patch` is generated as
+  `git diff <current github main>..HEAD` and must be refreshed whenever
+  upstream `main` moves; as of this audit upstream `main` is `a7e9799`
+  ("N4, V5, Gui update" -- the squash of our `0066`–`0069` work, tree-
+  identical to `8ff63de`), so the patch carries the post-G1 work: GUI G2,
+  STORE S6, FPU F0–F4 and this audit.
+- Every plan in the ledger above is **CLOSED** (CORE, CHIPSET, KERNEL-BOOT,
+  STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4, PERF P0–P5, TOOLING T0–T5,
+  COMPAT G0–G6, FPU F0–F4, GUI G1–G2).
+- `src/` is 17,657 lines of C. Green at the audit: `make test` (unit +
+  integration, incl. the 13-lane t4 snapshot gate), `make test-sanitize`
+  (ASan/UBSan), diff-fuzz 512/12 288 all-match with 0 host crashes, the GUI
+  suite, and both SeaBIOS ISO lanes (MBR-as-disk + ATAPI/El Torito).
+  Guest KERNEL/INITRD integration lanes SKIP without the frozen AuraLite-OS
+  artifacts (by design).
+
+### Measured gaps — what the tree honestly does not do
+
+| # | Gap | Evidence in the tree | Candidate plan |
+|---|-----|----------------------|----------------|
+| 1 | **xHCI (USB 3.0 host controller).** The guest's USB stack speaks UHCI/EHCI/xHCI; the machine has UHCI (U4) + EHCI (U3) only | north star above; no xHCI symbol in `src/` | `docs/plans/XHCI_PLAN.md` (X0–X5, the USB_PLAN shape) |
+| 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
+| 3 | **PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed | `docs/STATUS.md` (G5 entry); `src/pm.c` is Timer-only | `docs/plans/PM_PLAN.md` (P0–P3) |
+| 4 | Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT triple-FD (`0x02`→`0x06`) not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and no TIME_WAIT model (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice) | as named | one "upkeep" patch, or folded into the plans above when touched |
+
+No unmeasured defects are known: the F4 lanes closed the last flake class
+(run-dependent snapshot bytes), and the defect ledgers in each plan are
+either shipped or explicitly NO-GO (PERF P4).
+
+### Next-block candidates (dependency-ordered)
+
+1. **XHCI_PLAN (X0–X5)** — the north star names xHCI: AuraLite OS speaks all
+   three USB host controllers and the machine should too. Shape: X0
+   measured baseline (guest xHCI probe receipts against QEMU `qemu-xhci`);
+   X1 PCI/identity + capability/HCSPARAMS/HCSPARAMS2/ports register file;
+   X2 doorbells + the command ring (TRB engine, enable slot/EP context
+   handshake); X3 control+bulk endpoints through the shared device model
+   (the MSC path already exists); X4 USB2/USB3 protocol-speed and port
+   routing (EHCI-companion coexistence); X5 end-to-end + hardening (both
+   sticks byte-identical x2, matrix determinism). Each phase: measured
+   receipts, vectors, one NC, full gates, one patch.
+2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+   M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+   MSI capability + address/data programming; M2 LAPIC MSI delivery
+   (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+   fallback preserved (historical lanes byte-identical); M4 close-out.
+3. **PM_PLAN (P0–P3)** — complete the ACPI surface the G5 note leaves
+   open: PM1_STS/PM1_EN/PM1_CNT semantics, GPE0 block, SMI# as an honest
+   no-op or a measured vector, and at least S1 with a deterministic
+   machine state (snapshot-compatible).
+4. **Upkeep patch** — the row-4 small gaps in one measured pass (the
+   house recipe), scheduled around whichever plan touches those files.
+
+## Immediate queue (recent shipped patches)
+
+All twelve plans in the ledger above are **CLOSED**. Recent patches:
+
+- ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+  VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+  `--sata-port1=`), PxSIG `0xEB14`, `0xA0` PACKET (CDB from ct+0x40)
+  and `0xA1` IDENTIFY PACKET (word0 `0x8580`), CDB set 0x00 TUR /
+  0x03 REQUEST SENSE (18 B) / 0x12 INQUIRY / 0x1A MODE SENSE(6) /
+  0x1B START STOP / 0x1E PREVENT / 0x25 READ CAPACITY (2048) /
+  0x28 READ(10) (2048-B sectors via `ahci_dma_xfer`, byte offsets) /
+  0x43 READ TOC (min); unknown CDB -> CHECK CONDITION (sense 5/20,
+  PxIS.TFES+TFD.ERR); success -> D2H FIS + PxIS.DHRS.  Vectors in
+  `tests/test_ahci.c` + lane C of `tests/test_iso_boot.py` (already
+  SKIP-gated on `usage:`), snap fields (kind+sense), docs: STORE_PLAN
+  S6 row, ROADMAP, CHANGELOG.~~ shipped.
+
+- ~~`0070` — GUI G2: the native tkinter desktop application
+  (`tools/gui_app.py`, «Обычный»/«Экспертный», wizard, «выбери ISO ->
+  Пуск» via the `bios.bin`+`--sata=iso` recipe), plain ISO boot
+  acceptance (`tools/mkiso.py` + `tests/fixtures/bootstub.nas` +
+  `tests/test_iso_boot.py`, `make test-gui`/`make test-iso`), plus
+  measured fixes: IDENTIFY byte-pair swap + CHS words (stock SeaBIOS
+  refused CHS reads of small images with EPARAM), strict argv (unknown
+  option -> usage+exit 1), opt-in IVT dispatch log.~~ shipped.
 
 - ~~`0069` — GUI G1: `tools/launcher.py` + `web/gui.html` make the whole
   CLI surface reachable from one page -- machine setup (every option,

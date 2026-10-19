@@ -106,6 +106,7 @@ typedef struct {
     int32_t n_vcpus, cfg_cpus, cfg_smp, cfg_no_fb, cfg_no_uhci, pad;
     uint64_t disk_len;
     uint64_t sata_len[AHCI_CTRLS][AHCI_MAX_ATTACH];
+    uint8_t  sata_kind[AHCI_CTRLS][AHCI_MAX_ATTACH];   /* STORE S6 */
     uint32_t pci_devices, owned_windows;
 } shape_t;
 
@@ -124,7 +125,10 @@ static void shape_of(machine_t *m, const snap_cfg_t *cfg, shape_t *sh) {
     sh->cfg_no_fb = m->cfg_no_fb; sh->cfg_no_uhci = m->cfg_no_uhci;
     sh->disk_len = m->disk_len;
     for (int c = 0; c < AHCI_CTRLS; c++)
-        for (int i = 0; i < AHCI_MAX_ATTACH; i++) sh->sata_len[c][i] = m->sata_len[c][i];
+        for (int i = 0; i < AHCI_MAX_ATTACH; i++) {
+            sh->sata_len[c][i] = m->sata_len[c][i];
+            sh->sata_kind[c][i] = m->sata_kind[c][i];
+        }
     for (struct pci_dev *d = m->pci_devices; d; d = d->next) sh->pci_devices++;
     for (mmio_region_t *r = m->mmio_list; r; r = r->next) sh->owned_windows += r->owned_ctx ? 1u : 0u;
 }
@@ -145,7 +149,10 @@ static void shape_rec(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
                                                   (unsigned long long)file.kmain_va, (unsigned long long)live.kmain_va); return; }
     SAME(n_vcpus, "%d") SAME(cfg_cpus, "%d") SAME(cfg_smp, "%d") SAME(cfg_no_fb, "%d") SAME(cfg_no_uhci, "%d")
     if (file.disk_len != live.disk_len) { snap_fail(s, "machine shape differs: disk image size"); return; }
-    if (memcmp(file.sata_len, live.sata_len, sizeof file.sata_len)) { snap_fail(s, "machine shape differs: SATA attachments"); return; }
+    if (memcmp(file.sata_len, live.sata_len, sizeof file.sata_len)
+        || memcmp(file.sata_kind, live.sata_kind, sizeof file.sata_kind)) {
+        snap_fail(s, "machine shape differs: SATA attachments"); return;
+    }
     SAME(pci_devices, "%u") SAME(owned_windows, "%u")
 #undef SAME
 }
@@ -174,6 +181,7 @@ static void machine_rec(machine_t *m, sio_t *s) {
         t->fb = m->fb;  t->disk = m->disk;  t->disk_len = m->disk_len;
         memcpy(t->sata_img, m->sata_img, sizeof t->sata_img);
         memcpy(t->sata_len, m->sata_len, sizeof t->sata_len);
+        memcpy(t->sata_kind, m->sata_kind, sizeof t->sata_kind);
         t->max_instructions = m->max_instructions;
         t->kmain_va = m->kmain_va;
         t->cfg_cpus = m->cfg_cpus;  t->cfg_no_fb = m->cfg_no_fb;  t->cfg_no_uhci = m->cfg_no_uhci;

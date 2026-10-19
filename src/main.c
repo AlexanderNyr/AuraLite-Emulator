@@ -145,7 +145,10 @@ int main(int argc, char **argv) {
                                      * pre-boot keys verbatim -- measured.) */
     const char *kernel_path = NULL; /* --kernel=path: KERNEL-BOOT K1 direct-load lane */
     const char *initrd_path = NULL; /* --initrd=path: KERNEL-BOOT K4 USTAR rootfs */
-    const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}}; /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
+    const char *sata_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH] = {{0}};
+    const char *cdrom_path = NULL;      /* --cdrom= (STORE S6: ATAPI CD) */
+    int sata_kind_cfg[AHCI_CTRLS][AHCI_MAX_ATTACH];   /* 0 disk, 1 CD */
+    memset(sata_kind_cfg, 0, sizeof sata_kind_cfg); /* --sata/ --sata-portN (STORE S1+); S4: [ctrl][port], row 1 = --ahci2 */
     int cfg_ahci2 = 0;              /* --ahci2: second AHCI PCI function (STORE S4) */
     int cfg_no_uhci = 0;            /* --no-usb-uhci: EHCI-only machine shape (USB U5) */
     int cfg_no_fb = 0;              /* --no-fb: no linear fb published -- VGA text box (VIDEO V1) */
@@ -221,6 +224,7 @@ int main(int argc, char **argv) {
                 sata_cfg[0][port] = eq + 1;
         }
         else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
+        else if (!strncmp(argv[i], "--cdrom=", 8)) cdrom_path = argv[i]+8;   /* S6 */
         else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
         else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
         else if (!strncmp(argv[i], "--lpc=", 6)) {   /* COMPAT G4 */
@@ -256,6 +260,7 @@ int main(int argc, char **argv) {
                    "          [--smp=N] run N real vCPUs (max 8; use with --cpus=N for --kernel or --lpc=ich9 for BIOS SMP, K6/G6)\n"
                    "                      skips --rom entirely and starts at the ELF entry\n"
                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                   "          [--cdrom=img] ISO on an ATAPI CD -- ctrl 0 port 1, El Torito boot (STORE S6)\n"
                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
                   "          [--lpc=ich9|pantherpoint] LPC bridge identity (COMPAT G4): ich9 =\n"
@@ -281,7 +286,25 @@ int main(int argc, char **argv) {
                   "                      vtime / cap.  Executed attempts, not idle clock\n"
                   "                      quanta, are the throughput numerator (faults count)\n", argv[0]);
             return 0;
+        } else {
+            /* Unknown options used to fall through silently (measured: a
+             * --cdrom= typo booted a machine with no disks at all).  Refuse
+             * loudly, same contract as the GUI's schema validation. */
+            fprintf(stderr, "%s: unknown option '%s' (usage: --help)\n",
+                    argv[0], argv[i]);
+            return EXIT_INPUT_ERROR;
         }
+    }
+
+    /* STORE S6: --cdrom= pins an ATAPI CD on ctrl 0 port 1 and conflicts
+     * with a plain disk on the same port. */
+    if (cdrom_path) {
+        if (sata_cfg[0][1]) {
+            fprintf(stderr, "--cdrom: ctrl 0 port 1 is already taken by --sata-port1=\n");
+            return EXIT_INPUT_ERROR;
+        }
+        sata_cfg[0][1] = cdrom_path;
+        sata_kind_cfg[0][1] = 1;
     }
 
     FILE *debug_in = NULL;
@@ -372,8 +395,10 @@ int main(int argc, char **argv) {
                 continue;
             }
             m->sata_img[c][i] = img; m->sata_len[c][i] = len;
-            mlog(&m->log, "[ahci%s] port %d: attached %s (%zu bytes)",
-                 c ? "2" : "", i, sata_cfg[c][i], len);
+            m->sata_kind[c][i] = (uint8_t)sata_kind_cfg[c][i];
+            mlog(&m->log, "[ahci%s] port %d: attached %s (%zu bytes%s)",
+                 c ? "2" : "", i, sata_cfg[c][i], len,
+                 sata_kind_cfg[c][i] ? ", ATAPI CD" : "");
             /* S5: opt-in host write-through (default: copy-on-attach). */
             if (sata_wt) {
                 if (ahci_wt_attach(m, c, i, sata_cfg[c][i]) != 0)

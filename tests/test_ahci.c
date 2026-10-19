@@ -212,6 +212,25 @@ static void t_prdt(machine_t *m, int i, uint64_t dba, uint32_t bytes) {
     mem_write(m, T_CT + 0x8C + i * 16, 4, (bytes - 1) & 0x003FFFFF);
 }
 
+/* STORE S6 helpers: ATAPI CD attach, PACKET header + CDB. */
+static void fx_attach_cd(fx_t *f, int port, size_t bytes) {
+    if (!gx_disk) gx_disk = calloc(1, 4 * 1024 * 1024);
+    fx_attach_disk_c(f, 0, port, bytes, gx_disk);
+    f->m.sata_kind[0][port] = 1;
+}
+
+static void t_cdb(machine_t *m, const uint8_t *cdb) {
+    for (int i = 0; i < 16; i++) mem_write(m, T_CT + 0x40 + i, 1, cdb[i]);
+}
+
+static void atapi_cmd(machine_t *m, const uint8_t *cdb, uint16_t bc) {
+    t_hdr(m, 1, 0);
+    t_fis(m, 0xA0, 0, 0);
+    mem_write(m, T_CT + 5, 1, bc & 0xFF);           /* byte count */
+    mem_write(m, T_CT + 6, 1, bc >> 8);
+    t_cdb(m, cdb);
+}
+
 static void test_engine_read_single(void) {
     fx_t f; fx_init(&f);
     fx_attach_disk(&f, 0, 4 * 1024 * 1024);
@@ -296,8 +315,17 @@ static void test_engine_identify(void) {
     assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
     assert(mem_read(&f.m, T_CLB + 4, 4) == 512);
     assert(mem_read(&f.m, T_BUF3, 1) == 0x40);          /* word0 non-removable */
-    assert(mem_read(&f.m, T_BUF3 + 54, 1) == 'A');      /* model pair-swapped */
-    assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'u');
+    /* Measured on stock SeaBIOS 1.16.3: unswapped model bytes showed up as
+     * "uAariLetE umiDksH AB" -- the IDENTIFY model must be byte-pair swapped
+     * like real ATA words 27..46 (negative control: reverting the swap in
+     * ahci_identify fails these two asserts). */
+    assert(mem_read(&f.m, T_BUF3 + 54, 1) == 'u');      /* model pair-swapped */
+    assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'A');
+    /* Legacy CHS words 1/3/6: measured -- zeros made SeaBIOS report
+     * PCHS=0/0/0 and its CHS sanity check rejected every sector. */
+    assert(mem_read(&f.m, T_BUF3 + 2, 1) == 8);         /* word1: 8192/(16*63) cyls */
+    assert(mem_read(&f.m, T_BUF3 + 6, 1) == 16);        /* word3: heads */
+    assert(mem_read(&f.m, T_BUF3 + 12, 1) == 63);       /* word6: sectors/track */
     uint32_t secs28 = (uint32_t)mem_read(&f.m, T_BUF3 + 60 * 2, 4);
     assert(secs28 == 4u * 1024 * 1024 / 512);           /* LBA28 capacity */
     assert(mem_read(&f.m, T_FB + 0x40, 1) == 0x34);     /* D2H Register FIS */
@@ -305,6 +333,171 @@ static void test_engine_identify(void) {
     assert(mem_read(&f.m, T_FB + 0x43, 1) == 0);        /* no ATA error */
     fx_done(&f);
     printf("ok engine identify\n");
+}
+
+static void test_engine_atapi(void) {
+    fx_t f; fx_init(&f);
+    fx_attach_disk(&f, 0, 4 * 1024 * 1024);
+    fx_attach_cd(&f, 1, 4 * 1024 * 1024);
+    for (size_t i = 0; i < 4u * 1024 * 1024; i++) gx_disk[i] = (uint8_t)(i * 13 + 7);
+
+    /* PxSIG discriminates the device class (0xEB14 = ATAPI). */
+    assert(mem_read(&f.m, P(0, 0x24), 4) == 0x101u);
+    assert(mem_read(&f.m, P(1, 0x24), 4) == 0xEB14u);
+
+    mem_write(&f.m, P(1, 0x00), 4, T_CLB);
+    mem_write(&f.m, P(1, 0x08), 4, T_FB);
+    mem_write(&f.m, P(1, 0x18), 4, 1u << 4);        /* FRE */
+
+    /* IDENTIFY PACKET DEVICE: word0 = 0x8580 (removable CD-ROM). */
+    {
+        uint8_t cdb[16] = {0};
+        t_hdr(&f.m, 1, 0);
+        t_fis(&f.m, 0xA1, 0, 0);
+        t_cdb(&f.m, cdb);
+        t_prdt(&f.m, 0, T_BUF3, 512);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x38), 4) & 1u) == 0u);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 512);
+        assert(mem_read(&f.m, T_BUF3, 1) == 0x80);
+        assert(mem_read(&f.m, T_BUF3 + 1, 1) == 0x85);
+        assert(mem_read(&f.m, T_BUF3 + 54, 1) == 'u');  /* model swapped */
+        assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'A');
+    }
+
+    /* TEST UNIT READY: no data, D2H DRDY, sense cleared. */
+    {
+        uint8_t cdb[16] = {0};
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 0);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x38), 4) & 1u) == 0u);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 0);
+        assert((mem_read(&f.m, P(1, 0x10), 4) & 1u) != 0u);   /* DHRS */
+        assert(mem_read(&f.m, T_FB + 0x42, 1) == 0x40);
+    }
+
+    /* INQUIRY: 36 B, CD-ROM type, removable, vendor AURALITE. */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x12; cdb[4] = 36;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 36);
+        t_prdt(&f.m, 0, T_BUF1, 36);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x38), 4) & 1u) == 0u);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 36);
+        assert(mem_read(&f.m, T_BUF1, 1) == 0x05);
+        assert(mem_read(&f.m, T_BUF1 + 1, 1) == 0x80);
+        assert(mem_read(&f.m, T_BUF1 + 8, 1) == 'A');
+        assert(mem_read(&f.m, T_BUF1 + 15, 1) == 'E');
+    }
+
+    /* READ CAPACITY: 2048-byte blocks over the full image. */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x25;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 8);
+        t_prdt(&f.m, 0, T_BUF2, 8);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 8);
+        uint32_t last = ((uint32_t)mem_read(&f.m, T_BUF2, 1) << 24)
+                      | ((uint32_t)mem_read(&f.m, T_BUF2 + 1, 1) << 16)
+                      | ((uint32_t)mem_read(&f.m, T_BUF2 + 2, 1) << 8)
+                      |  (uint32_t)mem_read(&f.m, T_BUF2 + 3, 1);
+        assert(last == 4u * 1024 * 1024 / 2048 - 1);        /* 2047 */
+        assert(mem_read(&f.m, T_BUF2 + 7, 1) == 0x00 && mem_read(&f.m, T_BUF2 + 6, 1) == 0x08);
+    }
+
+    /* READ(10): 2048-byte sectors at byte offsets. */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x28;
+        cdb[5] = 2;                                  /* LBA 2 */
+        cdb[8] = 2;                                  /* count 2 */
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 4096);
+        t_prdt(&f.m, 0, T_BUF1, 4096);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x38), 4) & 1u) == 0u);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 4096);
+        int bad = 0;
+        for (int i = 0; i < 4096; i++)
+            if (mem_read(&f.m, T_BUF1 + i, 1) != gx_disk[2 * 2048 + i]) { bad = i + 1; break; }
+        assert(bad == 0);
+    }
+
+    /* READ TOC: one track, LBA 0. */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x43; cdb[8] = 12;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 12);
+        t_prdt(&f.m, 0, T_BUF2, 12);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 12);
+        assert(mem_read(&f.m, T_BUF2 + 3, 1) == 1);  /* last track 1 */
+    }
+
+    /* Unknown CDB: CHECK CONDITION sense 5/20; REQUEST SENSE consumes it. */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x99;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 0);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x10), 4) & (1u << 30)) != 0u); /* TFES */
+        assert((mem_read(&f.m, P(1, 0x20), 4) & 1u) == 1u);         /* ERR */
+        assert(mem_read(&f.m, T_FB + 0x43, 1) == 0x04);             /* ABRT */
+
+        uint8_t sense[16] = {0}; sense[0] = 0x03; sense[4] = 18;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, sense, 18);
+        t_prdt(&f.m, 0, T_BUF1, 18);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert(mem_read(&f.m, T_CLB + 4, 4) == 18);
+        assert(mem_read(&f.m, T_BUF1, 1) == 0x70);
+        assert(mem_read(&f.m, T_BUF1 + 2, 1) == 0x05);  /* ILLEGAL REQUEST */
+        assert(mem_read(&f.m, T_BUF1 + 12, 1) == 0x20); /* invalid opcode */
+        /* autosense consumed: the next REQUEST SENSE reports 0 */
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, sense, 18);
+        t_prdt(&f.m, 0, T_BUF1, 18);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert(mem_read(&f.m, T_BUF1 + 2, 1) == 0);
+    }
+
+    /* WRITE(10) on a CD: CHECK CONDITION sense 7/27 (data protect). */
+    {
+        uint8_t cdb[16] = {0}; cdb[0] = 0x2A; cdb[8] = 1;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 2048);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(1, 0x10), 4) & (1u << 30)) != 0u);
+        uint8_t sense[16] = {0}; sense[0] = 0x03; sense[4] = 18;
+        mem_write(&f.m, P(1, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, sense, 18);
+        t_prdt(&f.m, 0, T_BUF1, 18);
+        mem_write(&f.m, P(1, 0x38), 4, 1);
+        assert(mem_read(&f.m, T_BUF1 + 2, 1) == 0x07);
+        assert(mem_read(&f.m, T_BUF1 + 12, 1) == 0x27);
+    }
+
+    /* NC: PACKET/IDENTIFY PACKET on an ATA disk port must abort. */
+    {
+        uint8_t cdb[16] = {0};
+        mem_write(&f.m, P(0, 0x00), 4, T_CLB);
+        mem_write(&f.m, P(0, 0x08), 4, T_FB);
+        mem_write(&f.m, P(0, 0x18), 4, 1u << 4);
+        mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+        atapi_cmd(&f.m, cdb, 0);
+        mem_write(&f.m, P(0, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u);
+        mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+        t_hdr(&f.m, 1, 0);
+        t_fis(&f.m, 0xA1, 0, 0);
+        mem_write(&f.m, P(0, 0x38), 4, 1);
+        assert((mem_read(&f.m, P(0, 0x10), 4) & (1u << 30)) != 0u);
+    }
+
+    fx_done(&f);
+    printf("ok engine atapi cd\n");
 }
 
 static void test_engine_read_oob_tfes(void) {
@@ -662,6 +855,7 @@ int main(void) {
     test_engine_read_dma_lba28();
     test_engine_read_multi_prdt();
     test_engine_identify();
+    test_engine_atapi();
     test_engine_read_oob_tfes();
     test_engine_write_single_readback();
     test_engine_write_multi_prdt();

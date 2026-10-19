@@ -1,0 +1,2557 @@
+From 5899d152539a3c44332fa72f06ae2774aaa9cbb7 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Sun, 18 Oct 2026 21:00:07 +0000
+Subject: [PATCH] GUI G2: the desktop application + plain ISO boot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tools/gui_app.py is the native desktop app (tkinter, stdlib only -- no
+browser, no third-party packages), in Russian, with two switchable
+modes: Обычный (machine list, transport buttons, live screen, a
+three-step "new machine" wizard with iso/disk/kernel/empty boot media)
+and Экспертный (the full SCHEMA option surface, monitor console,
+artifacts, snapshots, TAP responder, run logs).  Both modes share the G1
+core (tools/launcher.py Machine/MonitorClient); frame buffers render
+through the FB keyframe protocol and the end stop keeps T5 semantics
+("Стоп" sends quit, the emulator prints stats and writes artifacts).
+make gui runs the app, make gui-web keeps the browser GUI; build.bat
+gui / build.bat gui-web / gui.bat match on Windows.
+
+"Select an ISO and start" boots it like VirtualBox/VMware: the wizard's
+iso kind builds --rom=<bios.bin> --lpc=ich9 --sata=<iso> (the documented
+docs/WINDOWS.md §E recipe) and a stock SeaBIOS is located via the
+remembered pick, ~/.x86emu-gui, the repo or $AURALITE_BIOS.  The
+acceptance lane is tests/test_iso_boot.py over tools/mkiso.py +
+tests/fixtures/bootstub.nas: a 1 MiB ISO9660+El Torito+MBR test image
+whose stub prints AURA_ISO_BOOT_OK to COM1; lane Q (SATA-as-disk) must
+see the marker (measured 8.2 s wall, 120M executed steps on stock
+SeaBIOS 1.16.3) and lane C (ATAPI/El Torito) SKIPs until STORE S6.
+make test-iso joins make test and make test-sanitize; everything SKIPs
+cleanly without nasm or a bios.bin.
+
+Three measured defects fixed along the way.  IDENTIFY DEVICE carried
+three un-honest fields: the model was not byte-pair swapped (firmware
+displayed "uAariLetE umiDksH AB") and legacy CHS words 1/3/6 were zero,
+so stock SeaBIOS reported PCHS=0/0/0, rounded the LCHS translation to
+zero cylinders and refused every CHS read with EPARAM -- the small test
+image could not boot at all (negative control: reverting the swap turns
+the two test_ahci asserts red).  Unknown CLI options were silently
+ignored (a --cdrom= typo booted a disk-less machine and looked like a
+firmware failure); main.c now refuses them with usage + exit 1, the
+same contract as the GUI schema, pinned by an NC in test_iso_boot.py.
+The IVT dispatch receipt is now opt-in (AURALITE_IVT_LOG=1): the
+unconditional log measured 9381 lines during a stock SeaBIOS keyboard
+spin-up alone and dominated BIOS-boot wall time.
+
+Gates (sequential): make test rc=0 (587 ok, 2 expected SKIPs: the CD
+lane and the Tk construction lane without a display), make test-sanitize
+rc=0 (265 ok), make fuzz (512 programs / 12288 states match), perf bench
+ok.  Test hygiene pinned where the gate load measured flakes: the
+find_seabios vectors are hermetic against a real $AURALITE_BIOS and the
+launcher WS frame wait tolerates 10-20x slower sanitized builds.
+---
+ Makefile                    |   16 +-
+ README.md                   |   52 +-
+ build.bat                   |   20 +-
+ gui.bat                     |    6 +-
+ src/ahci.c                  |   15 +-
+ src/cpu.c                   |    7 +-
+ src/main.c                  |    7 +
+ tests/fixtures/bootstub.nas |   38 +
+ tests/test_ahci.c           |   13 +-
+ tests/test_gui_app.py       |  336 +++++++++
+ tests/test_gui_launcher.py  |    4 +
+ tests/test_iso_boot.py      |  190 +++++
+ tools/gui_app.py            | 1396 +++++++++++++++++++++++++++++++++++
+ tools/mkiso.py              |  204 +++++
+ 14 files changed, 2281 insertions(+), 23 deletions(-)
+ create mode 100644 tests/fixtures/bootstub.nas
+ create mode 100644 tests/test_gui_app.py
+ create mode 100644 tests/test_iso_boot.py
+ create mode 100644 tools/gui_app.py
+ create mode 100644 tools/mkiso.py
+
+diff --git a/Makefile b/Makefile
+index 2470094..a560d6c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -273,10 +273,20 @@ test-monitor-codec: tests/test_monitor_codec.c src/ws.c src/ws.h
+ test-monitor: x86emu firmware/firmware.bin disk/disk.img tests/test_monitor.py web/monitor.html
+ 	X86EMU=./x86emu python3 tests/test_monitor.py
+ 
+-test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py tools/launcher.py web/gui.html
++test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py tests/test_gui_app.py tools/launcher.py tools/gui_app.py web/gui.html
+ 	python3 tests/test_gui_launcher.py
++	python3 tests/test_gui_app.py
++
++# Plain ISO boot (GUI "Загрузка с ISO"): needs stock SeaBIOS bios.bin (AURALITE_BIOS
++# or ~/.x86emu-gui/bios.bin) and NASM; lanes skip cleanly without them.
++test-iso: x86emu tests/test_iso_boot.py tools/mkiso.py tests/fixtures/bootstub.nas
++	python3 tests/test_iso_boot.py
+ 
+ gui: x86emu firmware/firmware.bin disk/disk.img
++	@echo "AuraLite Emulator -- desktop GUI (закройте окно, чтобы выйти)"
++	python3 tools/gui_app.py
++
++gui-web: x86emu firmware/firmware.bin disk/disk.img
+ 	@echo "GUI launcher: http://127.0.0.1:8080/  (Ctrl-C to stop)"
+ 	python3 tools/launcher.py
+ 
+@@ -333,7 +343,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -343,7 +353,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+diff --git a/README.md b/README.md
+index 8aaa5aa..17ca136 100644
+--- a/README.md
++++ b/README.md
+@@ -36,7 +36,8 @@ On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries wit
+ ```bat
+ build.bat           REM Build x86emu.exe, x86dis.exe, and (if nasm is in PATH) firmware/disk images
+ build.bat demo      REM Build and run the Haswell sample firmware demo
+-build.bat gui       REM Open the full GUI at http://127.0.0.1:8080/ (same as gui.bat)
++build.bat gui       REM Start the desktop GUI application (same as gui.bat)
++build.bat gui-web   REM Open the web GUI at http://127.0.0.1:8080/
+ build.bat monitor   REM Start the live browser monitor at http://127.0.0.1:8080/
+ build.bat test      REM Run the native Windows C unit tests + Python G3/G5/G6 acceptance gates
+ build.bat wsl test  REM Delegate full `make test` to WSL2
+@@ -44,9 +45,24 @@ build.bat wsl test  REM Delegate full `make test` to WSL2
+ 
+ ## GUI — no command line needed
+ 
+-`make gui` (or `python3 tools/launcher.py`; on Windows `build.bat gui` or
+-double-click `gui.bat`) opens **http://127.0.0.1:8080/** — a single page that
+-exposes everything the CLI offers:
++`make gui` (or `python3 tools/gui_app.py`; on Windows `build.bat gui` or
++double-click `gui.bat`) starts the **AuraLite Emulator desktop application** —
++a native window (tkinter, Python standard library only — no browser and no
++third-party packages) with two switchable modes:
++
++- **Обычный (Normal)** — VirtualBox/VMware style: a machine list, big
++  start/pause/stop buttons, the live screen, and a three-step *new machine*
++  wizard.  Pick an **ISO** and press Start — that is the whole procedure
++  (stock SeaBIOS `bios.bin` + the ISO on a SATA port, the documented
++  `docs/WINDOWS.md` recipe, wired automatically).
++- **Экспертный (Expert)** — the full option surface: every CLI option,
++  the monitor console (`regs`, `info break`, `exec`/`savevm`/`loadvm`),
++  artifacts, snapshots, the TAP responder and run logs.
++
++The web GUI remains available as `make gui-web` (or `python3
++tools/launcher.py`, `build.bat gui-web`) at **http://127.0.0.1:8080/** and
++exposes the same capabilities:
++
+ 
+ - **Machine setup**: boot path (firmware ROM / direct kernel ELF / disk),
+   platform profile, SMP, chipset (LPC identity, USB), SATA disks (both AHCI
+@@ -61,11 +77,15 @@ exposes everything the CLI offers:
+ - **Results**: per-run artifact download, named snapshots, named config
+   presets, and the process output (stdout receipts + stderr log ring).
+ 
+-The launcher builds the emulator's argv strictly from its option schema
+-(unknown/injected values are refused), runs each machine exactly like the
+-CLI would (`--monitor=127.0.0.1:<free port>` on loopback, spliced to the
+-page's `/ws`), and keeps its state (`~/.x86emu-gui` by default: presets,
+-per-run artifacts, snapshots) outside the repository. At the post-mortem
++Both front ends share one core (`tools/launcher.py`): the emulator's argv is
++built strictly from the option schema (unknown/injected values are refused),
++each machine runs exactly like the CLI would (`--monitor=127.0.0.1:<free
++port>` on loopback), and the state (`~/.x86emu-gui` by default: presets,
++per-run artifacts, snapshots, the remembered `bios.bin` location) lives
++outside the repository.  For plain ISO boot the app looks for a stock
++SeaBIOS (`bios.bin`, e.g. from the Debian/Ubuntu `seabios` package or
++seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
++a user-picked copy. At the post-mortem
+ "end" stop the page keeps the final state visible; **Остановить** sends the
+ monitor's `quit` so the emulator prints its stats and writes the artifacts
+ before exiting. There is no authentication — same rules as the live
+@@ -180,6 +200,20 @@ The focused CPU tests can be run independently:
+ make test-unit
+ ```
+ 
++`make test` includes `make test-gui` (both GUI layers: the web launcher
++vectors in `tests/test_gui_launcher.py` and the desktop app vectors in
++`tests/test_gui_app.py`) and `make test-iso` (`tests/test_iso_boot.py`).
++The ISO lane builds a 1 MiB El Torito test image in memory
++(`tools/mkiso.py` + `tests/fixtures/bootstub.nas`) and must see the boot
++stub's `AURA_ISO_BOOT_OK` marker after stock SeaBIOS reads its MBR off
++the SATA-attached image -- the exact path the GUI's «Загрузка с ISO»
++takes.  It SKIPs (exit 0) without `nasm` or a stock SeaBIOS `bios.bin`
++(found via `--bios`, `$AURALITE_BIOS`, `~/.x86emu-gui`, or the repo);
++the CD/El Torito lane SKIPs until `--cdrom` (STORE S6) exists.  Note
++the image must be at least 1008 sectors (512 B): smaller images round
++the BIOS CHS translation to 0 cylinders and firmware refuses the read
++(measured on stock SeaBIOS 1.16.3).
++
+ `make test` also runs the NET wire lane (`make test-net-tx`): a small
+ payload (`tests/nic_tx.asm`) boots through the real firmware transport
+ off a throwaway `--disk=` image, transmits a frame through the e1000 TX
+diff --git a/build.bat b/build.bat
+index e0c16a9..470125c 100644
+--- a/build.bat
++++ b/build.bat
+@@ -26,6 +26,7 @@ if /I "%TARGET%"=="firmware" goto :build_firmware
+ if /I "%TARGET%"=="demo"     goto :run_demo
+ if /I "%TARGET%"=="monitor"  goto :run_monitor
+ if /I "%TARGET%"=="gui"      goto :run_gui
++if /I "%TARGET%"=="gui-web"  goto :run_gui_web
+ if /I "%TARGET%"=="test"     goto :run_tests
+ 
+ echo [build.bat] Unknown command: "%TARGET%"
+@@ -177,8 +178,23 @@ if not defined PY (
+   echo [build.bat] Python 3 is required for the GUI launcher.
+   exit /b 1
+ )
+-echo [build.bat] Starting the GUI launcher on http://127.0.0.1:8080/ ...
+-echo             Open http://127.0.0.1:8080/ in your browser -- from here everything is GUI.
++echo [build.bat] Starting the AuraLite Emulator desktop GUI (закройте окно, чтобы выйти)...
++%PY% tools\gui_app.py
++exit /b %ERRORLEVEL%
++
++:run_gui_web
++if not exist x86emu.exe call :build_all
++if errorlevel 1 exit /b 1
++if not exist firmware\firmware.bin call :build_firmware
++if errorlevel 1 exit /b 1
++set "PY="
++where py >nul 2>nul && set "PY=py -3"
++if not defined PY where python >nul 2>nul && set "PY=python"
++if not defined PY (
++  echo [build.bat] Python 3 is required for the GUI launcher.
++  exit /b 1
++)
++echo [build.bat] Starting the web GUI launcher on http://127.0.0.1:8080/ ...
+ %PY% tools\launcher.py
+ exit /b %ERRORLEVEL%
+ 
+diff --git a/gui.bat b/gui.bat
+index 6c64fd0..9ce1b84 100644
+--- a/gui.bat
++++ b/gui.bat
+@@ -1,6 +1,6 @@
+ @echo off
+-REM gui.bat -- double-click to open the AuraLite-Emulator GUI in your browser.
+-REM Everything (machine setup, start/stop, live view, snapshots, artifacts)
+-REM happens in the browser at http://127.0.0.1:8080/ -- no command line needed.
++REM gui.bat -- double-click to open the AuraLite Emulator desktop application.
++REM Machines, ISO boot, live screen, snapshots and artifacts all happen in the
++REM window -- no command line and no browser needed (Normal / Expert modes).
+ cd /d "%~dp0"
+ call build.bat gui
+diff --git a/src/ahci.c b/src/ahci.c
+index fa0d435..dc51d22 100644
+--- a/src/ahci.c
++++ b/src/ahci.c
+@@ -230,14 +230,23 @@ static void ahci_identify(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
+     static uint8_t idb[512];
+     memset(idb, 0, sizeof idb);
+     idb[0] = 0x40;                                  /* word0: non-removable */
+-    /* ATA model string (words 27..46) is byte-pair swapped. */
++    /* ATA model string (words 27..46) is byte-pair swapped (measured:
++     * firmware that unswaps on read showed "uAariLetE umiDksH AB"). */
+     static const char model[] = "AuraLite EmuDisk HBA   ";
+     for (int w = 27; w <= 46 && (size_t)(w - 27) * 2 < sizeof(model); w++) {
+-        idb[w * 2]     = model[(w - 27) * 2];
+-        idb[w * 2 + 1] = model[(w - 27) * 2 + 1];
++        idb[w * 2]     = model[(w - 27) * 2 + 1];
++        idb[w * 2 + 1] = model[(w - 27) * 2];
+     }
+     idb[49 * 2] = 0x00; idb[49 * 2 + 1] = 0x03;     /* word49: LBA + DMA supported */
+     uint32_t secs28 = (uint32_t)(m->sata_len[a->ctrl][p] / 512);
++    /* Legacy CHS words 1/3/6: 16 heads, 63 spt, cylinders from the size.
++     * Zeros made firmware report PCHS=0/0/0 (measured on stock SeaBIOS). */
++    uint32_t chs_cyl = secs28 / (16 * 63);
++    if (chs_cyl > 16383) chs_cyl = 16383;
++    if (chs_cyl == 0 && secs28) chs_cyl = 1;
++    idb[1 * 2] = chs_cyl & 0xFF; idb[1 * 2 + 1] = (chs_cyl >> 8) & 0xFF;
++    idb[3 * 2] = 16; idb[3 * 2 + 1] = 0;
++    idb[6 * 2] = 63; idb[6 * 2 + 1] = 0;
+     if (secs28 > 0x0FFFFFFF) secs28 = 0x0FFFFFFF;   /* LBA28 ceiling */
+     idb[60 * 2] = secs28 & 0xFF; idb[60 * 2 + 1] = (secs28 >> 8) & 0xFF;
+     idb[61 * 2] = (secs28 >> 16) & 0xFF; idb[61 * 2 + 1] = (secs28 >> 24) & 0xFF;
+diff --git a/src/cpu.c b/src/cpu.c
+index 1086344..6668363 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -391,7 +391,12 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
+         c->rip = off;
+         c->rflags &= ~(FLAG_IF | FLAG_TF);
+         c->exception_taken = 1;
+-        mlog(&m->log, "[cpu] real-mode vector %d (%s) -> %04x:%04x via IVT", vector, vecname(vector), cs, off);
++        /* IVT dispatch receipts: measured 9381 INT16 lines during a stock
++         * SeaBIOS keyboard spin-up alone -- opt-in via AURALITE_IVT_LOG=1. */
++        { static int ivt_log = -1;
++          if (ivt_log < 0) { const char *e = getenv("AURALITE_IVT_LOG"); ivt_log = (e && e[0] == '1'); }
++          if (ivt_log)
++              mlog(&m->log, "[cpu] real-mode vector %d (%s) -> %04x:%04x via IVT", vector, vecname(vector), cs, off); }
+         c->in_exception = 0;
+         return;
+     }
+diff --git a/src/main.c b/src/main.c
+index ea488a3..5955516 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -281,6 +281,13 @@ int main(int argc, char **argv) {
+                   "                      vtime / cap.  Executed attempts, not idle clock\n"
+                   "                      quanta, are the throughput numerator (faults count)\n", argv[0]);
+             return 0;
++        } else {
++            /* Unknown options used to fall through silently (measured: a
++             * --cdrom= typo booted a machine with no disks at all).  Refuse
++             * loudly, same contract as the GUI's schema validation. */
++            fprintf(stderr, "%s: unknown option '%s' (usage: --help)\n",
++                    argv[0], argv[i]);
++            return EXIT_INPUT_ERROR;
+         }
+     }
+ 
+diff --git a/tests/fixtures/bootstub.nas b/tests/fixtures/bootstub.nas
+new file mode 100644
+index 0000000..75a36f9
+--- /dev/null
++++ b/tests/fixtures/bootstub.nas
+@@ -0,0 +1,38 @@
++; tests/fixtures/bootstub.nas -- 512-byte boot stub for the ISO acceptance lanes.
++;
++; Assembled with NASM (-f bin).  Used twice inside the test ISO built by
++; tools/mkiso.py:
++;   * at LBA 0 -- the MBR SeaBIOS reads when the ISO is attached as a disk
++;     (the quick GUI route, docs/WINDOWS.md E);
++;   * as the El Torito no-emulation boot image -- what SeaBIOS loads when the
++;     ISO is attached as an ATAPI CD (--cdrom=, STORE S6).
++; Either way the stub lands at 0x7c00 and prints its marker to COM1, whose
++; THR is flushed to the machine log by src/serial.c (measured contract).
++bits 16
++org 0x7c00
++
++start:
++    cli
++    xor ax, ax
++    mov ds, ax
++    mov es, ax
++    mov ss, ax
++    mov sp, 0x7c00
++    sti
++    mov dx, 0x3f8               ; COM1 THR (DLAB=0 after reset)
++    mov si, msg
++.put:
++    lodsb
++    test al, al
++    jz .halt
++    out dx, al
++    jmp .put
++.halt:
++    cli
++    hlt
++    jmp .halt
++
++msg db "AURA_ISO_BOOT_OK", 13, 10, 0
++
++times 510 - ($ - $$) db 0
++dw 0xaa55
+diff --git a/tests/test_ahci.c b/tests/test_ahci.c
+index c41b8c1..c838dd5 100644
+--- a/tests/test_ahci.c
++++ b/tests/test_ahci.c
+@@ -296,8 +296,17 @@ static void test_engine_identify(void) {
+     assert((mem_read(&f.m, P(0, 0x38), 4) & 1u) == 0u);
+     assert(mem_read(&f.m, T_CLB + 4, 4) == 512);
+     assert(mem_read(&f.m, T_BUF3, 1) == 0x40);          /* word0 non-removable */
+-    assert(mem_read(&f.m, T_BUF3 + 54, 1) == 'A');      /* model pair-swapped */
+-    assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'u');
++    /* Measured on stock SeaBIOS 1.16.3: unswapped model bytes showed up as
++     * "uAariLetE umiDksH AB" -- the IDENTIFY model must be byte-pair swapped
++     * like real ATA words 27..46 (negative control: reverting the swap in
++     * ahci_identify fails these two asserts). */
++    assert(mem_read(&f.m, T_BUF3 + 54, 1) == 'u');      /* model pair-swapped */
++    assert(mem_read(&f.m, T_BUF3 + 55, 1) == 'A');
++    /* Legacy CHS words 1/3/6: measured -- zeros made SeaBIOS report
++     * PCHS=0/0/0 and its CHS sanity check rejected every sector. */
++    assert(mem_read(&f.m, T_BUF3 + 2, 1) == 8);         /* word1: 8192/(16*63) cyls */
++    assert(mem_read(&f.m, T_BUF3 + 6, 1) == 16);        /* word3: heads */
++    assert(mem_read(&f.m, T_BUF3 + 12, 1) == 63);       /* word6: sectors/track */
+     uint32_t secs28 = (uint32_t)mem_read(&f.m, T_BUF3 + 60 * 2, 4);
+     assert(secs28 == 4u * 1024 * 1024 / 512);           /* LBA28 capacity */
+     assert(mem_read(&f.m, T_FB + 0x40, 1) == 0x34);     /* D2H Register FIS */
+diff --git a/tests/test_gui_app.py b/tests/test_gui_app.py
+new file mode 100644
+index 0000000..d717659
+--- /dev/null
++++ b/tests/test_gui_app.py
+@@ -0,0 +1,336 @@
++#!/usr/bin/env python3
++"""tests/test_gui_app.py -- GUI G2 vectors for tools/gui_app.py (tkinter).
++
++The desktop app must keep every G1 ground rule (SCHEMA-only argv, state dir,
++the monitor WebSocket protocol) while adding the normal/expert modes and the
++plain ISO boot flow.
++
++Vectors:
++  A. UI-state reader (corrupt file falls back to defaults) and SeaBIOS
++     discovery order.
++  B. normal_config() machine shapes: iso (SeaBIOS + lpc=ich9 + sata), disk,
++     kernel, empty -- each one must pass launcher.validate_config; refusals:
++     missing files, missing bios, directory instead of image.
++  C. MonitorClient + FrameBuffer against the real emulator: connect over
++     RFC 6455, first push is state + framebuffer keyframe, continue ends the
++     run with exit 0 and artifacts; FB\x01 delta decoding is byte-exact.
++  D. GUI construction lane (skipped when no display): App builds, mode switch
++     moves the notebook tabs, collect_config/set_config round-trip.
++"""
++import json
++import os
++import shutil
++import struct
++import sys
++import tempfile
++import time
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++import gui_app  # noqa: E402
++import launcher  # noqa: E402
++
++fails = 0
++
++
++def check(cond, label):
++    global fails
++    if cond:
++        print("ok  ", label)
++    else:
++        print("FAIL", label)
++        fails += 1
++
++
++def skip(label):
++    print("skip", label)
++
++
++# ---------------------------------------------------------------------------
++# A. ui state + SeaBIOS discovery
++# ---------------------------------------------------------------------------
++
++def test_ui_state(tmp):
++    os.makedirs(tmp, exist_ok=True)
++    st = gui_app.load_ui_state(tmp)
++    check(st["mode"] == "normal" and st["autostart"] is True, "A ui defaults intact")
++    with open(os.path.join(tmp, "gui_state.json"), "w", encoding="utf-8") as f:
++        f.write("{ this is not json")
++    st = gui_app.load_ui_state(tmp)
++    check(st == gui_app.DEFAULT_UI, "A corrupt gui_state.json falls back to defaults")
++    with open(os.path.join(tmp, "gui_state.json"), "w", encoding="utf-8") as f:
++        json.dump({"mode": "expert", "geometry": "800x600", "junk": 1}, f)
++    st = gui_app.load_ui_state(tmp)
++    check(st["mode"] == "expert" and st["geometry"] == "800x600"
++          and "junk" not in st, "A partial gui_state.json merges known keys only")
++
++
++def test_find_seabios(tmp):
++    os.makedirs(tmp, exist_ok=True)
++    # Hermetic: a real AURALITE_BIOS (or a repo bios.bin) must not shadow
++    # the fixtures -- save/restore the env and point ROOT at the sandbox.
++    saved_env = os.environ.pop("AURALITE_BIOS", None)
++    saved_root = gui_app.ROOT
++    gui_app.ROOT = tmp
++    try:
++        _find_seabios_body(tmp)
++    finally:
++        gui_app.ROOT = saved_root
++        if saved_env is not None:
++            os.environ["AURALITE_BIOS"] = saved_env
++
++
++def _find_seabios_body(tmp):
++    bios = os.path.join(tmp, "bios.bin")
++    with open(bios, "wb") as f:
++        f.write(b"\x00" * 128)
++    check(gui_app.find_seabios(tmp) == os.path.abspath(bios),
++          "A find_seabios sees the state-dir copy")
++    other = os.path.join(tmp, "other.bin")
++    with open(other, "wb") as f:
++        f.write(b"\x00" * 16)
++    check(gui_app.find_seabios(tmp, explicit=other) == os.path.abspath(other),
++          "A explicit pick wins the search order")
++    os.remove(bios)
++    os.environ["AURALITE_BIOS"] = other
++    try:
++        check(gui_app.find_seabios(tmp) == os.path.abspath(other),
++              "A AURALITE_BIOS env is honoured")
++    finally:
++        os.environ.pop("AURALITE_BIOS", None)
++    empty = os.path.join(tmp, "empty")
++    os.makedirs(empty, exist_ok=True)
++    check(gui_app.find_seabios(empty) is None,
++          "A no bios anywhere returns None")
++
++
++# ---------------------------------------------------------------------------
++# B. normal_config machine shapes
++# ---------------------------------------------------------------------------
++
++def test_normal_config(tmp):
++    iso = os.path.join(tmp, "test.iso")
++    with open(iso, "wb") as f:
++        f.write(b"\x00" * 4096)
++    bios = os.path.join(tmp, "bios.bin")
++    with open(bios, "wb") as f:
++        f.write(b"\x00" * 128)
++    disk = os.path.join(ROOT, "disk", "disk.img")
++
++    cfg = gui_app.normal_config("iso", path=iso, bios=bios)
++    check(cfg["rom"] == bios and cfg["lpc"] == "ich9" and cfg["sata"] == iso
++          and cfg["max_instr"] == gui_app.ISO_MAX_INSTR,
++          "B iso shape = SeaBIOS + ich9 + sata (docs/WINDOWS.md recipe)")
++    try:
++        launcher.validate_config(cfg)
++        check(True, "B iso config passes validate_config")
++    except launcher.ConfigError as e:
++        check(False, "B iso config passes validate_config (%s)" % e)
++
++    cfg = gui_app.normal_config("disk", path=disk)
++    check(cfg["disk"] == disk and cfg.get("sata") is None
++          and cfg["rom"].endswith("firmware.bin"),
++          "B disk shape = built-in firmware + disk image")
++    launcher.validate_config(cfg)
++
++    elf = os.path.join(tmp, "kernel.elf")
++    with open(elf, "wb") as f:
++        f.write(b"\x7fELF" + b"\x00" * 60)
++    initrd = os.path.join(tmp, "initrd.tar")
++    with open(initrd, "wb") as f:
++        f.write(b"\x00" * 16)
++    cfg = gui_app.normal_config("kernel", path=elf, initrd=initrd)
++    check(cfg["kernel"] == elf and cfg["initrd"] == initrd and "rom" not in cfg,
++          "B kernel shape = direct ELF boot without firmware")
++    launcher.validate_config(cfg)
++
++    cfg = gui_app.normal_config("empty")
++    check("rom" not in cfg and "disk" not in cfg and "sata" not in cfg,
++          "B empty shape carries no media")
++    launcher.validate_config(cfg)
++
++    # negative controls
++    try:
++        gui_app.normal_config("iso", path=iso)          # no bios
++        check(False, "B NC iso without bios is refused")
++    except launcher.ConfigError:
++        check(True, "B NC iso without bios is refused")
++    try:
++        gui_app.normal_config("iso", path=os.path.join(tmp, "nope.iso"), bios=bios)
++        check(False, "B NC missing iso file is refused")
++    except launcher.ConfigError:
++        check(True, "B NC missing iso file is refused")
++    try:
++        gui_app.normal_config("disk", path=tmp)          # a directory, not an image
++        check(False, "B NC directory instead of image is refused")
++    except launcher.ConfigError:
++        check(True, "B NC directory instead of image is refused")
++    try:
++        gui_app.normal_config("banana")
++        check(False, "B NC unknown machine kind is refused")
++    except launcher.ConfigError:
++        check(True, "B NC unknown machine kind is refused")
++
++
++# ---------------------------------------------------------------------------
++# C. MonitorClient + FrameBuffer against the real emulator
++# ---------------------------------------------------------------------------
++
++def fb_keyframe(w=4, h=2):
++    rows = b"".join(struct.pack("<H", y) + bytes([10 * y + x for x in range(w * 3)])
++                    for y in range(h))
++    return b"FB\x01" + struct.pack("<BHHH", 1, w, h, h) + rows
++
++
++def test_framebuffer():
++    fb = gui_app.FrameBuffer()
++    fb.apply(fb_keyframe())
++    check(fb.width == 4 and fb.height == 2 and fb.dirty == {0, 1},
++          "C keyframe decodes w/h and marks all rows dirty")
++    check(fb.row_colors(0) == "{#000102 #030405 #060708 #090a0b}",
++          "C row_colors renders one #rrggbb per pixel")
++    delta = b"FB\x01" + struct.pack("<BHHH", 0, 4, 2, 1) + \
++        struct.pack("<H", 1) + bytes([0xFF]) * 12
++    fb.dirty.clear()
++    fb.apply(delta)
++    check(fb.dirty == {1} and fb.row_colors(1) == "{" + " ".join(["#ffffff"] * 4) + "}",
++          "C delta updates exactly its rows byte-exact")
++    fb2 = gui_app.FrameBuffer()
++    fb2.apply(b"XXXX garbage")
++    check(fb2.width == 0, "C non-FB blobs are ignored")
++
++
++def test_monitor_client():
++    emu = os.path.join(ROOT, "x86emu")
++    if not os.path.isfile(emu):
++        check(False, "C x86emu is built (run make first)")
++        return
++    state = tempfile.mkdtemp(prefix="guiapp-state-")
++    try:
++        m = launcher.Machine(emu, state)
++        cfg = {"platform": "haswell", "rom": "firmware/firmware.bin",
++               "disk": "disk/disk.img", "max_instr": 3000000,
++               "stats": True, "log": True, "dump_fb": True}
++        m.start(cfg)
++        mon = gui_app.MonitorClient()
++        deadline = time.time() + 20
++        connected = False
++        while time.time() < deadline and not connected:
++            try:
++                mon.connect(m.monitor_port, timeout=1.0)
++                connected = True
++            except OSError:
++                time.sleep(0.1)
++        check(connected, "C MonitorClient handshakes with the live monitor")
++
++        saw_state = saw_fb = False
++        deadline = time.time() + 15
++        while time.time() < deadline and not (saw_state and saw_fb):
++            for kind, payload in mon.pump():
++                if kind == "text" and isinstance(payload, dict) \
++                        and payload.get("kind") == "state":
++                    saw_state = True
++                elif kind == "fb":
++                    if payload[:3] == b"FB\x01":
++                        saw_fb = True
++        check(saw_state, "C first pushes include a state message")
++        check(saw_fb, "C framebuffer keyframe arrives as a binary event")
++
++        mon.send({"cmd": "continue"})
++        # T5 end-stop semantics: with a monitor attached the machine lives on
++        # the post-mortem stop (stop_reason: end); a clean exit needs `quit`.
++        deadline = time.time() + 60
++        saw_end = False
++        while time.time() < deadline and not saw_end:
++            for kind, payload in mon.pump():
++                if kind == "text" and isinstance(payload, dict) \
++                        and payload.get("kind") == "state" \
++                        and payload.get("stop_reason") == "end":
++                    saw_end = True
++                    break
++            if m.status()["state"] == "exited":
++                break
++            time.sleep(0.05)
++        check(saw_end, "C run reaches the end stop through the GUI client")
++        if m.status()["state"] == "running":
++            mon.send({"cmd": "quit"})
++        deadline = time.time() + 30
++        exited = False
++        while time.time() < deadline:
++            if m.status()["state"] == "exited":
++                exited = True
++                break
++            time.sleep(0.05)
++        check(exited and m.status()["exit_code"] == 0,
++              "C quit turns the end stop into a clean exit 0")
++        arts = {a["name"] for a in m.artifacts()}
++        check("stdout.log" in arts and "argv.json" in arts,
++              "C artifacts land in the run dir")
++        mon.close()
++        try:
++            mon.send({"cmd": "state"})
++            check(False, "C NC send on a closed client raises")
++        except OSError:
++            check(True, "C NC send on a closed client raises")
++    finally:
++        m.stop()
++        shutil.rmtree(state, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------
++# D. GUI construction (needs a display; skipped headless)
++# ---------------------------------------------------------------------------
++
++def test_gui_construct(tmp):
++    try:
++        import tkinter as tk
++        root = tk.Tk()
++    except Exception as e:
++        skip("D GUI construction (no display: %s)" % e.__class__.__name__)
++        return
++    try:
++        emu = os.path.join(ROOT, "x86emu")
++        app = gui_app.App(root, emu, tmp)
++        check(app.ui["mode"] == "normal", "D App builds in normal mode")
++        app.set_mode("expert")
++        nb_tabs = set(app.nb.tabs())
++        check(str(app.tab_config) in nb_tabs and str(app.tab_mon) in nb_tabs,
++              "D expert mode exposes the full notebook")
++        app.set_mode("normal")
++        nb_tabs = set(app.nb.tabs())
++        check(str(app.tab_config) not in nb_tabs and str(app.tab_screen) in nb_tabs,
++              "D normal mode keeps just screen + log")
++        iso = os.path.join(tmp, "x.iso")
++        open(iso, "wb").write(b"\x00" * 512)
++        cfg = gui_app.normal_config("iso", path=iso, bios=iso)
++        app.set_config(cfg)
++        got = app.collect_config()
++        check(got.get("sata") == iso and got.get("lpc") == "ich9",
++              "D set_config/collect_config round-trips")
++        root.update()
++    finally:
++        try:
++            app.on_close()
++        except Exception:
++            root.destroy()
++
++
++# ---------------------------------------------------------------------------
++
++def main():
++    tmp = tempfile.mkdtemp(prefix="guiapp-ui-")
++    try:
++        test_ui_state(tmp)
++        test_find_seabios(tmp)
++        test_normal_config(tmp)
++        test_framebuffer()
++        test_monitor_client()
++        test_gui_construct(tmp)
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++    print("test_gui_app: %s" % ("FAIL" if fails else "PASS"))
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/test_gui_launcher.py b/tests/test_gui_launcher.py
+index 73dc107..67ab3b6 100644
+--- a/tests/test_gui_launcher.py
++++ b/tests/test_gui_launcher.py
+@@ -150,6 +150,10 @@ def ws_handshake(port):
+             break
+         buf += chunk
+     head = buf.split(b"\r\n\r\n")[0].decode(errors="replace")
++    # Frame reads inherit this timeout.  Sanitized emulators are 10-20x
++    # slower and one `make test-sanitize` run measured a 10s state-push
++    # flake here; 30s keeps the vector honest without masking deadlocks.
++    s.settimeout(30)
+     return s, head
+ 
+ 
+diff --git a/tests/test_iso_boot.py b/tests/test_iso_boot.py
+new file mode 100644
+index 0000000..412f81c
+--- /dev/null
++++ b/tests/test_iso_boot.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python3
++"""tests/test_iso_boot.py -- plain ISO boot acceptance.
++
++"Select an ISO and start" must actually boot it, like VirtualBox/VMware.
++
++Two lanes share one test ISO (tools/mkiso.py + tests/fixtures/bootstub.nas):
++  Q  quick route   --rom=bios.bin --lpc=ich9 --sata=test.iso
++     SeaBIOS reads the MBR at LBA 0 of the SATA-attached image (the
++     documented recipe, docs/WINDOWS.md E / GUI "Загрузка с ISO");
++  C  CD route      --rom=bios.bin --lpc=ich9 --cdrom=test.iso
++     SeaBIOS reads the El Torito catalog from an ATAPI CD (STORE S6).
++
++Both must print AURA_ISO_BOOT_OK from the boot stub to COM1 (src/serial.c
++flushes it into the machine log).  The lanes SKIP -- they never fail --
++when stock SeaBIOS (bios.bin) or NASM is not available on this host.
++"""
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++import mkiso  # noqa: E402
++
++MARKER = "AURA_ISO_BOOT_OK"
++fails = 0
++
++
++def check(cond, label):
++    global fails
++    if cond:
++        print("ok  ", label)
++    else:
++        print("FAIL", label)
++        fails += 1
++
++
++def skip(label):
++    print("skip", label)
++
++
++def find_bios(explicit=None):
++    if explicit and os.path.isfile(explicit):
++        return explicit
++    env = os.environ.get("AURALITE_BIOS")
++    if env and os.path.isfile(env):
++        return env
++    for d in (os.path.expanduser("~/.x86emu-gui"), ROOT,
++              os.path.join(ROOT, "firmware")):
++        for name in ("bios.bin", "seabios.bin"):
++            p = os.path.join(d, name)
++            if os.path.isfile(p):
++                return p
++    return None
++
++
++def build_stub(tmp):
++    nasm = shutil.which("nasm")
++    if not nasm:
++        return None
++    src = os.path.join(ROOT, "tests", "fixtures", "bootstub.nas")
++    out = os.path.join(tmp, "bootstub.bin")
++    r = subprocess.run([nasm, "-f", "bin", "-o", out, src],
++                       capture_output=True, text=True)
++    if r.returncode != 0 or not os.path.isfile(out):
++        print(r.stderr)
++        return None
++    return out
++
++
++def run_boot(emu, bios, iso, tag, tmp, extra=()):
++    log = os.path.join(tmp, tag + ".log.txt")
++    argv = [emu, "--rom=" + bios, "--lpc=ich9", *extra,
++            "--max-instr=2000000000", "--log=" + log, "--stats"]
++    t0 = time.time()
++    proc = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
++    marker = False
++    deadline = time.time() + 180
++    while time.time() < deadline:
++        for path in (log, None):
++            try:
++                if path:
++                    with open(path, "r", encoding="utf-8", errors="replace") as f:
++                        txt = f.read()
++                else:
++                    break
++                if MARKER in txt:
++                    marker = True
++                    break
++            except OSError:
++                pass
++        if marker:
++            break
++        if proc.poll() is not None:
++            break
++        time.sleep(0.2)
++    if proc.poll() is None:
++        proc.terminate()
++        try:
++            out, err = proc.communicate(timeout=10)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            out, err = proc.communicate()
++    else:
++        out, err = proc.communicate()
++    tail = ((out or b"") + (err or b"")).decode("utf-8", "replace")
++    if not marker:
++        try:
++            with open(log, "r", encoding="utf-8", errors="replace") as f:
++                marker = MARKER in f.read()
++        except OSError:
++            pass
++    if not marker:
++        marker = MARKER in tail
++    return marker, time.time() - t0, tail
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--bios", default=None, help="path to stock SeaBIOS bios.bin")
++    ap.add_argument("--emu", default=os.path.join(ROOT, "x86emu"))
++    a = ap.parse_args()
++
++    if not os.path.isfile(a.emu):
++        print("test_iso_boot: %s not found -- run make first" % a.emu, file=sys.stderr)
++        return 2
++    bios = find_bios(a.bios)
++    if not bios:
++        skip("Q ISO-as-disk boot (no stock SeaBIOS bios.bin -- see README)")
++        skip("C ISO-as-CD boot (no stock SeaBIOS bios.bin)")
++        print("test_iso_boot: PASS (skipped)")
++        return 0
++
++    tmp = tempfile.mkdtemp(prefix="isoboot-")
++    try:
++        stub = build_stub(tmp)
++        if not stub:
++            skip("Q ISO-as-disk boot (NASM not available)")
++            skip("C ISO-as-CD boot (NASM not available)")
++            print("test_iso_boot: PASS (skipped)")
++            return 0
++        with open(stub, "rb") as f:
++            boot = f.read()
++        iso_path = os.path.join(tmp, "test.iso")
++        with open(iso_path, "wb") as f:
++            f.write(mkiso.build_iso(boot))
++
++        # NC: unknown CLI options must be refused (measured defect: they
++        # used to be silently ignored -- --cdrom=... booted a disk-less
++        # machine and the lane-C skip detector could not see the difference).
++        bogus = subprocess.run([a.emu, "--definitely-not-a-flag"],
++                               cwd=ROOT, capture_output=True, text=True,
++                               timeout=60)
++        check(bogus.returncode != 0 and "usage:" in (bogus.stderr or ""),
++              "NC unknown CLI option is refused with usage")
++
++        marker, secs, tail = run_boot(a.emu, bios, iso_path, "q", tmp,
++                                      extra=["--sata=" + iso_path])
++        check(marker, "Q SeaBIOS boots the ISO as a disk (MBR) -- %s" %
++              ("%.1fs" % secs))
++        if not marker:
++            print(tail[-2000:])
++
++        # Lane C: --cdrom= exists only after STORE S6; pre-S6 the CLI prints
++        # its usage and exits 1 -- that is a skip, not a failure.
++        probe = subprocess.run([a.emu, "--cdrom=" + iso_path, "--max-instr=1"],
++                               cwd=ROOT, capture_output=True, text=True,
++                               timeout=60)
++        if probe.returncode != 0 and "usage:" in (probe.stderr or ""):
++            skip("C ISO-as-CD El Torito boot (--cdrom: STORE S6 not in this build)")
++        else:
++            marker, secs, tail = run_boot(a.emu, bios, iso_path, "c", tmp,
++                                          extra=["--cdrom=" + iso_path])
++            check(marker, "C SeaBIOS boots the ISO as an ATAPI CD (El Torito) -- %s"
++                  % ("%.1fs" % secs))
++            if not marker:
++                print(tail[-2000:])
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++    print("test_iso_boot: %s" % ("FAIL" if fails else "PASS"))
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/gui_app.py b/tools/gui_app.py
+new file mode 100644
+index 0000000..313b2dc
+--- /dev/null
++++ b/tools/gui_app.py
+@@ -0,0 +1,1396 @@
++#!/usr/bin/env python3
++"""AuraLite Emulator -- native desktop GUI (GUI G2).
++
++A real desktop application window (tkinter, Python standard library only --
++no browser, no third-party packages) that drives the emulator exactly like
++the CLI would.  The same option SCHEMA as tools/launcher.py is the single
++source of truth: user input can never become an arbitrary flag.
++
++Two user modes, switchable at any time and persisted:
++
++  * Обычный  -- VirtualBox-style: a machine list, a big screen, and a
++                three-step "new machine" wizard ending in one-click boot,
++                including plain ISO boot ("select ISO -> Start");
++  * Эксперт  -- the full option surface (every SCHEMA field), the monitor
++                console (exec), artifacts, snapshots, TAP responder.
++
++Ground rules (same as the launcher):
++  * the emulator is spawned exactly like the CLI (argv list, no shell),
++    cwd = repo root, monitor on 127.0.0.1:<free port>;
++  * the GUI speaks the monitor's WebSocket protocol directly over a raw
++    TCP socket (RFC 6455 client, stdlib only);
++  * state (presets, UI state, runs, snapshots) lives in --state-dir
++    (default ~/.x86emu-gui), never in the repo.
++
++ISO boot (the quick route, docs/WINDOWS.md): a stock SeaBIOS `bios.bin`
++plus the ISO on a SATA port boots any MBR/isohybrid image.  The app
++searches known locations for bios.bin and remembers a user-picked copy.
++"""
++import argparse
++import base64
++import json
++import os
++import shutil
++import socket
++import struct
++import sys
++import time
++import tkinter as tk
++from tkinter import filedialog, messagebox, ttk
++
++TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(TOOLS_DIR)
++sys.path.insert(0, TOOLS_DIR)
++
++import launcher  # noqa: E402
++from launcher import (BUILTIN_CONFIG, ConfigError, Machine, Presets,  # noqa: E402
++                      SCHEMA, validate_config)
++
++APP_TITLE = "AuraLite Emulator"
++ISO_MAX_INSTR = 10 ** 9          # docs/WINDOWS.md E uses 1e9 for BIOS boots
++MONITOR_POLL_MS = 80
++STATUS_POLL_MS = 300
++RENDER_MIN_MS = 90               # cap the screen repaint rate
++
++
++# ---------------------------------------------------------------------------
++# UI state persistence (tolerant reader: any corruption falls back to defaults)
++# ---------------------------------------------------------------------------
++
++DEFAULT_UI = {
++    "mode": "normal",            # "normal" | "expert"
++    "autostart": True,
++    "last_preset": "",
++    "bios": "",
++    "geometry": "1180x740",
++}
++
++
++def load_ui_state(state_dir):
++    out = dict(DEFAULT_UI)
++    try:
++        with open(os.path.join(state_dir, "gui_state.json"), "r", encoding="utf-8") as f:
++            data = json.load(f)
++        if isinstance(data, dict):
++            for k in DEFAULT_UI:
++                if k in data and isinstance(data[k], (str, bool)):
++                    out[k] = data[k]
++    except (OSError, ValueError):
++        pass
++    return out
++
++
++def save_ui_state(state_dir, ui):
++    keep = {k: ui.get(k, DEFAULT_UI[k]) for k in DEFAULT_UI}
++    try:
++        tmp = os.path.join(state_dir, "gui_state.json.tmp")
++        with open(tmp, "w", encoding="utf-8") as f:
++            json.dump(keep, f, indent=1)
++        os.replace(tmp, os.path.join(state_dir, "gui_state.json"))
++    except OSError:
++        pass
++
++
++# ---------------------------------------------------------------------------
++# SeaBIOS discovery + normal-mode machine shapes
++# ---------------------------------------------------------------------------
++
++def find_seabios(state_dir, explicit=None):
++    """Locate a stock SeaBIOS rom.  Returns an absolute path or None.
++
++    Search order: explicit argument (wizard pick), AURALITE_BIOS, the state
++    dir, then the repo (root / firmware/).
++    """
++    cands = []
++    if explicit:
++        cands.append(explicit)
++    env = os.environ.get("AURALITE_BIOS")
++    if env:
++        cands.append(env)
++    for d in (state_dir, ROOT, os.path.join(ROOT, "firmware")):
++        cands.append(os.path.join(d, "bios.bin"))
++        cands.append(os.path.join(d, "seabios.bin"))
++    for p in cands:
++        if p and os.path.isfile(p):
++            return os.path.abspath(p)
++    return None
++
++
++def _stat_flags():
++    return {"stats": True, "log": True, "dump_fb": True}
++
++
++def normal_config(kind, path=None, bios=None, initrd=None):
++    """Build a whole machine config for the usual-mode wizard.
++
++    kind: "iso" | "disk" | "kernel" | "empty"
++      iso    -- stock SeaBIOS + the image on a SATA port (docs/WINDOWS.md E);
++                boots MBR/isohybrid ISOs exactly like the documented recipe;
++      disk   -- the built-in sample firmware booting a disk image;
++      kernel -- direct ELF64 kernel boot (no firmware);
++      empty  -- the built-in sample firmware demo with no media.
++    """
++    cfg = {"platform": "haswell"}
++    if kind == "iso":
++        if not path or not os.path.isfile(path):
++            raise ConfigError("ISO-образ не найден: %s" % path)
++        if not bios or not os.path.isfile(bios):
++            raise ConfigError("нужен bios.bin (стоковый SeaBIOS) — укажите файл в мастере")
++        cfg.update({"rom": bios, "lpc": "ich9", "sata": path,
++                    "max_instr": ISO_MAX_INSTR})
++    elif kind == "disk":
++        if not path or not os.path.isfile(path):
++            raise ConfigError("дисковый образ не найден: %s" % path)
++        cfg.update({"rom": os.path.join(ROOT, "firmware", "firmware.bin"),
++                    "disk": path, "max_instr": 200 * 1000 * 1000})
++    elif kind == "kernel":
++        if not path or not os.path.isfile(path):
++            raise ConfigError("образ ядра не найден: %s" % path)
++        cfg.update({"kernel": path, "max_instr": 500 * 1000 * 1000})
++        if initrd:
++            if not os.path.isfile(initrd):
++                raise ConfigError("initrd не найден: %s" % initrd)
++            cfg["initrd"] = initrd
++    elif kind == "empty":
++        cfg.update({"max_instr": 2 * 1000 * 1000})
++    else:
++        raise ConfigError("неизвестный тип машины: %s" % kind)
++    cfg.update(_stat_flags())
++    return cfg
++
++
++# ---------------------------------------------------------------------------
++# Monitor protocol client (RFC 6455 over a raw socket, stdlib only)
++# ---------------------------------------------------------------------------
++
++class MonitorClient:
++    """Pollable WebSocket client for the emulator's monitor socket.
++
++    Events returned by pump():
++      ("text", dict)     -- JSON message (kind: state | reply)
++      ("fb",   bytes)    -- binary framebuffer delta ("FB\x01" protocol)
++      ("closed", None)   -- the connection is gone
++    """
++
++    def __init__(self):
++        self.sock = None
++        self.buf = b""
++
++    def connect(self, port, timeout=5.0):
++        s = socket.create_connection(("127.0.0.1", int(port)), timeout=timeout)
++        key = base64.b64encode(os.urandom(16)).decode("ascii")
++        req = ("GET /ws HTTP/1.1\r\n"
++               "Host: 127.0.0.1:%d\r\n"
++               "Upgrade: websocket\r\n"
++               "Connection: Upgrade\r\n"
++               "Sec-WebSocket-Key: %s\r\n"
++               "Sec-WebSocket-Version: 13\r\n\r\n" % (port, key))
++        s.sendall(req.encode("ascii"))
++        buf = b""
++        while b"\r\n\r\n" not in buf:
++            d = s.recv(4096)
++            if not d:
++                raise OSError("monitor closed during handshake")
++            buf += d
++        head, rest = buf.split(b"\r\n\r\n", 1)
++        if b" 101 " not in head.split(b"\r\n", 1)[0]:
++            raise OSError("monitor refused the websocket upgrade")
++        self.buf = rest
++        self.sock = s
++        self.sock.settimeout(0.02)
++        return self
++
++    def close(self):
++        if self.sock is not None:
++            try:
++                self.sock.close()
++            except OSError:
++                pass
++        self.sock = None
++
++    def send(self, obj):
++        if self.sock is None:
++            raise OSError("monitor is not connected")
++        payload = json.dumps(obj).encode("utf-8")
++        mask = os.urandom(4)
++        n = len(payload)
++        hdr = bytes([0x81])
++        if n < 126:
++            hdr += bytes([0x80 | n])
++        elif n < 65536:
++            hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
++        else:
++            hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
++        body = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
++        self.sock.settimeout(5.0)
++        try:
++            self.sock.sendall(hdr + mask + body)
++        finally:
++            self.sock.settimeout(0.02)
++
++    def _parse_frame(self):
++        if len(self.buf) < 2:
++            return None
++        b0, b1 = self.buf[0], self.buf[1]
++        op = b0 & 0x0F
++        masked = b1 & 0x80
++        n = b1 & 0x7F
++        off = 2
++        if n == 126:
++            if len(self.buf) < off + 2:
++                return None
++            n = struct.unpack(">H", self.buf[off:off + 2])[0]
++            off += 2
++        elif n == 127:
++            if len(self.buf) < off + 8:
++                return None
++            n = struct.unpack(">Q", self.buf[off:off + 8])[0]
++            off += 8
++        if n > 16 * 1024 * 1024:
++            raise OSError("monitor frame is too large")
++        mask = b""
++        if masked:
++            if len(self.buf) < off + 4:
++                return None
++            mask = self.buf[off:off + 4]
++            off += 4
++        if len(self.buf) < off + n:
++            return None
++        payload = self.buf[off:off + n]
++        if masked:
++            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
++        self.buf = self.buf[off + n:]
++        if op == 0x8:
++            return ("closed", None)
++        if op == 0x9:                       # ping -> pong
++            self._send_raw(0xA, payload)
++            return None
++        if op == 0x1:
++            try:
++                return ("text", json.loads(payload.decode("utf-8")))
++            except ValueError:
++                return None
++        if op == 0x2:
++            return ("fb", payload)
++        return None
++
++    def _send_raw(self, op, payload):
++        mask = os.urandom(4)
++        n = len(payload)
++        hdr = bytes([0x80 | op])
++        if n < 126:
++            hdr += bytes([0x80 | n])
++        else:
++            hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
++        body = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
++        self.sock.sendall(hdr + mask + body)
++
++    def pump(self):
++        events = []
++        if self.sock is None:
++            return events
++        try:
++            while True:
++                d = self.sock.recv(65536)
++                if not d:
++                    events.append(("closed", None))
++                    self.close()
++                    break
++                self.buf += d
++                while True:
++                    ev = self._parse_frame()
++                    if ev is None:
++                        break
++                    events.append(ev)
++                    if ev[0] == "closed":
++                        self.close()
++                        return events
++        except socket.timeout:
++            pass
++        except OSError:
++            events.append(("closed", None))
++            self.close()
++        return events
++
++
++class FrameBuffer:
++    """Accumulates the monitor's FB\x01 row deltas into a full RGB image."""
++
++    def __init__(self):
++        self.width = 0
++        self.height = 0
++        self.buf = bytearray()
++        self.dirty = set()
++
++    def apply(self, blob):
++        if len(blob) < 10 or blob[0:3] != b"FB\x01":
++            return
++        flags = blob[3]
++        w, h, rows = struct.unpack_from("<HHH", blob, 4)
++        if not w or not h or w > 4096 or h > 4096:
++            return
++        if w != self.width or h != self.height:
++            self.width, self.height = w, h
++            self.buf = bytearray(w * h * 3)
++            self.dirty = set(range(h))
++            flags |= 1
++        if flags & 1:                       # keyframe: the delta redraws all
++            self.buf = bytearray(w * h * 3)
++            self.dirty = set(range(h))
++        off = 10
++        for _ in range(rows):
++            if off + 2 > len(blob):
++                return
++            y = struct.unpack_from("<H", blob, off)[0]
++            off += 2
++            if y >= h or off + w * 3 > len(blob):
++                return
++            self.buf[y * w * 3:(y + 1) * w * 3] = blob[off:off + w * 3]
++            self.dirty.add(y)
++            off += w * 3
++
++    def row_colors(self, y):
++        w = self.width
++        row = self.buf[y * w * 3:(y + 1) * w * 3]
++        return "{" + " ".join("#%02x%02x%02x" % (row[i], row[i + 1], row[i + 2])
++                              for i in range(0, len(row), 3)) + "}"
++
++
++# ---------------------------------------------------------------------------
++# Application
++# ---------------------------------------------------------------------------
++
++class App:
++    def __init__(self, root, emu_path, state_dir):
++        self.root = root
++        self.state_dir = os.path.abspath(state_dir)
++        os.makedirs(self.state_dir, exist_ok=True)
++        self.machine = Machine(os.path.abspath(emu_path), self.state_dir)
++        self.presets = Presets(self.state_dir)
++        self.ui = load_ui_state(self.state_dir)
++        self.mon = MonitorClient()
++        self.fb = FrameBuffer()
++        self.photo = None
++        self.last_render = 0.0
++        self.machine_state = "off"
++        self.exit_code = None
++        self.last_state_msg = {}
++        self.log_lines = []
++        self.reply_text = "—"
++        self.connect_deadline = 0.0
++        self.stop_deadline = 0.0
++
++        root.title(APP_TITLE)
++        try:
++            root.geometry(self.ui["geometry"])
++        except Exception:
++            root.geometry("1180x740")
++        self._build_style()
++        self._build_menu()
++        self._build_layout()
++        self.set_mode(self.ui["mode"])
++        self.refresh_presets()
++        self.root.after(STATUS_POLL_MS, self._poll_status)
++        self.root.after(MONITOR_POLL_MS, self._poll_monitor)
++
++    # -- construction ------------------------------------------------------
++    def _build_style(self):
++        style = ttk.Style(self.root)
++        try:
++            style.theme_use("clam")
++        except Exception:
++            pass
++        style.configure("Big.TButton", padding=(12, 6))
++        style.configure("Mode.TRadiobutton", padding=(8, 4))
++        style.configure("Status.TLabel", padding=(6, 3))
++
++    def _build_menu(self):
++        menubar = tk.Menu(self.root)
++        m_file = tk.Menu(menubar, tearoff=0)
++        m_file.add_command(label="Новая машина…", command=self.on_new_machine)
++        m_file.add_separator()
++        m_file.add_command(label="Открыть папку состояния", command=self.open_state_dir)
++        m_file.add_separator()
++        m_file.add_command(label="Выход", command=self.on_close)
++        m_view = tk.Menu(menubar, tearoff=0)
++        self.mode_var = tk.StringVar(value=self.ui["mode"])
++        m_view.add_radiobutton(label="Обычный режим", variable=self.mode_var,
++                               value="normal", command=lambda: self.set_mode("normal"))
++        m_view.add_radiobutton(label="Экспертный режим", variable=self.mode_var,
++                               value="expert", command=lambda: self.set_mode("expert"))
++        m_help = tk.Menu(menubar, tearoff=0)
++        m_help.add_command(label="О программе", command=self.on_about)
++        menubar.add_cascade(label="Файл", menu=m_file)
++        menubar.add_cascade(label="Вид", menu=m_view)
++        menubar.add_cascade(label="Справка", menu=m_help)
++        self.root.config(menu=menubar)
++
++    def _build_layout(self):
++        top = ttk.Frame(self.root, padding=(8, 6))
++        top.pack(fill="x")
++        ttk.Label(top, text="Режим:").pack(side="left")
++        ttk.Radiobutton(top, text="Обычный", value="normal", variable=self.mode_var,
++                        style="Mode.TRadiobutton",
++                        command=lambda: self.set_mode("normal")).pack(side="left")
++        ttk.Radiobutton(top, text="Экспертный", value="expert", variable=self.mode_var,
++                        style="Mode.TRadiobutton",
++                        command=lambda: self.set_mode("expert")).pack(side="left")
++        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10)
++        self.autostart_var = tk.BooleanVar(value=bool(self.ui["autostart"]))
++        ttk.Checkbutton(top, text="Автозапуск после старта", variable=self.autostart_var,
++                        command=self._save_ui).pack(side="left")
++        self.badge_state = tk.Label(top, text="машина выключена", bg="#5b6470", fg="white",
++                                    padx=8, pady=2)
++        self.badge_state.pack(side="right", padx=4)
++        self.badge_mon = tk.Label(top, text="монитор: —", bg="#5b6470", fg="white",
++                                  padx=8, pady=2)
++        self.badge_mon.pack(side="right", padx=4)
++
++        main = ttk.PanedWindow(self.root, orient="horizontal")
++        main.pack(fill="both", expand=True, padx=8, pady=4)
++
++        # -- sidebar: machine (preset) list + controls --------------------
++        side = ttk.Frame(main, padding=4)
++        main.add(side, weight=0)
++        ttk.Label(side, text="Машины").pack(anchor="w")
++        self.preset_list = tk.Listbox(side, height=18, exportselection=False, width=28)
++        self.preset_list.pack(fill="both", expand=True, pady=4)
++        self.preset_list.bind("<<ListboxSelect>>", lambda e: self.on_preset_select())
++        btns = ttk.Frame(side)
++        btns.pack(fill="x")
++        self.btn_start = ttk.Button(btns, text="▶ Пуск", style="Big.TButton",
++                                    command=self.on_start)
++        self.btn_start.pack(fill="x", pady=2)
++        row = ttk.Frame(side)
++        row.pack(fill="x")
++        self.btn_pause = ttk.Button(row, text="⏸ Пауза", command=self.on_pause)
++        self.btn_pause.pack(side="left", fill="x", expand=True, padx=1)
++        self.btn_cont = ttk.Button(row, text="▶ Пуск ▶", command=self.on_continue)
++        self.btn_cont.pack(side="left", fill="x", expand=True, padx=1)
++        row2 = ttk.Frame(side)
++        row2.pack(fill="x")
++        self.btn_step = ttk.Button(row2, text="Шаг", command=self.on_step)
++        self.btn_step.pack(side="left", fill="x", expand=True, padx=1)
++        self.btn_stop = ttk.Button(row2, text="⏹ Стоп", command=self.on_stop)
++        self.btn_stop.pack(side="left", fill="x", expand=True, padx=1)
++        ttk.Button(side, text="↻ Перезапуск", command=self.on_restart).pack(fill="x", pady=2)
++        ttk.Button(side, text="＋ Новая машина…", command=self.on_new_machine).pack(fill="x", pady=2)
++        row3 = ttk.Frame(side)
++        row3.pack(fill="x", pady=(6, 0))
++        ttk.Button(row3, text="Изменить", command=self.on_preset_edit).pack(
++            side="left", fill="x", expand=True, padx=1)
++        ttk.Button(row3, text="Удалить", command=self.on_preset_delete).pack(
++            side="left", fill="x", expand=True, padx=1)
++
++        # -- notebook -----------------------------------------------------
++        self.nb = ttk.Notebook(main)
++        main.add(self.nb, weight=1)
++        self.tab_screen = ttk.Frame(self.nb, padding=4)
++        self.tab_config = ttk.Frame(self.nb, padding=4)
++        self.tab_mon = ttk.Frame(self.nb, padding=4)
++        self.tab_art = ttk.Frame(self.nb, padding=4)
++        self.tab_snap = ttk.Frame(self.nb, padding=4)
++        self.tab_net = ttk.Frame(self.nb, padding=4)
++        self.tab_log = ttk.Frame(self.nb, padding=4)
++        self.nb.add(self.tab_screen, text=" Экран ")
++        self.nb.add(self.tab_config, text=" Конфигурация ")
++        self.nb.add(self.tab_mon, text=" Монитор ")
++        self.nb.add(self.tab_art, text=" Артефакты ")
++        self.nb.add(self.tab_snap, text=" Снапшоты ")
++        self.nb.add(self.tab_net, text=" Сеть ")
++        self.nb.add(self.tab_log, text=" Журнал ")
++
++        self._build_screen_tab()
++        self._build_config_tab()
++        self._build_monitor_tab()
++        self._build_artifacts_tab()
++        self._build_snapshots_tab()
++        self._build_net_tab()
++        self._build_log_tab()
++
++        self.status = ttk.Label(self.root, text="готов", style="Status.TLabel", anchor="w")
++        self.status.pack(fill="x", side="bottom")
++
++    def _build_screen_tab(self):
++        bar = ttk.Frame(self.tab_screen)
++        bar.pack(fill="x")
++        ttk.Label(bar, text="Масштаб:").pack(side="left")
++        self.scale_var = tk.StringVar(value="fit")
++        cb = ttk.Combobox(bar, textvariable=self.scale_var, state="readonly", width=8,
++                          values=("fit", "1", "1.5", "2"))
++        cb.pack(side="left", padx=4)
++        cb.bind("<<ComboboxSelected>>", lambda e: self._apply_scale())
++        self.fb_info = ttk.Label(bar, text="фреймбуфер: —")
++        self.fb_info.pack(side="right")
++        wrap = ttk.Frame(self.tab_screen)
++        wrap.pack(fill="both", expand=True)
++        self.canvas = tk.Canvas(wrap, bg="black", highlightthickness=0)
++        self.canvas.pack(fill="both", expand=True)
++
++    def _apply_scale(self):
++        if self.photo is None:
++            return
++        v = self.scale_var.get()
++        if v == "fit":
++            self.canvas.coords("fb", 0, 0)
++            self.canvas.itemconfigure("fb", width=self.fb.width, height=self.fb.height)
++        else:
++            z = float(v)
++            self.canvas.itemconfigure("fb", width=int(self.fb.width * z),
++                                      height=int(self.fb.height * z))
++
++    def _build_config_tab(self):
++        outer = ttk.Frame(self.tab_config)
++        outer.pack(fill="both", expand=True)
++        canvas = tk.Canvas(outer, highlightthickness=0)
++        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
++        form = ttk.Frame(canvas, padding=8)
++        form.bind("<Configure>",
++                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
++        canvas.create_window((0, 0), window=form, anchor="nw")
++        canvas.configure(yscrollcommand=sb.set)
++        canvas.pack(side="left", fill="both", expand=True)
++        sb.pack(side="right", fill="y")
++
++        self.cfg_vars = {}
++        self.path_vars = {}
++
++        def section(title):
++            ttk.Separator(form, orient="horizontal").pack(fill="x", pady=6)
++            ttk.Label(form, text=title, font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
++
++        def row_path(key, label, browse_kind="file"):
++            r = ttk.Frame(form)
++            r.pack(fill="x", pady=1)
++            ttk.Label(r, text=label, width=22, anchor="w").pack(side="left")
++            var = tk.StringVar()
++            e = ttk.Entry(r, textvariable=var)
++            e.pack(side="left", fill="x", expand=True, padx=4)
++            def browse():
++                if browse_kind == "save":
++                    p = filedialog.asksaveasfilename(parent=self.root)
++                else:
++                    p = filedialog.askopenfilename(parent=self.root)
++                if p:
++                    var.set(p)
++            ttk.Button(r, text="…", width=3, command=browse).pack(side="left")
++            self.cfg_vars[key] = var
++
++        def row_choice(key, label, values):
++            r = ttk.Frame(form)
++            r.pack(fill="x", pady=1)
++            ttk.Label(r, text=label, width=22, anchor="w").pack(side="left")
++            var = tk.StringVar()
++            ttk.Combobox(r, textvariable=var, values=values, width=18).pack(
++                side="left", padx=4)
++            self.cfg_vars[key] = var
++
++        def row_str(key, label):
++            r = ttk.Frame(form)
++            r.pack(fill="x", pady=1)
++            ttk.Label(r, text=label, width=22, anchor="w").pack(side="left")
++            var = tk.StringVar()
++            ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True, padx=4)
++            self.cfg_vars[key] = var
++
++        def row_int(key, label):
++            row_str(key, label)
++
++        def row_bool(key, label):
++            r = ttk.Frame(form)
++            r.pack(fill="x", pady=1)
++            var = tk.BooleanVar()
++            ttk.Checkbutton(r, text=label, variable=var).pack(side="left")
++            self.cfg_vars[key] = var
++
++        section("Загрузка")
++        row_path("rom", "Прошивка (ROM)")
++        row_path("disk", "Диск (USB-образ)")
++        row_path("kernel", "Ядро (ELF64)")
++        row_path("initrd", "Initrd")
++        row_path("snapshot_load", "Снапшот для загрузки")
++        section("ЦП / платформа")
++        row_choice("platform", "Платформа", launcher.PLATFORMS)
++        row_int("smp", "vCPU (smp)")
++        row_int("cpus", "Ядер (cpus)")
++        row_bool("smp_probe", "smp-probe")
++        section("Чипсет")
++        row_choice("lpc", "LPC", launcher.LPCS)
++        row_bool("no_usb_uhci", "Без USB UHCI")
++        section("Накопители (SATA)")
++        row_path("sata", "Порт 0 (диск/ISO)")
++        row_path("sata1", "Порт 1")
++        row_path("sata2p", "Порт 2")
++        row_path("sata3", "Порт 3")
++        row_bool("ahci2", "Второй контроллер (ahci2)")
++        row_path("sata2", "ahci2: порт 0")
++        row_path("sata2_port1", "ahci2: порт 1")
++        row_bool("sata_writethrough", "Write-through")
++        section("Видео")
++        row_str("vbe", "Режим VBE (например 1024x768x32 / off)")
++        row_bool("no_fb", "Без фреймбуфера")
++        section("Сеть")
++        row_str("tap", "TAP (host:port)")
++        section("Прогон")
++        row_int("max_instr", "Лимит инструкций")
++        row_bool("stats", "Статистика")
++        row_bool("log", "Журнал (log)")
++        row_bool("dump_fb", "Скриншот fb")
++        row_bool("dump_text", "Текстовый экран")
++        row_bool("trace_file", "Трасса")
++        row_int("trace_from", "Трасса: с инструкции")
++        row_int("trace_count", "Трасса: сколько")
++        section("Отладка")
++        row_str("gdb", "GDB (порт или host:port)")
++        row_str("watch_phys", "Следить за физ. адресом")
++        row_path("symbols", "Файл символов")
++        row_path("debug_script", "Скрипт отладчика")
++        row_str("keys", "Скан-коды (hex, через запятую)")
++        row_str("keys_at", "Когда вводить (prompt/адрес)")
++        row_path("snapshot_save", "Сохранить снапшот в")
++
++        self._config_from_dict(BUILTIN_CONFIG)
++
++    def _build_monitor_tab(self):
++        bar = ttk.Frame(self.tab_mon)
++        bar.pack(fill="x")
++        ttk.Label(bar, text="Команда монитора:").pack(side="left")
++        self.mon_entry = ttk.Entry(bar)
++        self.mon_entry.pack(side="left", fill="x", expand=True, padx=4)
++        self.mon_entry.bind("<Return>", lambda e: self.on_exec())
++        ttk.Button(bar, text="Выполнить", command=self.on_exec).pack(side="left")
++        for label, line in (("regs", "regs"), ("breaks", "info break"),
++                            ("ahci", "ahci"), ("pic", "pic"), ("log", "log")):
++            ttk.Button(bar, text=label,
++                       command=lambda l=line: self.exec_line(l)).pack(side="left", padx=1)
++        self.mon_out = tk.Text(self.tab_mon, height=18, wrap="word",
++                               state="normal", bg="#101418", fg="#d7e0ea")
++        self.mon_out.pack(fill="both", expand=True, pady=4)
++        self.mon_out.insert("end", "—")
++        self.mon_out.configure(state="disabled")
++
++    def _build_artifacts_tab(self):
++        bar = ttk.Frame(self.tab_art)
++        bar.pack(fill="x")
++        ttk.Button(bar, text="Обновить", command=self.refresh_artifacts).pack(side="left")
++        ttk.Button(bar, text="Сохранить как…", command=self.on_artifact_save).pack(
++            side="left", padx=4)
++        ttk.Button(bar, text="Открыть папку", command=self.on_artifact_dir).pack(side="left")
++        self.art_tree = ttk.Treeview(self.tab_art, columns=("size", "mtime"),
++                                     show="headings", height=14)
++        self.art_tree.heading("size", text="Размер")
++        self.art_tree.heading("mtime", text="Изменён")
++        self.art_tree.pack(fill="both", expand=True, pady=4)
++
++    def _build_snapshots_tab(self):
++        bar = ttk.Frame(self.tab_snap)
++        bar.pack(fill="x")
++        ttk.Label(bar, text="Имя:").pack(side="left")
++        self.snap_name = tk.StringVar(value="gui.snap")
++        ttk.Entry(bar, textvariable=self.snap_name, width=24).pack(side="left", padx=4)
++        ttk.Button(bar, text="Сохранить (savevm)", command=self.on_snap_save).pack(side="left")
++        ttk.Button(bar, text="Загрузить (loadvm)", command=self.on_snap_load).pack(
++            side="left", padx=4)
++        ttk.Button(bar, text="Удалить", command=self.on_snap_delete).pack(side="left", padx=4)
++        ttk.Button(bar, text="Обновить", command=self.refresh_snapshots).pack(side="left", padx=4)
++        ttk.Label(self.tab_snap, foreground="#666",
++                  text="Снапшоты работают только на остановленной машине (пауза/шаг/точка)."
++                  ).pack(anchor="w", pady=2)
++        self.snap_tree = ttk.Treeview(self.tab_snap, columns=("size", "mtime"),
++                                      show="headings", height=14)
++        self.snap_tree.heading("size", text="Размер")
++        self.snap_tree.heading("mtime", text="Изменён")
++        self.snap_tree.pack(fill="both", expand=True, pady=4)
++
++    def _build_net_tab(self):
++        bar = ttk.Frame(self.tab_net, padding=4)
++        bar.pack(fill="x")
++        ttk.Label(bar, text="Порт респондера:").pack(side="left")
++        self.tap_port = tk.StringVar(value="8080")
++        ttk.Entry(bar, textvariable=self.tap_port, width=8).pack(side="left", padx=4)
++        ttk.Label(bar, text="drop:").pack(side="left")
++        self.tap_drop = tk.StringVar(value="")
++        ttk.Entry(bar, textvariable=self.tap_drop, width=16).pack(side="left", padx=4)
++        self.tap_no_tcp = tk.BooleanVar(value=False)
++        ttk.Checkbutton(bar, text="no-tcp", variable=self.tap_no_tcp).pack(side="left", padx=4)
++        ttk.Button(bar, text="Старт", command=self.on_tap_start).pack(side="left", padx=4)
++        ttk.Button(bar, text="Стоп", command=self.on_tap_stop).pack(side="left")
++        self.tap_status = ttk.Label(self.tab_net, text="респондер остановлен")
++        self.tap_status.pack(anchor="w", pady=4)
++        ttk.Label(self.tab_net, foreground="#666", wraplength=640, justify="left", text=(
++            "TAP-респондер отвечает на ARP/ICMP/DHCP/DNS/TCP для адреса host:port из "
++            "поля «TAP» в Конфигурации. Порт респондера выбирается из семейства "
++            "8080/8081/8082 (AURALITE_TAP_PORT) — см. docs/plans/NET_PLAN.md.")).pack(
++            anchor="w", pady=8)
++
++    def _build_log_tab(self):
++        bar = ttk.Frame(self.tab_log)
++        bar.pack(fill="x")
++        ttk.Label(bar, text="Фильтр:").pack(side="left")
++        self.log_filter = tk.StringVar(value="")
++        ttk.Entry(bar, textvariable=self.log_filter, width=24).pack(side="left", padx=4)
++        self.log_filter.trace_add("write", lambda *_: self._paint_log())
++        self.log_scroll = tk.BooleanVar(value=True)
++        ttk.Checkbutton(bar, text="автопрокрутка", variable=self.log_scroll).pack(side="left")
++        ttk.Button(bar, text="Обновить", command=self.refresh_output).pack(side="left", padx=4)
++        self.log_box = tk.Text(self.tab_log, height=20, wrap="none",
++                               bg="#101418", fg="#d7e0ea")
++        self.log_box.pack(fill="both", expand=True, pady=4)
++
++    # -- config <-> form --------------------------------------------------
++    def _config_from_dict(self, cfg):
++        for key, var in self.cfg_vars.items():
++            v = cfg.get(key, "")
++            if isinstance(var, tk.BooleanVar):
++                var.set(bool(v))
++            else:
++                var.set("" if v is None or v is False else str(v))
++
++    def collect_config(self):
++        cfg = {}
++        for key, var in self.cfg_vars.items():
++            spec = SCHEMA[key]
++            if isinstance(var, tk.BooleanVar):
++                if var.get():
++                    cfg[key] = True
++                continue
++            val = var.get().strip()
++            if not val:
++                continue
++            if spec["type"] == "int":
++                try:
++                    cfg[key] = int(val, 0)
++                except ValueError:
++                    raise ConfigError("%s: ожидается целое число" % key)
++            elif spec["type"] == "bool":
++                cfg[key] = True
++            else:
++                cfg[key] = val
++        return cfg
++
++    def set_config(self, cfg):
++        self._config_from_dict(cfg)
++
++    # -- modes ------------------------------------------------------------
++    def set_mode(self, mode):
++        mode = "expert" if mode == "expert" else "normal"
++        self.ui["mode"] = mode
++        self.mode_var.set(mode)
++        keep = {self.tab_screen, self.tab_log}
++        if mode == "expert":
++            keep |= {self.tab_config, self.tab_mon, self.tab_art,
++                     self.tab_snap, self.tab_net}
++        for tab in (self.tab_config, self.tab_mon, self.tab_art,
++                    self.tab_snap, self.tab_net):
++            if tab in keep:
++                if str(tab) not in self.nb.tabs():
++                    self.nb.add(tab)
++            else:
++                if str(tab) in self.nb.tabs():
++                    self.nb.forget(tab)
++        self._save_ui()
++
++    def _save_ui(self):
++        self.ui["autostart"] = bool(self.autostart_var.get())
++        self.ui["geometry"] = self.root.geometry()
++        save_ui_state(self.state_dir, self.ui)
++
++    # -- presets (machines) ------------------------------------------------
++    def refresh_presets(self):
++        self.preset_list.delete(0, "end")
++        for name in sorted(self.presets.load()):
++            self.preset_list.insert("end", name)
++        last = self.ui.get("last_preset", "")
++        names = sorted(self.presets.load())
++        if last in names:
++            self.preset_list.selection_set(names.index(last))
++
++    def current_preset(self):
++        sel = self.preset_list.curselection()
++        if not sel:
++            return None
++        return self.preset_list.get(sel[0])
++
++    def on_preset_select(self):
++        name = self.current_preset()
++        if not name:
++            return
++        self.ui["last_preset"] = name
++        self._save_ui()
++        cfg = self.presets.load().get(name)
++        if cfg:
++            self.set_config(cfg)
++
++    def on_preset_edit(self):
++        name = self.current_preset()
++        if not name:
++            messagebox.showinfo(APP_TITLE, "Сначала выберите машину в списке.")
++            return
++        self.set_mode("expert")
++        self.nb.select(self.tab_config)
++
++    def on_preset_delete(self):
++        name = self.current_preset()
++        if not name:
++            return
++        if not messagebox.askyesno(APP_TITLE, "Удалить машину «%s»?" % name):
++            return
++        self.presets.delete(name)
++        self.refresh_presets()
++
++    def save_current_preset(self, name, cfg):
++        validate_config(cfg)
++        self.presets.save(name, cfg)
++        self.refresh_presets()
++        self.ui["last_preset"] = name
++        self._save_ui()
++
++    # -- wizard ------------------------------------------------------------
++    def on_new_machine(self):
++        Wizard(self)
++
++    # -- lifecycle ---------------------------------------------------------
++    def on_start(self):
++        if self.machine_state == "running":
++            return
++        try:
++            cfg = self.collect_config()
++            validate_config(cfg)
++        except ConfigError as e:
++            messagebox.showerror(APP_TITLE, "Конфигурация не запущена:\n%s" % e)
++            return
++        try:
++            res = self.machine.start(cfg)
++        except ConfigError as e:
++            messagebox.showerror(APP_TITLE, "Запуск отклонён:\n%s" % e)
++            return
++        self.log_lines = []
++        self._paint_log()
++        self.mon.close()
++        self.connect_deadline = time.time() + 20.0
++        self.status.configure(text="монитор подключается… (порт %s)" % res["monitor_port"])
++        self.refresh_artifacts()
++
++    def on_pause(self):
++        self._send({"cmd": "pause"})
++
++    def on_continue(self):
++        self._send({"cmd": "continue"})
++
++    def on_step(self):
++        self._send({"cmd": "step"})
++
++    def on_stop(self):
++        """End-stop semantics (TOOLING T5): `quit` prints stats and artifacts."""
++        if self.machine_state == "running":
++            self._send({"cmd": "quit"})
++            self.stop_deadline = time.time() + 5.0
++        else:
++            self.machine.stop()
++            self.refresh_artifacts()
++
++    def on_restart(self):
++        cfg = None
++        try:
++            cfg = self.collect_config()
++            validate_config(cfg)
++        except ConfigError as e:
++            messagebox.showerror(APP_TITLE, "Конфигурация некорректна:\n%s" % e)
++            return
++        self.machine.stop()
++        self.mon.close()
++        self.on_start()
++
++    def _send(self, obj):
++        try:
++            self.mon.send(obj)
++        except OSError as e:
++            self.status.configure(text="монитор недоступен: %s" % e)
++
++    def _connect_monitor(self):
++        port = self.machine.monitor_port
++        if not port:
++            return
++        try:
++            self.mon.connect(port, timeout=1.0)
++        except OSError:
++            return
++        self.badge_mon.configure(text="монитор: на связи", bg="#2f7d32")
++        self.status.configure(text="монитор подключён")
++        if self.autostart_var.get():
++            self._send({"cmd": "continue"})
++
++    # -- polling -----------------------------------------------------------
++    def _poll_status(self):
++        st = self.machine.status()
++        self.machine_state = st["state"]
++        self.exit_code = st["exit_code"]
++        if st["state"] == "running":
++            if self.last_state_msg.get("stop_reason") == "end":
++                self.badge_state.configure(
++                    text="прогон завершён (end) — «Стоп» сохранит результаты",
++                    bg="#2f7d32")
++            else:
++                self.badge_state.configure(text="машина работает", bg="#2f7d32")
++            if self.mon.sock is None and time.time() < self.connect_deadline:
++                self._connect_monitor()
++        elif st["state"] == "exited":
++            txt = "прогон завершён (код %s)" % st["exit_code"]
++            self.badge_state.configure(text=txt,
++                                       bg="#2f7d32" if st["exit_code"] == 0 else "#a33")
++            if self.mon.sock is not None:
++                self.mon.close()
++                self.badge_mon.configure(text="монитор: —", bg="#5b6470")
++                self.refresh_artifacts()
++                self.refresh_output()
++        else:
++            self.badge_state.configure(text="машина выключена", bg="#5b6470")
++        if self.stop_deadline and time.time() > self.stop_deadline:
++            self.stop_deadline = 0.0
++            if self.machine.status()["state"] == "running":
++                self.machine.stop()
++                self.refresh_artifacts()
++        st_txt = "готов"
++        if self.last_state_msg:
++            st_txt = "%s | %s | инстр: %s" % (
++                self.last_state_msg.get("stop_reason", "—"),
++                self.last_state_msg.get("mode", "—"),
++                self.last_state_msg.get("executed", "—"))
++        taps = st.get("responder") or {}
++        self.status.configure(text=st_txt + (
++            " | TAP-респондер: %s" % ("pid %s" % taps["pid"] if taps.get("running") else "стоп")))
++        self.root.after(STATUS_POLL_MS, self._poll_status)
++
++    def _poll_monitor(self):
++        if self.mon.sock is not None:
++            for kind, payload in self.mon.pump():
++                if kind == "text":
++                    if payload.get("kind") == "state":
++                        self.last_state_msg = payload
++                        self._paint_state()
++                    elif payload.get("kind") == "reply":
++                        msg = "%s %s: %s" % ("OK" if payload.get("ok") else "ОШИБКА",
++                                             payload.get("cmd", ""),
++                                             payload.get("message", ""))
++                        if payload.get("output"):
++                            msg += "\n" + payload["output"]
++                        self.reply_text = msg
++                        self._paint_mon()
++                elif kind == "fb":
++                    self.fb.apply(payload)
++                    self._render_fb()
++                elif kind == "closed":
++                    self.badge_mon.configure(text="монитор: отключён", bg="#a33")
++        self.root.after(MONITOR_POLL_MS, self._poll_monitor)
++
++    def _paint_state(self):
++        s = self.last_state_msg
++        self.fb_info.configure(text="фреймбуфер: %sx%s" % (self.fb.width or "—",
++                                                           self.fb.height or "—"))
++        regs = s.get("registers") or {}
++        self._paint_mon()
++
++    def _paint_mon(self):
++        s = self.last_state_msg
++        regs = s.get("registers") or {}
++        body = [
++            "режим: %s   останов: %s   инстр: %s" % (
++                s.get("mode", "—"), s.get("stop_reason", "—"), s.get("executed", "—")),
++            "дизассемблер: %s" % s.get("disassembly", "—"),
++            "",
++        ]
++        for k, v in list(regs.items()):
++            body.append("%s = %s" % (k, v))
++        body.append("")
++        body.append("ответ: " + self.reply_text)
++        txt = "\n".join(body)
++        self.mon_out.configure(state="normal")
++        self.mon_out.delete("1.0", "end")
++        self.mon_out.insert("end", txt)
++        self.mon_out.configure(state="disabled")
++
++    def _render_fb(self):
++        if not self.fb.width or not self.fb.height:
++            return
++        now = time.time()
++        if (now - self.last_render) * 1000.0 < RENDER_MIN_MS:
++            return
++        self.last_render = now
++        if (self.photo is None or int(self.photo.width()) != self.fb.width
++                or int(self.photo.height()) != self.fb.height):
++            self.photo = tk.PhotoImage(width=self.fb.width, height=self.fb.height)
++            self.canvas.delete("all")
++            self.canvas.create_image(0, 0, image=self.photo, anchor="nw", tags="fb")
++            self._apply_scale()
++        for y in sorted(self.fb.dirty):
++            try:
++                self.photo.put(self.fb.row_colors(y), to=(0, y))
++            except tk.TclError:
++                return
++        self.fb.dirty.clear()
++        self.fb_info.configure(text="фреймбуфер: %sx%s" % (self.fb.width, self.fb.height))
++
++    # -- tabs actions ------------------------------------------------------
++    def on_exec(self):
++        line = self.mon_entry.get().strip()
++        if line:
++            self.exec_line(line)
++
++    def exec_line(self, line):
++        self._send({"cmd": "exec", "line": line})
++
++    def refresh_output(self):
++        out = self.machine.output("stdout", tail=400)
++        err = self.machine.output("stderr", tail=100)
++        self.log_lines = [l.rstrip("\n") for l in out.splitlines()]
++        if err:
++            self.log_lines += ["--- stderr ---"] + [l.rstrip("\n") for l in err.splitlines()]
++        self._paint_log()
++
++    def _paint_log(self):
++        f = (self.log_filter.get() or "").lower()
++        txt = "\n".join(l for l in self.log_lines if not f or f in l.lower()) or "(пусто)"
++        self.log_box.configure(state="normal")
++        self.log_box.delete("1.0", "end")
++        self.log_box.insert("end", txt)
++        if self.log_scroll.get():
++            self.log_box.see("end")
++        self.log_box.configure(state="disabled")
++
++    def refresh_artifacts(self):
++        for i in self.art_tree.get_children():
++            self.art_tree.delete(i)
++        for a in self.machine.artifacts():
++            self.art_tree.insert("", "end", iid=a["name"],
++                                 values=(a["size"],
++                                         time.strftime("%Y-%m-%d %H:%M:%S",
++                                                       time.localtime(a["mtime"]))))
++
++    def on_artifact_save(self):
++        sel = self.art_tree.selection()
++        if not sel:
++            return
++        name = sel[0]
++        src = self.machine.artifact_path(name)
++        if not src:
++            return
++        dst = filedialog.asksaveasfilename(parent=self.root, initialfile=name)
++        if dst:
++            shutil.copyfile(src, dst)
++
++    def on_artifact_dir(self):
++        if not self.machine.run_dir:
++            messagebox.showinfo(APP_TITLE, "Прогон ещё не запускался.")
++            return
++        path = self.machine.run_dir
++        try:
++            if sys.platform.startswith("win"):
++                os.startfile(path)  # noqa: S606
++            else:
++                subprocess.Popen(["xdg-open", path])
++        except OSError as e:
++            messagebox.showerror(APP_TITLE, "Не удалось открыть папку: %s" % e)
++
++    def refresh_snapshots(self):
++        for i in self.snap_tree.get_children():
++            self.snap_tree.delete(i)
++        for a in self.machine.snapshots():
++            self.snap_tree.insert("", "end", iid=a["name"],
++                                  values=(a["size"],
++                                          time.strftime("%Y-%m-%d %H:%M:%S",
++                                                        time.localtime(a["mtime"]))))
++
++    def _snap_path(self):
++        name = self.snap_name.get().strip()
++        if not name:
++            raise ConfigError("укажите имя снапшота")
++        return os.path.join(self.machine.snap_dir,
++                            os.path.basename(name.replace("/", "_")))
++
++    def on_snap_save(self):
++        try:
++            path = self._snap_path()
++        except ConfigError as e:
++            messagebox.showerror(APP_TITLE, str(e))
++            return
++        self.exec_line("savevm " + path)
++        self.root.after(400, self.refresh_snapshots)
++
++    def on_snap_load(self):
++        sel = self.snap_tree.selection()
++        name = sel[0] if sel else self.snap_name.get().strip()
++        if not name:
++            return
++        self.exec_line("loadvm " + os.path.join(self.machine.snap_dir,
++                                                os.path.basename(name)))
++        self.root.after(400, self.refresh_snapshots)
++
++    def on_snap_delete(self):
++        sel = self.snap_tree.selection()
++        if not sel:
++            return
++        self.machine.snapshot_delete(sel[0])
++        self.refresh_snapshots()
++
++    def on_tap_start(self):
++        try:
++            self.machine.responder_start({"port": int(self.tap_port.get()),
++                                          "drop": self.tap_drop.get(),
++                                          "no_tcp": self.tap_no_tcp.get()})
++        except (ConfigError, ValueError) as e:
++            messagebox.showerror(APP_TITLE, "Респондер не запущен:\n%s" % e)
++            return
++        self.tap_status.configure(text="респондер работает")
++
++    def on_tap_stop(self):
++        self.machine.responder_stop()
++        self.tap_status.configure(text="респондер остановлен")
++
++    def open_state_dir(self):
++        try:
++            if sys.platform.startswith("win"):
++                os.startfile(self.state_dir)  # noqa: S606
++            else:
++                subprocess.Popen(["xdg-open", self.state_dir])
++        except OSError:
++            pass
++
++    def on_about(self):
++        messagebox.showinfo(APP_TITLE, (
++            "AuraLite Emulator — графический запуск машин.\n\n"
++            "Обычный режим: мастер создания машин и загрузка с ISO.\n"
++            "Экспертный режим: все опции командной строки, монитор,\n"
++            "артефакты, снапшоты и TAP-респондер.\n\n"
++            "Все запуски строятся строго по SCHEMA — как в CLI."))
++
++    def on_close(self):
++        self._save_ui()
++        try:
++            self.machine.responder_stop()
++        except Exception:
++            pass
++        if self.machine_state == "running":
++            self._send({"cmd": "quit"})
++            deadline = time.time() + 3.0
++            while time.time() < deadline and self.machine.status()["state"] == "running":
++                time.sleep(0.05)
++        self.machine.stop()
++        self.mon.close()
++        self.root.destroy()
++
++
++# ---------------------------------------------------------------------------
++# New-machine wizard (normal mode)
++# ---------------------------------------------------------------------------
++
++KIND_LABELS = [
++    ("iso", "Загрузка с ISO / CD-образа (как в VirtualBox)"),
++    ("disk", "Дисковый образ (USB/SATA диск)"),
++    ("kernel", "Ядро ELF64 напрямую (без прошивки)"),
++    ("empty", "Демо-машина (встроенная прошивка)"),
++]
++
++
++class Wizard(tk.Toplevel):
++    def __init__(self, app):
++        super().__init__(app.root)
++        self.app = app
++        self.title("Новая машина")
++        self.resizable(False, False)
++        self.transient(app.root)
++        self.kind = tk.StringVar(value="iso")
++        self.name = tk.StringVar(value="")
++        self.path = tk.StringVar(value="")
++        self.initrd = tk.StringVar(value="")
++        self.bios = tk.StringVar(value=find_seabios(app.state_dir,
++                                                    app.ui.get("bios") or None) or "")
++        self.run_now = tk.BooleanVar(value=True)
++        self.page = 0
++        self.body = ttk.Frame(self, padding=12)
++        self.body.pack(fill="both", expand=True)
++        self.nav = ttk.Frame(self, padding=(12, 8))
++        self.nav.pack(fill="x")
++        self.btn_back = ttk.Button(self.nav, text="← Назад", command=self.on_back)
++        self.btn_back.pack(side="left")
++        self.btn_next = ttk.Button(self.nav, text="Далее →", command=self.on_next)
++        self.btn_next.pack(side="right")
++        self.render()
++
++    def render(self):
++        for w in self.body.winfo_children():
++            w.destroy()
++        app = self.app
++        if self.page == 0:
++            ttk.Label(self.body, text="Шаг 1. Имя и тип машины",
++                      font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
++            r = ttk.Frame(self.body)
++            r.pack(fill="x", pady=4)
++            ttk.Label(r, text="Имя:").pack(side="left")
++            ttk.Entry(r, textvariable=self.name, width=32).pack(side="left", padx=6)
++            for kind, label in KIND_LABELS:
++                ttk.Radiobutton(self.body, text=label, value=kind,
++                                variable=self.kind).pack(anchor="w", pady=2)
++            self.btn_next.configure(text="Далее →")
++            self.btn_back.configure(state="disabled")
++        elif self.page == 1:
++            kind = self.kind.get()
++            titles = {"iso": "Шаг 2. Выберите ISO-образ",
++                      "disk": "Шаг 2. Выберите дисковый образ",
++                      "kernel": "Шаг 2. Выберите ядро (ELF64)",
++                      "empty": "Шаг 2. Носитель не нужен"}
++            ttk.Label(self.body, text=titles[kind],
++                      font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
++            if kind == "empty":
++                ttk.Label(self.body, text=(
++                    "Демо-машина запускает встроенную прошивку без носителей.")).pack(
++                    anchor="w", pady=8)
++            else:
++                r = ttk.Frame(self.body)
++                r.pack(fill="x", pady=4)
++                filetypes = [("Все файлы", "*.*")]
++                if kind == "iso":
++                    filetypes = [("ISO / дисковые образы", "*.iso *.img *.bin"),
++                                 ("Все файлы", "*.*")]
++                elif kind == "kernel":
++                    filetypes = [("ELF", "*.elf *.bin"), ("Все файлы", "*.*")]
++                ttk.Label(r, text="Файл:").pack(side="left")
++                ttk.Entry(r, textvariable=self.path, width=46).pack(side="left", padx=6)
++
++                def browse():
++                    p = filedialog.askopenfilename(parent=self, filetypes=filetypes)
++                    if p:
++                        self.path.set(p)
++                ttk.Button(r, text="Обзор…", command=browse).pack(side="left")
++                if kind == "kernel":
++                    r2 = ttk.Frame(self.body)
++                    r2.pack(fill="x", pady=4)
++                    ttk.Label(r2, text="Initrd:").pack(side="left")
++                    ttk.Entry(r2, textvariable=self.initrd, width=46).pack(side="left", padx=6)
++                    ttk.Button(r2, text="Обзор…", command=lambda: (
++                        self.initrd.set(filedialog.askopenfilename(parent=self))
++                        or None)).pack(side="left")
++                if kind == "iso":
++                    ttk.Separator(self.body, orient="horizontal").pack(fill="x", pady=8)
++                    ttk.Label(self.body, text="Прошивка SeaBIOS (bios.bin):",
++                              font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
++                    r3 = ttk.Frame(self.body)
++                    r3.pack(fill="x", pady=4)
++                    ttk.Entry(r3, textvariable=self.bios, width=46).pack(
++                        side="left", padx=(0, 6))
++                    ttk.Button(r3, text="Обзор…", command=lambda: (
++                        self.bios.set(filedialog.askopenfilename(parent=self))
++                        or None)).pack(side="left")
++                    if not self.bios.get():
++                        ttk.Label(self.body, foreground="#a33", wraplength=520, text=(
++                            "Для загрузки с ISO нужен стоковый SeaBIOS (файл bios.bin, "
++                            "например из пакета Debian «seabios» или с www.seabios.org). "
++                            "Обычный режим подставит его автоматически.")).pack(anchor="w", pady=4)
++            self.btn_back.configure(state="normal")
++            self.btn_next.configure(text="Далее →")
++        else:
++            kind = self.kind.get()
++            try:
++                cfg = self.preview_config()
++            except ConfigError as e:
++                cfg = None
++                err = str(e)
++            ttk.Label(self.body, text="Шаг 3. Проверьте и создайте",
++                      font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
++            if cfg is None:
++                ttk.Label(self.body, foreground="#a33", wraplength=520,
++                          text="Не удалось собрать конфигурацию: %s" % err).pack(
++                    anchor="w", pady=8)
++            else:
++                lines = ["Имя: %s" % self.name.get().strip(),
++                         "Тип: %s" % dict(KIND_LABELS)[kind]]
++                for k in sorted(cfg):
++                    lines.append("  %s = %s" % (k, cfg[k]))
++                ttk.Label(self.body, text="Будет запущено:",
++                          font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
++                box = tk.Text(self.body, width=64, height=16, wrap="none")
++                box.pack(fill="both", expand=True, pady=4)
++                box.insert("end", "\n".join(lines))
++                box.configure(state="disabled")
++            ttk.Checkbutton(self.body, text="Запустить сразу после создания",
++                            variable=self.run_now).pack(anchor="w", pady=6)
++            self.btn_back.configure(state="normal")
++            self.btn_next.configure(text="Создать ✓")
++
++    def preview_config(self):
++        kind = self.kind.get()
++        path = self.path.get().strip() or None
++        bios = self.bios.get().strip() or None
++        initrd = self.initrd.get().strip() or None
++        return normal_config(kind, path=path, bios=bios, initrd=initrd)
++
++    def on_back(self):
++        if self.page > 0:
++            self.page -= 1
++            self.render()
++
++    def on_next(self):
++        if self.page < 2:
++            self.page += 1
++            self.render()
++            return
++        name = self.name.get().strip()
++        if not name:
++            messagebox.showerror(APP_TITLE, "Укажите имя машины.", parent=self)
++            return
++        try:
++            cfg = self.preview_config()
++            self.app.save_current_preset(name, cfg)
++        except ConfigError as e:
++            messagebox.showerror(APP_TITLE, "Машина не создана:\n%s" % e, parent=self)
++            return
++        if self.kind.get() == "iso" and self.bios.get().strip():
++            self.app.ui["bios"] = self.bios.get().strip()
++            self.app._save_ui()
++        self.destroy()
++        if self.run_now.get():
++            self.app.set_config(cfg)
++            self.app.on_start()
++
++
++# ---------------------------------------------------------------------------
++# main
++# ---------------------------------------------------------------------------
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description="AuraLite-Emulator desktop GUI")
++    ap.add_argument("--state-dir", default=os.path.expanduser("~/.x86emu-gui"))
++    ap.add_argument("--emu", default=os.path.join(ROOT, "x86emu"),
++                    help="path to the x86emu binary")
++    ap.add_argument("--preset", default="",
++                    help="machine (preset) to load and start immediately")
++    a = ap.parse_args(argv)
++
++    if not os.path.isfile(a.emu) and os.path.isfile(a.emu + ".exe"):
++        a.emu += ".exe"
++    if not os.path.isfile(a.emu):
++        print("gui_app: %s not found -- run `make` first" % a.emu, file=sys.stderr)
++        return 2
++
++    if sys.platform.startswith("win"):      # crisp text on high-DPI screens
++        try:
++            import ctypes
++            ctypes.windll.shcore.SetProcessDpiAwareness(1)
++        except Exception:
++            pass
++
++    root = tk.Tk()
++    app = App(root, a.emu, a.state_dir)
++    root.protocol("WM_DELETE_WINDOW", app.on_close)
++    if a.preset:
++        app.ui["last_preset"] = a.preset
++        app.refresh_presets()
++        cfg = app.presets.load().get(a.preset)
++        if cfg:
++            app.set_config(cfg)
++            app.on_start()
++    root.mainloop()
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/mkiso.py b/tools/mkiso.py
+new file mode 100644
+index 0000000..ec44dfa
+--- /dev/null
++++ b/tools/mkiso.py
+@@ -0,0 +1,204 @@
++#!/usr/bin/env python3
++"""tools/mkiso.py -- minimal ISO9660 + El Torito + MBR builder (stdlib only).
++
++Builds one small, honest ISO image that boots through both media routes the
++GUI offers:
++
++  * attached as a disk/ISO on a SATA port  -- SeaBIOS reads the MBR at
++    LBA 0 and jumps to it (the quick route, docs/WINDOWS.md E);
++  * attached as an ATAPI CD (--cdrom=)     -- SeaBIOS reads the El Torito
++    boot record (LBA 17), follows the catalog and loads the no-emulation
++    boot image at 0x7c00 (STORE S6).
++
++Layout (2048-byte LBAs):
++    0        MBR: the boot stub (512 B) + 0x55AA
++    1..15    system area (zeros)
++    16       Primary Volume Descriptor
++    17       El Torito boot record (catalog LBA inside)
++    18       Volume Descriptor Set Terminator
++    19       El Torito boot catalog (validation + default entry)
++    20       El Torito boot image (the same boot stub, 2048 B)
++    21/22    ISO9660 L/M path tables
++    23       root directory
++    24       README file
++"""
++import argparse
++import struct
++import sys
++
++SECTOR = 2048
++LBA_PVD = 16
++LBA_BOOTREC = 17
++LBA_TERM = 18
++LBA_CATALOG = 19
++LBA_BOOTIMG = 20
++LBA_PATHL = 21
++LBA_PATHM = 22
++LBA_ROOT = 23
++LBA_README = 24
++TOTAL_SECTORS = 512  # 1 MiB: >= 2 LBA-translation cylinders (16*63 sectors each);
++                     # a smaller image rounds LCHS cylinders to 0 and stock SeaBIOS
++                     # refuses every CHS read (measured, tests/test_iso_boot.py).
++
++
++def _both16(v):
++    return struct.pack("<H", v) + struct.pack(">H", v)
++
++
++def _both32(v):
++    return struct.pack("<I", v) + struct.pack(">I", v)
++
++
++def _date17(text="2026101800000000"):
++    return text.encode("ascii") + b"\x00"
++
++
++def _pad_name(name):
++    return name if name.endswith(b";1") else name + b";1"
++
++
++def _dir_record(name_bytes, lba, size, is_dir, date):
++    name_len = len(name_bytes)
++    rec_len = 33 + name_len
++    if rec_len & 1:
++        rec_len += 1
++    rec = bytearray(rec_len)
++    rec[0] = rec_len
++    rec[1] = 0
++    rec[2:10] = _both32(lba)
++    rec[10:18] = _both32(size)
++    rec[18:25] = date[:7]
++    rec[25] = 0x02 if is_dir else 0x00
++    rec[26] = 0
++    rec[27] = 0
++    rec[28:32] = _both16(1)
++    rec[32] = name_len
++    rec[33:33 + name_len] = name_bytes
++    return bytes(rec)
++
++
++def _cat_checksum(entry32):
++    """Validate-entry checksum: sum of the 16 LE words must be zero."""
++    words = list(struct.unpack("<16H", entry32))
++    words[14] = 0
++    return (-sum(words)) & 0xFFFF
++
++
++def build_iso(boot_stub, readme=b"AuraLite-Emulator test ISO (tools/mkiso.py)\n"):
++    """Return the complete ISO image as bytes.  boot_stub must be 512 bytes."""
++    if len(boot_stub) != 512:
++        raise ValueError("boot stub must be exactly 512 bytes")
++    if boot_stub[510:512] != b"\x55\xaa":
++        raise ValueError("boot stub must carry the 0x55AA boot signature")
++    date = _date17()
++
++    img = bytearray(TOTAL_SECTORS * SECTOR)
++
++    # -- LBA 0: the MBR half of the isohybrid trick ----------------------
++    img[0:512] = boot_stub
++
++    # -- LBA 16: Primary Volume Descriptor --------------------------------
++    pvd = bytearray(SECTOR)
++    pvd[0] = 1
++    pvd[1:6] = b"CD001"
++    pvd[6] = 1
++    pvd[8:40] = b"LINUX".ljust(32)
++    pvd[40:72] = b"AURALITE_TEST".ljust(32)
++    pvd[80:88] = _both32(TOTAL_SECTORS)
++    pvd[120:124] = _both16(1)                 # volume set size
++    pvd[124:128] = _both16(1)                 # volume sequence number
++    pvd[128:132] = _both16(SECTOR)            # logical block size
++    pvd[132:140] = _both32(10)                # path table size
++    pvd[140:144] = struct.pack("<I", LBA_PATHL)
++    pvd[148:152] = struct.pack(">I", LBA_PATHM)
++    root_size = 3 * 34 + 42                   # ".", "..", README + terminator
++    pvd[156:190] = _dir_record(b"\x00", LBA_ROOT, root_size, True, date[:7])
++    pvd[318:446] = b"AURALITE".ljust(128)
++    pvd[446:574] = b"AURALITE".ljust(128)
++    pvd[881:898] = _date17()
++    pvd[898:915] = _date17()
++    pvd[915:932] = b"0" * 16 + b"\x00"        # never expires
++    pvd[932:949] = _date17()
++    pvd[949] = 1                              # file structure version
++    img[LBA_PVD * SECTOR:(LBA_PVD + 1) * SECTOR] = pvd
++
++    # -- LBA 17: El Torito boot record ------------------------------------
++    br = bytearray(SECTOR)
++    br[0] = 0
++    br[1:6] = b"CD001"
++    br[6] = 1
++    br[7:39] = b"EL TORITO SPECIFICATION".ljust(32, b"\x00")
++    br[0x47:0x4B] = struct.pack("<I", LBA_CATALOG)
++    img[LBA_BOOTREC * SECTOR:(LBA_BOOTREC + 1) * SECTOR] = br
++
++    # -- LBA 18: terminator ------------------------------------------------
++    term = bytearray(SECTOR)
++    term[0] = 255
++    term[1:6] = b"CD001"
++    term[6] = 1
++    img[LBA_TERM * SECTOR:(LBA_TERM + 1) * SECTOR] = term
++
++    # -- LBA 19: boot catalog ---------------------------------------------
++    cat = bytearray(SECTOR)
++    val = bytearray(32)
++    val[0] = 0x01                            # validation entry
++    val[1] = 0x00                            # platform: x86
++    val[30] = 0x55
++    val[31] = 0xAA
++    struct.pack_into("<H", val, 28, _cat_checksum(bytes(val)))
++    cat[0:32] = val
++    ent = bytearray(32)
++    ent[0] = 0x88                            # bootable
++    ent[1] = 0x00                            # no emulation
++    ent[2:4] = struct.pack("<H", 0)          # load segment
++    ent[4] = 0                               # system type
++    ent[6:8] = struct.pack("<H", 4)          # virtual sector count (2048 B)
++    ent[8:12] = struct.pack("<I", LBA_BOOTIMG)   # Load RBA, little-endian
++    cat[32:64] = ent
++    img[LBA_CATALOG * SECTOR:(LBA_CATALOG + 1) * SECTOR] = cat
++
++    # -- LBA 20: boot image (the stub, zero-padded to one sector) ----------
++    img[LBA_BOOTIMG * SECTOR:LBA_BOOTIMG * SECTOR + 512] = boot_stub
++
++    # -- LBA 21/22: path tables -------------------------------------------
++    pt = bytearray(10)
++    pt[0] = 1
++    pt[1] = 0
++    pt[2:6] = struct.pack("<I", LBA_ROOT)
++    pt[6:8] = struct.pack("<H", 1)
++    img[LBA_PATHL * SECTOR:LBA_PATHL * SECTOR + 10] = pt
++    ptm = bytearray(pt)
++    ptm[2:6] = struct.pack(">I", LBA_ROOT)
++    ptm[6:8] = struct.pack(">H", 1)
++    img[LBA_PATHM * SECTOR:LBA_PATHM * SECTOR + 10] = ptm
++
++    # -- LBA 23: root directory -------------------------------------------
++    root = bytearray()
++    root += _dir_record(b"\x00", LBA_ROOT, root_size, True, date[:7])
++    root += _dir_record(b"\x01", LBA_ROOT, root_size, True, date[:7])
++    root += _dir_record(_pad_name(b"README"), LBA_README, len(readme),
++                        False, date[:7])
++    img[LBA_ROOT * SECTOR:LBA_ROOT * SECTOR + len(root)] = root
++
++    # -- LBA 24: README ----------------------------------------------------
++    img[LBA_README * SECTOR:LBA_README * SECTOR + len(readme)] = readme
++    return bytes(img)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description="build the AuraLite test ISO")
++    ap.add_argument("--bootstub", required=True,
++                    help="512-byte boot stub binary (tests/fixtures/bootstub.nas)")
++    ap.add_argument("-o", "--output", required=True)
++    a = ap.parse_args(argv)
++    with open(a.bootstub, "rb") as f:
++        stub = f.read()
++    iso = build_iso(stub)
++    with open(a.output, "wb") as f:
++        f.write(iso)
++    print("mkiso: %s (%d bytes, %d sectors)" % (a.output, len(iso), len(iso) // SECTOR))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.47.3
+

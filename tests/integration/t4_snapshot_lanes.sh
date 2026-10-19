@@ -66,6 +66,34 @@ else echo "FAIL determinism: snapshot files differ"; fail=1; fi
 if cmp -s "$WORK/fw-haswell-mid.snap" "$WORK/resave.snap"; then echo "ok   round trip: save -> load -> save byte-identical"
 else echo "FAIL round trip differs"; fail=1; fi
 
+# ---- FPU F4: the --kernel= x87 payload lanes (plan: F4 row) ----------
+if [ -f tests/fpu_payload.elf ]; then
+    split f4-payload 20 2000000 --kernel=tests/fpu_payload.elf
+    # the F0-F3 receipt content, produced inside a guest: COM1 lines land
+    # raw in the machine log (the test_iso_boot K1TEST convention)
+    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
+        --log="$WORK/fpu.log" >/dev/null 2>&1 || true
+    if grep -q 'F4R0=3800' "$WORK/fpu.log" && grep -q 'F4R3=447f2f58a24377f5fd3f' "$WORK/fpu.log"; then
+        echo "ok   x87 payload receipts: COM1 lines pinned in the machine log"
+    else echo "FAIL x87 payload receipts missing from the log"; fail=1; fi
+    # x87 file byte-stability through the real CLI: two processes saving the
+    # same state write the same bytes (the fst slots' padding rides cpu_t)
+    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
+        --snapshot-save="$WORK/fpu-a.snap" >/dev/null 2>&1 || true
+    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
+        --snapshot-save="$WORK/fpu-b.snap" >/dev/null 2>&1 || true
+    if cmp -s "$WORK/fpu-a.snap" "$WORK/fpu-b.snap"; then echo "ok   x87 file: two processes, same state -> identical snapshot files"
+    else echo "FAIL x87 file byte-stability"; fail=1; fi
+    # load + save with a zero step budget is the fixed point: nothing runs
+    # (a resumed run would advance device time at its own cadence by design)
+    "$X86EMU" --platform=haswell --max-instr=0 --kernel=tests/fpu_payload.elf \
+        --snapshot-load="$WORK/fpu-a.snap" --snapshot-save="$WORK/fpu-resave.snap" >/dev/null 2>&1 || true
+    if cmp -s "$WORK/fpu-a.snap" "$WORK/fpu-resave.snap"; then echo "ok   x87 file: save -> load -> save byte-identical"
+    else echo "FAIL x87 resave differs"; fail=1; fi
+else
+    echo "SKIP f4-payload lanes: tests/fpu_payload.elf not built"
+fi
+
 # refusals: exit code 1 and a reason
 refuse() {  # refuse <label> <pattern> <args...>
     label=$1 pat=$2; shift 2

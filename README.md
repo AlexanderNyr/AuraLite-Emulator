@@ -36,7 +36,8 @@ On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries wit
 ```bat
 build.bat           REM Build x86emu.exe, x86dis.exe, and (if nasm is in PATH) firmware/disk images
 build.bat demo      REM Build and run the Haswell sample firmware demo
-build.bat gui       REM Open the full GUI at http://127.0.0.1:8080/ (same as gui.bat)
+build.bat gui       REM Start the desktop GUI application (same as gui.bat)
+build.bat gui-web   REM Open the web GUI at http://127.0.0.1:8080/
 build.bat monitor   REM Start the live browser monitor at http://127.0.0.1:8080/
 build.bat test      REM Run the native Windows C unit tests + Python G3/G5/G6 acceptance gates
 build.bat wsl test  REM Delegate full `make test` to WSL2
@@ -44,9 +45,24 @@ build.bat wsl test  REM Delegate full `make test` to WSL2
 
 ## GUI — no command line needed
 
-`make gui` (or `python3 tools/launcher.py`; on Windows `build.bat gui` or
-double-click `gui.bat`) opens **http://127.0.0.1:8080/** — a single page that
-exposes everything the CLI offers:
+`make gui` (or `python3 tools/gui_app.py`; on Windows `build.bat gui` or
+double-click `gui.bat`) starts the **AuraLite Emulator desktop application** —
+a native window (tkinter, Python standard library only — no browser and no
+third-party packages) with two switchable modes:
+
+- **Обычный (Normal)** — VirtualBox/VMware style: a machine list, big
+  start/pause/stop buttons, the live screen, and a three-step *new machine*
+  wizard.  Pick an **ISO** and press Start — that is the whole procedure
+  (stock SeaBIOS `bios.bin` + the ISO on a SATA port, the documented
+  `docs/WINDOWS.md` recipe, wired automatically).
+- **Экспертный (Expert)** — the full option surface: every CLI option,
+  the monitor console (`regs`, `info break`, `exec`/`savevm`/`loadvm`),
+  artifacts, snapshots, the TAP responder and run logs.
+
+The web GUI remains available as `make gui-web` (or `python3
+tools/launcher.py`, `build.bat gui-web`) at **http://127.0.0.1:8080/** and
+exposes the same capabilities:
+
 
 - **Machine setup**: boot path (firmware ROM / direct kernel ELF / disk),
   platform profile, SMP, chipset (LPC identity, USB), SATA disks (both AHCI
@@ -61,11 +77,15 @@ exposes everything the CLI offers:
 - **Results**: per-run artifact download, named snapshots, named config
   presets, and the process output (stdout receipts + stderr log ring).
 
-The launcher builds the emulator's argv strictly from its option schema
-(unknown/injected values are refused), runs each machine exactly like the
-CLI would (`--monitor=127.0.0.1:<free port>` on loopback, spliced to the
-page's `/ws`), and keeps its state (`~/.x86emu-gui` by default: presets,
-per-run artifacts, snapshots) outside the repository. At the post-mortem
+Both front ends share one core (`tools/launcher.py`): the emulator's argv is
+built strictly from the option schema (unknown/injected values are refused),
+each machine runs exactly like the CLI would (`--monitor=127.0.0.1:<free
+port>` on loopback), and the state (`~/.x86emu-gui` by default: presets,
+per-run artifacts, snapshots, the remembered `bios.bin` location) lives
+outside the repository.  For plain ISO boot the app looks for a stock
+SeaBIOS (`bios.bin`, e.g. from the Debian/Ubuntu `seabios` package or
+seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
+a user-picked copy. At the post-mortem
 "end" stop the page keeps the final state visible; **Остановить** sends the
 monitor's `quit` so the emulator prints its stats and writes the artifacts
 before exiting. There is no authentication — same rules as the live
@@ -179,6 +199,20 @@ The focused CPU tests can be run independently:
 ```sh
 make test-unit
 ```
+
+`make test` includes `make test-gui` (both GUI layers: the web launcher
+vectors in `tests/test_gui_launcher.py` and the desktop app vectors in
+`tests/test_gui_app.py`) and `make test-iso` (`tests/test_iso_boot.py`).
+The ISO lane builds a 1 MiB El Torito test image in memory
+(`tools/mkiso.py` + `tests/fixtures/bootstub.nas`) and must see the boot
+stub's `AURA_ISO_BOOT_OK` marker after stock SeaBIOS reads its MBR off
+the SATA-attached image -- the exact path the GUI's «Загрузка с ISO»
+takes.  It SKIPs (exit 0) without `nasm` or a stock SeaBIOS `bios.bin`
+(found via `--bios`, `$AURALITE_BIOS`, `~/.x86emu-gui`, or the repo);
+the CD lane boots the same ISO through `--cdrom=` (ATAPI + El Torito).  Note
+the image must be at least 1008 sectors (512 B): smaller images round
+the BIOS CHS translation to 0 cylinders and firmware refuses the read
+(measured on stock SeaBIOS 1.16.3).
 
 `make test` also runs the NET wire lane (`make test-net-tx`): a small
 payload (`tests/nic_tx.asm`) boots through the real firmware transport

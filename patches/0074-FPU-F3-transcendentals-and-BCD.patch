@@ -1,0 +1,1077 @@
+From 198532fc5b00283684a06d3ae829a21725e259c2 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Mon, 19 Oct 2026 16:52:10 +0000
+Subject: [PATCH] FPU F3: transcendentals and BCD -- the x87 closes
+
+Phase F3 of docs/plans/FPU_PLAN.md lands the last numeric surface.  All
+eight transcendentals run their real encodings against the host x87 (the
+F2 silicon-exact policy: raw bytes, never GAS mnemonics), so payload
+digits, NaN folding and the odd corners come out of the very unit the
+ISA describes.  The FNINIT-isolated host probes (transprobe{,2..7} --
+the first run taught that FNCLEX does NOT clear C1) measure: FPATAN is
+atan2(ST1,ST0) with the full signed-zero quadrant table; |x| >= 2^63
+leaves the source unchanged with C2=1 and FPTAN/FSINCOS do not push;
+inf input puts QNaN-indefinite in BOTH pair slots (SNaN quiets into
+both) and a full stack faults with IE|SF|C1=1 and indefinite in the two
+written slots.  Quirks pinned by vectors: FYL2X with x=0,y=+-inf gives
+-+inf WITHOUT ZE; FYL2XP1 with x <= -1 returns ST0 for finite nonzero
+ST1 (PE) and ST0*ST1 for ST1 of 0/+-inf; F2XM1 with finite |x| > 1
+returns the source with PE (-inf -> -1.0).
+
+C-flag policy is measured, not assumed: preset probes show every op
+writes C1 (round-up indicator) and the trig four also write C2, while
+C0/C3 -- and C2 on F2XM1/FYL2X/FYL2XP1/FPATAN -- survive from before on
+silicon.  The engine preserves those bits instead of copying unmeasured
+host flags.
+
+FBSTP now rounds per FCW.RC (ties-to-even), tracks PE and the C1
+magnitude-up rule, keeps the source sign even for zero, and stores the
+QNaN-indefinite byte pattern with IE on NaN/Inf/1e18 overflow; denormal
+sources raise no DE (host receipt).  FBLD is pinned as the weighted
+nibble sum it measures to be (A-F count 10-15, no invalid-digit IE,
+sign = bit7 of byte 9).
+
+Vectors: tests/test_fpu.c F3 suites (44 groups total): payload pins,
+the 2^63 boundary, NaN/inf stack shape, the full-stack push fault on
+distinct canaries, FYL2X/FYL2XP1 corners, atan2 quadrants, F2XM1
+domain, the C-flag write policy and the FBSTP RC matrix + invalid
+forms.  Negative control: reverting the engine to the F2 tree reddens
+114 checks.  The frozen T-row pin reaches its permanent edge -- "D9 D1",
+the architecturally reserved hole, #UD forever -- after "D9 C0" (F1),
+"D8 C1" (F2) and "D9 F0" (F3) fell phase by phase.
+
+Gates: make test and make test-sanitize green (5-platform smoke, USB,
+NET and BOOT lanes byte-stable), diff-fuzz 512 programs / 12288
+instructions all-match (0 host crashes), both SeaBIOS ISO lanes green
+(MBR + El Torito).  Docs synced in this commit: the plan gains its F3
+receipt section (1d), CHANGELOG records patch 0074, STATUS closes the
+transcendentals paragraph.
+---
+ CHANGELOG.md           |  39 +++
+ docs/STATUS.md         |  30 ++-
+ docs/plans/FPU_PLAN.md |  53 +++-
+ src/cpu.c              | 203 +++++++++++++--
+ tests/test_fpu.c       | 542 ++++++++++++++++++++++++++++++++++++++++-
+ tests/test_table.c     |   9 +-
+ 6 files changed, 849 insertions(+), 27 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b2541d5..dbff831 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,45 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0074 (FPU F3: transcendentals and BCD -- the x87 closes)
++
++- **Transcendentals**: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/
++  FYL2XP1 execute their real encodings against the host x87 (the F2
++  silicon-exact policy), so result payloads and NaN folding come out of
++  the very unit the ISA describes. Host receipts (`/tmp/transprobe{,2..7}`,
++  FNINIT-isolated): FPATAN is `atan2(ST1,ST0)` with the full signed-zero
++  quadrants; `|x| >= 2^63` leaves the source unchanged with C2=1 and
++  FPTAN/FSINCOS do not push; inf input puts QNaN-indefinite in BOTH
++  FPTAN/FSINCOS slots (SNaN quiets into both) and a full stack faults
++  with IE|SF|C1=1 and indefinite in the two written slots. Quirks pinned
++  as vectors: FYL2X with `x=0, y=±inf` returns `-+inf` WITHOUT ZE;
++  FYL2XP1 with `x <= -1` returns ST0 for finite nonzero ST1 (PE) and
++  `ST0*ST1` for ST1 of 0/±inf; F2XM1 with finite `|x| > 1` returns the
++  source with PE (`-inf -> -1.0`).
++- **C-flag write policy** (measured by preset probes): every
++  transcendental writes C1 (round-up indicator) and the trig four also
++  write C2; C0/C3 -- and C2 on F2XM1/FYL2X/FYL2XP1/FPATAN -- survive
++  from before on silicon, so the engine preserves them instead of
++  copying unmeasured host bits.
++- **FBSTP** rounds to an integer per FCW.RC (ties-to-even), sets PE iff
++  the value changed and C1 iff the magnitude rounded up, keeps the
++  source sign even for a zero result, and on NaN/Inf/`|result| >= 1e18`
++  stores the QNaN-indefinite byte pattern (mem `00 x7 C0 FF FF`) with
++  IE; denormal sources do not raise DE (host receipt). **FBLD** is
++  pinned as the weighted nibble sum it measures to be (nibble values
++  A-F count 10-15, no invalid-digit exception, sign = bit 7 of byte 9).
++- **Vectors**: `tests/test_fpu.c` grows the F3 suites (44 groups total):
++  payload pins, the 2^63 boundary, NaN/inf stack shape, the full-stack
++  push fault on distinct canaries, FYL2X/FYL2XP1 corners, atan2
++  quadrants, F2XM1 domain, the C-flag write policy, and the FBSTP RC
++  matrix + invalid forms; NC red with 114 failures. The frozen T-row
++  pin moves to its permanent edge: `D9 D1` (architecturally reserved
++  hole, #UD forever) after `D9 C0`/`D8 C1`/`D9 F0` fell phase by phase.
++- Gates: `make test` and `make test-sanitize` green (5-platform smoke,
++  USB, NET and BOOT lanes byte-stable), diff-fuzz 512 programs / 12 288
++  instructions all-match (0 host crashes), both SeaBIOS ISO lanes green
++  (MBR + El Torito).
++
+ ### Added — patch 0073 (FPU F2: arithmetic and compare -- x87 computes)
+ 
+ - **D8/DA/DC/DE arithmetic**: FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR in the
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index aba38e0..a4efac9 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -787,6 +787,28 @@
+   `D9 F0` (F2XM1) is the pinned #UD edge until F3.  Gates: `make test`
+   and `make test-sanitize` green, diff-fuzz 512/12 288 all-match, both
+   SeaBIOS ISO lanes green.
++- FPU F3 (`patches/0074-FPU-F3-transcendentals-and-BCD.patch`): x87
++  transcendentals and the BCD store contract. FSIN/FCOS/FSINCOS/FPTAN/
++  FPATAN/F2XM1/FYL2X/FYL2XP1 run their real encodings on the host unit
++  (the same silicon-exact policy as F2), so payload digits, NaN folding
++  (QNaN beats SNaN; ties take the larger payload), the `|x| >= 2^63`
++  C2/no-push boundary, FPATAN = atan2 with the signed-zero quadrants and
++  the odd corners (FYL2X `x=0,y=±inf` gives `-+inf` with NO ZE; FYL2XP1
++  `x<=-1` returns ST0 for finite nonzero ST1; F2XM1 `|x|>1` returns the
++  source with PE) are host receipts pinned by vectors. C-flag policy
++  measured on silicon: every op writes C1, the trig four write C2,
++  C0/C3 (and C2 on the rest) survive. FBSTP now rounds per FCW.RC
++  (ties-to-even), tracks PE/C1 (magnitude-up), keeps the source sign,
++  and stores the QNaN-indefinite byte pattern with IE on NaN/Inf/1e18
++  overflow; FBLD stays the weighted nibble sum (A-F count 10-15, no
++  invalid-digit IE). Vectors: `tests/test_fpu.c` F3 suites (payload
++  pins, huge-C2, NaN/inf stack shape, full-stack push fault, FYL2X/
++  FYL2XP1 corners, atan2 quadrants, F2XM1 domain, C-flag write policy,
++  FBSTP RC matrix + invalid, FBLD receipts); NC red with 114 failures.
++  Frozen T-row moved to its final edge: `D9 D1`, the architecturally
++  reserved hole (#UD forever).  Gates: `make test` and `make
++  test-sanitize` green, diff-fuzz 512/12 288 all-match, both SeaBIOS
++  ISO lanes green.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+@@ -935,7 +957,9 @@ publishes no RSDP and reports seven E820 entries; that lane is historical and
+ deliberately unchanged.  The ACPI PM block models only the Timer register
+ (PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
+ so no power-management transition is claimed.  The x87 surface is
+-data, control (F1) and arithmetic/compare (F2) now; the transcendental
+-escapes (FSIN/FCOS/FSINCOS/FPATAN/FPTAN/F2XM1/FYL2X/FYL2XP1) still
+-raise #UD -- phase F3 of the FPU plan owns them.  x87 registers are not
++complete for the plan's F0–F3 scope (data, control, arithmetic/compare,
++transcendentals and BCD); the only remaining x87 #UD surface is the
++architecturally reserved register holes (D9 D1–D7, DD/DE/DF unmapped
++forms), pinned by the frozen table suite.  F4 closes the plan with
++integration receipts.  x87 registers are not
+ part of the gdbstub `g`-packet contract.
+diff --git a/docs/plans/FPU_PLAN.md b/docs/plans/FPU_PLAN.md
+index 6f9b5f7..eb883ef 100644
+--- a/docs/plans/FPU_PLAN.md
++++ b/docs/plans/FPU_PLAN.md
+@@ -6,14 +6,14 @@
+ > not assumed. Baseline measured 2026-10-18 on
+ > `AuraLite-Emulator@30d1c5d` (post G2/S6, x86-64 Linux reference host).
+ 
+-**Status: F0–F2 done ✅; F3–F4 queued**
++**Status: F0–F3 done ✅; F4 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | F0 | Baseline measurement + this plan (see §1 receipts) | ✅ done | rides with F1 |
+ | F1 | x87 state and data movement: the physical register file (80-bit IEEE 854) + TOP + FSW/FTW/FCW, FLD/FST/FSTP (m32/m64/m80 + ST(i)), FILD/FIST/FISTP (m16/m32/m64), FLD constants, FXCH/FFREE/FINCSTP/FDECSTP/FNOP, FNSTSW(AX/m16)/FNSTCW/FLDCW/FNINIT/FNCLEX, FNSTENV/FLDENV/FNSAVE/FRSTOR, live x87 in FXSAVE/FXRSTOR, CR0.EM/TS traps (#UD/#NM), rounding per FCW.RC with #MF on unmasked precision/underflow/overflow | ✅ done | `patches/0072-FPU-F1-x87-state-and-data.patch` |
+ | F2 | Arithmetic and compare: FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR (+P/+I/+R forms), FSQRT/FRNDINT/FPREM/FPREM1/FSCALE/FXTRACT, FCOM/FUCOM/FICOM families + FCOMI/FCOMIP/FUCOMI/FUCOMPP (FCHS/FABS/FTST/FXAM/FCMOV* landed early in F1 -- they are data/status, not arithmetic) | ✅ done | `patches/0073-FPU-F2-arithmetic-and-compare.patch` |
+-| F3 | Transcendentals + BCD: FSIN/FCOS/FSINCOS/FPATAN/FPTAN/F2XM1/FYL2X/FYL2XP1, FBLD/FBSTP | ⬜ queued | — |
++| F3 | Transcendentals + BCD: FSIN/FCOS/FSINCOS/FPATAN/FPTAN/F2XM1/FYL2X/FYL2XP1, FBLD/FBSTP | ✅ done | §1d receipts (`/tmp/transprobe{,2..7}`, `/tmp/bcdprobe`); 11 new vector groups; NC red with 114 failures |
+ | F4 | Integration: a `--kernel=` freestanding payload receipts pair (determinism x2), snapshot byte-stability of the x87 file, STATUS close-out | ⬜ queued | — |
+ 
+ ## 1. Measured baseline (F0)
+@@ -106,6 +106,55 @@ escape dispatch wholesale (measured: 104 vector failures, `test-fpu-nc`).
+ - **FRNDINT/FSQRT/FSCALE honour FCW.RC** through the host control word
+   (the F2 core sets `fesetround` before every numeric op).
+ 
++## 1d. F3 measured receipts (transcendentals + BCD)
++
++Host oracles `/tmp/transprobe{,2..7}` + `/tmp/bcdprobe` (raw encodings,
++FNINIT-isolated per case -- the first probe run taught that FNCLEX does
++NOT clear C1, so unpinned flags were polluted; every number below is
++from an isolated run).
++
++- **Semantics**: FPATAN = `atan2(y=ST1, x=ST0)` with the full signed-zero
++  quadrant table (`atan2(+0,-0)=+pi`, `atan2(-0,+0)=-0`, `atan2(±0,+inf)=±0`);
++  FYL2X = `ST1*log2(ST0)`; FYL2XP1 = `ST1*log2(1+ST0)`.
++- **Range-reduction boundary (trig four)**: `|x| >= 2^63` (exact
++  `2^63-eps` still computes) -> source UNCHANGED, C2=1, C1=0, quiet, and
++  FPTAN/FSINCOS do **not** push at all.
++- **Push-op shape**: FPTAN -> `[1.0, tan(x)]`, FSINCOS -> `[cos, sin]`
++  (ST0 on top). Inf input -> QNaN-indefinite in BOTH slots + IE; QNaN ->
++  the source NaN twice; SNaN -> its quieted form twice + IE. On a full
++  stack the op still pushes (ftop moves) but BOTH the old ST0 and the
++  push slot become indefinite with IE|SF|C1=1 (measured on distinct
++  canaries).
++- **NaN folding (two NaN inputs)**: QNaN beats SNaN in either position;
++  two QNaNs or two SNaNs -> the larger payload, quieted. Single SNaN ->
++  that NaN quieted + IE. (Undefined by SDM; pinned as host receipts.)
++- **F2XM1 domain quirk**: finite `|x| > 1` returns the SOURCE with PE
++  (1.5 -> 1.5, -2 -> -2); `+inf -> +inf`, `-inf -> -1.0` (the identity
++  `2^x-1` survives at infinities).
++- **FYL2X corners**: `x=0, y finite nonzero` -> `-sign(y)*inf` + ZE;
++  `x=0, y=±inf` -> `-+inf` WITHOUT the ZE (host quirk!); `x=0, y=±0` or
++  `y=0, x=+inf` -> indefinite + IE (0*inf); `x<0` -> indefinite + IE;
++  `x=+inf` -> `y*inf` folding. FYL2XP1 `x <= -1` -> the host returns
++  ST0 itself for finite nonzero ST1 (with PE), `ST0*ST1` for
++  ST1 in {0, ±inf}; `x=-inf` -> indefinite + IE.
++- **C-flag policy (probes 6/7)**: all eight ops WRITE C1 (the round-up
++  indicator: FSIN(0.5) C1=1, F2XM1(0.5) C1=0 under RC=nearest); the trig
++  four also WRITE C2; C0/C3 -- and C2 on F2XM1/FYL2X/FYL2XP1/FPATAN --
++  are preserved on silicon (preset survives), so the engine preserves
++  them too and never copies unmeasured host bits.
++- **FBLD**: a pure weighted nibble sum -- nibble values A-F count as
++  10-15 with NO invalid-digit exception; sign = bit 7 of byte 9 (the
++  low nibble ignored); always exact, no flags, C flags untouched.
++  (The all-FF byte pattern is NOT an "indefinite" for FBLD: it loads
++  -1666666666666666665.)
++- **FBSTP**: rounds to an integer per FCW.RC (ties-to-even under
++  RC=nearest), PE iff the value changed, C1 iff the magnitude rounded
++  UP (1.5 down -> 1 C1=0; -1.5 down -> -2 C1=1; 2.5 near -> 2 C1=0),
++  source sign kept even for a zero result (FBSTP(-0.9, up) -> -0);
++  NaN/Inf/rounded `|v| >= 1e18` -> IE + the QNaN-indefinite byte pattern
++  (mem `00 x7 C0 FF FF`); denormal sources do NOT raise DE (measured);
++  C0/C2/C3 untouched (measured: preset survives).
++
+ ## 2. Architecture decisions (F1)
+ 
+ - **Format.** The x87 register file holds IEEE 854 *double-extended*
+diff --git a/src/cpu.c b/src/cpu.c
+index c16996b..d7fd889 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -1120,7 +1120,14 @@ static int x87_to_int16(long double v, int16_t *out, uint16_t *raised) {
+     if (r != (long double)v) *raised |= FSW_PE;
+     return 1;
+ }
+-/* packed BCD (10 bytes): 9 digits + sign nibble */
++/* packed BCD (10 bytes): 18 digits + sign nibble (F3 receipts: bcdprobe,
++ * transprobe3/5). FBLD is a pure weighted nibble sum -- nibble values
++ * A-F count as 10-15 with NO invalid-digit exception, sign = bit 7 of
++ * byte 9 (low nibble ignored). FBSTP rounds to an integer per FCW.RC
++ * (ties-to-even), sets PE iff the value changed and C1 iff the magnitude
++ * rounded UP, keeps the source sign even for a zero result, and on
++ * NaN/Inf/|result| >= 1e18 stores the QNaN-indefinite bit pattern (mem
++ * 00 x7 C0 FF FF) with IE. Denormal sources do NOT raise DE (measured). */
+ static long double x87_from_bcd(const uint8_t b[10]) {
+     long double v = 0, mul = 1;
+     for (int i = 0; i < 9; i++) {
+@@ -1130,16 +1137,27 @@ static long double x87_from_bcd(const uint8_t b[10]) {
+     if (b[9] & 0x80) v = -v;
+     return v;
+ }
+-static void x87_to_bcd(long double v, uint8_t b[10]) {
+-    int neg = signbit(v) != 0;
+-    long double a = fabsl(v);
++static void x87_to_bcd(long double v, uint8_t b[10], uint16_t *raised, unsigned *c1) {
+     memset(b, 0, 10);
++    long double r = x87_round_to_int(v);   /* rintl under the current RC */
++    if (isnan(r) || isinf(r) || fabsl(r) >= 1.0e18L) {
++        b[7] = 0xC0; b[8] = 0xFF; b[9] = 0xFF;   /* QNaN-indefinite */
++        *raised |= FSW_IE;
++        *c1 = 0;
++        return;
++    }
++    if (r != v) {
++        *raised |= FSW_PE;
++        *c1 = (fabsl(r) > fabsl(v)) ? 1u : 0u;
++    } else {
++        *c1 = 0;
++    }
++    uint64_t n = (uint64_t)fabsl(r);   /* |r| < 1e18 fits */
+     for (int i = 0; i < 9; i++) {
+-        int lo = (int)fmodl(a, 10.0L); a = (a - (long double)lo) / 10.0L;
+-        int hi = (int)fmodl(a, 10.0L); a = (a - (long double)hi) / 10.0L;
+-        b[i] = (uint8_t)(lo | (hi << 4));
++        b[i] = (uint8_t)((n % 10u) | ((n / 10u % 10u) << 4));
++        n /= 100u;
+     }
+-    b[9] = neg ? 0x80 : 0x00;
++    b[9] = signbit(v) ? 0x80u : 0x00u;
+ }
+ 
+ /* ---- environment image (HOST-MEASURED layouts, envprobe2 receipt) ----
+@@ -1340,6 +1358,95 @@ static void x87_u_xtract(long double v, long double *s, long double *e, uint16_t
+ { (void)v; *s = 0; *e = 0; (void)r; }
+ #endif
+ 
++/* ---------------------------------------------------------------- x87 F3 --
++ * Transcendentals (phase F3) -- host silicon again: the real fsin/fcos/
++ * fsincos/fptan/fpatan/f2xm1/fyl2x/fyl2xp1 encodings run against the host
++ * unit, so payload digits, NaN folding, and the odd corners (FYL2XP1 with
++ * ST0 <= -1 returns ST0 for finite nonzero ST1 and ST0*ST1 for ST1 of
++ * 0/inf; FYL2X with ST0=0, ST1=+-inf gives -+inf WITHOUT ZE) all come out
++ * of the very silicon the ISA describes. Receipts: /tmp/transprobe{,2..7}.
++ *
++ * C-flag policy (transprobe6/7): all eight WRITE C1 (the round-up
++ * indicator); the trig four (FSIN/FCOS/FPTAN/FSINCOS) also WRITE C2
++ * (1 = range reduction incomplete, |x| >= 2^63). C0/C3 -- and C2 on the
++ * other four -- are undefined on silicon and measured PRESERVED there,
++ * so the engine preserves them too and never copies unmeasured host bits.
++ */
++
++enum { XT_2XM1, XT_L2X, XT_L2XP1, XT_PATAN, XT_SIN, XT_COS, XT_SINCOS, XT_TAN };
++
++static long double x87_indefinite(void) {
++    uint8_t b[10] = {0,0,0,0,0,0,0,0xC0,0xFF,0xFF};
++    return x87_ld_from80(b);
++}
++static void x87_c1(cpu_t *c, uint16_t psw) {
++    c->fsw &= (uint16_t)~FSW_C1;
++    if (psw & 0x0200u) c->fsw |= FSW_C1;
++}
++static void x87_c12(cpu_t *c, uint16_t psw) {
++    x87_c1(c, psw);
++    c->fsw &= (uint16_t)~FSW_C2;
++    if (psw & 0x0400u) c->fsw |= FSW_C2;
++}
++
++#if defined(__x86_64__) || defined(__i386__)
++/* single-result op; x = ST0, y = ST1 (the log2/atan2 family) */
++static long double x87_t_pair(int kind, long double x, long double y,
++                              uint16_t *raised, uint16_t *psw) {
++    long double r;
++    if (x87_is_denorm(x) || x87_is_denorm(y)) *raised |= FSW_DE;
++    feclearexcept(FE_ALL_EXCEPT);
++    switch (kind) {
++    case XT_2XM1:
++        __asm__ volatile("fldt %2; .byte 0xD9,0xF0; fnstsw %1; fstpt %0"
++                     : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
++        break;
++    case XT_L2X:
++        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF1; fnstsw %1; fstpt %0"
++                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
++        break;
++    case XT_L2XP1:
++        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF9; fnstsw %1; fstpt %0"
++                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
++        break;
++    case XT_PATAN:
++        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF3; fnstsw %1; fstpt %0"
++                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
++        break;
++    default: /* XT_SIN / XT_COS */
++        if (kind == XT_SIN)
++            __asm__ volatile("fldt %2; .byte 0xD9,0xFE; fnstsw %1; fstpt %0"
++                         : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
++        else
++            __asm__ volatile("fldt %2; .byte 0xD9,0xFF; fnstsw %1; fstpt %0"
++                         : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
++        break;
++    }
++    x87_get_fenv(raised);
++    return r;
++}
++/* push-pair op: after the op ST0 = r0, ST1 = r1 (FPTAN: 1.0 then tan;
++ * FSINCOS: cos then sin; NaN/inf inputs give the special in BOTH slots) */
++static void x87_t_pushpair(int kind, long double x, long double *r0, long double *r1,
++                           uint16_t *raised, uint16_t *psw) {
++    if (x87_is_denorm(x)) *raised |= FSW_DE;
++    feclearexcept(FE_ALL_EXCEPT);
++    if (kind == XT_TAN)
++        __asm__ volatile("fldt %3; .byte 0xD9,0xF2; fnstsw %1; fstpt %0; fstpt %2"
++                     : "=m"(*r0), "=a"(*psw), "=m"(*r1) : "m"(x) : "st", "memory");
++    else
++        __asm__ volatile("fldt %3; .byte 0xD9,0xFB; fnstsw %1; fstpt %0; fstpt %2"
++                     : "=m"(*r0), "=a"(*psw), "=m"(*r1) : "m"(x) : "st", "memory");
++    x87_get_fenv(raised);
++}
++#else
++static long double x87_t_pair(int kind, long double x, long double y, uint16_t *r, uint16_t *p)
++{ (void)kind; (void)x; (void)y; (void)r; (void)p; return 0; }
++static void x87_t_pushpair(int kind, long double x, long double *a, long double *b,
++                           uint16_t *r, uint16_t *p)
++{ (void)kind; (void)x; *a = 0; *b = 0; (void)r; (void)p; }
++#endif
++
+ /* compare result codes */
+ enum { XCP_GT, XCP_LT, XCP_EQ, XCP_UNORD };
+ 
+@@ -1534,8 +1641,9 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             }
+             x87_push(c, x87_ld_from80(b), &raised); break; }
+         default: {
+-            /* F2 unaries live here; F2XM1..FCOS stay the F3 boundary and
+-             * the D1-D7/E2/E3/E6/E7/EF holes keep their #UD. */
++            /* F2 unaries + F3 transcendentals live here; the D1-D7/E2/E3/
++             * E6/E7/EF register holes stay reserved (#UD, pinned in the
++             * table suite). */
+             uint16_t psw = 0;
+             long double v;
+             x87_set_round(c);
+@@ -1585,9 +1693,71 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                 c->fst[x87_phys(c, 0)] = v;
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 break;
+-            case 0xF0: case 0xF1: case 0xF2: case 0xF3:
+-            case 0xF9: case 0xFB: case 0xFE: case 0xFF:
+-                faultf(c, "#UD x87 transcendental out of scope (F3)"); return;
++            case 0xF0: { /* F2XM1: ST0 = 2^ST0 - 1 (|x|>1: source + PE quirk) */
++                if (!x87_check_src(c, 0, &raised)) break;
++                v = x87_t_pair(XT_2XM1, c->fst[x87_phys(c, 0)], 0.0L, &raised, &psw);
++                c->fst[x87_phys(c, 0)] = v;
++                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
++                x87_c1(c, psw);
++                break; }
++            case 0xF1: case 0xF9: case 0xF3: {
++                /* FYL2X: ST1 = ST1*log2(ST0); FYL2XP1: ST1 = ST1*log2(1+ST0);
++                 * FPATAN: ST1 = atan2(ST1, ST0) -- then pop (result at ST0). */
++                if (!x87_check_src(c, 0, &raised)) break;
++                if (!x87_check_src(c, 1, &raised)) break;
++                int kind = (modrm == 0xF1) ? XT_L2X : (modrm == 0xF9) ? XT_L2XP1 : XT_PATAN;
++                v = x87_t_pair(kind, c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)],
++                               &raised, &psw);
++                c->fst[x87_phys(c, 1)] = v;
++                x87_set_tag(c, x87_phys(c, 1), x87_class(v));
++                x87_pop(c, &raised);
++                x87_c1(c, psw);
++                break; }
++            case 0xFE: case 0xFF: { /* FSIN / FCOS */
++                if (!x87_check_src(c, 0, &raised)) break;
++                v = c->fst[x87_phys(c, 0)];
++                if (!isnan(v) && !isinf(v) && fabsl(v) >= 0x1p63L) {
++                    /* host receipt: |x| >= 2^63 -> source unchanged, C2=1,
++                     * C1=0, quiet (transprobe2 boundary) */
++                    c->fsw &= (uint16_t)~(FSW_C1 | FSW_C2);
++                    c->fsw |= FSW_C2;
++                    break;
++                }
++                v = x87_t_pair(modrm == 0xFE ? XT_SIN : XT_COS, v, 0.0L, &raised, &psw);
++                c->fst[x87_phys(c, 0)] = v;
++                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
++                x87_c12(c, psw);
++                break; }
++            case 0xF2: case 0xFB: { /* FPTAN: [1.0, tan]; FSINCOS: [cos, sin] */
++                if (!x87_check_src(c, 0, &raised)) break;
++                v = c->fst[x87_phys(c, 0)];
++                if (!isnan(v) && !isinf(v) && fabsl(v) >= 0x1p63L) {
++                    /* huge: no push at all, source unchanged, C2=1, C1=0 */
++                    c->fsw &= (uint16_t)~(FSW_C1 | FSW_C2);
++                    c->fsw |= FSW_C2;
++                    break;
++                }
++                long double r0, r1;
++                x87_t_pushpair(modrm == 0xF2 ? XT_TAN : XT_SINCOS, v,
++                               &r0, &r1, &raised, &psw);
++                int dst = (c->ftop - 1) & 7;
++                if (x87_get_tag(c, dst) != X87_T_EMPTY) {
++                    /* stack fault (transprobe3): IE|SF|C1=1 and BOTH the
++                     * old ST0 and the push slot become indefinite */
++                    raised |= FSW_IE | FSW_SF;
++                    c->fsw |= FSW_C1;
++                    r0 = x87_indefinite();
++                    r1 = x87_indefinite();
++                } else {
++                    x87_c12(c, psw);
++                }
++                c->ftop = dst;
++                c->fst[dst] = r0;
++                x87_set_tag(c, dst, x87_class(r0));
++                c->fst[(dst + 1) & 7] = r1;
++                x87_set_tag(c, (dst + 1) & 7, x87_class(r1));
++                x87_sync_top(c);
++                break; }
+             default:
+                 faultf(c, "#UD x87 D9 reg form out of scope (%02x)", modrm); return;
+             }
+@@ -1796,10 +1966,13 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             case 5: { /* FILD m64 */
+                 int64_t v = (int64_t)read_mem_v(m, ea, 8);
+                 x87_push(c, (long double)v, &raised); break; }
+-            case 6: { /* FBSTP m80 BCD */
++            case 6: { /* FBSTP m80 BCD (F3: rounds per RC, C1/PE/IE live) */
+                 if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+-                uint8_t b[10]; x87_to_bcd(c->fst[x87_phys(c, 0)], b);
++                uint8_t b[10]; unsigned c1 = 0;
++                x87_set_round(c);
++                x87_to_bcd(c->fst[x87_phys(c, 0)], b, &raised, &c1);
+                 for (int j = 0; j < 10; j++) write_mem_v(m, ea + (uint64_t)j, 1, b[j]);
++                if (c1) c->fsw |= FSW_C1; else c->fsw &= (uint16_t)~FSW_C1;
+                 x87_pop(c, &raised); break; }
+             case 7: { /* FISTP m64 */
+                 if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+diff --git a/tests/test_fpu.c b/tests/test_fpu.c
+index 27652f0..25c1a75 100644
+--- a/tests/test_fpu.c
++++ b/tests/test_fpu.c
+@@ -621,10 +621,12 @@ static void v_env(void) {
+ 
+ /* ============ the F3 transcendental boundary stays a pinned #UD ===== */
+ static void v_transcendental_boundary(void) {
++    /* F3 landed the transcendentals: the old #UD pins fell here. The
++     * architectural reserved holes (D9 D1-D7 etc.) keep their #UD and are
++     * pinned by the frozen table suite ("x87 d9 hole stays #UD"). */
+     static const uint8_t f2xm1[] = { 0xD9, 0xF0, 0xF4 };  /* F2XM1 */
+-    CHECK(run(f2xm1, sizeof f2xm1, 8) == -1, "F2XM1 must stay #UD until F3");
+-    static const uint8_t fsin[] = { 0xD9, 0xFE, 0xF4 };   /* FSIN */
+-    CHECK(run(fsin, sizeof fsin, 8) == -1, "FSIN must stay #UD until F3");
++    CHECK(run(f2xm1, sizeof f2xm1, 8) == 0, "F2XM1 computes since F3");
++    CHECK(eq80(g.cpu.fst[g.cpu.ftop], K_FLDZ), "F2XM1(0) != 0");
+ }
+ 
+ /* =================================================================== */
+@@ -1092,6 +1094,529 @@ static void v_d6_flag_map(void) {
+     CHECK((g.cpu.fsw & 0x08u) == 0x08u, "OE is bit3");
+ }
+ 
++/* =================================================================== */
++/* F3 vectors: transcendentals + BCD (host-silicon receipts,            */
++/* /tmp/transprobe{,2..7}: results, C-flag writes, push shape, corners) */
++/* =================================================================== */
++
++/* host-measured 80-bit payloads (transprobe2; mem order like K_* above) */
++static const uint8_t K_SIN_HALF [10] = {0x44,0x7F,0x2F,0x58,0xA2,0x43,0x77,0xF5,0xFD,0x3F};
++static const uint8_t K_COS_HALF [10] = {0xEE,0x7C,0xEA,0xDB,0x32,0x40,0xA9,0xE0,0xFE,0x3F};
++static const uint8_t K_TAN_HALF [10] = {0x19,0x52,0x3A,0x9A,0xDF,0x7A,0xDA,0x8B,0xFE,0x3F};
++static const uint8_t K_PI4     [10] = {0x35,0xC2,0x68,0x21,0xA2,0xDA,0x0F,0xC9,0xFE,0x3F};
++static const uint8_t K_PI2     [10] = {0x35,0xC2,0x68,0x21,0xA2,0xDA,0x0F,0xC9,0xFF,0x3F};
++static const uint8_t K_3PI4    [10] = {0xA8,0x91,0x0E,0x99,0xF9,0xE3,0xCB,0x96,0x00,0x40};
++static const uint8_t K_2XM1_HALF[10] = {0x11,0x92,0x79,0xE7,0xCF,0xCC,0x13,0xD4,0xFD,0x3F};
++static const uint8_t K_L2XP1   [10] = {0x6F,0xCB,0xC1,0xF9,0x56,0x27,0xA0,0xE0,0xFF,0x3F};
++static const uint8_t K_Q1      [10] = {0x01,0x00,0x00,0x00,0x00,0x00,0x00,0xC0,0xFF,0x7F};
++
++/* m80 store helpers: write ST0 back to memory at [bx] and halt */
++static void put_val(uint64_t at, long double v) { put80(at, v); }
++static long double mk_val(uint16_t se, uint64_t sig) {
++    uint8_t b[16]; memset(b, 0, 16);
++    memcpy(b, &sig, 8); b[8] = (uint8_t)se; b[9] = (uint8_t)(se >> 8);
++    long double v; memcpy(&v, b, 16); return v;
++}
++/* 10-byte pattern compare against guest memory */
++static int mem_cmp(uint64_t at, const uint8_t want[10]) {
++    for (int i = 0; i < 10; i++)
++        if ((uint8_t)mem_read(&g, at + (uint64_t)i, 1) != want[i]) return 0;
++    return 1;
++}
++
++/* FSIN/FCOS/F2XM1 one-operand shape: fld [bx]; OP; fstp [bx]; hlt */
++static void v_trans_results(void) {
++    static const uint8_t sin_p[]  = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFE, 0xDB,0x3F, 0xF4};
++    static const uint8_t cos_p[]  = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFF, 0xDB,0x3F, 0xF4};
++    static const uint8_t x2m1_p[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF0, 0xDB,0x3F, 0xF4};
++    /* fptan pair: [0x3000]=1.0 slot, tan stored to 0x3010 */
++    static const uint8_t tan_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF2, 0xDB,0x3F,
++        0xBB,0x10,0x30, 0xDB,0x3F, 0xF4};
++    static const uint8_t sincos_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFB, 0xDB,0x3F,
++        0xBB,0x10,0x30, 0xDB,0x3F, 0xF4};
++
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(!g.cpu.fault, "fsin 0.5 fault");
++    CHECK(mem_cmp(0x3000, K_SIN_HALF), "sin(0.5) payload");
++
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, cos_p, sizeof cos_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_COS_HALF), "cos(0.5) payload");
++
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_2XM1_HALF), "f2xm1(0.5) payload");
++    CHECK((g.cpu.fsw & 0x020u) == 0x020u, "f2xm1(0.5) PE");
++    CHECK(fsw_c1() == 0, "f2xm1 C1=0 (round-down receipt)");
++
++    /* exact identities */
++    setup_machine(&g); put_val(0x3000, 0.0L);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_FLDZ), "sin(0)=0");
++    CHECK(g.cpu.fsw == 0, "sin(0) clean FSW=%04x", g.cpu.fsw);
++    setup_machine(&g); put_val(0x3000, 0.0L);
++    run_program(&g, cos_p, sizeof cos_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_FLD1), "cos(0)=1");
++    setup_machine(&g); put_val(0x3000, 1.0L);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_FLD1), "f2xm1(1)=1");
++    CHECK((g.cpu.fsw & 0x020u) == 0x020u, "f2xm1(1) PE (host receipt)");
++    setup_machine(&g); put_val(0x3000, -1.0L);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    { uint8_t want[10] = {0,0,0,0,0,0,0,0x80,0xFE,0xBF};  /* -0.5 */
++      CHECK(mem_cmp(0x3000, want), "f2xm1(-1)=-0.5"); }
++
++    /* fptan(0.5): ST0=1.0, ST1=tan(0.5) */
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, tan_p, sizeof tan_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_FLD1), "fptan top=1.0");
++    CHECK(mem_cmp(0x3010, K_TAN_HALF), "fptan tan(0.5) payload");
++    CHECK(fsw_c1() == 1 && (g.cpu.fsw & 0x020u), "fptan C1=1 PE");
++
++    /* fsincos(0.5): ST0=cos, ST1=sin */
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, sincos_p, sizeof sincos_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_COS_HALF), "fsincos cos");
++    CHECK(mem_cmp(0x3010, K_SIN_HALF), "fsincos sin");
++
++    /* fpatan(y=1,x=1) = pi/4 (rounded pi/4 mantissa == FLDPI's) */
++    static const uint8_t atan_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,              /* fld y */
++        0x83,0xC3,0x10, 0xDB,0x2F,              /* fld x */
++        0xD9,0xF3, 0xDB,0x3F, 0xF4};
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, 1.0L);
++    run_program(&g, atan_p, sizeof atan_p, 0, 16);
++    CHECK(mem_cmp(0x3010, K_PI4), "fpatan(1,1)=pi/4");
++
++    /* fyl2x(y=3,x=2) = 3.0 exact-ish (3*log2(2)); fyl2xp1(y=3,x=0.5) */
++    static const uint8_t l2x_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF1, 0xDB,0x3F, 0xF4};
++    static const uint8_t l2xp1_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF9, 0xDB,0x3F, 0xF4};
++    setup_machine(&g); put_val(0x3000, 3.0L); put_val(0x3010, 2.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    { long double want = 3.0L; uint8_t wb[10]; to80(want, wb);
++      CHECK(mem_cmp(0x3010, wb), "fyl2x(3,2)=3"); }
++    setup_machine(&g); put_val(0x3000, 3.0L); put_val(0x3010, 0.5L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, K_L2XP1), "fyl2xp1(3,0.5) payload");
++}
++
++/* the |x| >= 2^63 boundary: source unchanged, C2=1, no push, quiet */
++static void v_trans_huge_c2(void) {
++    static const uint8_t sin_p[]  = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFE, 0xDB,0x3F, 0xF4};
++    static const uint8_t tan_p[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF2, 0xF4};
++    long double big = 0x1p63L;      /* 2^63 */
++    long double near = 0x1p63L - 1024.0L;  /* still 2^63? no: 2^63-1024 */
++    uint8_t bb[10]; to80(big, bb);
++
++    setup_machine(&g); put_val(0x3000, big);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(mem_cmp(0x3000, bb), "sin(2^63) source unchanged");
++    CHECK(fsw_c2() == 1 && fsw_c1() == 0, "sin(2^63) C2=1 C1=0");
++    CHECK(g.cpu.fsw == 0x0400u, "sin(2^63) quiet FSW=%04x", g.cpu.fsw);
++
++    setup_machine(&g); put_val(0x3000, near);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(fsw_c2() == 0, "sin(2^63-1024) reduces (C2=0)");
++    CHECK(!mem_cmp(0x3000, bb), "sin(2^63-1024) computed");
++
++    /* fptan huge: no push at all (the one fld stays at ftop=7) */
++    setup_machine(&g); put_val(0x3000, big);
++    run_program(&g, tan_p, sizeof tan_p, 0, 16);
++    CHECK(g.cpu.ftop == 7, "fptan huge must not push (ftop=%d)", g.cpu.ftop);
++    CHECK(g.cpu.fst[7] == big, "fptan huge source unchanged");
++    CHECK(fsw_c2() == 1 && (g.cpu.fsw & 0xC7FFu) == 0x0400u, "fptan huge FSW=%04x", g.cpu.fsw);
++
++    static const uint8_t sincos_p[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFB, 0xF4};
++    setup_machine(&g); put_val(0x3000, big);
++    run_program(&g, sincos_p, sizeof sincos_p, 0, 16);
++    CHECK(g.cpu.ftop == 7, "fsincos huge must not push");
++    CHECK(g.cpu.fst[7] == big, "fsincos huge unchanged");
++}
++
++/* NaN/inf shapes (transprobe2): passthrough, quiet-on-SNaN, double-indef */
++static void v_trans_nan_inf(void) {
++    static const uint8_t sin_p[]  = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFE, 0xDB,0x3F, 0xF4};
++    static const uint8_t tan_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF2, 0xDB,0x3F,
++        0xBB,0x10,0x30, 0xDB,0x3F, 0xF4};
++    long double inf  = mk_val(0x7FFF, 0x8000000000000000ull);
++    long double qnan = mk_val(0x7FFF, 0xC000000000000000ull);
++    long double snan = mk_val(0x7FFF, 0x8000000000000001ull);
++
++    setup_machine(&g); put_val(0x3000, inf);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_INDEF), "sin(inf)=indefinite");
++    CHECK(g.cpu.fsw & 0x001u, "sin(inf) IE");
++
++    setup_machine(&g); put_val(0x3000, qnan);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_INDEF) == 0, "sin(qnan) not indefinite");
++    { uint8_t qb[10]; to80(qnan, qb); CHECK(mem_cmp(0x3000, qb), "sin(qnan) passthrough bits"); }
++    CHECK(g.cpu.fsw == 0, "sin(qnan) quiet FSW=%04x", g.cpu.fsw);
++
++    setup_machine(&g); put_val(0x3000, snan);
++    run_program(&g, sin_p, sizeof sin_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_Q1), "sin(snan) quieted payload");
++    CHECK(g.cpu.fsw & 0x001u, "sin(snan) IE");
++
++    /* fptan(inf): BOTH slots indefinite, push happened */
++    setup_machine(&g); put_val(0x3000, inf);
++    run_program(&g, tan_p, sizeof tan_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_INDEF), "fptan(inf) top indef");
++    CHECK(mem_cmp(0x3010, K_INDEF), "fptan(inf) tan indef");
++    CHECK(g.cpu.fsw & 0x001u, "fptan(inf) IE");
++
++    setup_machine(&g); put_val(0x3000, qnan);
++    run_program(&g, tan_p, sizeof tan_p, 0, 16);
++    { uint8_t qb[10]; to80(qnan, qb);
++      CHECK(mem_cmp(0x3000, qb), "fptan(qnan) top");
++      CHECK(mem_cmp(0x3010, qb), "fptan(qnan) tan slot"); }
++    CHECK(g.cpu.fsw == 0, "fptan(qnan) quiet");
++
++    static const uint8_t sincos_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xFB, 0xDB,0x3F,
++        0xBB,0x10,0x30, 0xDB,0x3F, 0xF4};
++    setup_machine(&g); put_val(0x3000, snan);
++    run_program(&g, sincos_p, sizeof sincos_p, 0, 16);
++    CHECK(mem_cmp(0x3000, K_Q1), "fsincos(snan) cos quieted");
++    CHECK(mem_cmp(0x3010, K_Q1), "fsincos(snan) sin quieted");
++    CHECK(g.cpu.fsw & 0x001u, "fsincos(snan) IE");
++}
++
++/* push shape + stack faults (transprobe3 full-stack receipts) */
++static void v_trans_stack(void) {
++    /* 7 canaries (2.0 at 0x3000) + arg 0.5 (at 0x3010) = full stack */
++    static const uint8_t tan_full[] = {
++        0xBB,0x00,0x30,
++        0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F,
++        0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF2, 0xF4};
++    static const uint8_t sincos_full[] = {
++        0xBB,0x00,0x30,
++        0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F,
++        0xDB,0x2F, 0xDB,0x2F, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xFB, 0xF4};
++    uint8_t two[10]; to80(2.0L, two);
++
++    setup_machine(&g); put_val(0x3000, 2.0L); put_val(0x3010, 0.5L);
++    run_program(&g, tan_full, sizeof tan_full, 0, 24);
++    CHECK(!g.cpu.fault, "fptan full must not #MF (masked)");
++    CHECK(g.cpu.ftop == 7, "fptan full pushes anyway (ftop=%d)", g.cpu.ftop);
++    CHECK(eq80(g.cpu.fst[7], K_INDEF), "fptan full new ST0 indef");
++    CHECK(eq80(g.cpu.fst[0], K_INDEF), "fptan full old ST0 indef");
++    CHECK(g.cpu.fst[6] == 2.0L, "canary survives");
++    CHECK((g.cpu.fsw & 0x041u) == 0x041u, "IE+SF set FSW=%04x", g.cpu.fsw);
++    CHECK(fsw_c1() == 1, "overflow C1=1");
++
++    setup_machine(&g); put_val(0x3000, 2.0L); put_val(0x3010, 0.5L);
++    run_program(&g, sincos_full, sizeof sincos_full, 0, 24);
++    CHECK(g.cpu.ftop == 7, "fsincos full pushes");
++    CHECK(eq80(g.cpu.fst[7], K_INDEF), "fsincos full ST0 indef");
++    CHECK(eq80(g.cpu.fst[0], K_INDEF), "fsincos full ST1 indef");
++    CHECK((g.cpu.fsw & 0x041u) == 0x041u && fsw_c1() == 1, "fsincos full flags");
++
++    /* underflow: op on empty ST0 -> IE|SF, no fault, stack untouched */
++    static const uint8_t empty[] = { 0xD9, 0xFE, 0xF4 };
++    CHECK(run(empty, sizeof empty, 8) == 0, "fsin empty no fault");
++    CHECK((g.cpu.fsw & 0x041u) == 0x041u, "fsin empty IE+SF FSW=%04x", g.cpu.fsw);
++
++    /* normal push shape: ftop moves by one */
++    static const uint8_t tan_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF2, 0xF4};
++    setup_machine(&g); put_val(0x3000, 0.5L);
++    run_program(&g, tan_p, sizeof tan_p, 0, 16);
++    CHECK(g.cpu.ftop == 6, "fptan normal pushes (ftop=%d)", g.cpu.ftop);
++}
++
++/* FYL2X zero/inf corners (transprobe2 clean receipts, incl. the
++ * x=0,y=+-inf ZE quirk) */
++static void v_trans_l2x_corner(void) {
++    static const uint8_t l2x_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF1, 0xDB,0x3F, 0xF4};
++    long double inf  = mk_val(0x7FFF, 0x8000000000000000ull);
++    uint8_t minf[10], pinf[10], indef[10];
++    to80(-inf, minf); to80(inf, pinf); to80(0.0L, indef);
++    memcpy(indef, K_INDEF, 10);
++
++    /* (y=1, x=0) -> -inf + ZE */
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, 0.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, minf), "fyl2x(1,0)=-inf");
++    CHECK(g.cpu.fsw == 0x0004u, "fyl2x(1,0) ZE only FSW=%04x", g.cpu.fsw);
++
++    /* (y=-1, x=0) -> +inf + ZE */
++    setup_machine(&g); put_val(0x3000, -1.0L); put_val(0x3010, 0.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, pinf), "fyl2x(-1,0)=+inf");
++    CHECK(g.cpu.fsw == 0x0004u, "fyl2x(-1,0) ZE");
++
++    /* (y=0, x=0) -> indefinite + IE */
++    setup_machine(&g); put_val(0x3000, 0.0L); put_val(0x3010, 0.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fyl2x(0,0) indef");
++    CHECK(g.cpu.fsw == 0x0001u, "fyl2x(0,0) IE");
++
++    /* (y=+inf, x=0) -> -inf WITHOUT ZE (host quirk) */
++    setup_machine(&g); put_val(0x3000, inf); put_val(0x3010, 0.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, minf), "fyl2x(inf,0)=-inf");
++    CHECK(g.cpu.fsw == 0, "fyl2x(inf,0) NO ZE (quirk) FSW=%04x", g.cpu.fsw);
++
++    /* (y=1, x=-1) -> indefinite + IE (log of negative) */
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, -1.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fyl2x(1,-1) indef");
++    CHECK(g.cpu.fsw == 0x0001u, "fyl2x(1,-1) IE");
++
++    /* (y=0, x=+inf) -> indefinite + IE (0*inf) */
++    setup_machine(&g); put_val(0x3000, 0.0L); put_val(0x3010, inf);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fyl2x(0,inf) indef");
++    CHECK(g.cpu.fsw == 0x0001u, "fyl2x(0,inf) IE");
++
++    /* denorm operand -> DE */
++    setup_machine(&g); put_val(0x3000, x87_test_denorm()); put_val(0x3010, 2.0L);
++    run_program(&g, l2x_p, sizeof l2x_p, 0, 16);
++    CHECK(g.cpu.fsw & 0x002u, "fyl2x denorm y -> DE");
++}
++
++/* FYL2XP1 domain + the x <= -1 host corner (transprobe4 receipts) */
++static void v_trans_l2xp1_domain(void) {
++    static const uint8_t l2xp1_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF9, 0xDB,0x3F, 0xF4};
++    long double inf  = mk_val(0x7FFF, 0x8000000000000000ull);
++    uint8_t indef[10], one[10], mone[10], mtwo[10], mzero[10], minf[10];
++    memcpy(indef, K_INDEF, 10);
++    to80(1.0L, one); to80(-1.0L, mone); to80(-2.0L, mtwo);
++    to80(-0.0L, mzero); to80(-inf, minf);
++
++    /* normal: (y=1,x=1) -> 1.0 */
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, 1.0L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, one), "fyl2xp1(1,1)=1");
++    CHECK((g.cpu.fsw & 0x020u) == 0x020u, "fyl2xp1(1,1) PE");
++
++    /* normal inexact: (y=1,x=-0.5) -> log2(0.5) = -1 */
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, -0.5L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, mone), "fyl2xp1(1,-0.5)=-1");
++
++    /* host corner x <= -1: (y=5,x=-1) -> x = -1.0 + PE */
++    setup_machine(&g); put_val(0x3000, 5.0L); put_val(0x3010, -1.0L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, mone), "fyl2xp1(5,-1)=-1 (host corner)");
++    CHECK(g.cpu.fsw == 0x0020u, "corner flags FSW=%04x", g.cpu.fsw);
++
++    /* (y=3,x=-2) -> -2.0 (NOT y*x) + PE */
++    setup_machine(&g); put_val(0x3000, 3.0L); put_val(0x3010, -2.0L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, mtwo), "fyl2xp1(3,-2)=-2 (host corner)");
++
++    /* (y=0,x=-1) -> -0 (x*y fold) */
++    setup_machine(&g); put_val(0x3000, 0.0L); put_val(0x3010, -1.0L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, mzero), "fyl2xp1(0,-1)=-0");
++    CHECK(g.cpu.fsw == 0, "fold quiet FSW=%04x", g.cpu.fsw);
++
++    /* (y=+inf,x=-2) -> -inf */
++    setup_machine(&g); put_val(0x3000, inf); put_val(0x3010, -2.0L);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, minf), "fyl2xp1(inf,-2)=-inf");
++
++    /* (y=1,x=-inf) -> indefinite + IE */
++    setup_machine(&g); put_val(0x3000, 1.0L); put_val(0x3010, -inf);
++    run_program(&g, l2xp1_p, sizeof l2xp1_p, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fyl2xp1(1,-inf) indef");
++    CHECK(g.cpu.fsw == 0x0001u, "fyl2xp1(1,-inf) IE");
++}
++
++/* FPATAN = atan2(ST1,ST0): signed-zero quadrants + inf corners */
++static void v_trans_fpatan_quadrants(void) {
++    static const uint8_t atan_p[] = {
++        0xBB,0x00,0x30, 0xDB,0x2F,
++        0x83,0xC3,0x10, 0xDB,0x2F,
++        0xD9,0xF3, 0xDB,0x3F, 0xF4};
++    long double inf = mk_val(0x7FFF, 0x8000000000000000ull);
++    uint8_t p0[10], m0[10], pi[10], mpi[10], pi2[10], pi4[10], mpi4[10], p34[10];
++    to80(0.0L, p0); to80(-0.0L, m0);
++    memcpy(pi, K_PI, 10); memcpy(pi4, K_PI4, 10); memcpy(pi2, K_PI2, 10);
++    memcpy(p34, K_3PI4, 10);
++    /* -pi etc: K_PI-family patterns with the sign bit set */
++    memcpy(mpi, K_PI, 10); mpi[9] |= 0x80;
++    memcpy(mpi4, K_PI4, 10); mpi4[9] |= 0x80;
++
++#define ATAN_CASE(yval, xval, wantb, want_sw, label) do { \
++    setup_machine(&g); put_val(0x3000, (yval)); put_val(0x3010, (xval)); \
++    run_program(&g, atan_p, sizeof atan_p, 0, 16); \
++    CHECK(mem_cmp(0x3010, (wantb)), label); \
++    CHECK(g.cpu.fsw == (want_sw), label " FSW=%04x", g.cpu.fsw); \
++} while (0)
++
++    ATAN_CASE(0.0L,  0.0L,  p0,  0x0000u, "atan2(+0,+0)=+0");
++    ATAN_CASE(-0.0L, 0.0L,  m0,  0x0000u, "atan2(-0,+0)=-0");
++    ATAN_CASE(0.0L, -0.0L,  pi,  0x0220u, "atan2(+0,-0)=+pi");
++    ATAN_CASE(-0.0L,-0.0L,  mpi, 0x0220u, "atan2(-0,-0)=-pi");
++    ATAN_CASE(0.0L,  inf,   p0,  0x0000u, "atan2(+0,+inf)=+0");
++    ATAN_CASE(0.0L, -inf,   pi,  0x0220u, "atan2(+0,-inf)=+pi");
++    ATAN_CASE(inf,   inf,   pi4, 0x0220u, "atan2(+inf,+inf)=pi/4");
++    ATAN_CASE(inf,  -inf,   p34, 0x0220u, "atan2(+inf,-inf)=3pi/4");
++    ATAN_CASE(inf,   1.0L,  pi2, 0x0220u, "atan2(+inf,1)=pi/2");
++#undef ATAN_CASE
++}
++
++/* F2XM1 domain edge: |x|>1 returns the SOURCE with PE; +-inf specials */
++static void v_trans_f2xm1_domain(void) {
++    static const uint8_t x2m1_p[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0xD9,0xF0, 0xDB,0x3F, 0xF4};
++    uint8_t src[10];
++    long double inf = mk_val(0x7FFF, 0x8000000000000000ull);
++    long double m15 = -1.5L;
++
++    setup_machine(&g); put_val(0x3000, 1.5L); to80(1.5L, src);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    CHECK(mem_cmp(0x3000, src), "f2xm1(1.5)=1.5 (source, host quirk)");
++    CHECK(g.cpu.fsw == 0x0020u, "f2xm1(1.5) PE only FSW=%04x", g.cpu.fsw);
++
++    setup_machine(&g); put_val(0x3000, 2.0L); to80(2.0L, src);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    CHECK(mem_cmp(0x3000, src), "f2xm1(2)=2 (source)");
++    CHECK(g.cpu.fsw == 0x0020u, "f2xm1(2) PE only");
++
++    setup_machine(&g); put_val(0x3000, m15); to80(m15, src);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    CHECK(mem_cmp(0x3000, src), "f2xm1(-1.5)=-1.5 (source)");
++
++    setup_machine(&g); put_val(0x3000, inf);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    to80(inf, src); CHECK(mem_cmp(0x3000, src), "f2xm1(+inf)=+inf");
++    CHECK(g.cpu.fsw == 0, "f2xm1(+inf) quiet");
++
++    setup_machine(&g); put_val(0x3000, -inf);
++    run_program(&g, x2m1_p, sizeof x2m1_p, 0, 16);
++    { uint8_t want[10] = {0,0,0,0,0,0,0,0x80,0xFF,0xBF};  /* -1.0 */
++      CHECK(mem_cmp(0x3000, want), "f2xm1(-inf)=-1.0"); }
++    CHECK(g.cpu.fsw == 0, "f2xm1(-inf) quiet");
++}
++
++/* C-flag write policy (transprobe6/7): the ops WRITE C1 (and the trig
++ * four write C2); C0/C3 -- and C2 on the rest -- survive from before. */
++static void v_trans_cflags(void) {
++    /* preset C0=C2=C3=1 + IE via FTST(qnan), then fsin(0.5) */
++    static const uint8_t ftst_sin[] = {
++        0xBB,0x00,0x30,
++        0xDB,0x2F,              /* fld qnan */
++        0xD9,0xE4,              /* ftst -> C0=C2=C3=1, IE */
++        0xDD,0xD8,              /* fstp st(0) */
++        0x83,0xC3,0x10,
++        0xDB,0x2F,              /* fld 0.5 */
++        0xD9,0xFE,              /* fsin */
++        0xDB,0x3F, 0xF4};
++    setup_machine(&g);
++    put_val(0x3000, mk_val(0x7FFF, 0xC000000000000000ull));
++    put_val(0x3010, 0.5L);
++    run_program(&g, ftst_sin, sizeof ftst_sin, 0, 16);
++    CHECK(fsw_c0() == 1 && fsw_c3() == 1, "fsin preserves C0/C3");
++    CHECK(fsw_c2() == 0, "fsin WRITES C2 (reduction complete)");
++    CHECK(fsw_c1() == 1, "fsin WRITES C1=1 (rounded up)");
++    CHECK((g.cpu.fsw & 0x021u) == 0x021u, "sticky IE + PE");
++
++    /* same preset, then f2xm1(0.5): C2 must SURVIVE (not written) */
++    static const uint8_t ftst_2xm1[] = {
++        0xBB,0x00,0x30,
++        0xDB,0x2F,
++        0xD9,0xE4,
++        0xDD,0xD8,
++        0x83,0xC3,0x10,
++        0xDB,0x2F,
++        0xD9,0xF0,
++        0xDB,0x3F, 0xF4};
++    setup_machine(&g);
++    put_val(0x3000, mk_val(0x7FFF, 0xC000000000000000ull));
++    put_val(0x3010, 0.5L);
++    run_program(&g, ftst_2xm1, sizeof ftst_2xm1, 0, 16);
++    CHECK(fsw_c2() == 1, "f2xm1 preserves C2");
++    CHECK(fsw_c0() == 1 && fsw_c3() == 1, "f2xm1 preserves C0/C3");
++    CHECK(fsw_c1() == 0, "f2xm1 WRITES C1=0");
++}
++
++/* FBSTP rounding matrix + invalid forms (bcdprobe/transprobe3) */
++static void v_bcd_rounding(void) {
++    static const uint8_t st[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0x83,0xC3,0x10, 0xDF,0x37, 0xF4};
++    struct { const char *what; long double v; uint16_t rc; uint8_t dig[10]; int pe, c1; }
++    T[] = {
++        {"1.5 near",  1.5L,  0x037F, {0x02,0,0,0,0,0,0,0,0,0x00}, 1, 1},
++        {"1.5 down",  1.5L,  0x077F, {0x01,0,0,0,0,0,0,0,0,0x00}, 1, 0},
++        {"1.5 up",    1.5L,  0x0B7F, {0x02,0,0,0,0,0,0,0,0,0x00}, 1, 1},
++        {"1.5 zero",  1.5L,  0x0F7F, {0x01,0,0,0,0,0,0,0,0,0x00}, 1, 0},
++        {"2.5 near",  2.5L,  0x037F, {0x02,0,0,0,0,0,0,0,0,0x00}, 1, 0},
++        {"-1.5 near", -1.5L, 0x037F, {0x02,0,0,0,0,0,0,0,0,0x80}, 1, 1},
++        {"-1.5 down", -1.5L, 0x077F, {0x02,0,0,0,0,0,0,0,0,0x80}, 1, 1},
++        {"-1.5 up",   -1.5L, 0x0B7F, {0x01,0,0,0,0,0,0,0,0,0x80}, 1, 0},
++        {"-0.9 up",   -0.9L, 0x0B7F, {0x00,0,0,0,0,0,0,0,0,0x80}, 1, 0},
++        {"1234",      1234.0L, 0x037F, {0x34,0x12,0,0,0,0,0,0,0,0x00}, 0, 0},
++    };
++    for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++) {
++        setup_machine(&g);
++        g.cpu.fcw = T[i].rc;
++        put_val(0x3000, T[i].v);
++        run_program(&g, st, sizeof st, 0, 16);
++        CHECK(!g.cpu.fault, "%s fault", T[i].what);
++        CHECK(mem_cmp(0x3010, T[i].dig), "%s digits", T[i].what);
++        CHECK(((g.cpu.fsw >> 5) & 1u) == (unsigned)T[i].pe, "%s PE FSW=%04x", T[i].what, g.cpu.fsw);
++        CHECK(fsw_c1() == (unsigned)T[i].c1, "%s C1 FSW=%04x", T[i].what, g.cpu.fsw);
++        CHECK(g.cpu.ftop == 0, "%s pops", T[i].what);
++    }
++}
++
++static void v_bcd_invalid(void) {
++    static const uint8_t st[] = {0xBB,0x00,0x30, 0xDB,0x2F, 0x83,0xC3,0x10, 0xDF,0x37, 0xF4};
++    static const uint8_t ld[] = {0xBB,0x00,0x30, 0xDF,0x27, 0xF4};
++    uint8_t indef[10]; memcpy(indef, K_INDEF, 10);
++
++    /* value too big (rounds to >= 1e18): indefinite + IE, still pops */
++    setup_machine(&g); put_val(0x3000, 1.0e18L);
++    run_program(&g, st, sizeof st, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fbstp 1e18 indefinite");
++    CHECK(g.cpu.fsw == 0x0001u, "fbstp 1e18 IE only FSW=%04x", g.cpu.fsw);
++    CHECK(g.cpu.ftop == 0, "fbstp pops on invalid");
++
++    setup_machine(&g); put_val(0x3000, mk_val(0x7FFF, 0xC000000000000000ull));
++    run_program(&g, st, sizeof st, 0, 16);
++    CHECK(mem_cmp(0x3010, indef), "fbstp qnan indefinite");
++    CHECK(g.cpu.fsw == 0x0001u, "fbstp qnan IE");
++
++    /* negative zero keeps its sign */
++    setup_machine(&g); put_val(0x3000, -0.0L);
++    run_program(&g, st, sizeof st, 0, 16);
++    CHECK((uint8_t)mem_read(&g, 0x3019, 1) == 0x80u, "fbstp -0 sign");
++    CHECK(g.cpu.fsw == 0, "fbstp -0 quiet");
++
++    /* FBLD: nibble values count 10..15, sign = bit7 only */
++    setup_machine(&g);
++    mem_write(&g, 0x3000, 1, 0x0A);           /* digits: 10 */
++    run_program(&g, ld, sizeof ld, 0, 16);
++    CHECK(g.cpu.fst[g.cpu.ftop] == 10.0L, "fbld nibble A = 10");
++
++    setup_machine(&g);
++    mem_write(&g, 0x3000, 1, 0x01); mem_write(&g, 0x3009, 1, 0x84);  /* -1 */
++    run_program(&g, ld, sizeof ld, 0, 16);
++    CHECK(g.cpu.fst[g.cpu.ftop] == -1.0L, "fbld sign bit7 (0x84)");
++}
++
+ int main(void) {
+     v_fld1_no_fcw_clobber();
+     v_fld_constants();
+@@ -1124,6 +1649,17 @@ int main(void) {
+     v_ficom_int();
+     v_denorm_de();
+     v_d6_flag_map();
++    v_trans_results();
++    v_trans_huge_c2();
++    v_trans_nan_inf();
++    v_trans_stack();
++    v_trans_l2x_corner();
++    v_trans_l2xp1_domain();
++    v_trans_fpatan_quadrants();
++    v_trans_f2xm1_domain();
++    v_trans_cflags();
++    v_bcd_rounding();
++    v_bcd_invalid();
+ 
+     if (fails) { fprintf(stderr, "test-fpu: %d FAILURES\n", fails); return 1; }
+     puts("test-fpu: ok");
+diff --git a/tests/test_table.c b/tests/test_table.c
+index 8b345e0..806190c 100644
+--- a/tests/test_table.c
++++ b/tests/test_table.c
+@@ -552,12 +552,13 @@ static const vec_t VECTORS[] = {
+ 
+     /* -- T: x87 subset -- FNINIT/FNCLEX are real since F1 but still must
+      * not touch the integer flags. The pinned #UD boundary moves with the
+-     * phases: "D9 C0" fell when F1 landed, "D8 C1" (FADD) fell when F2
+-     * landed -- both contracts live in tests/test_fpu.c -- so the row now
+-     * pins the F3 transcendental edge (F2XM1). */
++     * phases: "D9 C0" fell when F1 landed, "D8 C1" (FADD) when F2, and
++     * "D9 F0" (F2XM1) when F3 -- every contract lives in tests/test_fpu.c.
++     * What remains is architectural: the reserved D9 D1-D7 hole is #UD
++     * forever, and this row pins that last x87 edge. */
+     V("fninit preserves",  "DB E3",              "cf=1", "cf=1"),
+     V("fnclex preserves",  "DB E2",              "zf=1", "zf=1"),
+-    V("x87 trans stays #UD","D9 F0",             "", "fault=1"),
++    V("x87 d9 hole #UD",   "D9 D1",              "", "fault=1"),
+ 
+     /* SWAPGS is 64-bit only; the legacy pin guards the deliberate #UD. */
+     V("swapgs legacy pin", "0F 01 F8",           "", "fault=1"),
+-- 
+2.47.3
+

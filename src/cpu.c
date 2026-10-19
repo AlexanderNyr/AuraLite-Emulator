@@ -10,6 +10,8 @@
 #include <math.h>
 #include <stdint.h>
 #include "machine.h"
+#include <fenv.h>
+#include <math.h>
 #include "platform.h"
 /* USB U3: device-cadence hook (devices_tick) -- installed by devices_init.
  * Narrow unit harnesses link cpu.c without devices.c and leave it NULL. */
@@ -391,7 +393,12 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
         c->rip = off;
         c->rflags &= ~(FLAG_IF | FLAG_TF);
         c->exception_taken = 1;
-        mlog(&m->log, "[cpu] real-mode vector %d (%s) -> %04x:%04x via IVT", vector, vecname(vector), cs, off);
+        /* IVT dispatch receipts: measured 9381 INT16 lines during a stock
+         * SeaBIOS keyboard spin-up alone -- opt-in via AURALITE_IVT_LOG=1. */
+        { static int ivt_log = -1;
+          if (ivt_log < 0) { const char *e = getenv("AURALITE_IVT_LOG"); ivt_log = (e && e[0] == '1'); }
+          if (ivt_log)
+              mlog(&m->log, "[cpu] real-mode vector %d (%s) -> %04x:%04x via IVT", vector, vecname(vector), cs, off); }
         c->in_exception = 0;
         return;
     }
@@ -889,11 +896,1269 @@ void cpu_reset(cpu_t *c) {
     c->rflags = 0x2;
     c->mxcsr = 0x1F80;   /* architected power-on value (K3) */
     c->fcw = 0x037F;       /* architected x87 init control word (K3) */
+    c->ftw = 0xFFFF;       /* F1: all eight x87 registers empty at power-on */
     c->cr0 = 0x60000010ULL;
     c->halted = 0; c->fault = 0; c->intr_delay = 0;
     /* CHIPSET H6: IA32_APIC_BASE resets to base|EN|BSP (the xAPIC comes
      * out of reset hardware-enabled and software-disabled at SVR). */
     cpu_set_msr(c, LAPIC_MSR_APICBASE, LAPIC_MSR_DEFAULT);
+}
+
+/* ---------------------------------------------------------------- x87 (F1) --
+ * The x87 data and control layer (phase F1). The register file lives in
+ * fst[8] as host long double -- the ISA's own 80-bit extended format --
+ * with ftop as FSW.TOP and a full 2-bit-per-register FTW. Conversions and
+ * rounding run through <fenv.h>: fesetround() mirrors FCW.RC and the host
+ * FP status flags fold back into FSW, so architected rounding and
+ * exception bits come out of the host unit, not out of software
+ * arithmetic. When the host long double is not the 80-bit format the two
+ * representations would silently disagree, so ops raise #UD there instead
+ * of pretending (the frozen "no data layer" boundary stays honest).
+ *
+ * FPU_PLAN.md phase split: this block owns D9/DB/DD/DF (loads, stores,
+ * constants, control, env/save, FCMOV). The arithmetic escapes
+ * D8/DA/DC/DE (incl. FCOM/FCOMPP) stay the deliberate #UD boundary of
+ * phase F2. Escapes and WAIT honour CR0.TS -> #NM(7) and CR0.EM -> #UD.
+ *
+ * FXSAVE x87/MXCSR image (HOST-MEASURED, /tmp/fxprobe2 receipt, pinned by
+ * test_fpu.c::v_fxsave_live_layout -- the pre-F1 code wrote the whole
+ * prefix two bytes off and stored MXCSR into the MASK slot):
+ *   0 FCW, 2 FSW, 4 FTW-abridged(1B), 6 FOP, 8 FIP, 12 FCS, 16 FDP,
+ *   20 FDS, 24 MXCSR, 28 MXCSR_MASK, 32+16*i ST(i) logical order (low
+ *   10 bytes = 80-bit value), 160+16*i XMMi.
+ */
+
+enum { X87_T_VALID = 0, X87_T_ZERO = 1, X87_T_SPECIAL = 2, X87_T_EMPTY = 3 };
+
+/* HOST-MEASURED exception-bit order (/tmp/flagbits, defect D6: F1 had
+ * these reversed): IE DE ZE OE UE PE -- the FCW mask bits mirror it. */
+#define FSW_IE 0x0001u
+#define FSW_DE 0x0002u
+#define FSW_ZE 0x0004u
+#define FSW_OE 0x0008u
+#define FSW_UE 0x0010u
+#define FSW_PE 0x0020u
+#define FSW_SF 0x0040u
+#define FSW_ES 0x0080u
+#define FSW_C0 0x0100u
+#define FSW_C1 0x0200u
+#define FSW_C2 0x0400u
+#define FSW_TOPM 0x3800u
+#define FSW_C3 0x4000u
+#define FSW_B  0x8000u
+#define FCW_EXCM 0x003Fu   /* per-exception mask bits, same order as FSW */
+
+/* 80-bit extended <-> host long double. On LDBL_MANT_DIG==64 hosts the
+ * struct is 10 value bytes plus padding: a plain memcpy is bit-exact. */
+static void x87_ld_to80(long double x, uint8_t b[10]) {
+    uint8_t t[16]; memcpy(t, &x, 16); memcpy(b, t, 10);
+}
+static long double x87_ld_from80(const uint8_t b[10]) {
+    uint8_t t[16] = {0}; long double x; memcpy(t, b, 10); memcpy(&x, t, 16); return x;
+}
+static int x87_host_ok(void) {
+#if (defined(__x86_64__) || defined(__i386__)) && defined(__LDBL_MANT_DIG__) && defined(__LDBL_MAX_EXP__)
+    return (__LDBL_MANT_DIG__ == 64 && __LDBL_MAX_EXP__ == 16384);
+#else
+    return 0;
+#endif
+}
+
+static void x87_set_tag(cpu_t *c, int phys, int tag) {
+    c->ftw = (uint16_t)((c->ftw & ~(3u << (phys * 2))) | ((unsigned)tag << (phys * 2)));
+}
+static int x87_get_tag(const cpu_t *c, int phys) { return (c->ftw >> (phys * 2)) & 3; }
+static int x87_phys(const cpu_t *c, int sti) { return (c->ftop + sti) & 7; }
+
+/* class of a value for the FTW (empty is set by the stack op itself) */
+static int x87_class(long double v) {
+    uint8_t b[10]; x87_ld_to80(v, b);
+    uint16_t se = (uint16_t)(b[8] | ((uint16_t)b[9] << 8));
+    uint64_t sig = 0; memcpy(&sig, b, 8);
+    unsigned exp = se & 0x7FFFu;
+    if (exp == 0 && sig == 0) return X87_T_ZERO;
+    if (exp == 0x7FFFu) return X87_T_SPECIAL;
+    if (exp == 0) return X87_T_SPECIAL;          /* denormal: "special" tag */
+    (void)v;
+    return X87_T_VALID;
+}
+/* FXAM classification codes (C3,C2,C0): see SDM FXAM */
+static void x87_fxam_code(long double v, int empty, unsigned *c3, unsigned *c2, unsigned *c0, unsigned *c1) {
+    uint8_t b[10]; x87_ld_to80(v, b);
+    uint16_t se = (uint16_t)(b[8] | ((uint16_t)b[9] << 8));
+    uint64_t sig = 0; memcpy(&sig, b, 8);
+    unsigned exp = se & 0x7FFFu;
+    *c1 = (se >> 15) & 1u;
+    if (empty)          { *c3 = 1; *c2 = 1; *c0 = 1; return; }
+    if (exp == 0x7FFFu) { if (sig & 0x7FFFFFFFFFFFFFFFull) { *c3 = 0; *c2 = 1; *c0 = 1; }
+                          else                              { *c3 = 1; *c2 = 1; *c0 = 0; } return; }
+    if (exp == 0)       { *c3 = (sig == 0); *c2 = 0; *c0 = 0; return; } /* zero vs denormal */
+                        { *c3 = 0; *c2 = 1; *c0 = 0; }
+}
+
+static void x87_sync_top(cpu_t *c) {
+    c->fsw = (uint16_t)((c->fsw & (uint16_t)~FSW_TOPM) | (((unsigned)c->ftop & 7u) << 11));
+}
+static void x87_set_c(cpu_t *c, unsigned c0, unsigned c1, unsigned c2, unsigned c3) {
+    c->fsw &= (uint16_t)~(FSW_C0 | FSW_C1 | FSW_C2 | FSW_C3);
+    if (c0) c->fsw |= FSW_C0;
+    if (c1) c->fsw |= FSW_C1;
+    if (c2) c->fsw |= FSW_C2;
+    if (c3) c->fsw |= FSW_C3;
+}
+
+/* F4: every fst write goes through x87_w. The slots are long doubles --
+ * 10 data bytes plus 6 padding bytes -- and only the raw cpu_t dump (the
+ * snapshot's machine.lo/machine.hi) ever sees the padding; FNSAVE and
+ * FXSAVE emit explicit 10-byte (+zeroed reserved) forms. Measured defect
+ * (F4 lanes): a computed long double (FBLD's accumulator) assigned to a
+ * slot carried run-dependent stack garbage into the padding, so two
+ * processes saving the same state wrote different snapshot files.
+ * Normalizing at every write keeps the raw dump byte-stable. */
+static void x87_w(cpu_t *c, int p, long double v) {
+    c->fst[p] = v;
+    memset((char *)&c->fst[p] + 10, 0, 6);
+}
+
+/* push: stack overflow overwrites the last register and raises IE|SF|C1 */
+static void x87_push(cpu_t *c, long double v, uint16_t *raised) {
+    int dst = (c->ftop - 1) & 7;
+    if (x87_get_tag(c, dst) != X87_T_EMPTY) {
+        *raised |= FSW_IE | FSW_SF; c->fsw |= FSW_C1;
+    }
+    c->ftop = dst;
+    x87_w(c, c->ftop, v);
+    x87_set_tag(c, c->ftop, x87_class(v));
+    x87_sync_top(c);
+}
+/* pop: underflow is popping an ALREADY-empty ST(0) (legal pops that empty
+ * the stack are not faults); raises IE|SF with C1=0 */
+static void x87_pop(cpu_t *c, uint16_t *raised) {
+    int was_empty = x87_get_tag(c, c->ftop) == X87_T_EMPTY;
+    x87_set_tag(c, c->ftop, X87_T_EMPTY);
+    c->ftop = (c->ftop + 1) & 7;
+    x87_sync_top(c);
+    if (was_empty) {
+        *raised |= FSW_IE | FSW_SF; c->fsw &= (uint16_t)~FSW_C1;
+    }
+}
+static int x87_st_empty(const cpu_t *c, int sti) {
+    return x87_get_tag(c, x87_phys(c, sti)) == X87_T_EMPTY;
+}
+/* underflow of an ST(i) reference: IE|SF, C1=0 */
+static int x87_check_src(cpu_t *c, int sti, uint16_t *raised) {
+    if (!x87_st_empty(c, sti)) return 1;
+    *raised |= FSW_IE | FSW_SF; c->fsw &= (uint16_t)~FSW_C1;
+    return 0;
+}
+
+static int x87_rc(const cpu_t *c) { return (c->fcw >> 10) & 3; }
+static void x87_set_round(const cpu_t *c) {
+    static const int map[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    fesetround(map[x87_rc(c)]);
+}
+static void x87_get_fenv(uint16_t *raised) {
+    int f = fetestexcept(FE_ALL_EXCEPT);
+    if (f & FE_INEXACT)   *raised |= FSW_PE;
+    if (f & FE_UNDERFLOW) *raised |= FSW_UE;
+    if (f & FE_OVERFLOW)  *raised |= FSW_OE;
+    if (f & FE_DIVBYZERO) *raised |= FSW_ZE;
+    if (f & FE_INVALID)   *raised |= FSW_IE;
+}
+
+/* ---- FXSAVE abridged tag: one bit per PHYSICAL register, 1 = non-empty ---- */
+static uint8_t x87_ftw_abridged(const cpu_t *c) {
+    uint8_t r = 0;
+    for (int p = 0; p < 8; p++)
+        if (x87_get_tag(c, p) != X87_T_EMPTY) r |= (uint8_t)(1u << p);
+    return r;
+}
+
+/* ---- conversion core: memory <-> ST ---- */
+static long double x87_from_m32(uint32_t bits) {
+    float f; memcpy(&f, &bits, 4);
+    return (long double)f;
+}
+static long double x87_from_m64(uint64_t bits) {
+    double d; memcpy(&d, &bits, 8);
+    return (long double)d;
+}
+static uint32_t x87_to_m32(long double v) {
+    /* the host x87 store honors the current rounding direction */
+    volatile long double t = v;
+    float f = (float)t;
+    uint32_t bits; memcpy(&bits, &f, 4);
+    return bits;
+}
+static uint64_t x87_to_m64(long double v) {
+    volatile long double t = v;
+    double d = (double)t;
+    uint64_t bits; memcpy(&bits, &d, 8);
+    return bits;
+}
+/* integer stores: round per RC via rintl (the raw C cast truncates), then
+ * range-check; out-of-range/NaN stores the architected indefinite and IE */
+static long double x87_round_to_int(long double v) {
+    volatile long double t = v;
+    return rintl(t);
+}
+static int x87_to_int32(long double v, int32_t *out, uint16_t *raised) {
+    long double r = x87_round_to_int(v);
+    if (isnan(r)) { *raised |= FSW_IE; *out = (int32_t)0x80000000u; return 1; }
+    if (r >= 2147483648.0L || r < -2147483648.0L) {
+        *raised |= FSW_IE; *out = (int32_t)0x80000000u; return 1;
+    }
+    *out = (int32_t)r;
+    if (r != (long double)v) *raised |= FSW_PE;
+    return 1;
+}
+static int x87_to_int64(long double v, int64_t *out, uint16_t *raised) {
+    long double r = x87_round_to_int(v);
+    long double lim = 9223372036854775808.0L;
+    if (isnan(r)) { *raised |= FSW_IE; *out = (int64_t)0x8000000000000000ull; return 1; }
+    if (r >= lim || r < -lim) {
+        *raised |= FSW_IE; *out = (int64_t)0x8000000000000000ull; return 1;
+    }
+    *out = (int64_t)r;
+    if (r != (long double)v) *raised |= FSW_PE;
+    return 1;
+}
+static int x87_to_int16(long double v, int16_t *out, uint16_t *raised) {
+    long double r = x87_round_to_int(v);
+    if (isnan(r)) { *raised |= FSW_IE; *out = (int16_t)0x8000u; return 1; }
+    if (r >= 32768.0L || r < -32768.0L) {
+        *raised |= FSW_IE; *out = (int16_t)0x8000u; return 1;
+    }
+    *out = (int16_t)r;
+    if (r != (long double)v) *raised |= FSW_PE;
+    return 1;
+}
+/* packed BCD (10 bytes): 18 digits + sign nibble (F3 receipts: bcdprobe,
+ * transprobe3/5). FBLD is a pure weighted nibble sum -- nibble values
+ * A-F count as 10-15 with NO invalid-digit exception, sign = bit 7 of
+ * byte 9 (low nibble ignored). FBSTP rounds to an integer per FCW.RC
+ * (ties-to-even), sets PE iff the value changed and C1 iff the magnitude
+ * rounded UP, keeps the source sign even for a zero result, and on
+ * NaN/Inf/|result| >= 1e18 stores the QNaN-indefinite bit pattern (mem
+ * 00 x7 C0 FF FF) with IE. Denormal sources do NOT raise DE (measured). */
+static long double x87_from_bcd(const uint8_t b[10]) {
+    long double v = 0, mul = 1;
+    for (int i = 0; i < 9; i++) {
+        v += (long double)(b[i] & 0xF) * mul; mul *= 10;
+        v += (long double)(b[i] >> 4) * mul; mul *= 10;
+    }
+    if (b[9] & 0x80) v = -v;
+    return v;
+}
+static void x87_to_bcd(long double v, uint8_t b[10], uint16_t *raised, unsigned *c1) {
+    memset(b, 0, 10);
+    long double r = x87_round_to_int(v);   /* rintl under the current RC */
+    if (isnan(r) || isinf(r) || fabsl(r) >= 1.0e18L) {
+        b[7] = 0xC0; b[8] = 0xFF; b[9] = 0xFF;   /* QNaN-indefinite */
+        *raised |= FSW_IE;
+        *c1 = 0;
+        return;
+    }
+    if (r != v) {
+        *raised |= FSW_PE;
+        *c1 = (fabsl(r) > fabsl(v)) ? 1u : 0u;
+    } else {
+        *c1 = 0;
+    }
+    uint64_t n = (uint64_t)fabsl(r);   /* |r| < 1e18 fits */
+    for (int i = 0; i < 9; i++) {
+        b[i] = (uint8_t)((n % 10u) | ((n / 10u % 10u) << 4));
+        n /= 100u;
+    }
+    b[9] = signbit(v) ? 0x80u : 0x00u;
+}
+
+/* ---- environment image (HOST-MEASURED layouts, envprobe2 receipt) ----
+ * 16-bit form (14B): CW@0 SW@2 TW@4 FIP16@6 FCS@8 FDP16@10 FDS@12
+ * 32-bit form (28B): CW@0 rsv(FFFF)@2 SW@4 rsv@6 TW@8 rsv@10 FIP32@12
+ *                    FCS@16 FOP@18 FDP32@20 FDS@24 rsv@26
+ * FNSAVE appends ST(0)..ST(7) in LOGICAL order, 10 bytes each. */
+static void x87_save_env(cpu_t *c, uint64_t ea, int wide) {
+    machine_t *m = c->mach;
+    if (!wide) {
+        write_mem_v(m, ea +  0, 2, c->fcw);
+        write_mem_v(m, ea +  2, 2, c->fsw);
+        write_mem_v(m, ea +  4, 2, c->ftw);
+        write_mem_v(m, ea +  6, 2, (uint16_t)c->fip);
+        write_mem_v(m, ea +  8, 2, c->fcs);
+        write_mem_v(m, ea + 10, 2, (uint16_t)c->fdp);
+        write_mem_v(m, ea + 12, 2, c->fds);
+    } else {
+        write_mem_v(m, ea +  0, 2, c->fcw);
+        write_mem_v(m, ea +  2, 2, 0xFFFF);
+        write_mem_v(m, ea +  4, 2, c->fsw);
+        write_mem_v(m, ea +  6, 2, 0xFFFF);
+        write_mem_v(m, ea +  8, 2, c->ftw);
+        write_mem_v(m, ea + 10, 2, 0xFFFF);
+        write_mem_v(m, ea + 12, 4, (uint32_t)c->fip);
+        write_mem_v(m, ea + 16, 2, c->fcs);
+        write_mem_v(m, ea + 18, 2, c->fop);
+        write_mem_v(m, ea + 20, 4, (uint32_t)c->fdp);
+        write_mem_v(m, ea + 24, 2, c->fds);
+        write_mem_v(m, ea + 26, 2, 0xFFFF);
+    }
+}
+static void x87_load_env(cpu_t *c, uint64_t ea, int wide) {
+    machine_t *m = c->mach;
+    if (!wide) {
+        c->fcw = (uint16_t)read_mem_v(m, ea +  0, 2);
+        c->fsw = (uint16_t)read_mem_v(m, ea +  2, 2);
+        c->ftw = (uint16_t)read_mem_v(m, ea +  4, 2);
+        c->fip = (uint16_t)read_mem_v(m, ea +  6, 2);
+        c->fcs = (uint16_t)read_mem_v(m, ea +  8, 2);
+        c->fdp = (uint16_t)read_mem_v(m, ea + 10, 2);
+        c->fds = (uint16_t)read_mem_v(m, ea + 12, 2);
+        c->fop = 0;
+    } else {
+        c->fcw = (uint16_t)read_mem_v(m, ea +  0, 2);
+        c->fsw = (uint16_t)read_mem_v(m, ea +  4, 2);
+        c->ftw = (uint16_t)read_mem_v(m, ea +  8, 2);
+        c->fip = read_mem_v(m, ea + 12, 4);
+        c->fcs = (uint16_t)read_mem_v(m, ea + 16, 2);
+        c->fop = (uint16_t)read_mem_v(m, ea + 18, 2);
+        c->fdp = read_mem_v(m, ea + 20, 4);
+        c->fds = (uint16_t)read_mem_v(m, ea + 24, 2);
+    }
+    c->ftop = (c->fsw >> 11) & 7;
+}
+static void x87_save_regs(cpu_t *c, uint64_t ea) {   /* logical ST(0)..ST(7) */
+    uint8_t b[10];
+    for (int i = 0; i < 8; i++) {
+        x87_ld_to80(c->fst[x87_phys(c, i)], b);
+        for (int j = 0; j < 10; j++) write_mem_v(c->mach, ea + (uint64_t)i * 10 + (uint64_t)j, 1, b[j]);
+    }
+}
+static void x87_load_regs(cpu_t *c, uint64_t ea) {
+    uint8_t b[10];
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 10; j++) b[j] = (uint8_t)read_mem_v(c->mach, ea + (uint64_t)i * 10 + (uint64_t)j, 1);
+        x87_w(c, x87_phys(c, i), x87_ld_from80(b));
+    }
+}
+
+static void x87_reset(cpu_t *c) {   /* FNINIT */
+    c->fcw = 0x037F;
+    c->fsw = 0;
+    c->ftw = 0xFFFF;
+    c->ftop = 0;
+    c->fop = 0; c->fcs = 0; c->fds = 0; c->fip = 0; c->fdp = 0;
+    for (int i = 0; i < 8; i++) x87_w(c, i, 0.0L);
+}
+
+/* EA of an x87 memory operand */
+static uint64_t x87_ea(dctx_t *d, rm_t *rm) {
+    uint64_t base = (rm->seg >= 0) ? d->c->seg[rm->seg].base : 0;
+    return base + rm_ea(d, rm);
+}
+
+/* ---------------------------------------------------------------- x87 F2 --
+ * Arithmetic and compare (phase F2). Every numeric op runs on the host
+ * x87 itself -- the same 80-bit extended unit the ISA specifies -- via
+ * volatile long double expressions (add/sub/mul/div) or raw instruction
+ * bytes (fsqrt/fprem/fprem1/frndint/fscale/fxtract have no C spelling).
+ * Result bits and NaN patterns therefore come out of silicon, and the
+ * <fenv.h> mapping from F1 carries the exception flags back into FSW.
+ *
+ * Operand-direction receipts (raw-byte probes, /tmp/rawdir):
+ *   D8 reg: OP ST(0),ST(i)   -> st0 = st0 OP sti (4=SUB st0-sti, 5=SUBR)
+ *   DC reg: OP ST(i),ST(0)   -> sti = sti OP st0 (E0+i=FSUBR st0-sti)
+ *   DE reg: OPP ST(i),ST(0)  -> same as DC then pop
+ *   D8/DC/DA/DE memory forms all use the NON-reversed /4-/7 map
+ *   (DC /4 = FSUB m64, /5 = FSUBR -- measured, matching ndisasm).
+ *
+ * FSW exception bits (HOST-MEASURED, /tmp/flagbits -- defect D6: the F1
+ * map had these reversed):
+ *   IE=0x0001 DE=0x0002 ZE=0x0004 OE=0x0008 UE=0x0010 PE=0x0020
+ */
+
+enum { XA_ADD, XA_MUL, XA_SUB, XA_SUBR, XA_DIV, XA_DIVR };
+
+static int x87_is_denorm(long double v) {
+    uint8_t b[10]; x87_ld_to80(v, b);
+    uint16_t se = (uint16_t)(b[8] | ((uint16_t)b[9] << 8));
+    uint64_t sig = 0; memcpy(&sig, b, 8);
+    return (se & 0x7FFFu) == 0 && sig != 0;
+}
+static int x87_is_snan(long double v) {
+    uint8_t b[10]; x87_ld_to80(v, b);
+    uint16_t se = (uint16_t)(b[8] | ((uint16_t)b[9] << 8));
+    uint64_t sig = 0; memcpy(&sig, b, 8);
+    return (se & 0x7FFFu) == 0x7FFFu && (sig & 0x7FFFFFFFFFFFFFFFull) != 0
+        && ((sig >> 62) & 1) == 0;   /* quiet bit clear (pseudo-NaN too) */
+}
+
+static long double x87_binop(cpu_t *c, int kind, long double a, long double b, uint16_t *raised) {
+    if (x87_is_denorm(a) || x87_is_denorm(b)) *raised |= FSW_DE;
+    volatile long double x = a, y = b, r = 0;
+    x87_set_round(c);
+    feclearexcept(FE_ALL_EXCEPT);
+    switch (kind) {
+    case XA_ADD:  r = x + y; break;
+    case XA_MUL:  r = x * y; break;
+    case XA_SUB:  r = x - y; break;
+    case XA_SUBR: r = y - x; break;
+    case XA_DIV:  r = x / y; break;
+    case XA_DIVR: r = y / x; break;
+    }
+    x87_get_fenv(raised);
+    return r;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+static long double x87_u_sqrt(long double v, uint16_t *raised) {
+    long double r;
+    if (x87_is_denorm(v)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    __asm__ volatile("fldt %1; fsqrt; fstpt %0" : "=m"(r) : "m"(v));
+    x87_get_fenv(raised);
+    return r;
+}
+static long double x87_u_rndint(long double v, uint16_t *raised) {
+    long double r;
+    if (x87_is_denorm(v)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    __asm__ volatile("fldt %1; frndint; fstpt %0" : "=m"(r) : "m"(v));
+    x87_get_fenv(raised);
+    return r;
+}
+static long double x87_u_scale(long double a, long double b, uint16_t *raised) {
+    long double r;
+    if (x87_is_denorm(a) || x87_is_denorm(b)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    __asm__ volatile("fldt %2; fldt %1; fscale; fstp %%st(1); fstpt %0"
+                 : "=m"(r) : "m"(a), "m"(b) : "st");
+    x87_get_fenv(raised);
+    return r;
+}
+static long double x87_u_prem(long double a, long double b, int ieee,
+                              uint16_t *raised, uint16_t *sw_out) {
+    long double r; uint16_t sw;
+    if (x87_is_denorm(a) || x87_is_denorm(b)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    if (ieee)
+        __asm__ volatile("fldt %3; fldt %2; fprem1; fnstsw %1; fstp %%st(1); fstpt %0"
+                     : "=m"(r), "=a"(sw) : "m"(a), "m"(b) : "st", "memory");
+    else
+        __asm__ volatile("fldt %3; fldt %2; fprem; fnstsw %1; fstp %%st(1); fstpt %0"
+                     : "=m"(r), "=a"(sw) : "m"(a), "m"(b) : "st", "memory");
+    x87_get_fenv(raised);
+    if (sw_out) *sw_out = sw;
+    return r;
+}
+static void x87_u_xtract(long double v, long double *sig, long double *exp,
+                         uint16_t *raised) {
+    if (x87_is_denorm(v)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    /* HOST-MEASURED (/tmp/rawdir2): after FXTRACT, ST0 = significand and
+     * ST1 = the unbiased exponent as a real. */
+    __asm__ volatile("fldt %2; fxtract; fstpt %0; fstpt %1"
+                 : "=m"(*sig), "=m"(*exp) : "m"(v) : "st");
+    x87_get_fenv(raised);
+}
+#else
+/* non-x86 hosts never get here: x87_host_ok() gates every escape first */
+static long double x87_u_sqrt(long double v, uint16_t *r) { (void)v; (void)r; return 0; }
+static long double x87_u_rndint(long double v, uint16_t *r) { (void)v; (void)r; return 0; }
+static long double x87_u_scale(long double a, long double b, uint16_t *r) { (void)a; (void)b; (void)r; return 0; }
+static long double x87_u_prem(long double a, long double b, int i, uint16_t *r, uint16_t *s)
+{ (void)a; (void)b; (void)i; (void)r; (void)s; return 0; }
+static void x87_u_xtract(long double v, long double *s, long double *e, uint16_t *r)
+{ (void)v; *s = 0; *e = 0; (void)r; }
+#endif
+
+/* ---------------------------------------------------------------- x87 F3 --
+ * Transcendentals (phase F3) -- host silicon again: the real fsin/fcos/
+ * fsincos/fptan/fpatan/f2xm1/fyl2x/fyl2xp1 encodings run against the host
+ * unit, so payload digits, NaN folding, and the odd corners (FYL2XP1 with
+ * ST0 <= -1 returns ST0 for finite nonzero ST1 and ST0*ST1 for ST1 of
+ * 0/inf; FYL2X with ST0=0, ST1=+-inf gives -+inf WITHOUT ZE) all come out
+ * of the very silicon the ISA describes. Receipts: /tmp/transprobe{,2..7}.
+ *
+ * C-flag policy (transprobe6/7): all eight WRITE C1 (the round-up
+ * indicator); the trig four (FSIN/FCOS/FPTAN/FSINCOS) also WRITE C2
+ * (1 = range reduction incomplete, |x| >= 2^63). C0/C3 -- and C2 on the
+ * other four -- are undefined on silicon and measured PRESERVED there,
+ * so the engine preserves them too and never copies unmeasured host bits.
+ */
+
+enum { XT_2XM1, XT_L2X, XT_L2XP1, XT_PATAN, XT_SIN, XT_COS, XT_SINCOS, XT_TAN };
+
+static long double x87_indefinite(void) {
+    uint8_t b[10] = {0,0,0,0,0,0,0,0xC0,0xFF,0xFF};
+    return x87_ld_from80(b);
+}
+static void x87_c1(cpu_t *c, uint16_t psw) {
+    c->fsw &= (uint16_t)~FSW_C1;
+    if (psw & 0x0200u) c->fsw |= FSW_C1;
+}
+static void x87_c12(cpu_t *c, uint16_t psw) {
+    x87_c1(c, psw);
+    c->fsw &= (uint16_t)~FSW_C2;
+    if (psw & 0x0400u) c->fsw |= FSW_C2;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+/* single-result op; x = ST0, y = ST1 (the log2/atan2 family) */
+static long double x87_t_pair(int kind, long double x, long double y,
+                              uint16_t *raised, uint16_t *psw) {
+    long double r;
+    if (x87_is_denorm(x) || x87_is_denorm(y)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    switch (kind) {
+    case XT_2XM1:
+        __asm__ volatile("fldt %2; .byte 0xD9,0xF0; fnstsw %1; fstpt %0"
+                     : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
+        break;
+    case XT_L2X:
+        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF1; fnstsw %1; fstpt %0"
+                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
+        break;
+    case XT_L2XP1:
+        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF9; fnstsw %1; fstpt %0"
+                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
+        break;
+    case XT_PATAN:
+        __asm__ volatile("fldt %3; fldt %2; .byte 0xD9,0xF3; fnstsw %1; fstpt %0"
+                     : "=m"(r), "=a"(*psw) : "m"(x), "m"(y) : "st", "memory");
+        break;
+    default: /* XT_SIN / XT_COS */
+        if (kind == XT_SIN)
+            __asm__ volatile("fldt %2; .byte 0xD9,0xFE; fnstsw %1; fstpt %0"
+                         : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
+        else
+            __asm__ volatile("fldt %2; .byte 0xD9,0xFF; fnstsw %1; fstpt %0"
+                         : "=m"(r), "=a"(*psw) : "m"(x) : "st", "memory");
+        break;
+    }
+    x87_get_fenv(raised);
+    return r;
+}
+/* push-pair op: after the op ST0 = r0, ST1 = r1 (FPTAN: 1.0 then tan;
+ * FSINCOS: cos then sin; NaN/inf inputs give the special in BOTH slots) */
+static void x87_t_pushpair(int kind, long double x, long double *r0, long double *r1,
+                           uint16_t *raised, uint16_t *psw) {
+    if (x87_is_denorm(x)) *raised |= FSW_DE;
+    feclearexcept(FE_ALL_EXCEPT);
+    if (kind == XT_TAN)
+        __asm__ volatile("fldt %3; .byte 0xD9,0xF2; fnstsw %1; fstpt %0; fstpt %2"
+                     : "=m"(*r0), "=a"(*psw), "=m"(*r1) : "m"(x) : "st", "memory");
+    else
+        __asm__ volatile("fldt %3; .byte 0xD9,0xFB; fnstsw %1; fstpt %0; fstpt %2"
+                     : "=m"(*r0), "=a"(*psw), "=m"(*r1) : "m"(x) : "st", "memory");
+    x87_get_fenv(raised);
+}
+#else
+static long double x87_t_pair(int kind, long double x, long double y, uint16_t *r, uint16_t *p)
+{ (void)kind; (void)x; (void)y; (void)r; (void)p; return 0; }
+static void x87_t_pushpair(int kind, long double x, long double *a, long double *b,
+                           uint16_t *r, uint16_t *p)
+{ (void)kind; (void)x; *a = 0; *b = 0; (void)r; (void)p; }
+#endif
+
+/* compare result codes */
+enum { XCP_GT, XCP_LT, XCP_EQ, XCP_UNORD };
+
+static int x87_cmp_vals(long double a, long double b, int quiet, uint16_t *raised) {
+    if (x87_is_denorm(a) || x87_is_denorm(b)) *raised |= FSW_DE;
+    if (isnan(a) || isnan(b)) {
+        if (!quiet || x87_is_snan(a) || x87_is_snan(b)) *raised |= FSW_IE;
+        return XCP_UNORD;
+    }
+    if (a > b) return XCP_GT;
+    if (a < b) return XCP_LT;
+    return XCP_EQ;
+}
+static void x87_com_cflags(cpu_t *c, int code) {
+    switch (code) {
+    case XCP_GT:    x87_set_c(c, 0, 0, 0, 0); break;
+    case XCP_LT:    x87_set_c(c, 1, 0, 0, 0); break;
+    case XCP_EQ:    x87_set_c(c, 0, 0, 0, 1); break;
+    default:        x87_set_c(c, 1, 0, 1, 1); break;
+    }
+}
+static void x87_com_eflags(cpu_t *c, int code) {
+    c->rflags &= ~(FLAG_CF | FLAG_PF | FLAG_ZF | FLAG_OF | FLAG_SF | FLAG_AF);
+    if (code == XCP_LT || code == XCP_UNORD) c->rflags |= FLAG_CF;
+    if (code == XCP_EQ || code == XCP_UNORD) c->rflags |= FLAG_ZF;
+    if (code == XCP_UNORD) c->rflags |= FLAG_PF;
+}
+
+/* the /r group map: D8/mem/DA/DE use it plain; DC/DE-register forms are
+ * named with the reversed sub/divr pair (measured /tmp/rawdir receipts) */
+static int x87_grp_kind(int grp) {
+    switch (grp) {
+    case 0: return XA_ADD;
+    case 1: return XA_MUL;
+    case 4: return XA_SUB;
+    case 5: return XA_SUBR;
+    case 6: return XA_DIV;
+    default: return XA_DIVR;
+    }
+}
+static int x87_grp_kind_rev(int grp) {
+    switch (grp) {
+    case 0: return XA_ADD;
+    case 1: return XA_MUL;
+    case 4: return XA_SUBR;
+    case 5: return XA_SUB;
+    case 6: return XA_DIVR;
+    default: return XA_DIV;
+    }
+}
+
+/* binary op into a destination register slot (D8: dst=ST0; DC/DE: dst=STi) */
+static void x87_apply_binop(cpu_t *c, int kind, int dst_sti, long double b,
+                            int pop, uint16_t *raised) {
+    long double a = c->fst[x87_phys(c, dst_sti)];
+    long double r = x87_binop(c, kind, a, b, raised);
+    x87_w(c, x87_phys(c, dst_sti), r);
+    x87_set_tag(c, x87_phys(c, dst_sti), x87_class(r));
+    if (pop) x87_pop(c, raised);
+}
+
+/* ---------------------------------------------------------------------------
+ * The escape dispatcher. modrm is fetched here so the reg/memory split is
+ * exact (the pre-F1 D9 path decoded register forms as memory -- measured
+ * FLD1 wrote AX into FCW, defect D1 of the F0 receipts).
+ * ------------------------------------------------------------------------- */
+static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+    uint8_t modrm = fetch8(d);
+    int mod = modrm >> 6, ext = (modrm >> 3) & 7, regi = modrm & 7;
+    uint16_t raised = 0;
+    int track = 1;   /* FIP/FOP bookkeeping: env/status/control ops stay out */
+    rm_t rm; memset(&rm, 0, sizeof rm);
+
+    /* CR0.EM / CR0.TS gates: every escape (and WAIT) sees these first. */
+    if (c->cr0 & 0x8u) {            /* CR0.TS -> #NM(7), a delivered fault */
+        raise_exception(m, 7, 0, 0);
+        return;
+    }
+    if (c->cr0 & 0x4u) {            /* CR0.EM -> #UD */
+        faultf(c, "#UD x87 (CR0.EM=1)");
+        return;
+    }
+    if (!x87_host_ok()) {
+        faultf(c, "#UD x87 needs host 80-bit long double");
+        return;
+    }
+
+    int is_mem = (mod != 3);
+    uint16_t fop = (uint16_t)(((op & 7) << 8) | modrm);
+    uint64_t ea = 0;
+    if (is_mem) {
+        rm = decode_modrm(d, modrm); fixup_riprel(d, &rm);
+        ea = x87_ea(d, &rm);
+    }
+
+    switch (op) {
+    /* ---------------- D9: loads/stores/env/status/constants ------------- */
+    case 0xD9:
+        switch (is_mem ? ext + 8 : modrm) {
+        case 0 + 8: { /* FLD m32 (converting: SNaN -> IE + quiet) */
+            uint32_t b = (uint32_t)read_mem_v(m, ea, 4);
+            feclearexcept(FE_ALL_EXCEPT);
+            long double v = x87_from_m32(b);
+            x87_get_fenv(&raised);
+            x87_push(c, v, &raised); break; }
+        case 1 + 8:   /* (reserved) */
+            faultf(c, "#UD x87 D9 /1"); return;
+        case 2 + 8: { /* FST m32 */
+            if (!x87_check_src(c, 0, &raised)) break;
+            x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+            write_mem_v(m, ea, 4, x87_to_m32(c->fst[x87_phys(c, 0)]));
+            x87_get_fenv(&raised); break; }
+        case 3 + 8: { /* FSTP m32 */
+            if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+            x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+            write_mem_v(m, ea, 4, x87_to_m32(c->fst[x87_phys(c, 0)]));
+            x87_get_fenv(&raised); x87_pop(c, &raised);
+            break; }
+        case 4 + 8:   /* FLDENV */
+                track = 0;
+            x87_load_env(c, ea, d->opsize != 2); break;
+        case 5 + 8:   /* FLDCW */
+                track = 0;
+            c->fcw = (uint16_t)read_mem_v(m, ea, 2); break;
+        case 6 + 8:   /* FNSTENV */
+                track = 0;
+            x87_save_env(c, ea, d->opsize != 2); break;
+        case 7 + 8:   /* FNSTCW */
+                track = 0;
+            write_mem_v(m, ea, 2, c->fcw); break;
+        case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+        case 0xC4: case 0xC5: case 0xC6: case 0xC7: { /* FLD ST(i) */
+            if (!x87_check_src(c, regi, &raised)) break;
+            x87_push(c, c->fst[x87_phys(c, regi)], &raised); break; }
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+        case 0xCC: case 0xCD: case 0xCE: case 0xCF: { /* FXCH ST(i) */
+            int p0 = x87_phys(c, 0), pi = x87_phys(c, regi);
+            long double t = c->fst[p0]; int tg = x87_get_tag(c, p0);
+            x87_w(c, p0, c->fst[pi]); x87_set_tag(c, p0, x87_get_tag(c, pi));
+            x87_w(c, pi, t); x87_set_tag(c, pi, tg);
+            c->fsw &= (uint16_t)~FSW_C1; break; }
+        case 0xD0:  /* FNOP */
+            break;
+        case 0xF6:  /* FINCSTP: TOP advances, tags stay, C1=0 */
+            c->ftop = (c->ftop + 1) & 7;
+            x87_sync_top(c); c->fsw &= (uint16_t)~FSW_C1; break;
+        case 0xF7:  /* FDECSTP */
+            c->ftop = (c->ftop - 1) & 7;
+            x87_sync_top(c); c->fsw &= (uint16_t)~FSW_C1; break;
+        case 0xE0:  /* FCHS */
+            if (!x87_check_src(c, 0, &raised)) break;
+            x87_w(c, x87_phys(c, 0), -c->fst[x87_phys(c, 0)]); break;
+        case 0xE1:  /* FABS */
+            if (!x87_check_src(c, 0, &raised)) break;
+            x87_w(c, x87_phys(c, 0), fabsl(c->fst[x87_phys(c, 0)])); break;
+        case 0xE4: { /* FTST: compare ST(0) with 0.0 -> C flags */
+            if (!x87_check_src(c, 0, &raised)) break;
+            long double v = c->fst[x87_phys(c, 0)];
+            uint8_t b[10]; x87_ld_to80(v, b);
+            uint16_t se = (uint16_t)(b[8] | ((uint16_t)b[9] << 8));
+            uint64_t sig = 0; memcpy(&sig, b, 8);
+            if (isnan(v)) {
+                x87_set_c(c, 1, 0, 1, 1);
+                raised |= FSW_IE;
+            } else if (v == 0.0L) x87_set_c(c, 0, 0, 0, 1);
+            else if (signbit(v))  x87_set_c(c, 1, 0, 0, 0);
+            else                  x87_set_c(c, 0, 0, 0, 0);
+            (void)se; (void)sig; break; }
+        case 0xE5: { /* FXAM */
+            unsigned c3, c2, c0, c1;
+            int empty = x87_st_empty(c, 0);
+            x87_fxam_code(c->fst[x87_phys(c, 0)], empty, &c3, &c2, &c0, &c1);
+            x87_set_c(c, c0, c1, c2, c3); break; }
+        case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+        case 0xEC: case 0xED: case 0xEE: {  /* FLD constants (host-measured bits) */
+            static const uint16_t k[7][5] = {
+                {0x3FFF,0x8000,0x0000,0x0000,0x0000},   /* 1  */
+                {0x4000,0xD49A,0x784B,0xCD1B,0x8AFE},   /* log2(10) */
+                {0x3FFF,0xB8AA,0x3B29,0x5C17,0xF0BC},   /* log2(e) */
+                {0x4000,0xC90F,0xDAA2,0x2168,0xC235},   /* pi */
+                {0x3FFD,0x9A20,0x9A84,0xFBCF,0xF799},   /* log10(2) */
+                {0x3FFE,0xB172,0x17F7,0xD1CF,0x79AC},   /* ln(2) */
+                {0x0000,0x0000,0x0000,0x0000,0x0000},   /* 0  */
+            };
+            const uint16_t *w = k[modrm - 0xE8];
+            uint8_t b[10];
+            /* rows are display-order words (se, sig-hi..sig-lo): se lands
+             * in bytes 8-9, the last row in bytes 0-1 (little-endian). */
+            for (int i = 0; i < 5; i++) {
+                b[8 - i * 2] = (uint8_t)w[i];
+                b[9 - i * 2] = (uint8_t)(w[i] >> 8);
+            }
+            x87_push(c, x87_ld_from80(b), &raised); break; }
+        default: {
+            /* F2 unaries + F3 transcendentals live here; the D1-D7/E2/E3/
+             * E6/E7/EF register holes stay reserved (#UD, pinned in the
+             * table suite). */
+            uint16_t psw = 0;
+            long double v;
+            x87_set_round(c);
+            switch (modrm) {
+            case 0xF4: { /* FXTRACT: push significand on top, exponent below */
+                if (!x87_check_src(c, 0, &raised)) break;
+                long double sig, ex;
+                x87_u_xtract(c->fst[x87_phys(c, 0)], &sig, &ex, &raised);
+                int dst = (c->ftop - 1) & 7;
+                if (x87_get_tag(c, dst) != X87_T_EMPTY) {
+                    raised |= FSW_IE | FSW_SF; c->fsw |= FSW_C1;
+                }
+                c->ftop = dst;
+                x87_w(c, dst, sig);
+                x87_set_tag(c, dst, x87_class(sig));
+                x87_w(c, (dst + 1) & 7, ex);
+                x87_set_tag(c, (dst + 1) & 7, x87_class(ex));
+                x87_sync_top(c);
+                break; }
+            case 0xF5: case 0xF8: { /* FPREM1 / FPREM */
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, 1, &raised)) break;
+                v = x87_u_prem(c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)],
+                               modrm == 0xF5, &raised, &psw);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                /* the instruction SW carries C0=Q2 C3=Q1 C1=Q0 C2=partial */
+                x87_set_c(c, (psw >> 8) & 1u, (psw >> 9) & 1u,
+                          (psw >> 10) & 1u, (psw >> 14) & 1u);
+                break; }
+            case 0xFA: /* FSQRT */
+                if (!x87_check_src(c, 0, &raised)) break;
+                v = x87_u_sqrt(c->fst[x87_phys(c, 0)], &raised);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                break;
+            case 0xFC: /* FRNDINT */
+                if (!x87_check_src(c, 0, &raised)) break;
+                v = x87_u_rndint(c->fst[x87_phys(c, 0)], &raised);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                break;
+            case 0xFD: /* FSCALE */
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, 1, &raised)) break;
+                v = x87_u_scale(c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)], &raised);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                break;
+            case 0xF0: { /* F2XM1: ST0 = 2^ST0 - 1 (|x|>1: source + PE quirk) */
+                if (!x87_check_src(c, 0, &raised)) break;
+                v = x87_t_pair(XT_2XM1, c->fst[x87_phys(c, 0)], 0.0L, &raised, &psw);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                x87_c1(c, psw);
+                break; }
+            case 0xF1: case 0xF9: case 0xF3: {
+                /* FYL2X: ST1 = ST1*log2(ST0); FYL2XP1: ST1 = ST1*log2(1+ST0);
+                 * FPATAN: ST1 = atan2(ST1, ST0) -- then pop (result at ST0). */
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, 1, &raised)) break;
+                int kind = (modrm == 0xF1) ? XT_L2X : (modrm == 0xF9) ? XT_L2XP1 : XT_PATAN;
+                v = x87_t_pair(kind, c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)],
+                               &raised, &psw);
+                x87_w(c, x87_phys(c, 1), v);
+                x87_set_tag(c, x87_phys(c, 1), x87_class(v));
+                x87_pop(c, &raised);
+                x87_c1(c, psw);
+                break; }
+            case 0xFE: case 0xFF: { /* FSIN / FCOS */
+                if (!x87_check_src(c, 0, &raised)) break;
+                v = c->fst[x87_phys(c, 0)];
+                if (!isnan(v) && !isinf(v) && fabsl(v) >= 0x1p63L) {
+                    /* host receipt: |x| >= 2^63 -> source unchanged, C2=1,
+                     * C1=0, quiet (transprobe2 boundary) */
+                    c->fsw &= (uint16_t)~(FSW_C1 | FSW_C2);
+                    c->fsw |= FSW_C2;
+                    break;
+                }
+                v = x87_t_pair(modrm == 0xFE ? XT_SIN : XT_COS, v, 0.0L, &raised, &psw);
+                x87_w(c, x87_phys(c, 0), v);
+                x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                x87_c12(c, psw);
+                break; }
+            case 0xF2: case 0xFB: { /* FPTAN: [1.0, tan]; FSINCOS: [cos, sin] */
+                if (!x87_check_src(c, 0, &raised)) break;
+                v = c->fst[x87_phys(c, 0)];
+                if (!isnan(v) && !isinf(v) && fabsl(v) >= 0x1p63L) {
+                    /* huge: no push at all, source unchanged, C2=1, C1=0 */
+                    c->fsw &= (uint16_t)~(FSW_C1 | FSW_C2);
+                    c->fsw |= FSW_C2;
+                    break;
+                }
+                long double r0, r1;
+                x87_t_pushpair(modrm == 0xF2 ? XT_TAN : XT_SINCOS, v,
+                               &r0, &r1, &raised, &psw);
+                int dst = (c->ftop - 1) & 7;
+                if (x87_get_tag(c, dst) != X87_T_EMPTY) {
+                    /* stack fault (transprobe3): IE|SF|C1=1 and BOTH the
+                     * old ST0 and the push slot become indefinite */
+                    raised |= FSW_IE | FSW_SF;
+                    c->fsw |= FSW_C1;
+                    r0 = x87_indefinite();
+                    r1 = x87_indefinite();
+                } else {
+                    x87_c12(c, psw);
+                }
+                c->ftop = dst;
+                x87_w(c, dst, r0);
+                x87_set_tag(c, dst, x87_class(r0));
+                x87_w(c, (dst + 1) & 7, r1);
+                x87_set_tag(c, (dst + 1) & 7, x87_class(r1));
+                x87_sync_top(c);
+                break; }
+            default:
+                faultf(c, "#UD x87 D9 reg form out of scope (%02x)", modrm); return;
+            }
+            break; }
+        }
+        break;
+
+    /* ---------------- DB: int/m80 stores, FCMOV, control -------------- */
+    case 0xDB:
+        if (is_mem) {
+            switch (ext) {
+            case 0: { /* FILD m32 */
+                int32_t v = (int32_t)read_mem_v(m, ea, 4);
+                x87_push(c, (long double)v, &raised); break; }
+            case 1: { /* FISTTP m32 (truncates regardless of RC) */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                fesetround(FE_TOWARDZERO); feclearexcept(FE_ALL_EXCEPT);
+                int32_t out; x87_to_int32(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 4, (uint32_t)out);
+                x87_set_round(c); x87_pop(c, &raised); break; }
+            case 2: { /* FIST m32 */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                int32_t out; x87_to_int32(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 4, (uint32_t)out); break; }
+            case 3: { /* FISTP m32 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                int32_t out; x87_to_int32(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 4, (uint32_t)out);
+                x87_pop(c, &raised); break; }
+            case 5: { /* FLD m80 */
+                uint8_t b[10];
+                for (int j = 0; j < 10; j++) b[j] = (uint8_t)read_mem_v(m, ea + (uint64_t)j, 1);
+                x87_push(c, x87_ld_from80(b), &raised); break; }
+            case 7: { /* FSTP m80 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                uint8_t b[10]; x87_ld_to80(c->fst[x87_phys(c, 0)], b);
+                for (int j = 0; j < 10; j++) write_mem_v(m, ea + (uint64_t)j, 1, b[j]);
+                x87_pop(c, &raised); break; }
+            default:  /* /4, /6 are reserved in memory form */
+                faultf(c, "#UD x87 DB /%d", ext); return;
+            }
+        } else {
+            switch (modrm) {
+            case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+            case 0xC4: case 0xC5: case 0xC6: case 0xC7: /* FCMOVNB ST(0),ST(i) */
+            case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+            case 0xCC: case 0xCD: case 0xCE: case 0xCF: /* FCMOVNE */
+            case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            case 0xD4: case 0xD5: case 0xD6: case 0xD7: /* FCMOVNBE */
+            case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+            case 0xDC: case 0xDD: case 0xDE: case 0xDF: { /* FCMOVNU */
+                int take = 0;
+                switch ((modrm >> 3) & 3) {
+                case 0: take = !(c->rflags & FLAG_CF); break;      /* NB */
+                case 1: take = !(c->rflags & FLAG_ZF); break;      /* NE */
+                case 2: take = !(c->rflags & FLAG_CF) && !(c->rflags & FLAG_ZF); break;
+                case 3: take = !(c->rflags & FLAG_PF); break;      /* NU */
+                }
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, regi, &raised)) break;
+                if (take) {
+                    x87_w(c, x87_phys(c, 0), c->fst[x87_phys(c, regi)]);
+                    x87_set_tag(c, x87_phys(c, 0), x87_get_tag(c, x87_phys(c, regi)));
+                }
+                break; }
+            case 0xE0: case 0xE1: case 0xE4: /* FNENI/FNDISI/FSETPM: legacy no-ops */
+                break;
+            case 0xE2: /* FNCLEX */
+                track = 0;
+                c->fsw &= (uint16_t)~(FSW_PE | FSW_UE | FSW_OE | FSW_ZE | FSW_DE |
+                                      FSW_IE | FSW_SF | FSW_ES | FSW_B);
+                break;
+            case 0xE3: /* FNINIT */
+                track = 0;
+                x87_reset(c); break;
+            case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+            case 0xEC: case 0xED: case 0xEE: case 0xEF: /* FUCOMI ST(i) */
+            case 0xF0: case 0xF1: case 0xF2: case 0xF3:
+            case 0xF4: case 0xF5: case 0xF6: case 0xF7: /* FCOMI ST(i) */
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, regi, &raised)) break;
+                x87_com_eflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                        c->fst[x87_phys(c, regi)], (modrm & 0xF8) == 0xE8, &raised));
+                break;
+            default:   /* the reserved holes */
+                faultf(c, "#UD x87 DB reg form out of scope (%02x)", modrm); return;
+            }
+        }
+        break;
+
+    /* ---------------- DD: m64 loads/stores, save/restore, FFREE ------- */
+    case 0xDD:
+        if (is_mem) {
+            switch (ext) {
+            case 0: { /* FLD m64 (converting: SNaN -> IE + quiet) */
+                uint64_t b = read_mem_v(m, ea, 8);
+                feclearexcept(FE_ALL_EXCEPT);
+                long double v = x87_from_m64(b);
+                x87_get_fenv(&raised);
+                x87_push(c, v, &raised); break; }
+            case 1: { /* FISTTP m64 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                fesetround(FE_TOWARDZERO); feclearexcept(FE_ALL_EXCEPT);
+                int64_t out; x87_to_int64(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 8, (uint64_t)out);
+                x87_set_round(c); x87_pop(c, &raised); break; }
+            case 2: { /* FST m64 */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                write_mem_v(m, ea, 8, x87_to_m64(c->fst[x87_phys(c, 0)]));
+                x87_get_fenv(&raised); break; }
+            case 3: { /* FSTP m64 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                write_mem_v(m, ea, 8, x87_to_m64(c->fst[x87_phys(c, 0)]));
+                x87_get_fenv(&raised); x87_pop(c, &raised);
+                break; }
+            case 4:   /* FRSTOR */
+                track = 0;
+                x87_load_env(c, ea, d->opsize != 2);
+                x87_load_regs(c, ea + (d->opsize != 2 ? 28u : 14u));
+                break;
+            case 6:   /* FNSAVE */
+                track = 0;
+                x87_save_env(c, ea, d->opsize != 2);
+                x87_save_regs(c, ea + (d->opsize != 2 ? 28u : 14u));
+                x87_reset(c);
+                break;
+            case 7:   /* FNSTSW m16 */
+                track = 0;
+                write_mem_v(m, ea, 2, c->fsw); break;
+            default:  /* /5 reserved */
+                faultf(c, "#UD x87 DD /%d", ext); return;
+            }
+        } else {
+            switch (modrm) {
+            case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+            case 0xC4: case 0xC5: case 0xC6: case 0xC7: /* FFREE ST(i) */
+                /* ST(i) is STACK-relative here (host-measured: FFREE ST(1)
+                 * with TOP=6 frees phys7, not phys1) */
+                x87_set_tag(c, x87_phys(c, regi), X87_T_EMPTY); break;
+            case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            case 0xD4: case 0xD5: case 0xD6: case 0xD7: /* FST ST(i) */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_w(c, x87_phys(c, regi), c->fst[x87_phys(c, 0)]);
+                x87_set_tag(c, x87_phys(c, regi), x87_get_tag(c, x87_phys(c, 0)));
+                break;
+            case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+            case 0xDC: case 0xDD: case 0xDE: case 0xDF: /* FSTP ST(i) */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                x87_w(c, x87_phys(c, regi), c->fst[x87_phys(c, 0)]);
+                x87_set_tag(c, x87_phys(c, regi), x87_get_tag(c, x87_phys(c, 0)));
+                x87_pop(c, &raised);
+                break;
+            case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+            case 0xE4: case 0xE5: case 0xE6: case 0xE7: /* FUCOM ST(i) */
+                if (!x87_check_src(c, 0, &raised)) break;
+                if (!x87_check_src(c, regi, &raised)) break;
+                x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                        c->fst[x87_phys(c, regi)], 1, &raised));
+                break;
+            case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+            case 0xEC: case 0xED: case 0xEE: case 0xEF: /* FUCOMP ST(i) */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                if (!x87_check_src(c, regi, &raised)) { x87_pop(c, &raised); break; }
+                x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                        c->fst[x87_phys(c, regi)], 1, &raised));
+                x87_pop(c, &raised);
+                break;
+            default:  /* the reserved holes */
+                faultf(c, "#UD x87 DD reg form out of scope (%02x)", modrm); return;
+            }
+        }
+        break;
+
+    /* ---------------- DF: m16/m64 ints, BCD, FNSTSW AX, FFREEP -------- */
+    case 0xDF:
+        if (is_mem) {
+            switch (ext) {
+            case 0: { /* FILD m16 */
+                int16_t v = (int16_t)read_mem_v(m, ea, 2);
+                x87_push(c, (long double)v, &raised); break; }
+            case 1: { /* FISTTP m16 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                fesetround(FE_TOWARDZERO); feclearexcept(FE_ALL_EXCEPT);
+                int16_t out; x87_to_int16(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 2, (uint16_t)out);
+                x87_set_round(c); x87_pop(c, &raised); break; }
+            case 2: { /* FIST m16 */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                int16_t out; x87_to_int16(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 2, (uint16_t)out); break; }
+            case 3: { /* FISTP m16 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                int16_t out; x87_to_int16(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 2, (uint16_t)out);
+                x87_pop(c, &raised); break; }
+            case 4: { /* FBLD m80 BCD */
+                uint8_t b[10];
+                for (int j = 0; j < 10; j++) b[j] = (uint8_t)read_mem_v(m, ea + (uint64_t)j, 1);
+                x87_push(c, x87_from_bcd(b), &raised); break; }
+            case 5: { /* FILD m64 */
+                int64_t v = (int64_t)read_mem_v(m, ea, 8);
+                x87_push(c, (long double)v, &raised); break; }
+            case 6: { /* FBSTP m80 BCD (F3: rounds per RC, C1/PE/IE live) */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                uint8_t b[10]; unsigned c1 = 0;
+                x87_set_round(c);
+                x87_to_bcd(c->fst[x87_phys(c, 0)], b, &raised, &c1);
+                for (int j = 0; j < 10; j++) write_mem_v(m, ea + (uint64_t)j, 1, b[j]);
+                if (c1) c->fsw |= FSW_C1; else c->fsw &= (uint16_t)~FSW_C1;
+                x87_pop(c, &raised); break; }
+            case 7: { /* FISTP m64 */
+                if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+                x87_set_round(c); feclearexcept(FE_ALL_EXCEPT);
+                int64_t out; x87_to_int64(c->fst[x87_phys(c, 0)], &out, &raised);
+                write_mem_v(m, ea, 8, (uint64_t)out);
+                x87_pop(c, &raised); break; }
+            }
+        } else if (modrm == 0xE0) { /* FNSTSW AX */
+            track = 0;
+            set_reg(c, RAX, 2, 0, c->fsw);
+        } else if ((modrm & 0xF8) == 0xC0) { /* FFREEP ST(i): free + pop */
+            x87_set_tag(c, x87_phys(c, regi), X87_T_EMPTY);
+            x87_pop(c, &raised);
+        } else if ((modrm & 0xF8) == 0xE8 || (modrm & 0xF8) == 0xF0) {
+            /* FUCOMIP / FCOMIP ST(i) */
+            if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+            if (!x87_check_src(c, regi, &raised)) { x87_pop(c, &raised); break; }
+            x87_com_eflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                    c->fst[x87_phys(c, regi)], (modrm & 0xF8) == 0xE8, &raised));
+            x87_pop(c, &raised);
+        } else {
+            faultf(c, "#UD x87 DF reg form out of scope (%02x)", modrm); return;
+        }
+        break;
+
+    /* ---------------- DA: FCMOVcc up front; rest is F2 arithmetic ----- */
+    case 0xDA:
+        if (!is_mem && (modrm & 0xF8) >= 0xC0 && (modrm & 0xF8) <= 0xD8) {
+            int take = 0;
+            switch ((modrm >> 3) & 3) {
+            case 0: take =  (c->rflags & FLAG_CF) != 0; break;                    /* B  */
+            case 1: take =  (c->rflags & FLAG_ZF) != 0; break;                    /* E  */
+            case 2: take =  (c->rflags & (FLAG_CF | FLAG_ZF)) != 0; break;        /* BE */
+            case 3: take =  (c->rflags & FLAG_PF) != 0; break;                    /* U  */
+            }
+            if (!x87_check_src(c, 0, &raised)) break;
+            if (!x87_check_src(c, regi, &raised)) break;
+            if (take) {
+                x87_w(c, x87_phys(c, 0), c->fst[x87_phys(c, regi)]);
+                x87_set_tag(c, x87_phys(c, 0), x87_get_tag(c, x87_phys(c, regi)));
+            }
+            break;
+        }
+        if (is_mem) {
+            long double src = (long double)(int32_t)(uint32_t)read_mem_v(m, ea, 4);
+            switch (ext) {
+            case 2: case 3:  /* FICOM/FICOMP m32int */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)], src, 0, &raised));
+                if (ext == 3) x87_pop(c, &raised);
+                break;
+            default:
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_apply_binop(c, x87_grp_kind(ext), 0, src, 0, &raised);
+                break;
+            }
+            break;
+        }
+        if (modrm == 0xE9) { /* FUCOMPP */
+            if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); x87_pop(c, &raised); break; }
+            if (!x87_check_src(c, 1, &raised)) { x87_pop(c, &raised); x87_pop(c, &raised); break; }
+            x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                                          c->fst[x87_phys(c, 1)], 1, &raised));
+            x87_pop(c, &raised); x87_pop(c, &raised);
+            break;
+        }
+        faultf(c, "#UD x87 DA reg form out of scope (%02x)", modrm);
+        return;
+
+    /* ---------------- D8: m32/ST(i) -> ST0 arithmetic, FCOM ---------- */
+    case 0xD8: {
+        long double src = 0;
+        if (is_mem) src = x87_from_m32((uint32_t)read_mem_v(m, ea, 4));
+        int grp = is_mem ? ext : (modrm >> 3) & 7;
+        if (grp == 2 || grp == 3) { /* FCOM/FCOMP */
+            if (!x87_check_src(c, 0, &raised)) break;
+            if (!is_mem && !x87_check_src(c, regi, &raised)) break;
+            x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                    is_mem ? src : c->fst[x87_phys(c, regi)], 0, &raised));
+            if (grp == 3) x87_pop(c, &raised);
+            break;
+        }
+        if (!x87_check_src(c, 0, &raised)) break;
+        if (!is_mem && !x87_check_src(c, regi, &raised)) break;
+        x87_apply_binop(c, x87_grp_kind(grp), 0,
+                        is_mem ? src : c->fst[x87_phys(c, regi)], 0, &raised);
+        break; }
+
+    /* ---------------- DC: m64/ST(i),ST(0) arithmetic ----------------- */
+    case 0xDC: {
+        long double src = 0;
+        if (is_mem) src = x87_from_m64(read_mem_v(m, ea, 8));
+        int grp = is_mem ? ext : (modrm >> 3) & 7;
+        if (!is_mem && (grp == 2 || grp == 3)) {
+            faultf(c, "#UD x87 DC reg form out of scope (%02x)", modrm); return;
+        }
+        if (grp == 2 || grp == 3) { /* FCOM/FCOMP m64 */
+            if (!x87_check_src(c, 0, &raised)) break;
+            x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)], src, 0, &raised));
+            if (grp == 3) x87_pop(c, &raised);
+            break;
+        }
+        if (!x87_check_src(c, 0, &raised)) break;
+        if (is_mem) {
+            x87_apply_binop(c, x87_grp_kind(grp), 0, src, 0, &raised);
+        } else {
+            if (!x87_check_src(c, regi, &raised)) break;
+            x87_apply_binop(c, x87_grp_kind_rev(grp), regi,
+                            c->fst[x87_phys(c, 0)], 0, &raised);
+        }
+        break; }
+
+    /* ---------------- DE: m16 int arithmetic, FCOMPP, +P forms -------- */
+    case 0xDE: {
+        if (is_mem) {
+            long double src = (long double)(int16_t)(uint16_t)read_mem_v(m, ea, 2);
+            int grp = ext;
+            if (grp == 2 || grp == 3) { /* FICOM/FICOMP m16int */
+                if (!x87_check_src(c, 0, &raised)) break;
+                x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)], src, 0, &raised));
+                if (grp == 3) x87_pop(c, &raised);
+                break;
+            }
+            if (!x87_check_src(c, 0, &raised)) break;
+            x87_apply_binop(c, x87_grp_kind(grp), 0, src, 0, &raised);
+            break;
+        }
+        if (modrm == 0xD9) { /* FCOMPP */
+            if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); x87_pop(c, &raised); break; }
+            if (!x87_check_src(c, 1, &raised)) { x87_pop(c, &raised); x87_pop(c, &raised); break; }
+            x87_com_cflags(c, x87_cmp_vals(c->fst[x87_phys(c, 0)],
+                                          c->fst[x87_phys(c, 1)], 0, &raised));
+            x87_pop(c, &raised); x87_pop(c, &raised);
+            break;
+        }
+        if ((modrm & 0xF8) == 0xC0 || (modrm & 0xF8) == 0xC8 ||
+            (modrm & 0xF8) == 0xE0 || (modrm & 0xF8) == 0xE8 ||
+            (modrm & 0xF8) == 0xF0 || (modrm & 0xF8) == 0xF8) {
+            int grp = (modrm >> 3) & 7;
+            if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+            if (!x87_check_src(c, regi, &raised)) { x87_pop(c, &raised); break; }
+            x87_apply_binop(c, x87_grp_kind_rev(grp), regi,
+                            c->fst[x87_phys(c, 0)], 1, &raised);
+            break;
+        }
+        faultf(c, "#UD x87 DE reg form out of scope (%02x)", modrm);
+        return; }
+
+    default:
+        faultf(c, "#UD x87 escape out of scope");
+        return;
+    }
+
+    if (track) {   /* FIP/FOP/FDP: last executed x87 op and its operand */
+        c->fip = d->start_pc;
+        c->fcs = c->seg[SEG_CS].sel;
+        c->fop = fop;
+        if (is_mem) {
+            c->fdp = ea;
+            c->fds = (rm.seg >= 0) ? c->seg[rm.seg].sel : c->seg[SEG_DS].sel;
+        }
+    }
+    /* exception bookkeeping: sticky bits first, then #MF when unmasked.
+     * Only the six FCW-maskable bits (PE..IE) can raise; SF/C1 ride along
+     * as sticky state and must NOT gate the #MF (measured in F0 testing). */
+    if (raised) {
+        c->fsw |= raised;
+        if ((raised & FCW_EXCM) & (uint16_t)~(c->fcw & FCW_EXCM)) {
+            c->fsw |= FSW_ES;
+            raise_exception(m, 16, 0, 0);   /* #MF: delivered fault */
+        }
+    }
 }
 
 /* ============================== main stepper ============================== */
@@ -2241,34 +3506,62 @@ really_slow:
             if (ext == 2) { c->mxcsr = (uint32_t)read_mem_v(m, addr, 4) & 0x0000FFFFu; break; }
             if (ext == 3) { write_mem_v(m, addr, 4, c->mxcsr); break; }
             if (addr & 15) { raise_exception(m, 13, 1, 0); break; }  /* FXSAVE aligns */
-            if (ext == 0) { /* FXSAVE m512: powered-on x87 state + our live
-                               MXCSR + live XMM file (K4: the scheduler's
-                               context images must round-trip the values
-                               userspace actually computed). */
-                write_mem_v(m, addr +  0, 2, 0x037F);             /* FCW */
-                write_mem_v(m, addr +  2, 2, 0);                  /* FSW */
-                write_mem_v(m, addr +  4, 2, 0);                  /* FTW */
-                write_mem_v(m, addr +  6, 2, 0);                  /* RSVD */
-                write_mem_v(m, addr +  8, 2, 0);                  /* FOP */
-                write_mem_v(m, addr + 10, 1, 0); write_mem_v(m, addr + 11, 1, 0);
-                write_mem_v(m, addr + 12, 4, 0);                  /* FIP */
-                write_mem_v(m, addr + 16, 2, 0);                  /* FCS */
-                write_mem_v(m, addr + 18, 2, 0);
-                write_mem_v(m, addr + 20, 4, 0);                  /* FDP */
-                write_mem_v(m, addr + 24, 2, 0);                  /* FDS */
-                write_mem_v(m, addr + 26, 2, 0);
-                write_mem_v(m, addr + 28, 4, c->mxcsr);           /* MXCSR */
-                write_mem_v(m, addr + 32, 4, 0x0000FFBF);         /* MXCSR_MASK */
-                for (int off = 32 + 4; off < 512; off += 4)
+            if (ext == 0) { /* FXSAVE m512: LIVE x87 state + live MXCSR +
+                               live XMM file (K4 round-trip pin). Layout is
+                               HOST-MEASURED (fxprobe2 receipt, pinned by
+                               test_fpu.c::v_fxsave_live_layout): the F0
+                               audit found the old image two bytes off with
+                               MXCSR sitting in the MASK slot -- */
+                write_mem_v(m, addr +  0, 2, c->fcw);
+                write_mem_v(m, addr +  2, 2, c->fsw);
+                write_mem_v(m, addr +  4, 1, x87_ftw_abridged(c)); /* FTW 1B */
+                write_mem_v(m, addr +  5, 1, 0);
+                write_mem_v(m, addr +  6, 2, c->fop);
+                write_mem_v(m, addr +  8, 4, (uint32_t)c->fip);
+                write_mem_v(m, addr + 12, 2, c->fcs);
+                write_mem_v(m, addr + 14, 2, 0);
+                write_mem_v(m, addr + 16, 4, (uint32_t)c->fdp);
+                write_mem_v(m, addr + 20, 2, c->fds);
+                write_mem_v(m, addr + 22, 2, 0);
+                write_mem_v(m, addr + 24, 4, c->mxcsr);           /* MXCSR@24 */
+                write_mem_v(m, addr + 28, 4, 0x0000FFBF);         /* MASK@28 */
+                for (int i = 0; i < 8; i++) {      /* ST(i): logical order */
+                    uint8_t b[10];
+                    x87_ld_to80(c->fst[x87_phys(c, i)], b);
+                    for (int j = 0; j < 10; j++)
+                        write_mem_v(m, addr + 32 + (uint64_t)i * 16 + (uint64_t)j, 1, b[j]);
+                    for (int j = 10; j < 16; j++)
+                        write_mem_v(m, addr + 32 + (uint64_t)i * 16 + (uint64_t)j, 1, 0);
+                }
+                for (int off = 160; off < 512; off += 4)
                     write_mem_v(m, addr + (uint64_t)off, 4, 0);
                 for (int i = 0; i < 16; i++) {
                     write_mem_v(m, addr + 160 + (uint64_t)i * 16,     8, c->xmm[i][0]);
                     write_mem_v(m, addr + 160 + (uint64_t)i * 16 + 8, 8, c->xmm[i][1]);
                 }
                 break; }
-            { /* ext == 1: FXRSTOR -- absorb the MXCSR (masked like the
-                 hardware does) and the live XMM file (K4). */
-                uint32_t nx = (uint32_t)read_mem_v(m, addr + 28, 4);
+            { /* ext == 1: FXRSTOR -- the live x87 block, MXCSR (masked
+                 like the hardware does) and the live XMM file (K4). */
+                c->fcw = (uint16_t)read_mem_v(m, addr +  0, 2);
+                c->fsw = (uint16_t)read_mem_v(m, addr +  2, 2);
+                c->ftop = (c->fsw >> 11) & 7;
+                c->fop = (uint16_t)read_mem_v(m, addr +  6, 2);
+                c->fip = read_mem_v(m, addr +  8, 4);
+                c->fcs = (uint16_t)read_mem_v(m, addr + 12, 2);
+                c->fdp = read_mem_v(m, addr + 16, 4);
+                c->fds = (uint16_t)read_mem_v(m, addr + 20, 2);
+                {   uint8_t aw = (uint8_t)read_mem_v(m, addr + 4, 1);
+                    for (int i = 0; i < 8; i++) {
+                        uint8_t b[10];
+                        for (int j = 0; j < 10; j++)
+                            b[j] = (uint8_t)read_mem_v(m, addr + 32 + (uint64_t)i * 16 + (uint64_t)j, 1);
+                        int phys = x87_phys(c, i);
+                        x87_w(c, phys, x87_ld_from80(b));
+                        x87_set_tag(c, phys, (aw & (1u << phys))
+                                    ? x87_class(c->fst[phys]) : X87_T_EMPTY);
+                    }
+                }
+                uint32_t nx = (uint32_t)read_mem_v(m, addr + 24, 4);
                 c->mxcsr = (c->mxcsr & ~0x0000FFFFu) | (nx & 0x0000FFFFu);
                 for (int i = 0; i < 16; i++) {
                     c->xmm[i][0] = read_mem_v(m, addr + 160 + (uint64_t)i * 16,     8);
@@ -2469,24 +3762,15 @@ really_slow:
 
     /* ---- IMUL r, r/m, imm (three-operand) -- caught missing by the C10
        table suite; same CF/OF semantics as the two-operand form. ---- */
-    case 0xDB: { /* x87 control subset (K3): FNINIT (DB E3) and FNCLEX
-                    (DB E2) are deliberate no-ops -- this machine has no x87
-                    data model (measured: AuraLite's context_switch issues
-                    fninit+ldmxcsr per switch). Every other encoding stays
-                    #UD: that is the honest silence boundary for x87 data
-                    ops, not accidental absence. */
-        uint8_t modrm = fetch8(&d);
-        if (modrm == 0xE3 /* FNINIT */ || modrm == 0xE2 /* FNCLEX */) break;
-        faultf(c, "#UD x87 data op out of scope (K3)"); break; }
-    case 0xD9: { /* x87 control words only (K3): FLDCW /5 m16 stores into a
-                    tracked control word, FNSTCW /7 m16 reads it back. Data
-                    opcodes (#UD) fail loudly rather than pretend. */
-        uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7, mod=modrm>>6;
-        (void)mod;
-        rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
-        if (ext==5) { c->fcw=(uint16_t)rm_read(&d,&rm,2); break; }
-        if (ext==7) { rm_write(&d,&rm,2,c->fcw); break; }
-        faultf(c, "#UD x87 data op out of scope (K3)"); break; }
+    case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+    case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
+        /* x87 escapes (F1): one decoder owns the reg/mem split -- the
+         * pre-F1 D9 path decoded register forms as memory and FLDCW'ed AX
+         * into the control word on FLD1 (F0 receipt defect D1). Data and
+         * control live in x87_exec; D8/DA/DC/DE stay the deliberate F2
+         * arithmetic boundary. */
+        x87_exec(m, c, &d, op);
+        break; }
     case 0x63: { /* MOVSXD r64, r/m32 in long mode (REX.W); without REX.W it
                     degrades to a 32-bit (osz4) or 16-bit (osz2) plain move
                     per the Intel table. In legacy modes the same byte is
@@ -2955,6 +4239,12 @@ really_slow:
             if (d.rep) str_dec_count(c,d.addrsize);
         }
         break; }
+
+    case 0x9B: /* WAIT/FWAIT: the x87 sync point. Under CR0.TS it raises #NM
+                * like any escape (F1); no pending unmasked x87 exception can
+                * exist between completed ops here. */
+        if (c->cr0 & 0x8u) raise_exception(m, 7, 0, 0);
+        break;
 
     default:
         faultf(c, "#UD unsupported opcode 0x%02x at rip=%08llx (mode %s)", op, (unsigned long long)d.start_pc, cpu_mode_name(c));

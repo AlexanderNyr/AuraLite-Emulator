@@ -109,6 +109,23 @@ typedef struct cpu {
     int trace;               /* if non-zero, print each instruction */
 
     machine_t *mach;         /* back-reference to owning machine (memory/io) */
+
+    /* ---------------- x87 state (phase F1) ----------------
+     * The whole block is appended AFTER mach: the frozen layout of every
+     * field above is a hard invariant (gdbstub RSP, MMX aliasing, the
+     * fcw..mxcsr contiguity the FXSAVE snapshot relies on) and must not
+     * shift by a byte. fst holds the PHYSICAL register file as host long
+     * double -- the ISA's own 80-bit extended format, bit-exact on the
+     * hosts this emulator builds for; ftop is FSW.TOP and ftw is the full
+     * 2-bit-per-register tag word (abridged only at the FXSAVE/FNSAVE
+     * boundary). */
+    uint16_t fsw;             /* x87 status word: C flags, TOP, exc bits */
+    uint16_t ftw;             /* full 2-bit-per-register tag word */
+    uint16_t fop;             /* last x87 opcode (FOP) */
+    uint16_t fcs, fds;        /* last x87 CS/DS selectors (FIP/FDP segs) */
+    uint64_t fip, fdp;        /* last x87 instruction / data offsets */
+    int      ftop;            /* physical register index of ST(0) */
+    long double fst[8];       /* physical regfile, 80-bit extended */
 } cpu_t;
 
 void cpu_reset(cpu_t *c);

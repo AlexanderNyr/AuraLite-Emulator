@@ -550,11 +550,15 @@ static const vec_t VECTORS[] = {
     V("bsf 16-bit src",    "0F BC C3",           "bx=0x10", "ax=4,zf=0"),
     V("bsr low bit",       "66 0F BD C3",        "ebx=0x1", "eax=0,zf=0"),
 
-    /* -- T: x87 control subset (K3) -- FNINIT/FNCLEX are pure no-ops
-     * (flags preserved), and the data-op boundary is a pinned #UD. */
+    /* -- T: x87 subset -- FNINIT/FNCLEX are real since F1 but still must
+     * not touch the integer flags. The pinned #UD boundary moves with the
+     * phases: "D9 C0" fell when F1 landed, "D8 C1" (FADD) when F2, and
+     * "D9 F0" (F2XM1) when F3 -- every contract lives in tests/test_fpu.c.
+     * What remains is architectural: the reserved D9 D1-D7 hole is #UD
+     * forever, and this row pins that last x87 edge. */
     V("fninit preserves",  "DB E3",              "cf=1", "cf=1"),
     V("fnclex preserves",  "DB E2",              "zf=1", "zf=1"),
-    V("x87 data stays #UD","D9 C0",              "", "fault=1"),
+    V("x87 d9 hole #UD",   "D9 D1",              "", "fault=1"),
 
     /* SWAPGS is 64-bit only; the legacy pin guards the deliberate #UD. */
     V("swapgs legacy pin", "0F 01 F8",           "", "fault=1"),

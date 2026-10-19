@@ -88,7 +88,12 @@ In terminal 2:
 gdb -ex "set architecture i386:x86-64" -ex "target remote 127.0.0.1:1234"
 ```
 
-#### E. Full BIOS Boot (`SeaBIOS → Stage 2 → AuraLite-OS Kernel Shell`, 1 or 4 vCPUs)
+#### E. Full BIOS Boot
+
+> The desktop GUI automates this exact recipe: `gui.bat` (or
+> `build.bat gui`) -> «Обычный» -> create machine -> pick the ISO ->
+> «Пуск» (see README «GUI»).  The manual command below remains the
+> reference. (`SeaBIOS → Stage 2 → AuraLite-OS Kernel Shell`, 1 or 4 vCPUs)
 With `bios.bin` (SeaBIOS 1.16.3, 128 KiB) and `auralite.iso`:
 ```bat
 REM Uniprocessor BIOS boot with ICH9 ACPI + PM timer:

@@ -7,7 +7,7 @@
 > `AuraLite-Emulator@b00c4d9` (== upstream tip, K7-K8 absorbed) with
 > `AuraLite-OS@0ed0d29`.
 
-**Status: complete — S0–S5 done ✅**
+**Status: complete — S0–S6 done ✅**
 
 | Phase | Scope | Status | Deliverable |
 |---|---|---|---|
@@ -17,6 +17,7 @@
 | S3 | DMA write: WRITE DMA EXT, guest `/disk` + `/fat` write→read round-trip (QEMU `test_ahci_rw.sh` parity) | ✅ done | `patches/0033-STORE-S3-ahci-write.patch` |
 | S4 | Breadth: up to 4 disks, port placement, second controller (QEMU `test_ahci_matrix.sh` parity) | ✅ done | `patches/0034-STORE-S4-ahci-matrix.patch` |
 | S5 | Large transfers + hardening (QEMU `test_ahci_large_read.sh` parity), IRQ honesty, determinism, docs | ✅ done | `patches/0035-STORE-S5-ahci-hardening.patch` |
+| S6 | ATAPI + El Torito: `--cdrom=` (ctrl 0 port 1), PxSIG `0xEB14`, `0xA1` IDENTIFY PACKET (word0 `0x8580`), `0xA0` PACKET (CDB at ct+0x40) with 0x00 TUR / 0x03 REQUEST SENSE (18 B, autosense) / 0x12 INQUIRY / 0x1A MODE SENSE(6) / 0x1B / 0x1E / 0x25 READ CAPACITY (2048) / 0x28 READ(10) (2048-B blocks) / 0x43 READ TOC; unknown CDB → CHECK CONDITION (sense 5/20), WRITE(10) → sense 7/27; sense fields in the snapshot, kind in the machine shape | ✅ done | `patches/0071-STORE-S6-atapi-el-torito.patch` |
 
 ## 1. Measured baseline
 

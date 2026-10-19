@@ -1,0 +1,902 @@
+From 05840e0eb98664ee1cf5cfdb439da663a1cfa7b7 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Mon, 19 Oct 2026 18:22:25 +0000
+Subject: [PATCH] FPU F4: integration gates -- receipts pair x2, x87 file
+ byte-stability
+
+The F4 row of docs/plans/FPU_PLAN.md, in the plan's measure-first style.
+
+The --kernel= freestanding x87 payload (tests/fpu_payload.c) boots
+through the loader core the CLI --kernel= flag drives and prints eight
+COM1 receipts: FNINIT-anchored FSW bits, FLD1/FLDPI/FSIN(0.5)/FADD byte
+pins (host-silicon payload) and the FBSTP/FBLD packed-BCD round trip.
+tests/test_fpu_gate.c boots it twice on fresh machines and requires the
+receipts byte-identical AND equal the pinned content (determinism x2);
+t4_snapshot_lanes.sh runs the file through the real CLI split lane and
+pins the receipt lines in the machine log.
+
+Snapshot byte-stability of the x87 file -- measured defect: a computed
+long double (FBLD's accumulator) assigned to an fst slot carried
+run/ENV-dependent stack garbage into the slot's 6 padding bytes, and
+the snapshot's raw cpu_t dump (machine.lo/machine.hi) wrote them into
+the file -- two processes saving the same state produced different
+snapshot files (flaky standalone, red under make's environment; two
+bytes inside fst[7]'s padding). The fix is x87_w in src/cpu.c: every
+one of the 24 fst write sites zeroes the slot padding, keeping the raw
+dump byte-stable. The guest formats never leaked (FNSAVE emits 10
+bytes/register, FXSAVE 10+zeroed reserved). Vectors: the gate's
+fresh-run byte-identity and save->load->save fixed point, plus the t4
+lanes (two-process file identity and the --max-instr=0 round trip --
+a resumed halted run advances the device cadence by design, and a
+resave must pass the same --kernel= or the machine-shape check refuses).
+
+NC: engine reverted to F2 -> the payload dies "#UD x87 transcendental
+out of scope (F3)", the gate red; run-dependent bytes injected at the
+fst dump -> both lanes red at the first padding byte.
+
+Gates: make test rc=0 (test-fpu 44 groups; test-table 369/369; t4 13
+split lanes incl. the four F4 lanes), make test-sanitize rc=0,
+diff-fuzz 512/12288 all-match, both SeaBIOS ISO lanes green.
+
+docs/plans/FPU_PLAN.md (status + section 1e), docs/STATUS.md and
+CHANGELOG.md updated in this commit; the plan F0-F4 is closed.
+---
+ CHANGELOG.md                           |  30 ++++
+ Makefile                               |  24 ++-
+ docs/STATUS.md                         |  38 ++++-
+ docs/plans/FPU_PLAN.md                 |  55 +++++-
+ src/cpu.c                              |  61 ++++---
+ tests/fpu_payload.c                    | 110 ++++++++++++
+ tests/integration/t4_snapshot_lanes.sh |  28 +++
+ tests/test_fpu_gate.c                  | 227 +++++++++++++++++++++++++
+ 8 files changed, 537 insertions(+), 36 deletions(-)
+ create mode 100644 tests/fpu_payload.c
+ create mode 100644 tests/test_fpu_gate.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dbff831..c6e51d6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,36 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0075 (FPU F4: integration gates -- the plan closes)
++
++- **`--kernel=` freestanding x87 payload receipts pair (determinism x2)**:
++  `tests/fpu_payload.c` is a freestanding guest that runs a fixed x87 tour
++  and prints eight COM1 receipts ("F4R0..7"): FNINIT-anchored FSW bits,
++  FLD1/FLDPI/FSIN(0.5)/FADD byte pins (host-silicon payload), and the
++  FBSTP/FBLD packed-BCD round trip (LSD digit-pair in byte 0 -- the m80
++  byte orders the vectors pin). `tests/test_fpu_gate.c` boots the payload
++  twice on fresh machines through the same loader core the CLI `--kernel=`
++  flag drives and requires the receipts byte-identical AND equal the
++  pinned content; `t4_snapshot_lanes.sh` runs the file through the real
++  CLI split lane and greps the receipt lines in the machine log.
++- **Snapshot byte-stability of the x87 file** -- measured defect: a
++  computed long double (FBLD's accumulator) assigned to an fst slot
++  carried run/ENV-dependent stack garbage into the slot's 6 padding
++  bytes, and the snapshot's raw `cpu_t` dump (`machine.lo`/`machine.hi`)
++  wrote them into the file -- two processes saving the same state
++  produced different snapshot files (flaky standalone, red under make).
++  The fix is `x87_w` in `src/cpu.c`: every one of the 24 fst write sites
++  now zeroes the slot padding, keeping the raw dump byte-stable; the
++  guest formats never leaked (FNSAVE emits 10 bytes/register, FXSAVE
++  10+zeroed reserved). Vectors: the gate's fresh-run byte-identity and
++  save->load->save fixed point, plus the t4 lanes (two-process file
++  identity and `--max-instr=0` round trip -- a resumed halted run
++  advances the device cadence by design, and a resave must pass the same
++  `--kernel=` or the machine-shape check refuses).
++- **NC**: engine reverted to F2 -> the payload dies `#UD x87
++  transcendental out of scope (F3)`, the gate red; run-dependent bytes
++  injected at the fst dump -> both lanes red at the first padding byte.
++
+ ### Added — patch 0074 (FPU F3: transcendentals and BCD -- the x87 closes)
+ 
+ - **Transcendentals**: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/
+diff --git a/Makefile b/Makefile
+index b68ca97..1f5f47c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -135,11 +135,25 @@ tests/kload_fixture.elf: tests/kload_fixture.c tests/kload_fixture.ld
+ 	    -Wl,-z,max-page-size=0x1000 -T tests/kload_fixture.ld \
+ 	    tests/kload_fixture.c -o $@
+ 
++# FPU F4: the --kernel= freestanding x87 payload (COM1 receipts).
++tests/fpu_payload.elf: tests/fpu_payload.c tests/kload_fixture.ld
++	$(CC) -std=c11 -O1 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
++	    -mcmodel=kernel -mno-sse -mno-sse2 -mno-mmx -mno-red-zone -nostdlib -no-pie \
++	    -Wl,-z,max-page-size=0x1000 -T tests/kload_fixture.ld \
++	    tests/fpu_payload.c -o $@
++
+ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_kload.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-kload -lm
+ 	./test-kload
+ 	rm -f test-kload
+ 
++# FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
++# snapshot byte-stability of the x87 file across fresh runs).
++test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
++	./test-fpu-gate
++	rm -f test-fpu-gate
++
+ test-ring3: tests/test_ring3.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
+ 	./test-ring3
+@@ -263,7 +277,7 @@ test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c sr
+ 	./test-snap
+ 	rm -f test-snap
+ 
+-test-snapshot: x86emu firmware/firmware.bin disk/disk.img tests/kload_fixture.elf tests/integration/t4_snapshot_lanes.sh
++test-snapshot: x86emu firmware/firmware.bin disk/disk.img tests/kload_fixture.elf tests/fpu_payload.elf tests/integration/t4_snapshot_lanes.sh
+ 	sh tests/integration/t4_snapshot_lanes.sh
+ 
+ # Exactly one T4 NC (RAM windows not carried); never in `make test`.
+@@ -351,7 +365,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -361,7 +375,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -410,4 +424,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index a4efac9..3930a72 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -810,6 +810,32 @@
+   test-sanitize` green, diff-fuzz 512/12 288 all-match, both SeaBIOS
+   ISO lanes green.
+ 
++- FPU F4 (`patches/0075-FPU-F4-integration-gates.patch`, plan close-out):
++  the integration gates the F4 row named. A freestanding x87 payload
++  (`tests/fpu_payload.c`) boots through the `--kernel=` loader core and
++  prints eight COM1 receipts (constants, FADD, the FSIN host payload,
++  FBSTP/FBLD bytes, FSW bits -- the F0-F3 vectors produced in-guest);
++  `tests/test_fpu_gate.c` boots it twice on fresh machines and requires
++  the receipts byte-identical AND equal the pinned content, and pins the
++  snapshot's x87 file byte-stability (fresh-run identity plus
++  save->load->save fixed point). The lane measured a real defect: a
++  computed long double (FBLD's accumulator) carried run/ENV-dependent
++  stack garbage into the fst slot's 6 padding bytes, which the raw cpu_t
++  dump (`machine.lo`/`machine.hi`) writes into snapshot files -- two
++  processes saving the same state produced different files (flaky
++  standalone, red under make's environment). The fix (`x87_w`) zeroes
++  the padding at every one of the 24 fst write sites; FNSAVE/FXSAVE
++  already emit explicit bytes and never leaked. The t4 CLI lanes add
++  f4-payload split identity, the receipts pinned in the machine log,
++  two-process file identity and the `--max-instr=0` fixed point (a
++  resumed halted run advances the device cadence by design; the resave
++  run must pass the same `--kernel=` or the shape check refuses). NC:
++  engine reverted to F2 -> the payload dies `#UD x87 transcendental out
++  of scope (F3)`, gate red; run-dependent bytes injected at the dump ->
++  both lanes red at the first padding byte. Gates: `make test`, `make
++  test-sanitize`, diff-fuzz 512/12 288 all-match, both SeaBIOS ISO
++  lanes green. The plan is closed.
++
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+ - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
+@@ -957,9 +983,11 @@ publishes no RSDP and reports seven E820 entries; that lane is historical and
+ deliberately unchanged.  The ACPI PM block models only the Timer register
+ (PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
+ so no power-management transition is claimed.  The x87 surface is
+-complete for the plan's F0–F3 scope (data, control, arithmetic/compare,
+-transcendentals and BCD); the only remaining x87 #UD surface is the
+-architecturally reserved register holes (D9 D1–D7, DD/DE/DF unmapped
+-forms), pinned by the frozen table suite.  F4 closes the plan with
+-integration receipts.  x87 registers are not
++complete for the plan's F0–F4 scope (data, control, arithmetic/compare,
++transcendentals, BCD and the integration gates); the fst slots' 6
++padding bytes are normalized at every write (`x87_w`) so the raw cpu_t
++dump in snapshot files is byte-stable, and the only remaining x87 #UD
++surface is the architecturally reserved register holes (D9 D1–D7,
++DD/DE/DF unmapped forms), pinned by the frozen table suite.  x87
++registers are not
+ part of the gdbstub `g`-packet contract.
+diff --git a/docs/plans/FPU_PLAN.md b/docs/plans/FPU_PLAN.md
+index eb883ef..e8e0e38 100644
+--- a/docs/plans/FPU_PLAN.md
++++ b/docs/plans/FPU_PLAN.md
+@@ -6,7 +6,7 @@
+ > not assumed. Baseline measured 2026-10-18 on
+ > `AuraLite-Emulator@30d1c5d` (post G2/S6, x86-64 Linux reference host).
+ 
+-**Status: F0–F3 done ✅; F4 queued**
++**Status: F0–F4 done ✅**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -14,7 +14,7 @@
+ | F1 | x87 state and data movement: the physical register file (80-bit IEEE 854) + TOP + FSW/FTW/FCW, FLD/FST/FSTP (m32/m64/m80 + ST(i)), FILD/FIST/FISTP (m16/m32/m64), FLD constants, FXCH/FFREE/FINCSTP/FDECSTP/FNOP, FNSTSW(AX/m16)/FNSTCW/FLDCW/FNINIT/FNCLEX, FNSTENV/FLDENV/FNSAVE/FRSTOR, live x87 in FXSAVE/FXRSTOR, CR0.EM/TS traps (#UD/#NM), rounding per FCW.RC with #MF on unmasked precision/underflow/overflow | ✅ done | `patches/0072-FPU-F1-x87-state-and-data.patch` |
+ | F2 | Arithmetic and compare: FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR (+P/+I/+R forms), FSQRT/FRNDINT/FPREM/FPREM1/FSCALE/FXTRACT, FCOM/FUCOM/FICOM families + FCOMI/FCOMIP/FUCOMI/FUCOMPP (FCHS/FABS/FTST/FXAM/FCMOV* landed early in F1 -- they are data/status, not arithmetic) | ✅ done | `patches/0073-FPU-F2-arithmetic-and-compare.patch` |
+ | F3 | Transcendentals + BCD: FSIN/FCOS/FSINCOS/FPATAN/FPTAN/F2XM1/FYL2X/FYL2XP1, FBLD/FBSTP | ✅ done | §1d receipts (`/tmp/transprobe{,2..7}`, `/tmp/bcdprobe`); 11 new vector groups; NC red with 114 failures |
+-| F4 | Integration: a `--kernel=` freestanding payload receipts pair (determinism x2), snapshot byte-stability of the x87 file, STATUS close-out | ⬜ queued | — |
++| F4 | Integration: a `--kernel=` freestanding payload receipts pair (determinism x2), snapshot byte-stability of the x87 file, STATUS close-out | ✅ done | `tests/fpu_payload.c` + `tests/test_fpu_gate.c` + `t4_snapshot_lanes.sh` f4 lanes; `x87_w` padding fix (`patches/0075`) |
+ 
+ ## 1. Measured baseline (F0)
+ 
+@@ -155,6 +155,57 @@ from an isolated run).
+   (mem `00 x7 C0 FF FF`); denormal sources do NOT raise DE (measured);
+   C0/C2/C3 untouched (measured: preset survives).
+ 
++## 1e. F4 measured receipts (integration gates)
++
++- **In-guest receipt pair** (`tests/fpu_payload.c`, booted through the
++  `--kernel=` loader core twice on fresh machines; COM1 lines pinned by
++  `tests/test_fpu_gate.c` and by the t4 CLI lane). Each block is
++  FNINIT-anchored; bytes are 80-bit stores in memory order:
++
++  | line | content | measured bytes |
++  |------|---------|----------------|
++  | `F4R0=3800` | FNSTSW after FNINIT+FLD1 (TOP=7, clean) | — |
++  | `F4R1=` | FLD1 -> FSTP m80 | `0000000000000080ff3f` |
++  | `F4R2=` | FLDPI -> FSTP m80 | `35c26821a2da0fc90040` |
++  | `F4R3=` | FSIN(0.5) -> FSTP m80 (host-silicon payload) | `447f2f58a24377f5fd3f` |
++  | `F4R4=3a20` | FNSTSW after FSIN(0.5) (TOP=7 \\| C1 \\| PE) | — |
++  | `F4R5=` | FBSTP(1234.0) (packed BCD, LSD-first) | `34120000000000000000` |
++  | `F4R6=` | 1.0+1.0 = 2.0 through FADD | `00000000000000800040` |
++  | `F4R7=` | FBLD(1234 BCD) -> FSTP = 1234.0 | `000000000000409a0940` |
++
++  (R5/R7 also pin the Intel packed-BCD byte order for the file: LSD
++  digit-pair in byte 0, sign byte at the end -- the m80 byte order of
++  1234.0 is `00 x6 40 9A 09 40`, NOT `.. 9A 09 40` with 9A in byte 7.)
++
++- **x87 file byte-stability -- the measured defect.** The fst slots are
++  `long double` (10 data bytes + 6 padding) and `machine.lo/machine.hi`
++  dump `cpu_t` RAW. FNSAVE and FXSAVE emit explicit bytes (10, and
++  10+zeroed reserved) so the guest formats never leaked, but a COMPUTED
++  long double assigned to a slot (measured at FBLD's accumulator) copied
++  its temporary's uninitialized -- run/ENV-dependent -- stack bytes into
++  the padding. Consequence: two processes saving the same state produced
++  different snapshot files (flaky standalone; red under `make`'s
++  environment; 2 bytes inside `fst[7]`'s padding). The fix is `x87_w` in
++  `src/cpu.c`: every one of the 24 fst write sites zeroes the slot's 6
++  padding bytes, keeping the raw dump byte-stable.
++
++- **CLI contract notes (measured while wiring the lanes).** (1) The
++  load+save fixed point is "nothing executes": `--max-instr` compares
++  against the RESTORED `run_steps`, so use the saved budget or
++  `--max-instr=0`; a resumed halted run advances `s_devtick` once (the
++  wake check is device time -- by design, not a snapshot bug). (2) The
++  snapshot shape pins `rom_hash` and `kmain_va`, so a resave run must
++  pass the same `--kernel=` or the load refuses ("a different ROM
++  image").
++
++- **Vectors / NC.** `tests/test_fpu_gate.c` (lane 1 receipts pair x2 +
++  pinned content; lane 2 fresh-run byte-identity + save->load->save) and
++  `t4_snapshot_lanes.sh` (f4-payload split 20/2000000, receipts pinned in
++  the machine log, two-process file identity, `--max-instr=0` fixed
++  point). NC (engine reverted to F2): the payload dies `#UD x87
++  transcendental out of scope (F3)` -> gate red. NC (run-dependent bytes
++  injected at the fst dump): both lanes red at the first padding byte.
++
+ ## 2. Architecture decisions (F1)
+ 
+ - **Format.** The x87 register file holds IEEE 854 *double-extended*
+diff --git a/src/cpu.c b/src/cpu.c
+index d7fd889..7b33de0 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -1007,6 +1007,19 @@ static void x87_set_c(cpu_t *c, unsigned c0, unsigned c1, unsigned c2, unsigned
+     if (c3) c->fsw |= FSW_C3;
+ }
+ 
++/* F4: every fst write goes through x87_w. The slots are long doubles --
++ * 10 data bytes plus 6 padding bytes -- and only the raw cpu_t dump (the
++ * snapshot's machine.lo/machine.hi) ever sees the padding; FNSAVE and
++ * FXSAVE emit explicit 10-byte (+zeroed reserved) forms. Measured defect
++ * (F4 lanes): a computed long double (FBLD's accumulator) assigned to a
++ * slot carried run-dependent stack garbage into the padding, so two
++ * processes saving the same state wrote different snapshot files.
++ * Normalizing at every write keeps the raw dump byte-stable. */
++static void x87_w(cpu_t *c, int p, long double v) {
++    c->fst[p] = v;
++    memset((char *)&c->fst[p] + 10, 0, 6);
++}
++
+ /* push: stack overflow overwrites the last register and raises IE|SF|C1 */
+ static void x87_push(cpu_t *c, long double v, uint16_t *raised) {
+     int dst = (c->ftop - 1) & 7;
+@@ -1014,7 +1027,7 @@ static void x87_push(cpu_t *c, long double v, uint16_t *raised) {
+         *raised |= FSW_IE | FSW_SF; c->fsw |= FSW_C1;
+     }
+     c->ftop = dst;
+-    c->fst[c->ftop] = v;
++    x87_w(c, c->ftop, v);
+     x87_set_tag(c, c->ftop, x87_class(v));
+     x87_sync_top(c);
+ }
+@@ -1224,7 +1237,7 @@ static void x87_load_regs(cpu_t *c, uint64_t ea) {
+     uint8_t b[10];
+     for (int i = 0; i < 8; i++) {
+         for (int j = 0; j < 10; j++) b[j] = (uint8_t)read_mem_v(c->mach, ea + (uint64_t)i * 10 + (uint64_t)j, 1);
+-        c->fst[x87_phys(c, i)] = x87_ld_from80(b);
++        x87_w(c, x87_phys(c, i), x87_ld_from80(b));
+     }
+ }
+ 
+@@ -1234,7 +1247,7 @@ static void x87_reset(cpu_t *c) {   /* FNINIT */
+     c->ftw = 0xFFFF;
+     c->ftop = 0;
+     c->fop = 0; c->fcs = 0; c->fds = 0; c->fip = 0; c->fdp = 0;
+-    for (int i = 0; i < 8; i++) c->fst[i] = 0.0L;
++    for (int i = 0; i < 8; i++) x87_w(c, i, 0.0L);
+ }
+ 
+ /* EA of an x87 memory operand */
+@@ -1503,7 +1516,7 @@ static void x87_apply_binop(cpu_t *c, int kind, int dst_sti, long double b,
+                             int pop, uint16_t *raised) {
+     long double a = c->fst[x87_phys(c, dst_sti)];
+     long double r = x87_binop(c, kind, a, b, raised);
+-    c->fst[x87_phys(c, dst_sti)] = r;
++    x87_w(c, x87_phys(c, dst_sti), r);
+     x87_set_tag(c, x87_phys(c, dst_sti), x87_class(r));
+     if (pop) x87_pop(c, raised);
+ }
+@@ -1585,8 +1598,8 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+         case 0xCC: case 0xCD: case 0xCE: case 0xCF: { /* FXCH ST(i) */
+             int p0 = x87_phys(c, 0), pi = x87_phys(c, regi);
+             long double t = c->fst[p0]; int tg = x87_get_tag(c, p0);
+-            c->fst[p0] = c->fst[pi]; x87_set_tag(c, p0, x87_get_tag(c, pi));
+-            c->fst[pi] = t; x87_set_tag(c, pi, tg);
++            x87_w(c, p0, c->fst[pi]); x87_set_tag(c, p0, x87_get_tag(c, pi));
++            x87_w(c, pi, t); x87_set_tag(c, pi, tg);
+             c->fsw &= (uint16_t)~FSW_C1; break; }
+         case 0xD0:  /* FNOP */
+             break;
+@@ -1598,10 +1611,10 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             x87_sync_top(c); c->fsw &= (uint16_t)~FSW_C1; break;
+         case 0xE0:  /* FCHS */
+             if (!x87_check_src(c, 0, &raised)) break;
+-            c->fst[x87_phys(c, 0)] = -c->fst[x87_phys(c, 0)]; break;
++            x87_w(c, x87_phys(c, 0), -c->fst[x87_phys(c, 0)]); break;
+         case 0xE1:  /* FABS */
+             if (!x87_check_src(c, 0, &raised)) break;
+-            c->fst[x87_phys(c, 0)] = fabsl(c->fst[x87_phys(c, 0)]); break;
++            x87_w(c, x87_phys(c, 0), fabsl(c->fst[x87_phys(c, 0)])); break;
+         case 0xE4: { /* FTST: compare ST(0) with 0.0 -> C flags */
+             if (!x87_check_src(c, 0, &raised)) break;
+             long double v = c->fst[x87_phys(c, 0)];
+@@ -1657,9 +1670,9 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                     raised |= FSW_IE | FSW_SF; c->fsw |= FSW_C1;
+                 }
+                 c->ftop = dst;
+-                c->fst[dst] = sig;
++                x87_w(c, dst, sig);
+                 x87_set_tag(c, dst, x87_class(sig));
+-                c->fst[(dst + 1) & 7] = ex;
++                x87_w(c, (dst + 1) & 7, ex);
+                 x87_set_tag(c, (dst + 1) & 7, x87_class(ex));
+                 x87_sync_top(c);
+                 break; }
+@@ -1668,7 +1681,7 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                 if (!x87_check_src(c, 1, &raised)) break;
+                 v = x87_u_prem(c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)],
+                                modrm == 0xF5, &raised, &psw);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 /* the instruction SW carries C0=Q2 C3=Q1 C1=Q0 C2=partial */
+                 x87_set_c(c, (psw >> 8) & 1u, (psw >> 9) & 1u,
+@@ -1677,26 +1690,26 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             case 0xFA: /* FSQRT */
+                 if (!x87_check_src(c, 0, &raised)) break;
+                 v = x87_u_sqrt(c->fst[x87_phys(c, 0)], &raised);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 break;
+             case 0xFC: /* FRNDINT */
+                 if (!x87_check_src(c, 0, &raised)) break;
+                 v = x87_u_rndint(c->fst[x87_phys(c, 0)], &raised);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 break;
+             case 0xFD: /* FSCALE */
+                 if (!x87_check_src(c, 0, &raised)) break;
+                 if (!x87_check_src(c, 1, &raised)) break;
+                 v = x87_u_scale(c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)], &raised);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 break;
+             case 0xF0: { /* F2XM1: ST0 = 2^ST0 - 1 (|x|>1: source + PE quirk) */
+                 if (!x87_check_src(c, 0, &raised)) break;
+                 v = x87_t_pair(XT_2XM1, c->fst[x87_phys(c, 0)], 0.0L, &raised, &psw);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 x87_c1(c, psw);
+                 break; }
+@@ -1708,7 +1721,7 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                 int kind = (modrm == 0xF1) ? XT_L2X : (modrm == 0xF9) ? XT_L2XP1 : XT_PATAN;
+                 v = x87_t_pair(kind, c->fst[x87_phys(c, 0)], c->fst[x87_phys(c, 1)],
+                                &raised, &psw);
+-                c->fst[x87_phys(c, 1)] = v;
++                x87_w(c, x87_phys(c, 1), v);
+                 x87_set_tag(c, x87_phys(c, 1), x87_class(v));
+                 x87_pop(c, &raised);
+                 x87_c1(c, psw);
+@@ -1724,7 +1737,7 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                     break;
+                 }
+                 v = x87_t_pair(modrm == 0xFE ? XT_SIN : XT_COS, v, 0.0L, &raised, &psw);
+-                c->fst[x87_phys(c, 0)] = v;
++                x87_w(c, x87_phys(c, 0), v);
+                 x87_set_tag(c, x87_phys(c, 0), x87_class(v));
+                 x87_c12(c, psw);
+                 break; }
+@@ -1752,9 +1765,9 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                     x87_c12(c, psw);
+                 }
+                 c->ftop = dst;
+-                c->fst[dst] = r0;
++                x87_w(c, dst, r0);
+                 x87_set_tag(c, dst, x87_class(r0));
+-                c->fst[(dst + 1) & 7] = r1;
++                x87_w(c, (dst + 1) & 7, r1);
+                 x87_set_tag(c, (dst + 1) & 7, x87_class(r1));
+                 x87_sync_top(c);
+                 break; }
+@@ -1821,7 +1834,7 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+                 if (!x87_check_src(c, 0, &raised)) break;
+                 if (!x87_check_src(c, regi, &raised)) break;
+                 if (take) {
+-                    c->fst[x87_phys(c, 0)] = c->fst[x87_phys(c, regi)];
++                    x87_w(c, x87_phys(c, 0), c->fst[x87_phys(c, regi)]);
+                     x87_set_tag(c, x87_phys(c, 0), x87_get_tag(c, x87_phys(c, regi)));
+                 }
+                 break; }
+@@ -1904,13 +1917,13 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+             case 0xD4: case 0xD5: case 0xD6: case 0xD7: /* FST ST(i) */
+                 if (!x87_check_src(c, 0, &raised)) break;
+-                c->fst[x87_phys(c, regi)] = c->fst[x87_phys(c, 0)];
++                x87_w(c, x87_phys(c, regi), c->fst[x87_phys(c, 0)]);
+                 x87_set_tag(c, x87_phys(c, regi), x87_get_tag(c, x87_phys(c, 0)));
+                 break;
+             case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+             case 0xDC: case 0xDD: case 0xDE: case 0xDF: /* FSTP ST(i) */
+                 if (!x87_check_src(c, 0, &raised)) { x87_pop(c, &raised); break; }
+-                c->fst[x87_phys(c, regi)] = c->fst[x87_phys(c, 0)];
++                x87_w(c, x87_phys(c, regi), c->fst[x87_phys(c, 0)]);
+                 x87_set_tag(c, x87_phys(c, regi), x87_get_tag(c, x87_phys(c, 0)));
+                 x87_pop(c, &raised);
+                 break;
+@@ -2012,7 +2025,7 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
+             if (!x87_check_src(c, 0, &raised)) break;
+             if (!x87_check_src(c, regi, &raised)) break;
+             if (take) {
+-                c->fst[x87_phys(c, 0)] = c->fst[x87_phys(c, regi)];
++                x87_w(c, x87_phys(c, 0), c->fst[x87_phys(c, regi)]);
+                 x87_set_tag(c, x87_phys(c, 0), x87_get_tag(c, x87_phys(c, regi)));
+             }
+             break;
+@@ -3543,7 +3556,7 @@ really_slow:
+                         for (int j = 0; j < 10; j++)
+                             b[j] = (uint8_t)read_mem_v(m, addr + 32 + (uint64_t)i * 16 + (uint64_t)j, 1);
+                         int phys = x87_phys(c, i);
+-                        c->fst[phys] = x87_ld_from80(b);
++                        x87_w(c, phys, x87_ld_from80(b));
+                         x87_set_tag(c, phys, (aw & (1u << phys))
+                                     ? x87_class(c->fst[phys]) : X87_T_EMPTY);
+                     }
+diff --git a/tests/fpu_payload.c b/tests/fpu_payload.c
+new file mode 100644
+index 0000000..4041a4e
+--- /dev/null
++++ b/tests/fpu_payload.c
+@@ -0,0 +1,110 @@
++/* tests/fpu_payload.c -- FPU F4: the --kernel= freestanding x87 payload.
++ *
++ * The last lane of the FPU plan: a kernel built from this file is booted
++ * through the --kernel= loader (the same kloader.c core the CLI flag
++ * drives) and runs a fixed x87 tour, printing COM1 receipt lines
++ * ("F4R<n>=<hex>") whose bytes pin the F0-F3 receipt content from inside
++ * a real guest: constants, arithmetic, the FSIN host payload, BCD store
++ * and load, and FSW bits. tests/test_fpu_gate.c boots it twice on fresh
++ * machines and requires the receipts to be byte-identical AND equal the
++ * pinned content; tests/integration/t4_snapshot_lanes.sh runs the same
++ * file through the real CLI --kernel= lane and pins the receipt line.
++ *
++ * x87 opcodes are emitted as raw .byte sequences: GAS mis-assembles some
++ * x87 mnemonics (the fsubp/fsubrp family), and the vectors here must be
++ * readable against an opcode table, so every x87 byte is spelled out.
++ * There is no libc here: freestanding, COM1 via `outb`, exit via HLT.
++ */
++typedef unsigned char  u8;
++typedef unsigned short u16;
++typedef unsigned int   u32;
++
++/* scratch for the 80-bit stores (16 bytes: the extra 6 are the padding
++ * bytes the engine's fst slots also carry -- the receipts print the 10
++ * data bytes only) */
++static u8 buf[16];
++
++static void outb(u16 port, u8 v) {
++    __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(port));
++}
++static void pchar(char c) { outb(0x3F8, (u8)c); }
++static void pstr(const char *s) { while (*s) pchar(*s++); }
++static void phexn(u32 v, int n) {
++    static const char d[] = "0123456789abcdef";
++    for (int i = n - 1; i >= 0; i--) pchar(d[(v >> (4 * i)) & 15]);
++}
++/* the 80-bit store's 10 data bytes, first byte first (memory order) */
++static void pbytes(const u8 *b) {
++    for (int i = 0; i < 10; i++) phexn(b[i], 2);
++}
++static void pend(void) { pchar('\n'); }
++
++/* FNSTSW AX -> AX (raw like the rest; "=a" on the 16-bit part) */
++static u16 fnstsw_ax(void) {
++    u16 sw;
++    __asm__ volatile(".byte 0xDF,0xE0" : "=a"(sw));
++    return sw;
++}
++
++/* +0.5 as 80-bit (se=0xBFFE, sig=0x8000) */
++static const u8 half[10] = {0,0,0,0,0,0,0,0x80,0xFE,0x3F};
++/* 1234.0 as 80-bit (se=0x4009, sig=0x9A40..: byte 6 is 0x40, byte 7 0x9A) */
++static const u8 v1234[10] = {0,0,0,0,0,0,0x40,0x9A,0x09,0x40};
++/* 1234 as packed BCD: FBSTP/FBLD order is LSD-first (byte 0 = ones/tens) */
++static const u8 bcd[10] = {0x34,0x12,0,0,0,0,0,0,0,0};
++
++__attribute__((section(".text._start")))
++void _start(void) {
++    /* R0: FNINIT + FLD1 + FNSTSW -- TOP=7 (0x3800), no exceptions */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");            /* fninit */
++    __asm__ volatile(".byte 0xD9,0xE8" ::: "memory");            /* fld1   */
++    pstr("F4R0="); phexn(fnstsw_ax(), 4); pend();
++
++    /* R1: FLD1 -> FSTP m80: the constant's bytes */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xD9,0xE8" ::: "memory");
++    __asm__ volatile(".byte 0xDB,0x3B" :: "b"(buf) : "memory");  /* fstp [rbx] */
++    pstr("F4R1="); pbytes(buf); pend();
++
++    /* R2: FLDPI -> FSTP m80 */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xD9,0xEB" ::: "memory");            /* fldpi  */
++    __asm__ volatile(".byte 0xDB,0x3B" :: "b"(buf) : "memory");
++    pstr("F4R2="); pbytes(buf); pend();
++
++    /* R3: FSIN(0.5) -> FSTP m80: the host-silicon payload (F0/F3 pin) */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xDB,0x2B" :: "b"(half) : "memory"); /* fld m80 */
++    __asm__ volatile(".byte 0xD9,0xFE" ::: "memory");            /* fsin    */
++    __asm__ volatile(".byte 0xDB,0x3B" :: "b"(buf) : "memory");
++    pstr("F4R3="); pbytes(buf); pend();
++
++    /* R4: FNSTSW right after FSIN(0.5): TOP=7 | C1 | PE = 0x3a20 */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xDB,0x2B" :: "b"(half) : "memory");
++    __asm__ volatile(".byte 0xD9,0xFE" ::: "memory");
++    pstr("F4R4="); phexn(fnstsw_ax(), 4); pend();
++
++    /* R5: FBSTP(1234.0) -> the 10 BCD bytes */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xDB,0x2B" :: "b"(v1234) : "memory");
++    __asm__ volatile(".byte 0xDF,0x33" :: "b"(buf) : "memory");  /* fbstp [rbx] */
++    pstr("F4R5="); pbytes(buf); pend();
++
++    /* R6: 1.0 + 1.0 = 2.0 through the FADD path */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xD9,0xE8" ::: "memory");            /* fld1 */
++    __asm__ volatile(".byte 0xD9,0xE8" ::: "memory");            /* fld1 */
++    __asm__ volatile(".byte 0xD8,0xC1" ::: "memory");            /* fadd st0,st1 */
++    __asm__ volatile(".byte 0xDB,0x3B" :: "b"(buf) : "memory");
++    pstr("F4R6="); pbytes(buf); pend();
++
++    /* R7: FBLD of the 1234 BCD bytes -> FSTP: back to 1234.0 */
++    __asm__ volatile(".byte 0xDB,0xE3" ::: "memory");
++    __asm__ volatile(".byte 0xDF,0x23" :: "b"(bcd) : "memory");  /* fbld [rbx] */
++    __asm__ volatile(".byte 0xDB,0x3B" :: "b"(buf) : "memory");
++    pstr("F4R7="); pbytes(buf); pend();
++
++    for (;;)
++        __asm__ volatile("cli; hlt");
++}
+diff --git a/tests/integration/t4_snapshot_lanes.sh b/tests/integration/t4_snapshot_lanes.sh
+index 4d4989f..2a4fcca 100644
+--- a/tests/integration/t4_snapshot_lanes.sh
++++ b/tests/integration/t4_snapshot_lanes.sh
+@@ -66,6 +66,34 @@ else echo "FAIL determinism: snapshot files differ"; fail=1; fi
+ if cmp -s "$WORK/fw-haswell-mid.snap" "$WORK/resave.snap"; then echo "ok   round trip: save -> load -> save byte-identical"
+ else echo "FAIL round trip differs"; fail=1; fi
+ 
++# ---- FPU F4: the --kernel= x87 payload lanes (plan: F4 row) ----------
++if [ -f tests/fpu_payload.elf ]; then
++    split f4-payload 20 2000000 --kernel=tests/fpu_payload.elf
++    # the F0-F3 receipt content, produced inside a guest: COM1 lines land
++    # raw in the machine log (the test_iso_boot K1TEST convention)
++    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
++        --log="$WORK/fpu.log" >/dev/null 2>&1 || true
++    if grep -q 'F4R0=3800' "$WORK/fpu.log" && grep -q 'F4R3=447f2f58a24377f5fd3f' "$WORK/fpu.log"; then
++        echo "ok   x87 payload receipts: COM1 lines pinned in the machine log"
++    else echo "FAIL x87 payload receipts missing from the log"; fail=1; fi
++    # x87 file byte-stability through the real CLI: two processes saving the
++    # same state write the same bytes (the fst slots' padding rides cpu_t)
++    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
++        --snapshot-save="$WORK/fpu-a.snap" >/dev/null 2>&1 || true
++    "$X86EMU" --platform=haswell --max-instr=2000000 --kernel=tests/fpu_payload.elf \
++        --snapshot-save="$WORK/fpu-b.snap" >/dev/null 2>&1 || true
++    if cmp -s "$WORK/fpu-a.snap" "$WORK/fpu-b.snap"; then echo "ok   x87 file: two processes, same state -> identical snapshot files"
++    else echo "FAIL x87 file byte-stability"; fail=1; fi
++    # load + save with a zero step budget is the fixed point: nothing runs
++    # (a resumed run would advance device time at its own cadence by design)
++    "$X86EMU" --platform=haswell --max-instr=0 --kernel=tests/fpu_payload.elf \
++        --snapshot-load="$WORK/fpu-a.snap" --snapshot-save="$WORK/fpu-resave.snap" >/dev/null 2>&1 || true
++    if cmp -s "$WORK/fpu-a.snap" "$WORK/fpu-resave.snap"; then echo "ok   x87 file: save -> load -> save byte-identical"
++    else echo "FAIL x87 resave differs"; fail=1; fi
++else
++    echo "SKIP f4-payload lanes: tests/fpu_payload.elf not built"
++fi
++
+ # refusals: exit code 1 and a reason
+ refuse() {  # refuse <label> <pattern> <args...>
+     label=$1 pat=$2; shift 2
+diff --git a/tests/test_fpu_gate.c b/tests/test_fpu_gate.c
+new file mode 100644
+index 0000000..b35be44
+--- /dev/null
++++ b/tests/test_fpu_gate.c
+@@ -0,0 +1,227 @@
++/* tests/test_fpu_gate.c -- FPU F4: integration gates (plan: F4 row).
++ *
++ * Two lanes, both live here because both close the plan's F4:
++ *
++ *  1. --kernel= freestanding payload receipts pair (determinism x2):
++ *     the kloader core the CLI --kernel= flag drives boots
++ *     tests/fpu_payload.elf twice on fresh machines; the COM1 receipts
++ *     must be byte-identical between the runs AND equal the pinned
++ *     receipt content (constants, arithmetic, the FSIN host payload,
++ *     FBSTP/FBLD bytes, FSW bits -- the F0-F3 vectors, now produced
++ *     inside a real guest).
++ *
++ *  2. snapshot byte-stability of the x87 file: an x87 tour (the surface
++ *     test_fpu.c pins) runs to a fixed step count on fresh machines and
++ *     is snap_save'd; the snapshot files must be byte-identical. The
++ *     fst slots' 6 padding bytes ride the raw cpu_t dump inside
++ *     machine_rec -- that garbage is the trap this lane exists to pin.
++ *     save -> load -> save must be a fixed point on the same file.
++ */
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "machine.h"
++#include "cpu.h"
++#include "platform.h"
++#include "kloader.h"
++#include "snapshot.h"
++#include "harness.h"
++
++#define PAYLOAD "tests/fpu_payload.elf"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++/* COM1 byte capture (the test's own sink; devices.c's line-logger is not
++ * wired in the kload lane) */
++static char   g_ser[256];
++static size_t g_ser_n;
++
++static uint32_t ser_read(void *ctx, uint16_t port, int size) {
++    (void)ctx; (void)port; (void)size;
++    return 0x20;
++}
++static void ser_write(void *ctx, uint16_t port, int size, uint32_t val) {
++    (void)ctx; (void)size;
++    if (port == 0x3F8 && g_ser_n < sizeof(g_ser) - 1)
++        g_ser[g_ser_n++] = (char)val;
++}
++
++static machine_t g_m;
++static void fx_init(void) {
++    setup_machine(&g_m);
++    g_m.fb_w = 800; g_m.fb_h = 600;   /* what devices_init_common() sets */
++    io_register(&g_m, 0x3F8, 1, ser_read, ser_write, NULL, "COM1-capture");
++    g_ser_n = 0;
++}
++
++/* the pinned receipt content, measured host-side (F0/F3 protocol) and
++ * reproduced by the guest payload: FNINIT-anchored, so only the payload
++ * bytes move between hosts -- the FSW pins assume x87 arithmetic */
++static const char GOLDEN[] =
++    "F4R0=3800\n"
++    "F4R1=0000000000000080ff3f\n"
++    "F4R2=35c26821a2da0fc90040\n"
++    "F4R3=447f2f58a24377f5fd3f\n"
++    "F4R4=3a20\n"
++    "F4R5=34120000000000000000\n"
++    "F4R6=00000000000000800040\n"
++    "F4R7=000000000000409a0940\n";
++
++static void run_payload(char *out, size_t n) {
++    fx_init();
++    assert(kload_boot(&g_m, PAYLOAD, NULL) == 0);
++    machine_t *m = &g_m;
++    for (int i = 0; i < 20000 && !m->cpu.halted && !m->cpu.fault; i++)
++        cpu_step(&m->cpu);
++    assert(!m->cpu.fault);
++    assert(m->cpu.halted);
++    g_ser[g_ser_n] = 0;
++    assert(g_ser_n < n);
++    memcpy(out, g_ser, g_ser_n + 1);
++}
++
++/* ---- lane 2: the x87 tour program (real mode at physical 0) ----
++ * constants -> arith -> the F2/F3 surface -> compares/stack ops ->
++ * env save/restore -> HLT, leaving the fst array full of computed
++ * values so the snapshot's raw cpu_t dump carries them. */
++static const uint8_t tour[] = {
++    0xDB, 0xE3,          /* fninit         */
++    0xD9, 0xE8,          /* fld1           */
++    0xD9, 0xEB,          /* fldpi          */
++    0xD9, 0xE9,          /* fldl2t         */
++    0xD9, 0xEA,          /* fldl2e         */
++    0xD9, 0xEC,          /* fldlg2         */
++    0xD9, 0xED,          /* fldln2         */
++    0xD9, 0xEE,          /* fldz           */
++    0xD8, 0xC1,          /* fadd st0,st1   */
++    0xD8, 0xE1,          /* fsub st0,st1   */
++    0xD8, 0xC9,          /* fmul st0,st1   */
++    0xD8, 0xF1,          /* fdiv st0,st1   */
++    0xD9, 0xFB,          /* fsincos        */
++    0xD9, 0xFE,          /* fsin           */
++    0xD9, 0xFF,          /* fcos           */
++    0xD9, 0xF2,          /* fptan          */
++    0xD9, 0xF3,          /* fpatan         */
++    0xD9, 0xFA,          /* fsqrt          */
++    0xD9, 0xF8,          /* fprem          */
++    0xD9, 0xFC,          /* frndint        */
++    0xD9, 0xF0,          /* f2xm1          */
++    0xD9, 0xF1,          /* fyl2x          */
++    0xD9, 0xF9,          /* fyl2xp1        */
++    0xD9, 0xC9,          /* fxch st1       */
++    0xDF, 0xE0,          /* fnstsw ax      */
++    0xBB, 0x00, 0x31,    /* mov bx,0x3100  */
++    0xDB, 0x2F,          /* fld m80 [bx]   */
++    0xDB, 0x3F,          /* fstp m80 [bx]  */
++    0xDF, 0x27,          /* fbld [bx]      */
++    0xDF, 0x37,          /* fbstp [bx]     */
++    0xD9, 0x37,          /* fnstenv [bx]   */
++    0xDD, 0x37,          /* fnsave [bx]    */
++    0xDD, 0x27,          /* frstor [bx]    */
++    0x0F, 0xAE, 0x07,    /* fxsave [bx]    */
++    0x0F, 0xAE, 0x0F,    /* fxrstor [bx]   */
++    0xF4                 /* hlt            */
++};
++
++static void boot_tour(machine_t *m) {
++    setup_machine(m);
++    cpu_devtick_set(0);   /* a fresh process starts the device cadence at 0 */
++    memcpy(m->ram, tour, sizeof tour);
++    m->cpu.gpr[RSP] = 0x8000;
++}
++static void run_tour(machine_t *m, uint64_t n) {
++    while (m->run_steps < n) {
++        if (cpu_step(&m->cpu) != 0) break;
++        m->run_steps++;
++    }
++}
++
++static int same_file(const char *a, const char *b) {
++    FILE *x = fopen(a, "rb"), *y = fopen(b, "rb");
++    int ok = x && y;
++    while (ok) {
++        int c = fgetc(x), d = fgetc(y);
++        if (c != d) ok = 0;
++        if (c == EOF || d == EOF) break;
++    }
++    if (x) fclose(x);
++    if (y) fclose(y);
++    return ok;
++}
++/* name the first bytes that differ (diagnostics for EXPECT) */
++static void file_diff(const char *a, const char *b) {
++    FILE *x = fopen(a, "rb"), *y = fopen(b, "rb");
++    long off = 0;
++    if (!x || !y) { printf("  (diff: missing file)\n"); if (x) fclose(x); if (y) fclose(y); return; }
++    for (;;) {
++        int c = fgetc(x), d = fgetc(y);
++        if (c != d) {
++            printf("  first difference at offset %ld (%s=%02x %s=%02x)\n",
++                   off, a, c == EOF ? 0 : (unsigned)c, b, d == EOF ? 0 : (unsigned)d);
++            break;
++        }
++        if (c == EOF) { printf("  (identical)\n"); break; }
++        off++;
++    }
++    fclose(x); fclose(y);
++}
++
++static const snap_cfg_t CFG = { "Haswell", 0, 0 };
++static const char *PA = "/tmp/fpu-gate-a.snap";
++static const char *PB = "/tmp/fpu-gate-b.snap";
++static const char *PC = "/tmp/fpu-gate-c.snap";
++
++int main(void) {
++    /* ================= lane 1: receipts pair (determinism x2) ========== */
++    static char r1[256], r2[256];
++    int f0;
++    run_payload(r1, sizeof r1);
++    run_payload(r2, sizeof r2);
++    f0 = fails;
++    EXPECT(strcmp(r1, r2) == 0,
++           "payload receipts pair: two fresh-machine runs differ:\n  run1=%s\n  run2=%s", r1, r2);
++    EXPECT(strcmp(r1, GOLDEN) == 0,
++           "payload receipts content:\n  got=%s\n  want=%s", r1, GOLDEN);
++    if (fails == f0)
++        printf("ok --kernel= payload receipts: pair identical x2, content pinned\n");
++
++    /* ================= lane 2: x87 file byte-stability ================= */
++    {
++        /* static: machine_t is ~2.8MB -- three of them overflow the stack */
++        static machine_t A, B, C;
++        f0 = fails;
++        boot_tour(&A);
++        run_tour(&A, 200);
++        EXPECT(A.cpu.halted, "tour must reach HLT (steps=%llu fault=%d rip=%llx msg=%s)",
++               (unsigned long long)A.run_steps, (int)A.cpu.fault,
++               (unsigned long long)A.cpu.fault_rip, A.cpu.fault_msg);
++        EXPECT(snap_save(&A, PA, &CFG) == 0, "snap_save A");
++
++        boot_tour(&B);
++        run_tour(&B, 200);
++        EXPECT(snap_save(&B, PB, &CFG) == 0, "snap_save B");
++        EXPECT(same_file(PA, PB),
++               "x87 file byte-stability: fresh-run snapshots differ (fst padding?)");
++
++        boot_tour(&C);
++        EXPECT(snap_load(&C, PA, &CFG) == 0, "snap_load A into C");
++        EXPECT(C.run_steps == A.run_steps, "load restores run_steps (%llu vs %llu)",
++               (unsigned long long)C.run_steps, (unsigned long long)A.run_steps);
++        /* the CLI's load+save lane executes nothing: --max-instr lands on the
++         * restored run_steps budget and the parked/halted vCPU never steps
++         * (t4_snapshot_lanes.sh's round trip). Do not call run_tour here --
++         * even a no-op cpu_step on a halted machine advances the device
++         * cadence (s_devtick), which the file pins. */
++        EXPECT(snap_save(&C, PC, &CFG) == 0, "snap_save C");
++        EXPECT(same_file(PA, PC), "x87 file: save -> load -> save fixed point");
++        if (!same_file(PA, PC)) { printf("  resave differs from A:\n"); file_diff(PA, PC); }
++        if (fails == f0)
++            printf("ok snapshot x87 file: byte-identical across fresh runs; save->load->save fixed point\n");
++        if (!fails) { remove(PA); remove(PB); remove(PC); }
++    }
++
++    if (fails) { printf("test-fpu-gate: %d FAILED\n", fails); return 1; }
++    puts("test-fpu-gate: all vectors passed");
++    return 0;
++}
+-- 
+2.47.3
+

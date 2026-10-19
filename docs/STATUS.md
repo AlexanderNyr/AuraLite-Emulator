@@ -748,6 +748,94 @@
   accept GUID: HTTP/101 pass and the client's sample-key assertion alone
   fails.
 
+- FPU F1 (`patches/0072-FPU-F1-x87-state-and-data.patch`, plan:
+  `docs/plans/FPU_PLAN.md`): the x87 data and control layer. The physical
+  register file is IEEE 854 double-extended (host `long double`, 80-bit
+  bit-exact) with FSW.TOP/FTW/FCW kept live; D9/DB/DD/DF execute FLD/FST/
+  FSTP (m32/m64/m80 + ST(i)), FILD/FIST/FISTP/FISTTP (m16/m32/m64),
+  FBLD/FBSTP, the seven FLD constants (host-measured bit patterns),
+  FXCH/FFREE/FFREEP/FINCSTP/FDECSTP/FNOP/FCMOVcc, FCHS/FABS/FTST/FXAM,
+  FNSTSW(AX/m16)/FNSTCW/FLDCW/FNINIT/FNCLEX, FNSTENV/FLDENV/FNSAVE/FRSTOR
+  (host-measured 14/28-byte env images), and FXSAVE/FXRSTOR round-trip the
+  live state in the host-measured image layout (this also closes defect
+  D5: the old image had MXCSR in the MASK slot). Rounding follows FCW.RC
+  through the host unit (`fesetround`), exception bits fold into FSW, and
+  unmasked PE/UE/OE/ZE/IE raise #MF(16); CR0.EM -> #UD, CR0.TS/WAIT ->
+  #NM(7). Vectors: `tests/test_fpu.c` (test-fpu in test-unit and
+  test-sanitize) with host-verified constants/layouts/rounding; the NC
+  reverts the escape dispatch (104 vector failures). The arithmetic
+  escapes D8/DA/DC/DE (FADD.., FCOM family) stay the deliberate #UD
+  boundary until F2 -- the old K3 pin was narrowed accordingly in the
+  frozen table (`D8 C1` stays #UD, `D9 C0` is a valid FLD ST(0) now).
+  Gates: `make test` and `make test-sanitize` green (5-platform smoke,
+  USB, NET and BOOT lanes byte-stable), diff-fuzz 512 programs / 12 288
+  instructions all-match, both SeaBIOS ISO lanes green.
+- FPU F2 (`patches/0073-FPU-F2-arithmetic-and-compare.patch`): x87
+  arithmetic and compare. D8/DA/DC/DE execute FADD/FMUL/FSUB/FSUBR/
+  FDIV/FDIVR (+P and integer forms) with the raw-byte-measured operand
+  directions, D9 F4/F5/F8/FA/FC/FD execute FXTRACT/FPREM1/FPREM/FSQRT/
+  FRNDINT/FSCALE (raw x87 encodings on the host unit), and the compare
+  families FCOM/FCOMP/FCOMPP/FUCOM/FUCOMP/FUCOMPP/FICOM/FICOMP plus the
+  EFLAGS forms FCOMI/FCOMIP/FUCOMI/FUCOMIP follow the host-measured NaN
+  matrix (IE on any NaN for FCOM*, only SNaN for FUCOM*). FSW exception
+  bits corrected to the measured order (defect D6: F1 had IE..PE
+  reversed; FCW mask bits mirror the same order). Vectors:
+  `tests/test_fpu.c` F2 suites (direction pins vs host long double
+  results, div-zero/invalid/indefinite receipts, FPREM quotient flags,
+  FXTRACT layout, compare/COMI matrices, denormal DE + unmasked-DM #MF,
+  D6 bit pins); NC red with 46 failures. Frozen T-row narrowed again:
+  `D9 F0` (F2XM1) is the pinned #UD edge until F3.  Gates: `make test`
+  and `make test-sanitize` green, diff-fuzz 512/12 288 all-match, both
+  SeaBIOS ISO lanes green.
+- FPU F3 (`patches/0074-FPU-F3-transcendentals-and-BCD.patch`): x87
+  transcendentals and the BCD store contract. FSIN/FCOS/FSINCOS/FPTAN/
+  FPATAN/F2XM1/FYL2X/FYL2XP1 run their real encodings on the host unit
+  (the same silicon-exact policy as F2), so payload digits, NaN folding
+  (QNaN beats SNaN; ties take the larger payload), the `|x| >= 2^63`
+  C2/no-push boundary, FPATAN = atan2 with the signed-zero quadrants and
+  the odd corners (FYL2X `x=0,y=±inf` gives `-+inf` with NO ZE; FYL2XP1
+  `x<=-1` returns ST0 for finite nonzero ST1; F2XM1 `|x|>1` returns the
+  source with PE) are host receipts pinned by vectors. C-flag policy
+  measured on silicon: every op writes C1, the trig four write C2,
+  C0/C3 (and C2 on the rest) survive. FBSTP now rounds per FCW.RC
+  (ties-to-even), tracks PE/C1 (magnitude-up), keeps the source sign,
+  and stores the QNaN-indefinite byte pattern with IE on NaN/Inf/1e18
+  overflow; FBLD stays the weighted nibble sum (A-F count 10-15, no
+  invalid-digit IE). Vectors: `tests/test_fpu.c` F3 suites (payload
+  pins, huge-C2, NaN/inf stack shape, full-stack push fault, FYL2X/
+  FYL2XP1 corners, atan2 quadrants, F2XM1 domain, C-flag write policy,
+  FBSTP RC matrix + invalid, FBLD receipts); NC red with 114 failures.
+  Frozen T-row moved to its final edge: `D9 D1`, the architecturally
+  reserved hole (#UD forever).  Gates: `make test` and `make
+  test-sanitize` green, diff-fuzz 512/12 288 all-match, both SeaBIOS
+  ISO lanes green.
+
+- FPU F4 (`patches/0075-FPU-F4-integration-gates.patch`, plan close-out):
+  the integration gates the F4 row named. A freestanding x87 payload
+  (`tests/fpu_payload.c`) boots through the `--kernel=` loader core and
+  prints eight COM1 receipts (constants, FADD, the FSIN host payload,
+  FBSTP/FBLD bytes, FSW bits -- the F0-F3 vectors produced in-guest);
+  `tests/test_fpu_gate.c` boots it twice on fresh machines and requires
+  the receipts byte-identical AND equal the pinned content, and pins the
+  snapshot's x87 file byte-stability (fresh-run identity plus
+  save->load->save fixed point). The lane measured a real defect: a
+  computed long double (FBLD's accumulator) carried run/ENV-dependent
+  stack garbage into the fst slot's 6 padding bytes, which the raw cpu_t
+  dump (`machine.lo`/`machine.hi`) writes into snapshot files -- two
+  processes saving the same state produced different files (flaky
+  standalone, red under make's environment). The fix (`x87_w`) zeroes
+  the padding at every one of the 24 fst write sites; FNSAVE/FXSAVE
+  already emit explicit bytes and never leaked. The t4 CLI lanes add
+  f4-payload split identity, the receipts pinned in the machine log,
+  two-process file identity and the `--max-instr=0` fixed point (a
+  resumed halted run advances the device cadence by design; the resave
+  run must pass the same `--kernel=` or the shape check refuses). NC:
+  engine reverted to F2 -> the payload dies `#UD x87 transcendental out
+  of scope (F3)`, gate red; run-dependent bytes injected at the dump ->
+  both lanes red at the first padding byte. Gates: `make test`, `make
+  test-sanitize`, diff-fuzz 512/12 288 all-match, both SeaBIOS ISO
+  lanes green. The plan is closed.
+
 ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
 
 - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
@@ -894,4 +982,12 @@ vCPUs through the BIOS route and passes `irqapwake` + `smpstress` (G6, up to
 publishes no RSDP and reports seven E820 entries; that lane is historical and
 deliberately unchanged.  The ACPI PM block models only the Timer register
 (PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
-so no power-management transition is claimed.
+so no power-management transition is claimed.  The x87 surface is
+complete for the plan's F0–F4 scope (data, control, arithmetic/compare,
+transcendentals, BCD and the integration gates); the fst slots' 6
+padding bytes are normalized at every write (`x87_w`) so the raw cpu_t
+dump in snapshot files is byte-stable, and the only remaining x87 #UD
+surface is the architecturally reserved register holes (D9 D1–D7,
+DD/DE/DF unmapped forms), pinned by the frozen table suite.  x87
+registers are not
+part of the gdbstub `g`-packet contract.

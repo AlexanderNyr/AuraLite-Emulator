@@ -7,6 +7,258 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0075 (FPU F4: integration gates -- the plan closes)
+
+- **`--kernel=` freestanding x87 payload receipts pair (determinism x2)**:
+  `tests/fpu_payload.c` is a freestanding guest that runs a fixed x87 tour
+  and prints eight COM1 receipts ("F4R0..7"): FNINIT-anchored FSW bits,
+  FLD1/FLDPI/FSIN(0.5)/FADD byte pins (host-silicon payload), and the
+  FBSTP/FBLD packed-BCD round trip (LSD digit-pair in byte 0 -- the m80
+  byte orders the vectors pin). `tests/test_fpu_gate.c` boots the payload
+  twice on fresh machines through the same loader core the CLI `--kernel=`
+  flag drives and requires the receipts byte-identical AND equal the
+  pinned content; `t4_snapshot_lanes.sh` runs the file through the real
+  CLI split lane and greps the receipt lines in the machine log.
+- **Snapshot byte-stability of the x87 file** -- measured defect: a
+  computed long double (FBLD's accumulator) assigned to an fst slot
+  carried run/ENV-dependent stack garbage into the slot's 6 padding
+  bytes, and the snapshot's raw `cpu_t` dump (`machine.lo`/`machine.hi`)
+  wrote them into the file -- two processes saving the same state
+  produced different snapshot files (flaky standalone, red under make).
+  The fix is `x87_w` in `src/cpu.c`: every one of the 24 fst write sites
+  now zeroes the slot padding, keeping the raw dump byte-stable; the
+  guest formats never leaked (FNSAVE emits 10 bytes/register, FXSAVE
+  10+zeroed reserved). Vectors: the gate's fresh-run byte-identity and
+  save->load->save fixed point, plus the t4 lanes (two-process file
+  identity and `--max-instr=0` round trip -- a resumed halted run
+  advances the device cadence by design, and a resave must pass the same
+  `--kernel=` or the machine-shape check refuses).
+- **NC**: engine reverted to F2 -> the payload dies `#UD x87
+  transcendental out of scope (F3)`, the gate red; run-dependent bytes
+  injected at the fst dump -> both lanes red at the first padding byte.
+
+### Added — patch 0074 (FPU F3: transcendentals and BCD -- the x87 closes)
+
+- **Transcendentals**: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/
+  FYL2XP1 execute their real encodings against the host x87 (the F2
+  silicon-exact policy), so result payloads and NaN folding come out of
+  the very unit the ISA describes. Host receipts (`/tmp/transprobe{,2..7}`,
+  FNINIT-isolated): FPATAN is `atan2(ST1,ST0)` with the full signed-zero
+  quadrants; `|x| >= 2^63` leaves the source unchanged with C2=1 and
+  FPTAN/FSINCOS do not push; inf input puts QNaN-indefinite in BOTH
+  FPTAN/FSINCOS slots (SNaN quiets into both) and a full stack faults
+  with IE|SF|C1=1 and indefinite in the two written slots. Quirks pinned
+  as vectors: FYL2X with `x=0, y=±inf` returns `-+inf` WITHOUT ZE;
+  FYL2XP1 with `x <= -1` returns ST0 for finite nonzero ST1 (PE) and
+  `ST0*ST1` for ST1 of 0/±inf; F2XM1 with finite `|x| > 1` returns the
+  source with PE (`-inf -> -1.0`).
+- **C-flag write policy** (measured by preset probes): every
+  transcendental writes C1 (round-up indicator) and the trig four also
+  write C2; C0/C3 -- and C2 on F2XM1/FYL2X/FYL2XP1/FPATAN -- survive
+  from before on silicon, so the engine preserves them instead of
+  copying unmeasured host bits.
+- **FBSTP** rounds to an integer per FCW.RC (ties-to-even), sets PE iff
+  the value changed and C1 iff the magnitude rounded up, keeps the
+  source sign even for a zero result, and on NaN/Inf/`|result| >= 1e18`
+  stores the QNaN-indefinite byte pattern (mem `00 x7 C0 FF FF`) with
+  IE; denormal sources do not raise DE (host receipt). **FBLD** is
+  pinned as the weighted nibble sum it measures to be (nibble values
+  A-F count 10-15, no invalid-digit exception, sign = bit 7 of byte 9).
+- **Vectors**: `tests/test_fpu.c` grows the F3 suites (44 groups total):
+  payload pins, the 2^63 boundary, NaN/inf stack shape, the full-stack
+  push fault on distinct canaries, FYL2X/FYL2XP1 corners, atan2
+  quadrants, F2XM1 domain, the C-flag write policy, and the FBSTP RC
+  matrix + invalid forms; NC red with 114 failures. The frozen T-row
+  pin moves to its permanent edge: `D9 D1` (architecturally reserved
+  hole, #UD forever) after `D9 C0`/`D8 C1`/`D9 F0` fell phase by phase.
+- Gates: `make test` and `make test-sanitize` green (5-platform smoke,
+  USB, NET and BOOT lanes byte-stable), diff-fuzz 512 programs / 12 288
+  instructions all-match (0 host crashes), both SeaBIOS ISO lanes green
+  (MBR + El Torito).
+
+### Added — patch 0073 (FPU F2: arithmetic and compare -- x87 computes)
+
+- **D8/DA/DC/DE arithmetic**: FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR in the
+  register (D8: `OP ST(0),ST(i)`, DC: `OP ST(i),ST(0)`, DE: same + pop),
+  memory (m32/m64) and integer (FI* m16/m32) forms. Operand directions
+  are pinned against raw-byte host probes (`/tmp/rawdir`) -- GAS swaps
+  the `fsubp`/`fsubrp` mnemonics, so the encodings were executed
+  directly. Numeric ops run on the host x87 (volatile long double or
+  raw encodings), so result bits and NaN patterns are silicon-exact;
+  every op sets the rounding direction from FCW.RC first.
+- **D9 unaries**: FSQRT, FRNDINT (honours FCW.RC), FPREM/FPREM1 (the
+  instruction SW supplies the quotient flags C0=Q2 C3=Q1 C1=Q0, C2 for
+  partial steps), FSCALE, FXTRACT (host-measured: after the push ST0 =
+  significand, ST1 = the unbiased exponent).
+- **Compare families**: FCOM/FCOMP/FCOMPP (C0/C2/C3), FUCOM/FUCOMP/
+  FUCOMPP (quiet on QNaN), FICOM/FICOMP (m16/m32 int), and the EFLAGS
+  forms FCOMI/FCOMIP/FUCOMI/FUCOMIP (CF/PF/ZF, OF/SF/AF cleared) --
+  host-measured NaN matrix: FCOM* raise IE on any NaN, FUCOM* only on
+  SNaN; denormal sources set DE (bit1) and compare normally.
+- **Defect D6 (found by the F2 compare probes): the FSW/FCW exception
+  bits were reversed in F1.**  Host-measured order is
+  IE=0x0001 DE=0x0002 ZE=0x0004 OE=0x0008 UE=0x0010 PE=0x0020 (FCW
+  mask bits mirror it: IM=bit0..PM=bit5).  The F1 vectors that pinned
+  the wrong bits were corrected; `v_d6_flag_map` locks the measured
+  order (inexact->PE bit5, divzero->ZE bit2, overflow->OE bit3,
+  invalid->IE bit0, denormal->DE bit1).
+- **Converting loads**: FLD m32/m64 of an SNaN quiets the value and
+  raises IE (host receipt); FLD m80 stays a pure move (SNaN preserved,
+  no exception) -- so the FUCOM-SNaN rule remains testable through m80
+  loads.
+- **Vectors**: `tests/test_fpu.c` grows the F2 suites (33 groups total):
+  direction pins vs host-computed results, 1/0 -> +inf + ZE and 0/0 ->
+  real indefinite + IE (and #MF delivery for unmasked ZM/DM), FPREM
+  flag receipts, FXTRACT layout, compare/COMI matrices with QNaN/SNaN,
+  and the D6 pins.  Negative control: faulting the F2 escapes again
+  reddens 46 checks.  The frozen T-row narrows to the F3 edge (`D9 F0`
+  F2XM1 stays #UD).
+- **Gates**: `make test` and `make test-sanitize` green (guest lanes
+  byte-stable; the sample firmware never executes x87), diff-fuzz 512
+  programs / 12 288 instructions all-match with zero host-level
+  crashes, SeaBIOS ISO lanes green (Q MBR 10.4 s, C El Torito 10.0 s).
+
+### Added — patch 0072 (FPU F1: x87 state and data -- the FPU is real)
+
+- **x87 register file as first-class state**: `fst[8]` holds 80-bit
+  IEEE 854 values (host `long double` on `LDBL_MANT_DIG==64` hosts -- the
+  ISA format itself), `ftop` is FSW.TOP, `ftw` is the full 2-bit tag
+  word; the fields are appended after `mach` so every frozen `cpu_t`
+  offset stays put.
+- **D9/DB/DD/DF execute** FLD/FST/FSTP (m32/m64/m80 + ST(i)), FILD/
+  FIST/FISTP/FISTTP (m16/m32/m64), FBLD/FBSTP packed BCD, the seven FLD
+  constants (bit patterns taken from the host unit), FXCH/FFREE/FFREEP/
+  FINCSTP/FDECSTP/FNOP/FCMOVcc (EFLAGS-driven), FCHS/FABS/FTST/FXAM,
+  FNSTSW (AX/m16), FNSTCW/FLDCW, FNINIT/FNCLEX (real resets now --
+  defect D2), FNSTENV/FLDENV/FNSAVE/FRSTOR (host-measured 14/28-byte
+  images, logical ST order, 94/108-byte FNSAVE).
+- **FXSAVE/FXRSTOR round-trip the live x87 block** in the HOST-MEASURED
+  image layout (FCW@0 FSW@2 FTW-abridged@4 FOP@6 FIP@8 FCS@12 FDP@16
+  FDS@20 MXCSR@24 MASK@28 ST(i)@32+16i XMM@160) -- defect D5: the old
+  image was two bytes off with MXCSR in the MASK slot, invisible because
+  FXRSTOR read the same wrong offsets.
+- **Traps and exceptions**: CR0.EM -> #UD, CR0.TS and WAIT -> #NM(7),
+  unmasked PE/UE/OE/ZE/IE -> #MF(16), all delivered through the same
+  real-mode IVT path as #GP with the faulting IP in the frame. Rounding
+  follows FCW.RC through `fesetround`; host FP status flags fold into
+  FSW. FIST/FISTP round per RC (raw C casts truncate), FISTTP always
+  truncates.
+- **Measured semantics pinned along the way**: FFREE ST(i) is
+  stack-relative (host probe), stack overflow/underflow fire on the
+  destination-of-push / already-empty-pop conditions, FINCSTP/FDECSTP
+  never fault, #MF gating sees only the six maskable bits (SF is sticky
+  state).
+- **Vectors**: `tests/test_fpu.c` (test-fpu, in `test-unit` and
+  `test-sanitize`) -- 20 vector groups, host-checked constant bits,
+  env/FXSAVE layouts, rounding receipts, delivered #NM/#MF frames with
+  faulting-IP semantics, and the F2 boundary kept as a pinned #UD.
+  Negative control: reverting the escape dispatch to the K3 stubs reddens
+  104 checks.  The frozen table's T-row was narrowed per the V5 recipe
+  (`x87 arith stays #UD` on `D8 C1`; `D9 C0` is valid FLD ST(0) now).
+- **Gates**: `make test` and `make test-sanitize` green (guest lanes
+  byte-stable; the sample firmware never executes x87 data), diff-fuzz
+  512 programs / 12 288 instructions all-match with zero host-level
+  crashes, SeaBIOS ISO lanes green (Q MBR 11.0 s, C El Torito 11.2 s).
+
+### Added — patch 0071 (STORE S6: ATAPI + El Torito -- any ISO boots like VirtualBox)
+
+- **`--cdrom=`: an ATAPI CD on HBA ctrl 0 port 1** (conflicts with
+  `--sata-port1=` -- one device per port).  The port reports PxSIG
+  `0xEB14`; `0xA1` IDENTIFY PACKET DEVICE answers word0 `0x8580`
+  (removable CD-ROM) so stock SeaBIOS classifies the drive as
+  `DVD/CD [...]`; ATA disks keep aborting `0xA1` (SeaBIOS then falls
+  back to IDENTIFY DEVICE -- pinned as an NC).
+- **`0xA0` PACKET executes SCSI CDBs** (16 bytes at ct+0x40, byte count
+  in the FIS lba_mid/lba_high pair): 0x00 TUR, 0x03 REQUEST SENSE
+  (18 B, autosense consumed on read), 0x12 INQUIRY (36 B, type 5 +
+  removable + `AURALITE`/`EmuCD`), 0x1A MODE SENSE(6) (write-protect +
+  geometry page), 0x1B START STOP, 0x1E PREVENT, 0x25 READ CAPACITY
+  (2048-byte blocks), 0x28 READ(10) (2048-B sectors through
+  `ahci_dma_xfer` with byte-granular image offsets), 0x43 READ TOC
+  (one track, LBA 0).  Unknown CDBs take CHECK CONDITION (sense
+  5/20, PxIS.TFES + TFD.ERR + ABRT), WRITE(10) reports sense 7/27
+  (data protect); any later success clears autosense.  Vectors:
+  `test_engine_atapi` in `tests/test_ahci.c` (kind, IDENTIFY PACKET,
+  TUR, INQUIRY, CAPACITY, READ(10) round-trip, TOC, sense lifecycle,
+  write-protect, two NCs).
+- **Machine shape and snapshots carry the new state**: `sata_kind[][]`
+  joins the shape check (a CD snapshot cannot load against a disk
+  setup) and the port sense fields ride the existing `ahci_snap`.
+### Fixed — patch 0071
+
+- **The launcher WS test ate frames that arrived with the 101 response**
+  (measured flake rate 2/12 standalone runs, 17%): the monitor's state
+  push coalesces into the same TCP segment as the handshake response,
+  and the test's header-only reader discarded that tail, then parsed
+  mid-frame garbage through the whole lifecycle block.  The test now
+  keeps the prefix (like production `MonitorClient` already did) in a
+  `WSock` reader; 15/15 clean re-runs after the fix.
+
+- **Lane C of `tests/test_iso_boot.py` is live** (it SKIP-gated on
+  `usage:` until this patch): stock SeaBIOS boots the 1 MiB El Torito
+  test ISO from `--cdrom=` and prints the stub's `AURA_ISO_BOOT_OK`
+  (measured 7.9 s wall).  The GUI's «Загрузка с ISO» now uses the same
+  path (`normal_config("iso")` -> `--cdrom=`), expert mode exposes the
+  option through the SCHEMA.
+
+
+### Added — patch 0070 (GUI G2: the desktop application + plain ISO boot)
+
+- **`tools/gui_app.py`: the native desktop application.**  tkinter
+  (Python stdlib only -- no browser, no third-party packages), Russian
+  UI, two switchable modes: **Обычный** (machine list, big transport
+  buttons, live screen, three-step *new machine* wizard with boot-media
+  kinds iso/disk/kernel/empty) and **Экспертный** (the full SCHEMA
+  option surface, monitor console, artifacts, snapshots, TAP responder,
+  run logs).  Both modes share the G1 core (`tools/launcher.py`
+  Machine/MonitorClient); the frame buffer renders through the
+  `FB\x01` protocol, end-stop semantics stay T5 («Стоп» sends `quit`,
+  the emulator prints stats and writes artifacts).
+- **«Select an ISO and start» boots it, like VirtualBox/VMware.**  The
+  wizard's ISO kind builds
+  `normal_config("iso") = --rom=<bios.bin> --lpc=ich9 --sata=<iso>`,
+  the documented `docs/WINDOWS.md` §E recipe; a stock SeaBIOS is found
+  via the remembered pick / `~/.x86emu-gui` / repo / `$AURALITE_BIOS`
+  (search order pinned in `tests/test_gui_app.py`).  `make gui` runs the
+  app, `make gui-web` keeps the browser GUI; `build.bat gui` /
+  `build.bat gui-web` / `gui.bat` match on Windows.
+- **`tools/mkiso.py` + `tests/fixtures/bootstub.nas` +
+  `tests/test_iso_boot.py`: plain ISO boot acceptance.**  The stdlib
+  ISO9660+El Torito+MBR builder produces a 1 MiB test image whose MBR
+  stub prints `AURA_ISO_BOOT_OK` to COM1; the Q lane (`--sata=iso`,
+  stock SeaBIOS) must see the marker -- measured 8.2 s wall / 120M
+  executed steps -- and the C lane (`--cdrom=iso`, El Torito) SKIPs
+  until STORE S6.  `make test-iso` is wired into `make test` and
+  `make test-sanitize`; both lanes SKIP cleanly without nasm or a
+  `bios.bin` (`--bios` / `$AURALITE_BIOS` / `~/.x86emu-gui` / repo).
+  Negative control: a bogus CLI option must be refused with `usage:`.
+
+### Fixed — patch 0070
+
+- **IDENTIFY DEVICE was un-honest in three fields** (measured on stock
+  SeaBIOS 1.16.3 against the G3 diagnostic ROM): the model string was
+  not byte-pair swapped (firmware displayed `uAariLetE umiDksH AB`) and
+  legacy CHS words 1/3/6 were zero, so firmware reported `PCHS=0/0/0`
+  and rounded the LCHS translation to **0 cylinders** -- refusing every
+  CHS read with EPARAM.  `ahci_identify` now swaps the model and fills
+  16 heads / 63 spt / computed cylinders (regression vector:
+  `test_engine_identify` in `tests/test_ahci.c`; negative control:
+  reverting the swap turns its two asserts red).
+- **Unknown CLI options were silently ignored** (measured: a `--cdrom=`
+  typo booted a machine with no disks at all and looked like a firmware
+  failure).  `main.c` now refuses them with `usage:` + `EXIT_INPUT_ERROR`,
+  the same contract the GUI's schema validation enforces (NC vector in
+  `tests/test_iso_boot.py`).
+- **IVT dispatch receipts are opt-in** (`AURALITE_IVT_LOG=1`): the
+  unconditional `[cpu] real-mode vector ...` mlog measured 9381 lines
+  during a stock SeaBIOS keyboard spin-up alone and dominated BIOS-boot
+  wall time.  Default log output keeps every other receipt byte-identical.
+- Test hygiene (both flakes measured under gate load): the
+  `find_seabios` vectors are hermetic against a real `$AURALITE_BIOS`
+  or repo `bios.bin`, and the launcher WS frame wait tolerates
+  sanitized (10-20x slower) emulator builds.
+
+
 ### Added — patch 0069 (GUI G1, the no-command-line control panel)
 
 - **`tools/launcher.py` + `web/gui.html`: the whole CLI surface reachable

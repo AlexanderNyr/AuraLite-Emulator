@@ -36,8 +36,9 @@
 #define PXCMD_FR   (1u << 14)
 #define PXCMD_CR   (1u << 15)
 
-#define SATA_SIG_ATA  0x00000101u
-#define SATA_SIG_NONE 0xFFFFFFFFu
+#define SATA_SIG_ATA   0x00000101u
+#define SATA_SIG_ATAPI 0x0000EB14u   /* S6: packet device on the port */
+#define SATA_SIG_NONE  0xFFFFFFFFu
 
 /* Present ports: device idle-ready (DRDY set, BSY/DRQ clear) -- the exact
  * 0x88 mask the guest polls must be 0 for it to issue a command.  Absent
@@ -58,6 +59,9 @@ typedef struct {
     uint32_t serr;                 /* W1C diagnostic bits */
     uint32_t ci;                   /* command-issue latch, engine clears */
     uint32_t tfd_err;              /* sticky ERR until the next good command */
+    /* S6: last CHECK CONDITION (sense key + ASC); REQUEST SENSE returns
+     * them and clears, any later success clears too.  In the snapshot. */
+    uint8_t sense_key, sense_asc;
 } port_regs_t;
 
 typedef struct {
@@ -159,6 +163,11 @@ static int port_of(uint64_t off) {
  * keeps the exact historical spelling so no S1-S3 receipt greps change. */
 static const char *tagc(const ahci_t *a) { return a->ctrl ? "[ahci2]" : "[ahci]"; }
 
+/* S6: kind 1 = ATAPI CD (--cdrom=). */
+static int port_is_cd(ahci_t *a, int p) {
+    return a->m->sata_kind[a->ctrl][p] == 1;
+}
+
 /* ---- S2 command engine: FIS decode + ATA READ DMA EXT / IDENTIFY ----
  *
  * Contract measured from the guest driver: it builds ONE command header
@@ -194,11 +203,11 @@ static uint64_t fis_u64(const uint8_t *f, int i) {
  * (READ), w=1 guest->device (WRITE); S5 decides host write-through
  * (today the image is in-memory, the USB stick's own convention). */
 static int ahci_dma_xfer(ahci_t *a, int p, uint64_t lba, uint32_t bytes,
-                         uint32_t prdtl, uint64_t ct, int w) {
+                         uint32_t prdtl, uint64_t ct, int w, uint32_t blk) {
     machine_t *m = a->m;
     uint8_t *img = m->sata_img[a->ctrl][p];
-    uint64_t off = lba * 512ull;
-    if (lba > UINT64_MAX / 512 || off + bytes > m->sata_len[a->ctrl][p]) return -1; /* OOB: TFES */
+    uint64_t off = lba * (uint64_t)blk;   /* 512 ATA / 2048 ATAPI (S6) */
+    if (lba > UINT64_MAX / blk || off + bytes > m->sata_len[a->ctrl][p]) return -1; /* OOB: TFES */
     uint64_t remain = bytes;
     for (uint32_t i = 0; i < prdtl && remain; i++) {
         uint64_t dba  = gdr(m, ct + 0x80 + i * 16)
@@ -224,20 +233,51 @@ static int ahci_dma_xfer(ahci_t *a, int p, uint64_t lba, uint32_t bytes,
     return (int)(bytes - remain);
 }
 
+/* IDENTIFY (both flavors): the ATA model string (words 27..46) is
+ * byte-pair swapped (measured: firmware that unswaps on read showed
+ * "uAariLetE umiDksH AB"). */
+static void identify_model(uint8_t *idb) {
+    static const char model[] = "AuraLite EmuDisk HBA   ";
+    for (int w = 27; w <= 46 && (size_t)(w - 27) * 2 < sizeof(model); w++) {
+        idb[w * 2]     = model[(w - 27) * 2 + 1];
+        idb[w * 2 + 1] = model[(w - 27) * 2];
+    }
+}
+
+/* Copy a small response buffer out through the command's PRDT. */
+static int prdt_put(ahci_t *a, uint32_t prdtl, uint64_t ct,
+                    const uint8_t *src, uint32_t n) {
+    machine_t *m = a->m;
+    uint32_t done = 0;
+    for (uint32_t i = 0; i < prdtl && done < n; i++) {
+        uint64_t dba  = gdr(m, ct + 0x80 + i * 16)
+                     | ((uint64_t)gdr(m, ct + 0x84 + i * 16) << 32);
+        uint32_t dbc  = (gdr(m, ct + 0x8C + i * 16) & 0x003FFFFFu) + 1u;
+        if (dbc > n - done) dbc = n - done;
+        for (uint32_t k = 0; k < dbc; k++)
+            mem_write(m, dba + k, 1, src[done + k]);
+        done += dbc;
+    }
+    return (int)done;
+}
+
 /* IDENTIFY DEVICE: the standard 512-byte block, machine-honest fields. */
 static void ahci_identify(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
     machine_t *m = a->m;
     static uint8_t idb[512];
     memset(idb, 0, sizeof idb);
     idb[0] = 0x40;                                  /* word0: non-removable */
-    /* ATA model string (words 27..46) is byte-pair swapped. */
-    static const char model[] = "AuraLite EmuDisk HBA   ";
-    for (int w = 27; w <= 46 && (size_t)(w - 27) * 2 < sizeof(model); w++) {
-        idb[w * 2]     = model[(w - 27) * 2];
-        idb[w * 2 + 1] = model[(w - 27) * 2 + 1];
-    }
+    identify_model(idb);
     idb[49 * 2] = 0x00; idb[49 * 2 + 1] = 0x03;     /* word49: LBA + DMA supported */
     uint32_t secs28 = (uint32_t)(m->sata_len[a->ctrl][p] / 512);
+    /* Legacy CHS words 1/3/6: 16 heads, 63 spt, cylinders from the size.
+     * Zeros made firmware report PCHS=0/0/0 (measured on stock SeaBIOS). */
+    uint32_t chs_cyl = secs28 / (16 * 63);
+    if (chs_cyl > 16383) chs_cyl = 16383;
+    if (chs_cyl == 0 && secs28) chs_cyl = 1;
+    idb[1 * 2] = chs_cyl & 0xFF; idb[1 * 2 + 1] = (chs_cyl >> 8) & 0xFF;
+    idb[3 * 2] = 16; idb[3 * 2 + 1] = 0;
+    idb[6 * 2] = 63; idb[6 * 2 + 1] = 0;
     if (secs28 > 0x0FFFFFFF) secs28 = 0x0FFFFFFF;   /* LBA28 ceiling */
     idb[60 * 2] = secs28 & 0xFF; idb[60 * 2 + 1] = (secs28 >> 8) & 0xFF;
     idb[61 * 2] = (secs28 >> 16) & 0xFF; idb[61 * 2 + 1] = (secs28 >> 24) & 0xFF;
@@ -255,6 +295,94 @@ static void ahci_identify(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
             mem_write(m, dba + k, 1, idb[k]);
         break;
     }
+}
+
+/* STORE S6: IDENTIFY PACKET DEVICE -- word0 0x8580 marks an ATAPI CD-ROM
+ * (bit7 removable, device type 5 in bits 12..8 of word0). */
+static void ahci_identify_packet(ahci_t *a, int p, uint32_t prdtl, uint64_t ct) {
+    static uint8_t idb[512];
+    memset(idb, 0, sizeof idb);
+    idb[0] = 0x80; idb[1] = 0x85;                   /* word0 = 0x8580 */
+    identify_model(idb);
+    (void)a; (void)p;
+    prdt_put(a, prdtl, ct, idb, 512);
+}
+
+/* STORE S6: the ATAPI PACKET command (SCSI CDB at ct+0x40).  Returns the
+ * transferred byte count, or -1 for CHECK CONDITION (sense stored in the
+ * port regs; the caller raises PxIS.TFES + TFD.ERR). */
+static int atapi_exec(ahci_t *a, int p, const uint8_t *cdb, uint32_t bc,
+                      uint32_t prdtl, uint64_t ct) {
+    machine_t *m = a->m;
+    port_regs_t *r = &a->port[p];
+    uint8_t rsp[36];
+    memset(rsp, 0, sizeof rsp);
+    uint32_t alloc = cdb[4] ? cdb[4] : 0xFFFFFFFFu; /* SCSI allocation length */
+    int len = 0;
+    switch (cdb[0]) {
+    case 0x00:                                      /* TEST UNIT READY */
+    case 0x1B:                                      /* START STOP UNIT */
+    case 0x1E:                                      /* PREVENT/ALLOW MEDIUM */
+        len = 0;
+        break;
+    case 0x03:                                      /* REQUEST SENSE (18 B) */
+        rsp[0] = 0x70; rsp[2] = r->sense_key; rsp[7] = 10;
+        rsp[12] = r->sense_asc;
+        r->sense_key = r->sense_asc = 0;            /* autosense consumed */
+        len = 18;
+        break;
+    case 0x12:                                      /* INQUIRY (36 B) */
+        rsp[0] = 0x05;                              /* CD-ROM device type */
+        rsp[1] = 0x80;                              /* removable */
+        rsp[2] = 0x02; rsp[3] = 0x02;               /* SPC-2, response fmt 2 */
+        rsp[4] = 31;                                /* additional length */
+        memcpy(&rsp[8],  "AURALITE", 8);
+        memcpy(&rsp[16], "EmuCD              ", 16);
+        memcpy(&rsp[32], "1.0 ", 4);
+        len = 36;
+        break;
+    case 0x1A:                                      /* MODE SENSE(6) */
+        rsp[0] = 13; rsp[2] = 0x80;                 /* write-protect */
+        rsp[4] = 0x04; rsp[5] = 0x0A;               /* geometry page, 10 B */
+        len = 16;
+        break;
+    case 0x25: {                                    /* READ CAPACITY */
+        uint64_t secs = m->sata_len[a->ctrl][p] / 2048;
+        uint32_t last = secs ? (uint32_t)(secs - 1) : 0;
+        if (secs > 0x100000000ull) last = 0xFFFFFFFFu;
+        rsp[0] = (uint8_t)(last >> 24); rsp[1] = (uint8_t)(last >> 16);
+        rsp[2] = (uint8_t)(last >> 8);  rsp[3] = (uint8_t)last;
+        rsp[6] = 0x08;                              /* 2048-byte blocks */
+        len = 8;
+        break;
+    }
+    case 0x28: {                                    /* READ(10), 2048-B blocks */
+        uint64_t lba = ((uint64_t)cdb[2] << 24) | ((uint64_t)cdb[3] << 16)
+                     | ((uint64_t)cdb[4] << 8)  |  (uint64_t)cdb[5];
+        uint32_t cnt = ((uint32_t)cdb[7] << 8) | cdb[8];
+        if (cnt == 0) return 0;
+        return ahci_dma_xfer(a, p, lba, cnt * 2048u, prdtl, ct, 0, 2048);
+    }
+    case 0x43:                                      /* READ TOC: one track */
+        rsp[1] = 10;                                /* toc length (BE) */
+        rsp[2] = 1; rsp[3] = 1;                     /* first/last track */
+        rsp[5] = 0x14; rsp[6] = 1;                  /* ADR=1 CTRL=4, track 1 */
+        len = 12;
+        break;
+    case 0x2A:                                      /* WRITE(10): read-only */
+        r->sense_key = 0x07; r->sense_asc = 0x27;   /* DATA PROTECT */
+        return -1;
+    default:
+        r->sense_key = 0x05; r->sense_asc = 0x20;   /* ILLEGAL REQUEST */
+        return -1;
+    }
+    if (len) {
+        uint32_t n = (uint32_t)len;
+        if (alloc < n) n = alloc;
+        if (bc && bc < n) n = bc;
+        return prdt_put(a, prdtl, ct, rsp, n);
+    }
+    return 0;
 }
 
 /* SeaBIOS polls PxIS, then reads rfis[2] for a completed command. Mirror
@@ -309,14 +437,14 @@ static void ahci_engine_port(ahci_t *a, int p) {
         case ATA_CMD_READ_DMA:
         case ATA_CMD_READ_DMA_EXT:
             if (wr) goto tfes;
-            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 0);
+            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 0, 512);
             if (done < 0) goto tfes;
             break;
         case ATA_CMD_WRITE_DMA:
         case ATA_CMD_WRITE_DMA_EXT:
             if (!wr) goto tfes;
             /* S3: writes travel guest PRDT -> attached image. */
-            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 1);
+            done = ahci_dma_xfer(a, p, lba, cnt * 512u, prdtl, ct, 1, 512);
             if (done < 0) goto tfes;
             break;
         case ATA_CMD_SET_FEATURES:
@@ -329,12 +457,30 @@ static void ahci_engine_port(ahci_t *a, int p) {
             done = 512;
             break;
         }
+        case 0xA1:                                  /* IDENTIFY PACKET DEVICE */
+            /* ATA disks abort (SeaBIOS then falls back to IDENTIFY DEVICE);
+             * CD ports answer with word0 = 0x8580. */
+            if (wr || !port_is_cd(a, p)) goto tfes;
+            ahci_identify_packet(a, p, prdtl, ct);
+            done = 512;
+            break;
+        case 0xA0: {                                /* PACKET */
+            if (wr || !port_is_cd(a, p)) goto tfes;
+            uint8_t cdb[16];
+            for (int i = 0; i < 16; i++) cdb[i] = (uint8_t)mem_read(m, ct + 0x40 + i, 1);
+            /* byte count lives in the FIS lba_mid/lba_high fields */
+            uint32_t bc = (uint32_t)cfis[5] | ((uint32_t)cfis[6] << 8);
+            done = atapi_exec(a, p, cdb, bc, prdtl, ct);
+            if (done < 0) goto tfes;
+            break;
+        }
         default:
             mlog(&m->log, "%s port %d: unsupported ATA cmd 0x%02x (S3 scope)\n", tagc(a), p, cmd);
             goto tfes;
         }
         gdw(m, hdr + 4, (uint32_t)done);       /* prdbc: bytes transferred */
         r->ci &= ~(1u << s);                    /* slot complete */
+        r->sense_key = r->sense_asc = 0;        /* success clears autosense */
         ahci_write_d2h_fis(a, p, 0);
         r->is |= 1u;                            /* DHRS: FIS D2H received */
         intx_update(a);                         /* S5: IS change -> line */
@@ -373,7 +519,9 @@ static uint64_t port_read(ahci_t *a, int p, uint32_t sub) {
         if (r->tfd_err) v |= 1;              /* ERR sticky until next ok */
         return v;
     }
-    case 0x24: return port_attached(a, p) ? SATA_SIG_ATA : SATA_SIG_NONE;
+    case 0x24: return port_attached(a, p)
+                   ? (port_is_cd(a, p) ? SATA_SIG_ATAPI : SATA_SIG_ATA)
+                   : SATA_SIG_NONE;
     case 0x28: return port_attached(a, p) ? SSTS_ATTACHED : SSTS_DARK;
     case 0x2C: return r->sctl;
     case 0x30: return r->serr;

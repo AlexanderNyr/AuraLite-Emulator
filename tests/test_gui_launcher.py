@@ -135,6 +135,35 @@ def test_http_surface(port):
 # ---------------- C. lifecycle + WS proxy -----------------------------------
 
 
+class WSock:
+    """Raw client socket + bytes already read past the 101 headers.
+
+    Measured flake: the monitor's state push coalesces into the same TCP
+    segment as the handshake response about one run in six; a header-only
+    reader that discards that tail then "receives" mid-frame garbage and
+    the whole lifecycle block fails.  MonitorClient in tools/gui_app.py
+    already keeps this prefix -- the test must too."""
+
+    def __init__(self, s, prefix=b""):
+        self.s = s
+        self.buf = prefix
+
+    def sendall(self, data):
+        self.s.sendall(data)
+
+    def close(self):
+        self.s.close()
+
+    def recv(self, n):
+        while len(self.buf) < n:
+            d = self.s.recv(65536)
+            if not d:
+                break
+            self.buf += d
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+
 def ws_handshake(port):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     key = base64.b64encode(os.urandom(16)).decode()
@@ -149,8 +178,12 @@ def ws_handshake(port):
         if not chunk:
             break
         buf += chunk
-    head = buf.split(b"\r\n\r\n")[0].decode(errors="replace")
-    return s, head
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    # Frame reads inherit this timeout.  Sanitized emulators are 10-20x
+    # slower and one `make test-sanitize` run measured a 10s state-push
+    # flake here; 30s keeps the vector honest without masking deadlocks.
+    s.settimeout(30)
+    return WSock(s, rest), head.decode(errors="replace")
 
 
 def ws_frame(s):

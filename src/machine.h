@@ -168,6 +168,8 @@ struct machine {
      * row 1 = the --ahci2 controller (0:31:3). */
     uint8_t *sata_img[AHCI_CTRLS][AHCI_MAX_ATTACH];
     size_t   sata_len[AHCI_CTRLS][AHCI_MAX_ATTACH];
+    /* STORE S6: attach kind 0 = ATA disk, 1 = ATAPI CD (--cdrom=). */
+    uint8_t  sata_kind[AHCI_CTRLS][AHCI_MAX_ATTACH];
 
     logring_t log;
 
