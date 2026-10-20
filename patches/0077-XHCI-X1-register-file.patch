@@ -1,0 +1,979 @@
+From 089df01bfa91c63e22cb5094dc6b6cdb5d3472d6 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 13:05:54 +0000
+Subject: [PATCH] XHCI X1: PCI identity + register file
+
+Phase X1 of docs/plans/XHCI_PLAN.md: the controller exists on the bus.
+
+PCI 0:20.0 carries the QEMU qemu-xhci identity (1b36:000d rev 01,
+class 0x0C/0x03/0x30, subsystem 1af4:1100, INTA# on the measured-free
+IRQ 10 -- in use: 0 PIT, 1 KBC, 8 RTC, 11 e1000, 14/15 AHCI, and
+EHCI/UHCI drive no PIC line).  BAR0 is a 64-bit 64 KiB MMIO window
+seeded at 0xFEB20000 (measured clear of EHCI 0xFEB00000, AHCI
+0xFEB10000/0xFEB12000, e1000 0xFEBC0000) with the AHCI BAR5 pattern
+for the sizing probe (0xFFFF0004) and firmware-relocation rebind.
+
+src/xhci.c models the full register file against the measured guest
+contract (XHCI_PLAN section 1a): the capability block (dword
+0x01000040; HCSPARAMS1 32 slots / 1 interrupter / 4 ports;
+HCSPARAMS2=0 so the guest skips scratchpads; HCCPARAMS1 AC64 with
+CSZ=0/PPC=0; DBOFF 0x1000, RTSOFF 0x800), operational registers with
+the HCRST handshake (programmed state wiped, HCRST self-clears,
+CNR=0), CONFIG/DCBAAP/CRCR/DNCTRL stores, PORTSC empty-port semantics
+(PP=1 under PPC=0, wake bits store, writes fabricate no CCS/PED/
+change bits), interrupter-0 ERSTSZ/ERSTBA/ERDP/IMOD/IMAN stores, and
+doorbells accepted (the ring engine is X2).  State is plain data and
+rides snapshots through xhci_snap ("dev.xhci").
+
+Vectors: tests/test_xhci.c, 9 groups through the real 0xCF8/0xCFC and
+MMIO paths, including a miniature replay of the guest's measured
+11-step xhci_init (0 devices until X4 binds the sticks).  NC: the
+devices.c wiring reverted -> 58 failures (the class scan finds
+nothing).
+
+Presence is unconditional (the UHCI-default pattern) and measured
+receipt-neutral: make test and make test-sanitize green with every
+historical lane byte-identical, both SeaBIOS ISO lanes green.
+
+docs/plans/XHCI_PLAN.md (status + section 1e), docs/STATUS.md,
+ROADMAP.md and CHANGELOG.md updated in this commit; patch 0077
+follows.
+---
+ CHANGELOG.md            |  25 +++
+ Makefile                |  36 +++--
+ ROADMAP.md              |   6 +-
+ docs/STATUS.md          |  20 +++
+ docs/plans/XHCI_PLAN.md |  34 +++-
+ src/devices.c           |  18 +++
+ src/xhci.c              | 335 ++++++++++++++++++++++++++++++++++++++++
+ src/xhci.h              |  29 ++++
+ tests/test_xhci.c       | 243 +++++++++++++++++++++++++++++
+ 9 files changed, 727 insertions(+), 19 deletions(-)
+ create mode 100644 src/xhci.c
+ create mode 100644 src/xhci.h
+ create mode 100644 tests/test_xhci.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7670499..1643c35 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,31 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0077 (XHCI X1: PCI identity + register file)
++
++- **The xHCI controller exists on the bus**: PCI 0:20.0 **1b36:000d**
++  rev 01 (QEMU `qemu-xhci` parity; class 0x0C/0x03/0x30, subsystem
++  1af4:1100, INTA# on the measured-free IRQ 10). BAR0 is a 64-bit
++  64 KiB MMIO window seeded at 0xFEB20000 (clear of EHCI/AHCI/e1000),
++  with the AHCI-style sizing probe (0xFFFF0004) and firmware-relocation
++  rebind.
++- **The full register file** (`src/xhci.c`): capability block
++  (0x01000040; 32 slots / 1 interrupter / 4 ports; no scratchpads;
++  AC64, CSZ=0, PPC=0; DBOFF 0x1000, RTSOFF 0x800), operational
++  registers with the HCRST handshake (programmed state wiped, HCRST
++  self-clears, CNR=0), CONFIG/DCBAAP/CRCR/DNCTRL stores, PORTSC
++  empty-port semantics (PP=1 under PPC=0, wake bits store, writes
++  fabricate nothing), interrupter-0 ERST/ERDP/IMAN/IMOD stores, and
++  doorbells accepted (the ring engine is X2). State serializes through
++  `xhci_snap`.
++- **Vectors** (`tests/test_xhci.c`, 9 groups): identity/BAR probe/caps/
++  reset/programming/ports/interrupter/doorbell pins plus a miniature
++  replay of the guest's measured 11-step bring-up. Presence is
++  unconditional and measured receipt-neutral: `make test` and
++  `make test-sanitize` green, every historical lane byte-identical,
++  both SeaBIOS ISO lanes green. **NC**: devices wiring reverted ->
++  58 failures.
++
+ ### Added — patch 0076 (XHCI X0: measured baseline + plan)
+ 
+ - **`docs/plans/XHCI_PLAN.md`**: the plan for the north-star USB 3.0
+diff --git a/Makefile b/Makefile
+index 1f5f47c..1ae4afc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -35,18 +35,18 @@ disk/disk.img: disk/test_kernel.bin
+ demo: x86emu firmware/firmware.bin disk/disk.img
+ 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
+ 
+-test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
++test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/xhci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
+ 	./test-cpu
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu -lm
+ 	./test-fpu
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+ 	./test-usb
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
+ 	./test-pam
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
+ 	./test-video
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
+ 	./test-net
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
+ 	./test-pic
+@@ -78,8 +78,8 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
+ # RSDP.  --lpc=ich9 switches the LPC function to the Q35-paired ICH9 ID.
+ # Vectors pin both identities, the untouched class/header fields, the host
+ # bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
+-test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
++test-compat: tests/test_compat.c tests/harness.h src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
+ 	./test-compat
+ 	rm -f test-compat
+ 
+@@ -150,10 +150,16 @@ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
+ # FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
+ # snapshot byte-stability of the x87 file across fresh runs).
+ test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
+ 	./test-fpu-gate
+ 	rm -f test-fpu-gate
+ 
++# XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
++test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-xhci -lm
++	./test-xhci
++	rm -f test-xhci
++
+ test-ring3: tests/test_ring3.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
+ 	./test-ring3
+@@ -272,8 +278,8 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
+ # (split identity, determinism, sparse RAM, refusals; sanitizer lane too).
+ # test-snapshot: split-run identity lanes on real workloads (the frozen
+ # guest lanes SKIP unless KERNEL/INITRD are set).
+-test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
++test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+ 	./test-snap
+ 	rm -f test-snap
+ 
+@@ -281,7 +287,7 @@ test-snapshot: x86emu firmware/firmware.bin disk/disk.img tests/kload_fixture.el
+ 	sh tests/integration/t4_snapshot_lanes.sh
+ 
+ # Exactly one T4 NC (RAM windows not carried); never in `make test`.
+-test-snapshot-nc: tests/integration/t4_snapshot_nc.sh src/devices.c
++test-snapshot-nc: tests/integration/t4_snapshot_nc.sh src/xhci.c src/devices.c
+ 	sh tests/integration/t4_snapshot_nc.sh
+ 
+ # TOOLING T5: RFC 6455 codec vectors + live HTTP/WebSocket protocol and
+@@ -365,7 +371,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -375,7 +381,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -424,4 +430,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 8447912..24f853c 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -36,7 +36,7 @@ maps to exactly one plan below.
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+-| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0 done ✅; X1 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
++| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X1 done ✅; X2 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -100,8 +100,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    (the MSC path already exists); X4 USB2/USB3 protocol-speed and port
+    routing (EHCI-companion coexistence); X5 end-to-end + hardening (both
+    sticks byte-identical x2, matrix determinism). Each phase: measured
+-   receipts, vectors, one NC, full gates, one patch. **Started: X0
+-   shipped (`patches/0076`)**.
++   receipts, vectors, one NC, full gates, one patch. **In progress: X0
++   (`0076`) + X1 register file (`0077`) shipped; X2 queued**.
+ 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 1b215bd..475cdd3 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -856,6 +856,26 @@
+   bulk/interrupt -> interrupter/ports/close-out). Docs-only; gates
+   unchanged green.
+ 
++- XHCI X1 (`patches/0077-XHCI-X1-register-file.patch`): the controller
++  exists. PCI 0:20.0 **1b36:000d** rev 01 (class 0C/03/30, subsystem
++  1af4:1100, INTA# on measured-free IRQ 10) with a 64-bit 64 KiB BAR0 at
++  0xFEB20000 (sizing probe 0xFFFF0004, firmware relocation rebinds --
++  the AHCI BAR5 pattern) and the full register file in `src/xhci.c`:
++  capability block (dword 0x01000040, HCSPARAMS1 32 slots/1 interrupter/
++  4 ports, no scratchpads, HCCPARAMS1 AC64 with CSZ=0/PPC=0, DBOFF
++  0x1000, RTSOFF 0x800), operational registers with the HCRST handshake
++  (state wiped, HCRST self-clears, CNR=0 immediately), CONFIG/DCBAAP/
++  CRCR/DNCTRL stores, PORTSC with PPC=0 power (empty port reads PP=1,
++  wake bits store, writes fabricate no change bits), interrupter-0
++  ERSTSZ/ERSTBA/ERDP/IMOD/IMAN stores, doorbells accepted (engine is
++  X2). Vectors: `tests/test_xhci.c` 9 groups through the real
++  0xCF8/0xCFC + MMIO paths, incl. a miniature replay of the guest's
++  measured 11-step `xhci_init` (0 devices until X4 binds the sticks);
++  NC (wiring reverted) red with 58 failures. Presence is unconditional
++  (the UHCI-default pattern): `make test` and `make test-sanitize`
++  green with every historical receipt byte-identical, both SeaBIOS ISO
++  lanes green. State rides snapshots via `xhci_snap` ("dev.xhci").
++
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+ - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
+diff --git a/docs/plans/XHCI_PLAN.md b/docs/plans/XHCI_PLAN.md
+index ded89ff..aebdf08 100644
+--- a/docs/plans/XHCI_PLAN.md
++++ b/docs/plans/XHCI_PLAN.md
+@@ -12,7 +12,7 @@
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | X0 | Measured baseline: the guest contract, the QEMU identity, our topology, the defect ledger | ✅ done | this file (`patches/0076`) |
+-| X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ⬜ queued | `tests/test_xhci.c` register-file vectors |
++| X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ✅ done | `src/xhci.c` + `tests/test_xhci.c` (9 groups) (`patches/0077`) |
+ | X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ⬜ queued | command-ring gates |
+ | X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ⬜ queued | control-transfer vectors |
+ | X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ⬜ queued | bulk/interrupt vectors + stick receipts |
+@@ -151,6 +151,38 @@ receipt.
+ | D6 | no transfer rings / transfer events | no enumeration, no data | X3/X4 |
+ | D7 | no interrupter / INTx / Port Status Change events | hotplug dead, U8 receipts impossible | X5 |
+ 
++## 1e. X1 measured receipts (PCI + register file)
++
++- **Identity/topology pins** (`tests/test_xhci.c`, 9 groups, all through
++  the real 0xCF8/0xCFC mechanism + mem_read/mem_write): the guest's
++  class scan finds **1b36:000d rev 01 at 0:20.0** (subsystem 1af4:1100,
++  cfg 0x3C=10 / 0x3D=1); BAR0 seeded 64-bit at **0xFEB20000** (measured
++  free: EHCI 0xFEB00000, AHCI 0xFEB10000/0xFEB12000, e1000 0xFEBC0000);
++  the sizing probe reads 0xFFFF0004 (mask + 64-bit type), BAR1 probe 0,
++  and a firmware relocation rebinds the decode window (the AHCI BAR5
++  pattern, probe flag included).
++- **Register file**: caps dword `0x01000040`; HCSPARAMS1 = 32 slots /
++  1 interrupter / 4 ports; HCSPARAMS2=0 (the guest skips its scratchpad
++  step); HCCPARAMS1 = AC64 (CSZ=0, PPC=0); DBOFF 0x1000 / RTSOFF 0x800.
++  HCRST wipes the programmed state and self-clears with CNR=0
++  immediately (the guest's 1e6 spin budgets never burn); CONFIG/DCBAAP/
++  CRCR/DNCTRL store as 32-bit halves, PAGESIZE reads 1; empty PORTSC
++  reads PP=1 only, wake bits store, an all-ones write fabricates no
++  CCS/PED/change bits; interrupter-0 ERSTSZ/ERSTBA/ERDP/IMOD/IMAN store
++  with IP quiet; doorbells are accepted and read 0 (engine is X2).
++- **Guest bring-up replay**: the 11 measured init steps (section 1a)
++  complete against the register file; the port scan reports 0 devices
++  (the sticks bind in X4).
++- **Presence is unconditional** (the UHCI-default pattern): measured
++  against the full lane kit, `make test` rc=0 with every historical
++  receipt byte-identical, so no omit flag exists. **IRQ 10** measured
++  free (in use: 0 PIT, 1 KBC, 8 RTC, 11 e1000, 14/15 AHCI; EHCI/UHCI
++  drive no PIC line).
++- **NC**: `src/devices.c` wiring reverted → `test-xhci` red with 58
++  failures (the class scan finds nothing). The RW1C *clear* path gets
++  its vector in X5, when hardware can latch CSC (in X1 writes cannot
++  set change bits, exactly as on silicon with empty ports).
++
+ ## 2. Architecture decisions (X1)
+ 
+ - **PCI identity**: 1b36:000d, rev 01, class 0x0C/0x03/0x30, subsystem
+diff --git a/src/devices.c b/src/devices.c
+index bc4c31e..109f0a4 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -15,6 +15,7 @@
+ #include "cpu.h"    /* USB U3: cpu_devices_tick hook */
+ #include "serial.h"
+ #include "ahci.h"
++#include "xhci.h"
+ #include "vga_font.h"
+ #include "snapshot.h"   /* TOOLING T4 */
+ 
+@@ -1372,6 +1373,22 @@ void devices_init_common(machine_t *m) {
+     g_ehci.hcs = 0x11; g_ehci.op = 0;       /* +0x04 alias: caps until op mode */
+     /* HCCPARAMS @0x08 = 0: 32-bit addressing only */
+ 
++    /* XHCI X1: USB 3.0 host controller at 0:20.0 with the QEMU qemu-xhci
++     * identity (1b36:000d, rev 01, prog-if 0x30 -- docs/plans/XHCI_PLAN.md
++     * section 1b).  BAR0 is a 64-bit 64 KiB MMIO window; the guest reads
++     * BAR1 for the upper dword when the type bits read 10b. */
++    pci_dev_t *xhci_pci = pci_add_device(m, 0,20,0, "xhci", 0x1B36, 0x000D, 0x0C, 0x03, 0x30);
++    xhci_pci->cfg[0x08] = 0x01;                       /* revision 01 */
++    { uint64_t bar = (uint64_t)XHCI_MMIO_BASE | 0x4u; /* 64-bit memory BAR */
++      for (int i = 0; i < 8; i++) xhci_pci->cfg[0x10 + i] = (uint8_t)(bar >> (8 * i)); }
++    xhci_pci->cfg[0x2C] = 0xF4; xhci_pci->cfg[0x2D] = 0x1A;   /* subsystem 1af4:1100 */
++    xhci_pci->cfg[0x2E] = 0x00; xhci_pci->cfg[0x2F] = 0x11;
++    xhci_pci->cfg[0x3C] = (uint8_t)XHCI_IRQ;          /* Interrupt Line */
++    xhci_pci->cfg[0x3D] = 0x01;                       /* Interrupt Pin: INTA# */
++    xhci_pci->cfg_read = xhci_pci_cfg_read;
++    xhci_pci->cfg_write = xhci_pci_cfg_write;
++    xhci_register(m);
++
+     /* GPU VRAM / framebuffer, BAR0 = 0xD0000000 as the firmware's own "enable:" code
+      * sets it; this buffer doubles as the pixel buffer shown in the GUI.
+      * V5: the aperture is the full 16 MiB QEMU/Bochs std-VGA window (modes
+@@ -1465,6 +1482,7 @@ void devices_snap(machine_t *m, snap_t *s) {
+     snap_bytes(s, "dev.usb.bot", &g_st, sizeof g_st);
+     { uhci_t t = g_uhci; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.uhci", &t, sizeof t);
+       if (snap_loading(s)) { t.m = g_uhci.m; g_uhci = t; } }
++    xhci_snap(m, s);   /* XHCI X1 */
+     { vga_t t = g_vga; if (!snap_loading(s)) { t.m = NULL; t.text = NULL; } snap_bytes(s, "dev.vga", &t, sizeof t);
+       if (snap_loading(s)) { t.m = g_vga.m; t.text = g_vga.text; g_vga = t; } }
+     { dispi_t t = g_dispi; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.dispi", &t, sizeof t);
+diff --git a/src/xhci.c b/src/xhci.c
+new file mode 100644
+index 0000000..2a76711
+--- /dev/null
++++ b/src/xhci.c
+@@ -0,0 +1,335 @@
++// xhci.c -- USB 3.0 host controller (XHCI plan, docs/plans/XHCI_PLAN.md).
++//
++// X1: PCI identity 1b36:000d (QEMU qemu-xhci parity) + the full register
++// file: capability, operational, runtime/interrupter-0, doorbell and
++// root-port registers, the HCRST/CNR handshake and PORTSC RW1C
++// discipline.  Rings and transfers are X2+; doorbells are accepted and
++// ignored here.  Everything the guest driver touches is 32-bit MMIO
++// (AuraLite-OS@main drivers/usb/xhci.c, XHCI_PLAN section 1a); other
++// sizes compose from the containing dword like the AHCI model does.
++#include <stdint.h>
++#include <string.h>
++#include "xhci.h"
++#include "pci.h"
++
++/* capability register values (BAR0-relative dword reads) */
++#define X_CAP_LEN        0x40u
++#define X_HCI_VERSION    0x0100u
++#define X_HCSPARAMS1     ((XHCI_MAX_PORTS << 24) | (1u << 8) | XHCI_MAX_SLOTS)
++#define X_HCCPARAMS1     0x1u          /* AC64; CSZ=0 (32B contexts), PPC=0 */
++#define X_DBOFF          0x1000u
++#define X_RTSOFF         0x0800u
++/* operational register offsets (from BAR0 + X_CAP_LEN) */
++#define OP_USBCMD        0x00
++#define OP_USBSTS        0x04
++#define OP_PAGESIZE      0x08
++#define OP_DNCTRL        0x14
++#define OP_CRCR          0x18
++#define OP_DCBAAP        0x30
++#define OP_CONFIG        0x38
++#define OP_PORT_BASE     0x400
++#define OP_PORT_STRIDE   0x10
++/* USBCMD bits */
++#define CMD_RUN          (1u << 0)
++#define CMD_HCRST        (1u << 1)
++#define CMD_INTE         (1u << 2)
++#define CMD_HSEE         (1u << 3)
++#define CMD_LHCRST       (1u << 7)
++/* USBSTS bits */
++#define STS_HCH          (1u << 0)
++#define STS_PCD          (1u << 4)
++/* CRCR bits */
++#define CRCR_CRR         (1u << 3)
++/* PORTSC bits */
++#define P_PP             (1u << 9)
++#define P_WAKE           ((1u << 25) | (1u << 26) | (1u << 27))
++#define P_CHANGE         ((1u << 17) | (1u << 18) | (1u << 19) | (1u << 20) | \
++                          (1u << 21) | (1u << 22) | (1u << 23))
++/* runtime: interrupter 0 offsets (from BAR0 + X_RTSOFF) */
++#define RT_IMAN          0x20
++#define RT_IMOD          0x24
++#define RT_ERSTSZ        0x28
++#define RT_ERSTBA        0x30
++#define RT_ERDP          0x38
++#define IMAN_IP          (1u << 0)
++#define IMAN_IE          (1u << 1)
++
++typedef struct {
++    machine_t *m;
++    uint32_t base;          /* live BAR0 decode base */
++    int bar_probe;          /* BAR sizing probe in flight */
++    uint32_t usbcmd, config, dnctrl;
++    uint64_t crcr, dcbaap;
++    uint32_t port_change[XHCI_MAX_PORTS];   /* latched RW1C bits */
++    uint32_t port_wake[XHCI_MAX_PORTS];     /* WCE|WDE|WOE */
++    int iman_ie;
++    uint32_t imod, erstsz;
++    uint64_t erstba, erdp;
++    int intx_level;         /* last level driven on XHCI_IRQ */
++} xhci_t;
++
++static xhci_t g_xhci;
++
++/* ---- host-controller reset: every software-visible register to its
++ * power-on value (XHCI_PLAN X1; the guest's init step 2 waits on the
++ * HCRST bit self-clearing and on CNR clearing, both immediate here). */
++static void xhci_hw_reset(xhci_t *x) {
++    machine_t *m = x->m;
++    uint32_t base = x->base;
++    int probe = x->bar_probe;
++    memset(x, 0, sizeof *x);
++    x->m = m;
++    x->base = base;
++    x->bar_probe = probe;
++}
++
++static uint32_t op_read(xhci_t *x, uint32_t off) {
++    switch (off) {
++    case OP_USBCMD:  return x->usbcmd;
++    case OP_USBSTS: {
++        uint32_t v = 0;
++        if (!(x->usbcmd & CMD_RUN)) v |= STS_HCH;
++        for (int p = 0; p < XHCI_MAX_PORTS; p++)
++            if (x->port_change[p]) { v |= STS_PCD; break; }
++        return v;
++    }
++    case OP_PAGESIZE: return 1;                 /* 4 KiB pages */
++    case OP_DNCTRL:   return x->dnctrl;
++    case OP_CRCR: {
++        uint32_t v = (uint32_t)(x->crcr & ~0xFu) | (uint32_t)(x->crcr & 1u);
++        if ((x->usbcmd & CMD_RUN) && (x->crcr & ~0xFull)) v |= CRCR_CRR;
++        return v;
++    }
++    case OP_CRCR + 4:  return (uint32_t)(x->crcr >> 32);
++    case OP_DCBAAP:    return (uint32_t)x->dcbaap;
++    case OP_DCBAAP + 4:return (uint32_t)(x->dcbaap >> 32);
++    case OP_CONFIG:    return x->config;
++    default: break;
++    }
++    if (off >= OP_PORT_BASE && off < OP_PORT_BASE + XHCI_MAX_PORTS * OP_PORT_STRIDE) {
++        int p = (int)((off - OP_PORT_BASE) / OP_PORT_STRIDE);
++        uint32_t sub = (off - OP_PORT_BASE) % OP_PORT_STRIDE;
++        if (sub == 0)   /* PORTSC: PPC=0 -> power always on; no devices in X1 */
++            return P_PP | x->port_change[p] | x->port_wake[p];
++        return 0;       /* PORTPMSC / PORTLI / reserved */
++    }
++    return 0;
++}
++
++static void op_write(xhci_t *x, uint32_t off, uint32_t val) {
++    switch (off) {
++    case OP_USBCMD:
++        if (val & CMD_HCRST) { xhci_hw_reset(x); return; }
++        x->usbcmd = val & (CMD_RUN | CMD_INTE | CMD_HSEE);
++        return;
++    case OP_USBSTS:  return;                    /* HSE/EINT never latch in X1 */
++    case OP_DNCTRL:  x->dnctrl = val; return;
++    case OP_CRCR:
++        x->crcr = (x->crcr & 0xFFFFFFFF00000000ull) | (val & ~0x6u);
++        return;
++    case OP_CRCR + 4:
++        x->crcr = (x->crcr & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        return;
++    case OP_DCBAAP:
++        x->dcbaap = (x->dcbaap & 0xFFFFFFFF00000000ull) | (val & ~0x3Fu);
++        return;
++    case OP_DCBAAP + 4:
++        x->dcbaap = (x->dcbaap & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        return;
++    case OP_CONFIG:  x->config = val; return;
++    default: break;
++    }
++    if (off >= OP_PORT_BASE && off < OP_PORT_BASE + XHCI_MAX_PORTS * OP_PORT_STRIDE) {
++        int p = (int)((off - OP_PORT_BASE) / OP_PORT_STRIDE);
++        uint32_t sub = (off - OP_PORT_BASE) % OP_PORT_STRIDE;
++        if (sub == 0) {   /* PORTSC: RW1C change bits + wake enables */
++            x->port_change[p] &= ~(val & P_CHANGE);
++            x->port_wake[p] = val & P_WAKE;
++        }
++        return;
++    }
++}
++
++static uint32_t rt_read(xhci_t *x, uint32_t off) {
++    switch (off) {
++    case RT_IMAN:    return x->iman_ie ? IMAN_IE : 0;   /* IP: X5 */
++    case RT_IMOD:    return x->imod;
++    case RT_ERSTSZ:  return x->erstsz;
++    case RT_ERSTBA:  return (uint32_t)x->erstba;
++    case RT_ERSTBA + 4: return (uint32_t)(x->erstba >> 32);
++    case RT_ERDP:    return (uint32_t)x->erdp;
++    case RT_ERDP + 4:   return (uint32_t)(x->erdp >> 32);
++    default:         return 0;   /* MFINDEX + interrupters 1.. (MaxIntrs=1) */
++    }
++}
++
++static void rt_write(xhci_t *x, uint32_t off, uint32_t val) {
++    switch (off) {
++    case RT_IMAN:    x->iman_ie = (val & IMAN_IE) != 0; return;
++    case RT_IMOD:    x->imod = val; return;
++    case RT_ERSTSZ:  x->erstsz = val & 0xFFFFu; return;
++    case RT_ERSTBA:
++        x->erstba = (x->erstba & 0xFFFFFFFF00000000ull) | (val & ~0x3Fu);
++        return;
++    case RT_ERSTBA + 4:
++        x->erstba = (x->erstba & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        return;
++    case RT_ERDP:
++        x->erdp = (x->erdp & 0xFFFFFFFF00000000ull) | val;
++        return;
++    case RT_ERDP + 4:
++        x->erdp = (x->erdp & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        return;
++    default: return;
++    }
++}
++
++static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
++    if (off < X_CAP_LEN) {
++        switch (off) {
++        case 0x00: return (X_HCI_VERSION << 16) | X_CAP_LEN;
++        case 0x04: return X_HCSPARAMS1;
++        case 0x10: return X_HCCPARAMS1;
++        case 0x14: return X_DBOFF;
++        case 0x18: return X_RTSOFF;
++        default:   return 0;   /* HCSPARAMS2/3, HCCPARAMS2 */
++        }
++    }
++    if (off >= X_RTSOFF && off < X_DBOFF) return rt_read(x, off - X_RTSOFF);
++    if (off >= X_DBOFF) return 0;               /* doorbells read 0 */
++    return op_read(x, off - X_CAP_LEN);
++}
++
++static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
++    if (off < X_CAP_LEN) return;                /* capability space is RO */
++    if (off >= X_RTSOFF && off < X_DBOFF) { rt_write(x, off - X_RTSOFF, val); return; }
++    if (off >= X_DBOFF) return;                 /* doorbells: X2 rings the engine */
++    op_write(x, off - X_CAP_LEN, val);
++}
++
++static uint64_t xhci_mmio_read(void *ctx, uint64_t addr, int size) {
++    xhci_t *x = ctx;
++    uint32_t off = (uint32_t)(addr - x->base);
++    if (size == 8) {
++        return (uint64_t)xhci_read32(x, off & ~3u) |
++               ((uint64_t)xhci_read32(x, (off & ~3u) + 4) << 32);
++    }
++    if (size != 4) {   /* guest is 32-bit only; compose like AHCI */
++        uint32_t dw = xhci_read32(x, off & ~3u);
++        uint32_t in = off & 3u;
++        if ((uint32_t)size + in <= 4)
++            return (dw >> (8 * in)) & ((size >= 4) ? 0xFFFFFFFFu : ((1u << (8 * size)) - 1u));
++        return 0;
++    }
++    return xhci_read32(x, off);
++}
++
++static void xhci_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
++    xhci_t *x = ctx;
++    uint32_t off = (uint32_t)(addr - x->base);
++    if (size == 8) {
++        xhci_write32(x, off & ~3u, (uint32_t)val);
++        xhci_write32(x, (off & ~3u) + 4, (uint32_t)(val >> 32));
++        return;
++    }
++    if (size != 4) {
++        uint32_t old = xhci_read32(x, off & ~3u);
++        uint32_t in = off & 3u, mask = 0;
++        for (int i = 0; i < size; i++) mask |= 0xFFu << (8 * (in + i));
++        val = (old & ~mask) | ((val << (8 * in)) & mask);
++        off &= ~3u;
++    }
++    xhci_write32(x, off, (uint32_t)val);
++}
++
++/* ---- BAR0 (64-bit, 64 KiB) probe + relocation, the AHCI BAR5 pattern -- */
++static void xhci_set_base(xhci_t *x, uint64_t base) {
++    int enabled = base != 0 && (base >> 32) == 0;
++    x->base = enabled ? (uint32_t)base : 0;
++    if (!x->m) return;
++    for (mmio_region_t *r = x->m->mmio_list; r; r = r->next) {
++        if (r->ctx == x && r->size == XHCI_MMIO_SIZE) {
++            r->base = x->base;
++            r->enabled = enabled;
++            return;
++        }
++    }
++}
++
++static xhci_t *xhci_pci_controller(pci_dev_t *d) {
++    if (!d || d->bus != 0 || d->dev != 20 || d->func != 0) return NULL;
++    return &g_xhci;
++}
++
++static uint64_t xhci_bar_value(xhci_t *x, pci_dev_t *d) {
++    if (x->bar_probe) return 0xFFFF0004ull;    /* mask | 64-bit type, hi=0 */
++    uint64_t v = 0;
++    for (int i = 0; i < 8; i++) v |= (uint64_t)d->cfg[0x10 + i] << (8 * i);
++    return v;
++}
++
++uint64_t xhci_pci_cfg_read(struct pci_dev *dev, int reg, int size) {
++    pci_dev_t *d = dev;
++    xhci_t *x = xhci_pci_controller(d);
++    if (!x || size <= 0 || size > 8) return 0;
++    uint64_t bar = xhci_bar_value(x, d);
++    uint64_t value = 0;
++    for (int i = 0; i < size; i++) {
++        int off = reg + i;
++        uint8_t byte = 0;
++        if (off >= 0x10 && off < 0x18)
++            byte = (uint8_t)(bar >> (8 * (off - 0x10)));
++        else if (!((off >= 0x18 && off < 0x28) || (off >= 0x30 && off < 0x34))
++                 && off >= 0 && off < 256)
++            byte = d->cfg[off];
++        value |= (uint64_t)byte << (8 * i);
++    }
++    return value;
++}
++
++void xhci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
++    pci_dev_t *d = dev;
++    xhci_t *x = xhci_pci_controller(d);
++    if (!x || size <= 0 || size > 8) return;
++    if ((reg == 0x10 || reg == 0x14) && size == 4 && (uint32_t)val == 0xFFFFFFFFu) {
++        x->bar_probe = 1;
++        return;
++    }
++    int touches_bar = reg < 0x18 && reg + size > 0x10;
++    if (touches_bar) x->bar_probe = 0;
++    pci_default_cfg_write(d, reg, size, val);
++    /* BAR2..5 and the expansion-ROM BAR are not implemented. */
++    memset(d->cfg + 0x18, 0, 0x10);
++    memset(d->cfg + 0x30, 0, 4);
++    if (touches_bar) {
++        uint64_t req = 0;
++        for (int i = 0; i < 8; i++) req |= (uint64_t)d->cfg[0x10 + i] << (8 * i);
++        uint64_t base = req & ~(uint64_t)(XHCI_MMIO_SIZE - 1u) & ~0xFull;
++        uint64_t stored = base | 0x4u;         /* 64-bit memory BAR */
++        for (int i = 0; i < 8; i++) d->cfg[0x10 + i] = (uint8_t)(stored >> (8 * i));
++        xhci_set_base(x, base);
++    }
++}
++
++void xhci_register(machine_t *m) {
++    xhci_t *x = &g_xhci;
++    memset(x, 0, sizeof *x);
++    x->m = m;
++    x->base = XHCI_MMIO_BASE;
++    mem_register_mmio(m, x->base, XHCI_MMIO_SIZE, xhci_mmio_read,
++                      xhci_mmio_write, x, "XHCI BAR0");
++    mlog(&m->log, "[xhci] BAR0 registered at 0x%x (%d ports, X1: register file)\n",
++         x->base, XHCI_MAX_PORTS);
++}
++
++void xhci_snap(machine_t *m, snap_t *s) {
++    (void)m;
++    xhci_t t = g_xhci;
++    if (!snap_loading(s)) t.m = NULL;
++    snap_bytes(s, "dev.xhci", &t, sizeof t);
++    if (snap_loading(s)) {
++        t.m = g_xhci.m;
++        g_xhci = t;
++        xhci_set_base(&g_xhci, g_xhci.base);
++    }
++}
+diff --git a/src/xhci.h b/src/xhci.h
+new file mode 100644
+index 0000000..3d2be16
+--- /dev/null
++++ b/src/xhci.h
+@@ -0,0 +1,29 @@
++/* xhci.h -- XHCI plan: USB 3.0 host controller (docs/plans/XHCI_PLAN.md).
++ *
++ * X1: PCI identity + register file.  The contract is measured from the
++ * guest driver (AuraLite-OS@main drivers/usb/xhci.c, see XHCI_PLAN.md
++ * section 1a): class 0x0C/0x03/0x30 probe, legacy INTx, 64 KiB BAR0,
++ * the exact 11-step bring-up.  State is a plain-data global (the AHCI
++ * pattern) so snapshots serialize it via xhci_snap().
++ */
++#ifndef EMU_XHCI_H
++#define EMU_XHCI_H
++
++#include <stdint.h>
++#include "machine.h"
++#include "snapshot.h"
++
++#define XHCI_MMIO_BASE   0xFEB20000u   /* 64 KiB; clear of EHCI/AHCI/e1000 */
++#define XHCI_MMIO_SIZE   0x10000u
++#define XHCI_IRQ         10            /* measured free ISA line */
++#define XHCI_MAX_SLOTS   32
++#define XHCI_MAX_PORTS   4
++
++struct pci_dev;
++
++void     xhci_register(machine_t *m);
++void     xhci_snap(machine_t *m, snap_t *s);
++uint64_t xhci_pci_cfg_read(struct pci_dev *dev, int reg, int size);
++void     xhci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val);
++
++#endif
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+new file mode 100644
+index 0000000..10b277a
+--- /dev/null
++++ b/tests/test_xhci.c
+@@ -0,0 +1,243 @@
++/* tests/test_xhci.c -- XHCI X1 vectors: PCI identity + register file.
++ *
++ * Everything pinned here is the measured guest contract (XHCI_PLAN.md
++ * section 1a: AuraLite-OS drivers/usb/xhci.c) and the QEMU identity
++ * (section 1b: qemu-xhci = 1b36:000d rev 01).  The fixture is the full
++ * machine (devices_init_common), PCI config goes through the real
++ * 0xCF8/0xCFC mechanism and MMIO through mem_read/mem_write, so the
++ * vectors see exactly what the guest driver sees.
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++#include "harness.h"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static machine_t M;   /* static: machine_t is ~2.8MB */
++
++#define XHCI_BAR   0xFEB20000u
++#define OP(off)    (XHCI_BAR + 0x40u + (off))          /* operational */
++#define PORT(p)    (XHCI_BAR + 0x40u + 0x400u + (p) * 0x10u)
++#define RT(off)    (XHCI_BAR + 0x800u + (off))         /* runtime */
++
++static uint32_t rd32(uint32_t a) { return (uint32_t)mem_read(&M, a, 4); }
++static void     wr32(uint32_t a, uint32_t v) { mem_write(&M, a, 4, v); }
++
++/* PCI mechanism #1, the test_pam.c recipe */
++static void pci_addr(int dev, int reg) {
++    io_write(&M, 0xCF8, 4, 0x80000000u | ((uint32_t)dev << 11) | ((uint32_t)reg & 0xFCu));
++}
++static uint32_t pci_rd32(int dev, int reg) { pci_addr(dev, reg); return (uint32_t)io_read(&M, 0xCFC, 4); }
++static void pci_wr32(int dev, int reg, uint32_t v) { pci_addr(dev, reg); io_write(&M, 0xCFC, 4, v); }
++static uint8_t pci_rd8(int dev, int reg) { pci_addr(dev, reg); return (uint8_t)io_read(&M, 0xCFC + (reg & 3), 1); }
++
++/* ---- v_pci_identity: the guest's class probe finds 1b36:000d ---------- */
++static void v_pci_identity(void) {
++    int f0 = fails;
++    int found = -1;
++    for (int d = 0; d < 32 && found < 0; d++) {
++        if ((pci_rd32(d, 0) & 0xFFFFu) == 0xFFFFu) continue;
++        if (pci_rd8(d, 0x0B) == 0x0C && pci_rd8(d, 0x0A) == 0x03 && pci_rd8(d, 0x09) == 0x30)
++            found = d;
++    }
++    EXPECT(found == 20, "class 0C/03/30 scan finds dev 20 (got %d)", found);
++    EXPECT(pci_rd32(20, 0x00) == 0x000D1B36u, "vendor:device 1b36:000d (got %08x)", pci_rd32(20, 0x00));
++    EXPECT(pci_rd32(20, 0x08) == 0x0C033001u, "class/revision dword (got %08x)", pci_rd32(20, 0x08));
++    EXPECT(pci_rd32(20, 0x2C) == 0x11001AF4u, "subsystem 1af4:1100 (got %08x)", pci_rd32(20, 0x2C));
++    EXPECT(pci_rd8(20, 0x3C) == 10, "interrupt line 10 (got %u)", pci_rd8(20, 0x3C));
++    EXPECT(pci_rd8(20, 0x3D) == 1, "interrupt pin INTA# (got %u)", pci_rd8(20, 0x3D));
++    EXPECT(pci_rd32(20, 0x10) == (XHCI_BAR | 0x4u), "BAR0 seeded 64-bit (got %08x)", pci_rd32(20, 0x10));
++    EXPECT(pci_rd32(20, 0x14) == 0, "BAR1 (upper dword) 0");
++    EXPECT(pci_rd32(20, 0x18) == 0 && pci_rd32(20, 0x30) == 0, "unimplemented BARs read 0");
++    if (fails == f0) printf("ok pci identity: 1b36:000d class 0C/03/30 at 0:20.0, IRQ 10 INTA#\n");
++}
++
++/* ---- v_bar_probe: sizing reads the 64 KiB mask, relocation rebinds ---- */
++static void v_bar_probe(void) {
++    int f0 = fails;
++    pci_wr32(20, 0x10, 0xFFFFFFFFu);
++    EXPECT(pci_rd32(20, 0x10) == 0xFFFF0004u, "BAR0 probe mask (got %08x)", pci_rd32(20, 0x10));
++    pci_wr32(20, 0x14, 0xFFFFFFFFu);
++    EXPECT(pci_rd32(20, 0x14) == 0, "BAR1 probe reads 0 (no bits above 32)");
++    /* place the BAR back; the MMIO window must decode at the seeded base */
++    pci_wr32(20, 0x10, XHCI_BAR | 0x4u);
++    pci_wr32(20, 0x14, 0);
++    EXPECT(pci_rd32(20, 0x10) == (XHCI_BAR | 0x4u), "BAR0 restored");
++    EXPECT(rd32(XHCI_BAR) == 0x01000040u, "caps dword decodes at the BAR base");
++    if (fails == f0) printf("ok bar probe: sizing mask + restore + decode\n");
++}
++
++/* ---- v_caps: the capability block the guest parses -------------------- */
++static void v_caps(void) {
++    int f0 = fails;
++    EXPECT(rd32(XHCI_BAR + 0x00) == 0x01000040u, "CAPLENGTH=0x40 HCIVERSION=1.00");
++    uint32_t h1 = rd32(XHCI_BAR + 0x04);
++    EXPECT((h1 & 0xFFu) == 32, "HCSPARAMS1 MaxSlots=32");
++    EXPECT(((h1 >> 8) & 0xFFu) == 1, "HCSPARAMS1 MaxIntrs=1");
++    EXPECT((h1 >> 24) == 4, "HCSPARAMS1 MaxPorts=4");
++    EXPECT(rd32(XHCI_BAR + 0x08) == 0, "HCSPARAMS2: no scratchpads");
++    EXPECT(rd32(XHCI_BAR + 0x10) == 1, "HCCPARAMS1: AC64 only (CSZ=0, PPC=0)");
++    EXPECT(rd32(XHCI_BAR + 0x14) == 0x1000u, "DBOFF");
++    EXPECT(rd32(XHCI_BAR + 0x18) == 0x800u, "RTSOFF");
++    /* sub-dword reads compose (test_usb.c EHCI-cap precedent) */
++    EXPECT(mem_read(&M, XHCI_BAR, 1) == 0x40, "CAPLENGTH byte read");
++    EXPECT(mem_read(&M, XHCI_BAR + 2, 2) == 0x0100, "HCIVERSION word read");
++    /* capability space is read-only */
++    wr32(XHCI_BAR + 0x00, 0xDEADBEEFu);
++    EXPECT(rd32(XHCI_BAR + 0x00) == 0x01000040u, "caps ignore writes");
++    if (fails == f0) printf("ok caps: version 1.00, 32 slots, 4 ports, AC64, RO\n");
++}
++
++/* ---- v_op_reset: the halt/reset/run handshake (guest init 1-3, 10) ---- */
++static void v_op_reset(void) {
++    int f0 = fails;
++    EXPECT(rd32(OP(0x04)) & 1u, "power-on USBSTS.HCH set");
++    wr32(OP(0x00), 0);                                   /* halt */
++    EXPECT(rd32(OP(0x04)) & 1u, "HCH after USBCMD=0");
++    wr32(OP(0x00), 4u | 1u);                             /* INTE|RUN */
++    EXPECT(!(rd32(OP(0x04)) & 1u), "HCH clears with RUN");
++    /* program state, then HCRST must wipe it */
++    wr32(OP(0x38), 32);                                  /* CONFIG */
++    wr32(OP(0x30), 0x00030000u);                         /* DCBAAP lo */
++    wr32(OP(0x18), 0x00040001u);                         /* CRCR ptr|RCS */
++    wr32(OP(0x00), 2u);                                  /* HCRST */
++    EXPECT(rd32(OP(0x00)) == 0, "HCRST self-clears (USBCMD=0)");
++    EXPECT(!(rd32(OP(0x04)) & (1u << 11)), "CNR clear after reset");
++    EXPECT(rd32(OP(0x04)) & 1u, "HCH set after reset");
++    EXPECT(rd32(OP(0x38)) == 0 && rd32(OP(0x30)) == 0 && rd32(OP(0x18)) == 0,
++           "CONFIG/DCBAAP/CRCR reset to 0");
++    if (fails == f0) printf("ok op reset: halt -> HCRST (self-clear, CNR=0) -> state wiped\n");
++}
++
++/* ---- v_programming: store registers read back exactly ----------------- */
++static void v_programming(void) {
++    int f0 = fails;
++    wr32(OP(0x38), 32);
++    EXPECT(rd32(OP(0x38)) == 32, "CONFIG MaxSlotsEn store");
++    wr32(OP(0x30), 0x00030000u); wr32(OP(0x34), 0x2u);
++    EXPECT(rd32(OP(0x30)) == 0x00030000u && rd32(OP(0x34)) == 2u, "DCBAAP 64-bit store");
++    wr32(OP(0x14), 0xFFFFu);
++    EXPECT(rd32(OP(0x14)) == 0xFFFFu, "DNCTRL store");
++    EXPECT(rd32(OP(0x08)) == 1, "PAGESIZE reads 1 (4 KiB)");
++    wr32(OP(0x08), 0xFFFFu);
++    EXPECT(rd32(OP(0x08)) == 1, "PAGESIZE is RO");
++    wr32(OP(0x18), 0x00040001u);
++    EXPECT(rd32(OP(0x18)) == 0x00040001u, "CRCR ptr|RCS store, CRR=0 while stopped");
++    wr32(OP(0x00), 4u | 1u);                             /* INTE|RUN */
++    EXPECT(rd32(OP(0x18)) == (0x00040001u | (1u << 3)), "CRR set once running");
++    wr32(OP(0x00), 0);
++    if (fails == f0) printf("ok programming: CONFIG/DCBAAP/CRCR/DNCTRL/PAGESIZE semantics\n");
++}
++
++/* ---- v_ports: empty ports, PPC=0 power, wake bits, no fake changes ---- */
++static void v_ports(void) {
++    int f0 = fails;
++    for (int p = 0; p < 4; p++) {
++        uint32_t ps = rd32(PORT(p));
++        EXPECT(ps == (1u << 9), "port %d empty: PP=1 only (got %08x)", p, ps);
++        EXPECT(rd32(PORT(p) + 4) == 0 && rd32(PORT(p) + 8) == 0, "port %d PMSC/LI read 0", p);
++    }
++    /* the guest's bring-up writes: PP alone, then PP|WCE|WDE */
++    wr32(PORT(0), 1u << 9);
++    EXPECT(rd32(PORT(0)) == (1u << 9), "PP-only write is stable");
++    wr32(PORT(0), (1u << 9) | (1u << 25) | (1u << 26));
++    EXPECT(rd32(PORT(0)) == ((1u << 9) | (1u << 25) | (1u << 26)), "wake bits store");
++    /* an all-ones write must not fabricate change/CCS/PED bits */
++    wr32(PORT(1), 0xFFFFFFFFu);
++    uint32_t ps = rd32(PORT(1));
++    EXPECT(!(ps & 0x3u), "all-ones write: CCS/PED stay 0 (got %08x)", ps);
++    EXPECT(!(ps & (0x7Fu << 17)), "all-ones write: no change bits fabricated");
++    EXPECT((ps & (7u << 25)) == (7u << 25), "all-ones write: wake bits taken");
++    if (fails == f0) printf("ok ports: PP=1 (PPC=0), wake store, writes fabricate nothing\n");
++}
++
++/* ---- v_interrupter: runtime registers store, IP quiet in X1 ----------- */
++static void v_interrupter(void) {
++    int f0 = fails;
++    wr32(RT(0x28), 1);
++    EXPECT(rd32(RT(0x28)) == 1, "ERSTSZ store");
++    wr32(RT(0x30), 0x00050000u); wr32(RT(0x34), 0);
++    EXPECT(rd32(RT(0x30)) == 0x00050000u, "ERSTBA store");
++    wr32(RT(0x38), 0x00060000u); wr32(RT(0x3C), 0);
++    EXPECT(rd32(RT(0x38)) == 0x00060000u, "ERDP store");
++    wr32(RT(0x24), 0);
++    EXPECT(rd32(RT(0x24)) == 0, "IMOD store");
++    wr32(RT(0x20), 2u);                                  /* IMAN.IE */
++    EXPECT(rd32(RT(0x20)) == 2u, "IMAN: IE=1, IP=0");
++    EXPECT(rd32(RT(0x40)) == 0, "interrupter 1 absent (MaxIntrs=1)");
++    if (fails == f0) printf("ok interrupter: ERST/ERDP/IMAN/IMOD store semantics\n");
++}
++
++/* ---- v_doorbell: X1 accepts and ignores (X2 rings the engine) --------- */
++static void v_doorbell(void) {
++    int f0 = fails;
++    wr32(XHCI_BAR + 0x1000u, 0);                         /* DB0: command ring */
++    wr32(XHCI_BAR + 0x1004u, 1u);                        /* DB1: slot 1 EP0 */
++    EXPECT(rd32(XHCI_BAR + 0x1000u) == 0, "doorbells read 0");
++    if (fails == f0) printf("ok doorbell: writes accepted, reads 0 (engine is X2)\n");
++}
++
++/* ---- v_guest_init: the guest's 11-step bring-up, in miniature ----------
++ * Replays xhci_init's register sequence (XHCI_PLAN 1a steps 1-11) with
++ * dummy DMA addresses; every wait the guest spins on must complete
++ * immediately, and the port scan must see 4 empty ports. */
++static void v_guest_init(void) {
++    int f0 = fails;
++    wr32(OP(0x00), 2u);                                  /* fresh HCRST */
++    int t = 1000000;
++    wr32(OP(0x00), 0);
++    while (!(rd32(OP(0x04)) & 1u) && t-- > 0) { }
++    EXPECT(t > 0, "step 1: halt waits HCH");
++    wr32(OP(0x00), 2u);
++    t = 1000000;
++    while ((rd32(OP(0x00)) & 2u) && t-- > 0) { }
++    EXPECT(t > 0, "step 2: HCRST clears");
++    t = 1000000;
++    while ((rd32(OP(0x04)) & (1u << 11)) && t-- > 0) { }
++    EXPECT(t > 0, "step 3: CNR clears");
++    wr32(OP(0x38), 32);                                  /* step 4: CONFIG */
++    wr32(OP(0x30), 0x00030000u); wr32(OP(0x34), 0);      /* steps 5-6: DCBAAP */
++    wr32(OP(0x18), 0x00040000u | 1u); wr32(OP(0x1C), 0); /* step 7: CRCR|RCS */
++    wr32(RT(0x28), 1);                                   /* step 8: interrupter 0 */
++    wr32(RT(0x30), 0x00050000u); wr32(RT(0x34), 0);
++    wr32(RT(0x38), 0x00060000u); wr32(RT(0x3C), 0);
++    wr32(RT(0x20), 2u); wr32(RT(0x24), 0);
++    for (int p = 0; p < 4; p++) {                        /* step 9: port power */
++        uint32_t ps = rd32(PORT(p));
++        if (!(ps & (1u << 9))) wr32(PORT(p), 1u << 9);
++    }
++    wr32(OP(0x00), 4u | 1u);                             /* step 10: INTE|RUN */
++    for (int p = 0; p < 4; p++) {
++        uint32_t ps = rd32(PORT(p));
++        wr32(PORT(p), (ps & (1u << 9)) | (1u << 25) | (1u << 26));
++    }
++    t = 1000000;
++    while ((rd32(OP(0x04)) & 1u) && t-- > 0) { }
++    EXPECT(t > 0, "step 10: controller running (HCH clear)");
++    int ready = 0;                                       /* step 11: port scan */
++    for (int p = 0; p < 4; p++) if (rd32(PORT(p)) & 1u) ready++;
++    EXPECT(ready == 0, "step 11: no devices attached yet (X4 binds the sticks)");
++    if (fails == f0) printf("ok guest init replay: steps 1-11 complete, 0 devices (X1 state)\n");
++}
++
++int main(void) {
++    setup_machine(&M);
++    devices_init_common(&M);
++    v_pci_identity();
++    v_bar_probe();
++    v_caps();
++    v_op_reset();
++    v_programming();
++    v_ports();
++    v_interrupter();
++    v_doorbell();
++    v_guest_init();
++    devices_done(&M);
++    if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
++    puts("test-xhci: all vectors passed");
++    return 0;
++}
+-- 
+2.47.3
+

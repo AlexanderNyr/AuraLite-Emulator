@@ -15,6 +15,7 @@
 #include "cpu.h"    /* USB U3: cpu_devices_tick hook */
 #include "serial.h"
 #include "ahci.h"
+#include "xhci.h"
 #include "vga_font.h"
 #include "snapshot.h"   /* TOOLING T4 */
 
@@ -633,6 +634,15 @@ typedef struct {
 } uhci_t;
 
 static uhci_t g_uhci;
+
+/* XHCI X4 (src/xhci.c): its BOT state, served through the same stick
+ * engine -- exported via devices.h for the xHCI bulk rings. */
+static bot_state_t g_bot_xhci;
+
+uint32_t usb_stick_serve(machine_t *m, int ctl, int pid, uint32_t total, uint32_t buf) {
+    bot_state_t *st = ctl == 2 ? &g_bot_xhci : ctl == 1 ? &g_uhci.bot : &g_st.bot;
+    return usb_serve(m, st, pid, total, buf);
+}
 
 /* The stick sits behind the shared connector: both the EHCI port and its
  * UHCI companion see the one image (single-device model, two host sides --
@@ -1372,6 +1382,22 @@ void devices_init_common(machine_t *m) {
     g_ehci.hcs = 0x11; g_ehci.op = 0;       /* +0x04 alias: caps until op mode */
     /* HCCPARAMS @0x08 = 0: 32-bit addressing only */
 
+    /* XHCI X1: USB 3.0 host controller at 0:20.0 with the QEMU qemu-xhci
+     * identity (1b36:000d, rev 01, prog-if 0x30 -- docs/plans/XHCI_PLAN.md
+     * section 1b).  BAR0 is a 64-bit 64 KiB MMIO window; the guest reads
+     * BAR1 for the upper dword when the type bits read 10b. */
+    pci_dev_t *xhci_pci = pci_add_device(m, 0,20,0, "xhci", 0x1B36, 0x000D, 0x0C, 0x03, 0x30);
+    xhci_pci->cfg[0x08] = 0x01;                       /* revision 01 */
+    { uint64_t bar = (uint64_t)XHCI_MMIO_BASE | 0x4u; /* 64-bit memory BAR */
+      for (int i = 0; i < 8; i++) xhci_pci->cfg[0x10 + i] = (uint8_t)(bar >> (8 * i)); }
+    xhci_pci->cfg[0x2C] = 0xF4; xhci_pci->cfg[0x2D] = 0x1A;   /* subsystem 1af4:1100 */
+    xhci_pci->cfg[0x2E] = 0x00; xhci_pci->cfg[0x2F] = 0x11;
+    xhci_pci->cfg[0x3C] = (uint8_t)XHCI_IRQ;          /* Interrupt Line */
+    xhci_pci->cfg[0x3D] = 0x01;                       /* Interrupt Pin: INTA# */
+    xhci_pci->cfg_read = xhci_pci_cfg_read;
+    xhci_pci->cfg_write = xhci_pci_cfg_write;
+    xhci_register(m);
+
     /* GPU VRAM / framebuffer, BAR0 = 0xD0000000 as the firmware's own "enable:" code
      * sets it; this buffer doubles as the pixel buffer shown in the GUI.
      * V5: the aperture is the full 16 MiB QEMU/Bochs std-VGA window (modes
@@ -1463,8 +1489,10 @@ void devices_snap(machine_t *m, snap_t *s) {
     { ehci_t t = g_ehci; if (!snap_loading(s)) { t.regs = NULL; t.m = NULL; } snap_bytes(s, "dev.ehci", &t, sizeof t);
       if (snap_loading(s)) { t.regs = g_ehci.regs; t.m = g_ehci.m; g_ehci = t; } }
     snap_bytes(s, "dev.usb.bot", &g_st, sizeof g_st);
+    snap_bytes(s, "dev.usb.bot.xhci", &g_bot_xhci, sizeof g_bot_xhci);
     { uhci_t t = g_uhci; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.uhci", &t, sizeof t);
       if (snap_loading(s)) { t.m = g_uhci.m; g_uhci = t; } }
+    xhci_snap(m, s);   /* XHCI X1 */
     { vga_t t = g_vga; if (!snap_loading(s)) { t.m = NULL; t.text = NULL; } snap_bytes(s, "dev.vga", &t, sizeof t);
       if (snap_loading(s)) { t.m = g_vga.m; t.text = g_vga.text; g_vga = t; } }
     { dispi_t t = g_dispi; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.dispi", &t, sizeof t);

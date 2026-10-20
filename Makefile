@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -35,18 +35,18 @@ disk/disk.img: disk/test_kernel.bin
 demo: x86emu firmware/firmware.bin disk/disk.img
 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
 
-test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
+test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/xhci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
 	./test-cpu
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu -lm
 	./test-fpu
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
 	./test-usb
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
 	./test-pam
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
 	./test-video
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
 	./test-net
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
 	./test-pic
@@ -78,8 +78,8 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
 # RSDP.  --lpc=ich9 switches the LPC function to the Q35-paired ICH9 ID.
 # Vectors pin both identities, the untouched class/header fields, the host
 # bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
-test-compat: tests/test_compat.c tests/harness.h src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
+test-compat: tests/test_compat.c tests/harness.h src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
 	./test-compat
 	rm -f test-compat
 
@@ -150,9 +150,15 @@ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
 # FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
 # snapshot byte-stability of the x87 file across fresh runs).
 test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
 	./test-fpu-gate
 	rm -f test-fpu-gate
+
+# XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
+test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-xhci -lm
+	./test-xhci
+	rm -f test-xhci
 
 test-ring3: tests/test_ring3.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
@@ -272,8 +278,8 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
 # (split identity, determinism, sparse RAM, refusals; sanitizer lane too).
 # test-snapshot: split-run identity lanes on real workloads (the frozen
 # guest lanes SKIP unless KERNEL/INITRD are set).
-test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
 	./test-snap
 	rm -f test-snap
 
@@ -281,7 +287,7 @@ test-snapshot: x86emu firmware/firmware.bin disk/disk.img tests/kload_fixture.el
 	sh tests/integration/t4_snapshot_lanes.sh
 
 # Exactly one T4 NC (RAM windows not carried); never in `make test`.
-test-snapshot-nc: tests/integration/t4_snapshot_nc.sh src/devices.c
+test-snapshot-nc: tests/integration/t4_snapshot_nc.sh src/xhci.c src/devices.c
 	sh tests/integration/t4_snapshot_nc.sh
 
 # TOOLING T5: RFC 6455 codec vectors + live HTTP/WebSocket protocol and
@@ -365,7 +371,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -375,7 +381,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
@@ -424,4 +430,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf

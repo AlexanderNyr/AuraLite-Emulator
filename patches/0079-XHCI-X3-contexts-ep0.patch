@@ -1,0 +1,885 @@
+From ed0acd63a3e64654ca4523079747de26b3efc988 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 16:20:07 +0000
+Subject: [PATCH] XHCI X3: contexts, Address Device, EP0 control transfers
+
+Per-slot/endpoint state joins the controller: for every enabled slot
+the model keeps each endpoint's transfer-ring consumer (dequeue +
+cycle), EP state, Max Packet Size and EP Type, all wiped by HCRST and
+Disable Slot and carried by snapshots as part of the device state.
+
+Address Device reads the guest's Input Context (ICC Add flags, Slot
+and EP0 contexts in 32-byte CSZ=0 layout) and writes the Output Device
+Context through DCBAA exactly where the guest looks: slot dword3 gets
+Slot State Addressed (Default with BSR) and the hardware address
+(= slot id), the EP0 output context reads Running with the live
+dequeue pointer. Configure Endpoint installs Add-flagged contexts,
+drops Drop-flagged ones, deconfigures on DC, and moves the slot to
+Configured. Evaluate Context refreshes Max Packet Size and EP Type
+only -- the guest's xhci_update_max_packet0 passes ring-base|producer
+cycle in the dequeue field, so applying that field would rewind the
+consumer; a vector moves the ring, evaluates, and proves the next TD
+answers. Reset/Stop Endpoint and Set TR Dequeue Pointer maintain the
+same internal state and mirror it into the output context. Refusals:
+11 Slot Not Enabled (also for Configure/Evaluate before Address),
+14 Endpoint Not Enabled, 5 TRB Error (bad ids / missing DCBAA entry).
+
+Control transfers run on EP0 at the slot doorbell (value = target
+endpoint, as the guest rings it): one Setup/[Data]/Status TD executes
+against the same MSC device EP0 the UHCI/EHCI models serve
+(0525:a4a5 descriptors, SET/GET_CONFIGURATION, GET_STATUS,
+GET_MAX_LUN) and posts exactly one Transfer Event -- the guest's
+wait takes the first slot+EP match and parks later events, so a
+second event would poison the next transfer. Short IN reads complete
+cc 13 Short Packet with residue = untransferred bytes in the event
+Status dword[23:0] (the only residue the guest believes); exact reads
+complete cc 1. A refused request completes cc 6 Stall Error and halts
+the endpoint -- queued TDs do not move -- until the guest's recovery
+(Reset Endpoint + Set TR Dequeue to its enqueue point) runs.
+
+tests/test_xhci.c gains four groups (17 total) replaying the guest's
+xhci_address_device and recovery code field for field: the slot-state
+output gate, descriptor reads (8-byte MPS discovery, short 256->32
+config read with residue, strings), the stall/halt/recover cycle, and
+Configure/Evaluate incl. the dequeue-move trap. The X2 "unknown
+command" vector now expects the refined cc 11 for Address Device on an
+unenabled slot. NC: src/xhci.c reverted to X2 -> 39 failures. Gates:
+make test, make test-sanitize, both SeaBIOS ISO lanes green.
+
+Stated X3 boundary: transfers run on EP0 only (bulk/interrupt rings
+are X4) and an addressed slot reaches the built-in device regardless
+of port state (port presence is X5).
+---
+ CHANGELOG.md            |  33 ++++
+ ROADMAP.md              |   4 +-
+ docs/STATUS.md          |  16 ++
+ docs/plans/XHCI_PLAN.md |  41 ++++-
+ src/xhci.c              | 343 +++++++++++++++++++++++++++++++++++++++-
+ tests/test_xhci.c       | 230 +++++++++++++++++++++++++--
+ 6 files changed, 648 insertions(+), 19 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f25c54c..9f3e7b4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,39 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0079 (XHCI X3: contexts + EP0 control transfers)
++
++- **Slots become devices**: Address Device (11) consumes the guest's
++  Input Context (32-byte contexts) and writes the Output Device
++  Context its driver gates on -- Slot State = Addressed with the
++  hardware address in slot dword3 -- bringing EP0 up from the input's
++  dequeue/DCS/MaxPacket fields. Configure Endpoint (12) adds and
++  drops endpoint contexts and moves the slot to Configured; Stop (14),
++  Reset Endpoint (15) and Set TR Dequeue (16) complete the shape.
++  Evaluate Context (13) refreshes Max Packet Size and EP Type only:
++  the input's dequeue field carries ring base + producer cycle in the
++  guest's reprogramming path, and applying it would rewind the
++  consumer -- a vector moves the ring first, evaluates, and proves
++  the next TD still answers.
++- **Control transfers run**: a Setup/Data/Status TD completes at the
++  slot's doorbell and posts exactly one Transfer Event (the guest
++  takes the first matching event and parks the rest). EP0 answers for
++  the same USB stick the UHCI/EHCI models expose (0525:a4a5):
++  device/configuration/string descriptors, SET/GET_CONFIGURATION,
++  GET_STATUS, GET_MAX_LUN. Short IN reads complete **cc 13 Short
++  Packet** with the untransferred-byte count in the event's residue
++  field -- the only form the guest trusts -- never a padded Success.
++- **Stall halts, honestly**: a refused request (a descriptor index the
++  device does not have) completes cc 6 and halts EP0; queued TDs stay
++  frozen until the guest's own recovery sequence -- Reset Endpoint
++  then Set TR Dequeue to its enqueue point -- runs, after which
++  transfers answer again. Refusals keep spec codes (11 slot not
++  enabled, 14 endpoint not enabled).
++- **Vectors**: four new `tests/test_xhci.c` groups (17 total) replay
++  the guest's own context construction and recovery code field for
++  field. NC: engine reverted to X2 -> 39 failures. Bulk/interrupt
++  rings and port presence remain X4/X5, stated as such.
++
+ ### Added — patch 0078 (XHCI X2: command ring engine)
+ 
+ - **The command ring runs**: doorbell 0 walks the guest's ring under
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 3128670..eb66df0 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -36,7 +36,7 @@ maps to exactly one plan below.
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+-| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X2 done ✅; X3 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
++| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X3 done ✅; X4 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -102,7 +102,7 @@ either shipped or explicitly NO-GO (PERF P4).
+    sticks byte-identical x2, matrix determinism). Each phase: measured
+    receipts, vectors, one NC, full gates, one patch. **In progress: X0
+    (`0076`) + X1 register file (`0077`) + X2 command ring (`0078`)
+-   shipped; X3 queued**.
++   + X3 contexts/EP0 (`0079`) shipped; X4 queued**.
+ 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index c58784a..fb38ae2 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -889,6 +889,22 @@
+   refused with cc 5, unowned TRBs untouched, a stopped doorbell queues).
+   NC (engine reverted to X1) red with 24 failures. Gates: `make test`,
+   `make test-sanitize`, both SeaBIOS ISO lanes green.
++- XHCI X3 (`patches/0079-XHCI-X3-contexts-ep0.patch`): device contexts
++  and EP0 control transfers. Address Device writes the output Slot
++  Context the guest gates on (Slot State Addressed, hardware address =
++  slot id) and brings EP0 up from the guest's input context; Configure
++  Endpoint adds/drops endpoint contexts and marks the slot Configured;
++  Evaluate Context refreshes Max Packet Size only -- the guest's input
++  dequeue field carries ring-base|cycle and must not move the consumer
++  (vector proves it); Reset/Stop Endpoint and Set TR Dequeue complete
++  the command set. Control TDs run at doorbell time against the shared
++  MSC stick's descriptors (0525:a4a5): exactly one Transfer Event per
++  TD (the guest parks later events), short IN reads complete cc 13
++  Short Packet with the untransferred-byte residue the guest believes,
++  and a refused request completes cc 6 and halts EP0 until the guest's
++  Reset + Set-Dequeue recovery. NC (engine at X2) red with 39 failures.
++  Gates: `make test`, `make test-sanitize`, both SeaBIOS ISO lanes
++  green.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/XHCI_PLAN.md b/docs/plans/XHCI_PLAN.md
+index cb241a0..5281a0d 100644
+--- a/docs/plans/XHCI_PLAN.md
++++ b/docs/plans/XHCI_PLAN.md
+@@ -7,14 +7,14 @@
+ > slot addressing, endpoint contexts). The machine has UHCI + EHCI only;
+ > a class 0x0C/0x03/prog-if 0x30 scan of bus 0 finds nothing today.
+ 
+-**Status: X0–X2 done ✅; X3 queued**
++**Status: X0–X3 done ✅; X4 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | X0 | Measured baseline: the guest contract, the QEMU identity, our topology, the defect ledger | ✅ done | this file (`patches/0076`) |
+ | X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ✅ done | `src/xhci.c` + `tests/test_xhci.c` (9 groups) (`patches/0077`) |
+ | X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ✅ done | `tests/test_xhci.c` X2 groups (13 total) (`patches/0078`) |
+-| X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ⬜ queued | control-transfer vectors |
++| X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ✅ done | `tests/test_xhci.c` X3 groups (17 total) (`patches/0079`) |
+ | X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ⬜ queued | bulk/interrupt vectors + stick receipts |
+ | X5 | Interrupter + ports + close-out: IMAN/IMOD/ERST/ERDP, EINT/PCD, INTx delivery, hotplug (CSC / Port Status Change events), determinism x2, guest receipts where artifacts exist | ⬜ queued | close-out + docs |
+ 
+@@ -212,6 +212,43 @@ receipt.
+   behave.
+ - NC: `src/xhci.c` reverted to X1 → 24 failures, all in the X2 groups.
+ 
++## 1g. X3 measured receipts (contexts + EP0 control)
++
++- **Address Device** (guest xhci.c:1124–1243): the guest programs
++  DCBAA[slot] *before* the command and then gates on the OUTPUT Slot
++  Context -- Slot State (dword3[31:27]) must read **Addressed (2)**,
++  with the hardware address in dword3[7:0]. Input shapes pinned: ICC
++  Add = A0|A1, Slot = route|speed<<20|entries<<27 + rootport<<16, EP0
++  = CErr 3 | Type 4 | MPS<<16 | dequeue|DCS. Hardware address = slot
++  id; BSR honoured (state Default). Address on an unenabled or
++  disabled slot = cc 11.
++- **One event per TD**: the guest takes the *first* Transfer Event
++  matching slot+EP and parks later ones (xhci.c:1396–1420), so the
++  engine completes the whole Setup->Data->Status TD and posts exactly
++  one event (TRB pointer = Status TRB). Residue goes in the event
++  Status dword[23:0] and is believed only on cc=13, so a short IN
++  (every variable-length descriptor read) completes **cc 13 with
++  residue = untransferred bytes**; exact transfers complete cc 1 --
++  measured 256-ask on the 32-byte config descriptor. EP0 of the shared
++  MSC stick (0525:a4a5, same descriptors as UHCI/EHCI); SET/GET
++  CONFIGURATION, GET_STATUS, GET_MAX_LUN round-trip.
++- **Stall discipline**: a refused request (unknown descriptor index)
++  completes cc 6 **and halts EP0** -- queued TDs do not move -- until
++  the guest's own recovery runs: Reset Endpoint (Halted->Running),
++  then Set TR Dequeue to the producer enqueue point. Refusals: Reset
++  of an unconfigured EP = cc 14 (Endpoint Not Enabled).
++- **Evaluate does not move the consumer**: the guest's input EP
++  context carries ring-base|producer-cycle in its dequeue field
++  (xhci_update_max_packet0); only MaxPacket/EP Type are taken. The
++  vector proves it by moving the consumer first, evaluating MPS
++  64->32, and answering the next TD. Configure Endpoint copies
++  Add-flagged contexts, drops Drop-flagged ones, and moves the output
++  slot state to Configured (3).
++- X3 boundary, stated: transfers run on EP0 only; a doorbell for
++  bulk/interrupt endpoints is still inert (X4), and any addressed slot
++  reaches the built-in device -- port presence (CCS) joins in X5.
++- NC: `src/xhci.c` reverted to X2 → 39 failures.
++
+ ## 2. Architecture decisions (X1)
+ 
+ - **PCI identity**: 1b36:000d, rev 01, class 0x0C/0x03/0x30, subsystem
+diff --git a/src/xhci.c b/src/xhci.c
+index e030340..6169da3 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -55,6 +55,23 @@
+ #define IMAN_IP          (1u << 0)
+ #define IMAN_IE          (1u << 1)
+ 
++/* X3: per-endpoint transfer-ring state.  `state` uses the spec EP State
++ * values written to the output context: 0 Disabled, 1 Running,
++ * 2 Halted, 3 Stopped. */
++typedef struct {
++    uint64_t deq;
++    int ccs;
++    int state;
++    uint16_t max_packet;
++    uint8_t type;           /* EP Type from the input context */
++} xhci_ep_t;
++
++typedef struct {
++    int addressed;          /* Address Device has run (slot state >= 2) */
++    uint8_t config;         /* SET_CONFIGURATION value seen on EP0 */
++    xhci_ep_t ep[31];       /* ep_id 1..31 at [0..30] */
++} xhci_slot_t;
++
+ typedef struct {
+     machine_t *m;
+     uint32_t base;          /* live BAR0 decode base */
+@@ -75,6 +92,7 @@ typedef struct {
+     uint32_t slot_mask;     /* enabled slots (bit s-1 = slot s) */
+     uint64_t ev_prod, ev_cons;
+     int iman_ip;            /* interrupter pending latch (EINT mirror) */
++    xhci_slot_t slots[XHCI_MAX_SLOTS];   /* X3: slot s at [s-1] */
+ } xhci_t;
+ 
+ static xhci_t g_xhci;
+@@ -283,8 +301,148 @@ static int ev_post(xhci_t *x, uint64_t param, uint32_t status, uint32_t control)
+ 
+ #define CC_SUCCESS        1u
+ #define CC_TRB_ERROR      5u
++#define CC_STALL          6u
+ #define CC_NO_SLOTS       9u
+ #define CC_SLOT_NOT_EN    11u
++#define CC_SHORT_PACKET   13u
++#define CC_EP_NOT_EN      14u
++
++/* ==================== X3: contexts + device commands ===================
++ * 32-byte contexts (HCCPARAMS1 CSZ=0).  Input Context: ICC at +0 (Drop
++ * flags dword0, Add flags dword1), Slot at +32, EP[ep_id] at
++ * +(1+ep_id)*32.  Output Device Context via DCBAA[slot]: Slot at +0,
++ * EP[ep_id] at +ep_id*32.  What the guest reads back (xhci.c:1215-1226)
++ * is the Slot State + hardware address in slot dword3 -- state must say
++ * Addressed -- so the output contexts are written from the same
++ * internal state that runs the rings.  Hardware address = slot id. */
++
++#define CTX 32u
++
++static uint64_t devctx_base(xhci_t *x, uint32_t slot) {
++    if (!x->dcbaap) return 0;
++    uint64_t ent = x->dcbaap + (uint64_t)slot * 8;
++    return (uint64_t)g_rd32(x, ent) | ((uint64_t)g_rd32(x, ent + 4) << 32);
++}
++
++static void ep_from_ctx(xhci_t *x, xhci_ep_t *ep, uint64_t ctx) {
++    uint32_t d1 = g_rd32(x, ctx + 4);
++    uint32_t d2 = g_rd32(x, ctx + 8);
++    uint32_t d3 = g_rd32(x, ctx + 12);
++    ep->type = (uint8_t)((d1 >> 3) & 7u);
++    ep->max_packet = (uint16_t)(d1 >> 16);
++    ep->deq = (((uint64_t)d3 << 32) | d2) & ~0xFull;
++    ep->ccs = (int)(d2 & 1u);
++    ep->state = 1;                              /* Running */
++}
++
++/* copy an input EP context to the output context with the live EP State
++ * and the consumer dequeue pointer the ring actually uses */
++static void ep_to_ctx(xhci_t *x, const xhci_ep_t *ep, uint64_t in, uint64_t out) {
++    g_wr32(x, out + 0, (g_rd32(x, in) & ~7u) | (uint32_t)ep->state);
++    g_wr32(x, out + 4, g_rd32(x, in + 4));
++    g_wr32(x, out + 8, (uint32_t)ep->deq | (uint32_t)ep->ccs);
++    g_wr32(x, out + 12, (uint32_t)(ep->deq >> 32));
++    g_wr32(x, out + 16, g_rd32(x, in + 16));
++}
++
++static void slot_state_wr(xhci_t *x, uint64_t out, uint32_t slot, uint32_t state) {
++    uint32_t d3 = g_rd32(x, out + 12);
++    g_wr32(x, out + 12, (d3 & 0x07FFFF00u) | (state << 27) | (slot & 0xFFu));
++}
++
++static uint32_t cmd_ctx(xhci_t *x, uint32_t type, const uint32_t trb[4], uint32_t slot) {
++    if (slot == 0 || slot > XHCI_MAX_SLOTS) return CC_TRB_ERROR;
++    if (!(x->slot_mask & (1u << (slot - 1)))) return CC_SLOT_NOT_EN;
++    xhci_slot_t *sl = &x->slots[slot - 1];
++    uint64_t param = (uint64_t)trb[0] | ((uint64_t)trb[1] << 32);
++    uint32_t epid = (trb[3] >> 16) & 0x1Fu;
++    uint64_t out = devctx_base(x, slot);
++
++    switch (type) {
++    case 11: {                                  /* Address Device */
++        if (!out) return CC_TRB_ERROR;          /* no DCBAA entry yet */
++        uint64_t in = param;
++        for (int i = 0; i < 3; i++)
++            g_wr32(x, out + 4 * i, g_rd32(x, in + CTX + 4 * i));
++        ep_from_ctx(x, &sl->ep[0], in + 2 * CTX);
++        ep_to_ctx(x, &sl->ep[0], in + 2 * CTX, out + CTX);
++        sl->addressed = 1;
++        slot_state_wr(x, out, slot, (trb[3] & (1u << 9)) ? 1 : 2);  /* BSR */
++        return CC_SUCCESS;
++    }
++    case 12: {                                  /* Configure Endpoint */
++        if (!sl->addressed || !out) return CC_SLOT_NOT_EN;
++        if (trb[3] & (1u << 9)) {               /* DC: deconfigure */
++            for (int e = 1; e < 31; e++) sl->ep[e].state = 0;
++            slot_state_wr(x, out, slot, 2);
++            return CC_SUCCESS;
++        }
++        uint64_t in = param;
++        uint32_t drop = g_rd32(x, in), add = g_rd32(x, in + 4);
++        if (add & 1u)
++            for (int i = 0; i < 2; i++)
++                g_wr32(x, out + 4 * i, g_rd32(x, in + CTX + 4 * i));
++        for (uint32_t e = 1; e < 32; e++) {
++            if (drop & (1u << e)) {
++                sl->ep[e - 1].state = 0;
++                g_wr32(x, out + e * CTX, g_rd32(x, out + e * CTX) & ~7u);
++            } else if (add & (1u << e)) {
++                ep_from_ctx(x, &sl->ep[e - 1], in + (1 + e) * CTX);
++                ep_to_ctx(x, &sl->ep[e - 1], in + (1 + e) * CTX, out + e * CTX);
++            }
++        }
++        slot_state_wr(x, out, slot, 3);         /* Configured */
++        return CC_SUCCESS;
++    }
++    case 13: {  /* Evaluate Context: MaxPacket/type refresh only.  The
++                 * input's dequeue field carries ring base + producer
++                 * cycle (xhci_update_max_packet0) and must NOT move the
++                 * consumer -- measured against the guest. */
++        if (!sl->addressed || !out) return CC_SLOT_NOT_EN;
++        uint64_t in = param;
++        uint32_t add = g_rd32(x, in + 4);
++        for (uint32_t e = 1; e < 32; e++) {
++            if (!(add & (1u << e))) continue;
++            xhci_ep_t *ep = &sl->ep[e - 1];
++            if (!ep->state) return CC_EP_NOT_EN;
++            uint32_t d1 = g_rd32(x, in + (1 + e) * CTX + 4);
++            ep->type = (uint8_t)((d1 >> 3) & 7u);
++            ep->max_packet = (uint16_t)(d1 >> 16);
++            g_wr32(x, out + e * CTX + 4, d1);
++        }
++        return CC_SUCCESS;
++    }
++    case 14:                                    /* Stop Endpoint */
++    case 15: {                                  /* Reset Endpoint */
++        if (epid == 0) return CC_TRB_ERROR;
++        xhci_ep_t *ep = &sl->ep[epid - 1];
++        if (!ep->state) return CC_EP_NOT_EN;
++        ep->state = (type == 15) ? 1 : 3;
++        if (out) {
++            uint64_t o = out + (uint64_t)epid * CTX;
++            g_wr32(x, o, (g_rd32(x, o) & ~7u) | (uint32_t)ep->state);
++            g_wr32(x, o + 8, (uint32_t)ep->deq | (uint32_t)ep->ccs);
++            g_wr32(x, o + 12, (uint32_t)(ep->deq >> 32));
++        }
++        return CC_SUCCESS;
++    }
++    case 16: {                                  /* Set TR Dequeue Pointer */
++        if (epid == 0) return CC_TRB_ERROR;
++        xhci_ep_t *ep = &sl->ep[epid - 1];
++        if (!ep->state) return CC_EP_NOT_EN;
++        ep->deq = param & ~0xFull;
++        ep->ccs = (int)(param & 1u);
++        if (out) {
++            uint64_t o = out + (uint64_t)epid * CTX;
++            g_wr32(x, o + 8, (uint32_t)ep->deq | (uint32_t)ep->ccs);
++            g_wr32(x, o + 12, (uint32_t)(ep->deq >> 32));
++        }
++        return CC_SUCCESS;
++    }
++    default:
++        return CC_TRB_ERROR;
++    }
++}
+ 
+ static void cmd_process(xhci_t *x) {
+     if (!(x->usbcmd & CMD_RUN)) return;
+@@ -317,9 +475,15 @@ static void cmd_process(xhci_t *x) {
+         case 10:                                            /* Disable Slot */
+             if (slot == 0 || slot > XHCI_MAX_SLOTS) cc = CC_TRB_ERROR;
+             else if (!(x->slot_mask & (1u << (slot - 1)))) cc = CC_SLOT_NOT_EN;
+-            else x->slot_mask &= ~(1u << (slot - 1));
++            else {
++                x->slot_mask &= ~(1u << (slot - 1));
++                memset(&x->slots[slot - 1], 0, sizeof x->slots[0]);
++            }
++            break;
++        case 11: case 12: case 13: case 14: case 15: case 16:
++            cc = cmd_ctx(x, type, trb, slot);               /* X3 */
+             break;
+-        default:                                            /* X3+ commands */
++        default:                                            /* other cmds */
+             cc = CC_TRB_ERROR;
+             break;
+         }
+@@ -327,6 +491,172 @@ static void cmd_process(xhci_t *x) {
+     }
+ }
+ 
++/* ==================== X3: EP0 control transfers ========================
++ * One TD (Setup -> [Data] -> Status) runs to completion at doorbell
++ * time and posts exactly one Transfer Event: the guest takes the first
++ * event matching slot+endpoint and parks the rest (xhci.c:1396-1420),
++ * so a second event would be consumed as the next transfer's answer.
++ * The residue lands in the event Status dword[23:0] (its `control`
++ * field) and is only believed on cc=13 (xhci.c:1442-1448, 1584): a
++ * short IN must therefore complete Short Packet, never Success, or
++ * the guest trusts bytes that were never written.  A stalled request
++ * halts the endpoint until Reset Endpoint + Set TR Dequeue -- the
++ * guest's recovery path (xhci.c:1330-1360).  The device behind EP0 is
++ * the same MSC stick the UHCI/EHCI models expose (0525:a4a5); bulk
++ * traffic joins it in X4. */
++
++static const uint8_t x_desc_device[18] = {
++    18, 1, 0x00, 0x02, 0, 0, 0, 64,
++    0x25, 0x05, 0xA5, 0xA4, 0x00, 0x01, 1, 2, 3, 1
++};
++static const uint8_t x_desc_config[32] = {
++    9, 2, 32, 0, 1, 1, 0, 0x80, 50,
++    9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0,
++    7, 5, 0x81, 2, 0x00, 0x02, 0,
++    7, 5, 0x02, 2, 0x00, 0x02, 0
++};
++static const uint8_t x_desc_str0[4] = { 4, 3, 0x09, 0x04 };
++
++static uint32_t x_str_desc(uint8_t idx, uint8_t *out) {
++    static const char *s[3] = { "AURALITE", "USB DISK", "1234567890" };
++    const char *p = s[(idx - 1) % 3];
++    uint32_t n = 0;
++    while (p[n]) n++;
++    out[0] = (uint8_t)(2 + 2 * n); out[1] = 3;
++    for (uint32_t i = 0; i < n; i++) { out[2 + 2 * i] = (uint8_t)p[i]; out[3 + 2 * i] = 0; }
++    return 2 + 2 * n;
++}
++
++/* run one control request; for IN transfers *actual is how many bytes
++ * the device offers (wLength-bounded).  Returns 0, or -1 for Stall. */
++static int dev_control(xhci_slot_t *sl, const uint8_t su[8], uint8_t *buf,
++                       uint32_t *actual) {
++    uint8_t rt = su[0], req = su[1];
++    uint32_t wv = su[2] | ((uint32_t)su[3] << 8);
++    uint32_t wl = su[6] | ((uint32_t)su[7] << 8);
++    *actual = 0;
++    if (rt == 0x80 && req == 0x06) {            /* GET_DESCRIPTOR */
++        uint32_t dt = wv >> 8, idx = wv & 0xFF, n;
++        if (dt == 1)      { memcpy(buf, x_desc_device, sizeof x_desc_device); n = sizeof x_desc_device; }
++        else if (dt == 2) { memcpy(buf, x_desc_config, sizeof x_desc_config); n = sizeof x_desc_config; }
++        else if (dt == 3 && idx == 0) { memcpy(buf, x_desc_str0, 4); n = 4; }
++        else if (dt == 3 && idx >= 1 && idx <= 3) n = x_str_desc((uint8_t)idx, buf);
++        else return -1;                         /* no such descriptor */
++        *actual = n < wl ? n : wl;
++        return 0;
++    }
++    if (rt == 0x00 && req == 0x09) { sl->config = (uint8_t)wv; return 0; }
++    if (rt == 0x00 && req == 0x05) return 0;    /* SET_ADDRESS: host-owned */
++    if ((rt & 0x81) == 0x80 && req == 0x00) {   /* GET_STATUS */
++        buf[0] = buf[1] = 0;
++        *actual = wl < 2 ? wl : 2;
++        return 0;
++    }
++    if (rt == 0x80 && req == 0x08) {            /* GET_CONFIGURATION */
++        buf[0] = sl->config;
++        *actual = wl < 1 ? wl : 1;
++        return 0;
++    }
++    if (rt == 0xA1 && req == 0xFE) {            /* GET_MAX_LUN */
++        buf[0] = 0;
++        *actual = wl < 1 ? wl : 1;
++        return 0;
++    }
++    if (req == 0x01 || req == 0x03)            /* CLEAR/SET_FEATURE */
++        if ((rt & 0x60) == 0) return 0;
++    if (rt == 0x01 && req == 0x0B) return 0;    /* SET_INTERFACE */
++    if (rt == 0x21 && req == 0xFF) return 0;    /* BOT reset */
++    return -1;
++}
++
++/* fetch the next owned TRB on an endpoint ring (Link handled inside) */
++static int ep_next(xhci_t *x, xhci_ep_t *ep, uint32_t trb[4], uint64_t *addr) {
++    for (int guard = 0; guard < 4; guard++) {
++        for (int i = 0; i < 4; i++) trb[i] = g_rd32(x, ep->deq + 4 * i);
++        if ((trb[3] & 1u) != (uint32_t)ep->ccs) return 0;
++        *addr = ep->deq;
++        ep->deq += 16;
++        if (((trb[3] >> 10) & 0x3Fu) == 6) {    /* Link */
++            ep->deq = (((uint64_t)trb[1] << 32) | trb[0]) & ~0xFull;
++            if (trb[3] & 2u) ep->ccs ^= 1;
++            continue;
++        }
++        return 1;
++    }
++    return 0;
++}
++
++static void tr_event(xhci_t *x, uint32_t slot, uint32_t epid, uint64_t trb_addr,
++                     uint32_t cc, uint32_t residue) {
++    ev_post(x, trb_addr, (cc << 24) | (residue & 0xFFFFFFu),
++            (32u << 10) | (epid << 16) | (slot << 24));
++}
++
++static void ep0_process(xhci_t *x, uint32_t slot) {
++    xhci_slot_t *sl = &x->slots[slot - 1];
++    xhci_ep_t *ep = &sl->ep[0];
++    uint64_t out = devctx_base(x, slot);
++    for (int budget = 0; budget < 64 && ep->state == 1; budget++) {
++        uint32_t su[4], trb[4];
++        uint64_t a_setup, a_data = 0, a_status;
++        if (!ep_next(x, ep, su, &a_setup)) break;
++        if (((su[3] >> 10) & 0x3Fu) != 2) {     /* not a Setup Stage */
++            tr_event(x, slot, 1, a_setup, CC_TRB_ERROR, 0);
++            continue;
++        }
++        uint8_t setup[8];
++        if (su[3] & (1u << 6)) {                /* IDT: setup in the TRB */
++            for (int i = 0; i < 4; i++) setup[i] = (uint8_t)(su[0] >> (8 * i));
++            for (int i = 0; i < 4; i++) setup[4 + i] = (uint8_t)(su[1] >> (8 * i));
++        } else {
++            uint64_t p = (uint64_t)su[0] | ((uint64_t)su[1] << 32);
++            for (int i = 0; i < 8; i++) setup[i] = (uint8_t)mem_read(x->m, p + i, 1);
++        }
++        uint32_t trt = (su[3] >> 16) & 3u;
++        uint32_t data_len = 0;
++        uint64_t data_buf = 0;
++        if (trt) {
++            if (!ep_next(x, ep, trb, &a_data)) break;   /* half a TD: leave */
++            if (((trb[3] >> 10) & 0x3Fu) != 3) {
++                tr_event(x, slot, 1, a_data, CC_TRB_ERROR, 0);
++                continue;
++            }
++            data_buf = (uint64_t)trb[0] | ((uint64_t)trb[1] << 32);
++            data_len = trb[2] & 0x1FFFFu;
++        }
++        if (!ep_next(x, ep, trb, &a_status)) break;     /* half a TD: leave */
++        if (((trb[3] >> 10) & 0x3Fu) != 4) {
++            tr_event(x, slot, 1, a_status, CC_TRB_ERROR, 0);
++            continue;
++        }
++        uint8_t buf[256];
++        uint32_t actual = 0;
++        if (dev_control(sl, setup, buf, &actual) != 0) {
++            ep->state = 2;                              /* Halted */
++            if (out) {
++                uint64_t o = out + CTX;
++                g_wr32(x, o, (g_rd32(x, o) & ~7u) | 2u);
++            }
++            tr_event(x, slot, 1, trt ? a_data : a_setup, CC_STALL, data_len);
++            break;
++        }
++        uint32_t cc = CC_SUCCESS, residue = 0;
++        if (trt == 3) {                                 /* IN data stage */
++            uint32_t n = actual < data_len ? actual : data_len;
++            for (uint32_t i = 0; i < n; i++)
++                mem_write(x->m, data_buf + i, 1, buf[i]);
++            residue = data_len - n;
++            if (actual < data_len) cc = CC_SHORT_PACKET;
++        }
++        tr_event(x, slot, 1, a_status, cc, residue);
++    }
++    if (out) {                                          /* dequeue mirror */
++        uint64_t o = out + CTX;
++        g_wr32(x, o + 8, (uint32_t)ep->deq | (uint32_t)ep->ccs);
++        g_wr32(x, o + 12, (uint32_t)(ep->deq >> 32));
++    }
++}
++
+ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+     if (off < X_CAP_LEN) {
+         switch (off) {
+@@ -348,8 +678,13 @@ static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
+     if (off < X_CAP_LEN) return;                /* capability space is RO */
+     if (off >= X_RTSOFF && off < X_DBOFF) { rt_write(x, off - X_RTSOFF, val); return; }
+     if (off >= X_DBOFF) {                       /* doorbells */
+-        if (off == X_DBOFF) cmd_process(x);     /* DB0: command ring (X2) */
+-        return;                                 /* slot DBs: X3/X4 */
++        if (off == X_DBOFF) { cmd_process(x); return; }
++        uint32_t slot = (off - X_DBOFF) / 4;
++        uint32_t epid = val & 0xFFu;            /* guest: db_wr(slot, ep) */
++        if ((x->usbcmd & CMD_RUN) && slot >= 1 && slot <= XHCI_MAX_SLOTS
++            && x->slots[slot - 1].addressed && epid == 1)
++            ep0_process(x, slot);               /* X3: EP0; bulk/intr X4 */
++        return;
+     }
+     op_write(x, off - X_CAP_LEN, val);
+ }
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index bddb422..d2287a7 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -266,10 +266,19 @@ static void hc_reset_program(int maxslots) {
+ 
+ /* one guest-shaped submit + consume; ev[] gets the raw event TRB */
+ static uint32_t t_last_cmd_addr;
+-static void cmd_submit(uint32_t flags, uint32_t ev[4]) {
++/* consume one event exactly like the guest's ring reader does */
++static void next_event(uint32_t ev[4]) {
++    uint32_t eb = EVTRING + (uint32_t)t_ev_idx * 16;
++    for (int i = 0; i < 4; i++) ev[i] = ram_rd32(eb + 4 * (uint32_t)i);
++    t_ev_idx++;
++    if (t_ev_idx >= 256) { t_ev_idx = 0; t_ev_cycle ^= 1; }
++    wr32(RT(0x38), (EVTRING + (uint32_t)t_ev_idx * 16) | 0x8u);      /* ERDP|EHB */
++    wr32(RT(0x3C), 0);
++}
++static void cmd_submit_p(uint32_t flags, uint32_t p0, uint32_t p1, uint32_t ev[4]) {
+     uint32_t base = CMDRING + (uint32_t)t_cmd_idx * 16;
+     t_last_cmd_addr = base;
+-    ram_wr32(base + 0, 0); ram_wr32(base + 4, 0); ram_wr32(base + 8, 0);
++    ram_wr32(base + 0, p0); ram_wr32(base + 4, p1); ram_wr32(base + 8, 0);
+     ram_wr32(base + 12, flags | (uint32_t)t_cmd_cycle);
+     t_cmd_idx++;
+     if (t_cmd_idx >= 255) {
+@@ -279,13 +288,9 @@ static void cmd_submit(uint32_t flags, uint32_t ev[4]) {
+         t_cmd_cycle ^= 1;
+     }
+     wr32(DB0, 0);
+-    uint32_t eb = EVTRING + (uint32_t)t_ev_idx * 16;
+-    for (int i = 0; i < 4; i++) ev[i] = ram_rd32(eb + 4 * (uint32_t)i);
+-    t_ev_idx++;
+-    if (t_ev_idx >= 256) { t_ev_idx = 0; t_ev_cycle ^= 1; }
+-    wr32(RT(0x38), (EVTRING + (uint32_t)t_ev_idx * 16) | 0x8u);      /* ERDP|EHB */
+-    wr32(RT(0x3C), 0);
++    next_event(ev);
+ }
++static void cmd_submit(uint32_t flags, uint32_t ev[4]) { cmd_submit_p(flags, 0, 0, ev); }
+ #define EV_CC(ev)    (((ev)[2] >> 24) & 0xFFu)
+ #define EV_TYPE(ev)  (((ev)[3] >> 10) & 0x3Fu)
+ #define EV_SLOT(ev)  (((ev)[3] >> 24) & 0xFFu)
+@@ -374,8 +379,8 @@ static void v_cmd_unknown(void) {
+     int f0 = fails;
+     hc_reset_program(32);
+     uint32_t ev[4];
+-    cmd_submit(TRB_CMD(11) | (1u << 24), ev);        /* Address Device: X3 */
+-    EXPECT(EV_CC(ev) == 5, "X3 command in X2 -> cc 5 TRB Error (got %u)", EV_CC(ev));
++    cmd_submit(TRB_CMD(11) | (1u << 24), ev);        /* Address, slot not enabled */
++    EXPECT(EV_CC(ev) == 11, "Address on unenabled slot -> cc 11 (got %u)", EV_CC(ev));
+     cmd_submit(TRB_CMD(23), ev);
+     EXPECT(EV_CC(ev) == 1, "ring keeps working after a refused command");
+     /* a TRB the consumer does not own yet (cycle flipped) is left alone */
+@@ -397,7 +402,206 @@ static void v_cmd_unknown(void) {
+     wr32(DB0, 0);
+     EXPECT((ram_rd32(EVTRING + 12) & 1u) == 1, "event lands once running");
+     EXPECT(((ram_rd32(EVTRING + 8) >> 24) & 0xFFu) == 1, "and it is the queued No Op");
+-    if (fails == f0) printf("ok cmd edges: X3 refusal cc5, cycle ownership, stopped doorbell\n");
++    if (fails == f0) printf("ok cmd edges: unenabled-slot refusal cc11, cycle ownership, stopped doorbell\n");
++}
++
++/* ================= X3: contexts + EP0 control ==========================
++ * The fixture replays the guest's xhci_address_device() (input context
++ * shapes copied field-for-field) and drives control transfers with the
++ * guest's Setup/Data/Status TRB shapes. */
++#define INCTX   0x00043000u
++#define DEVCTX  0x00044000u
++#define EP0RING 0x00045000u
++#define EPXRING 0x00046000u
++#define DATABUF 0x00047000u
++#define DBS(s)  (DB0 + 4u * (uint32_t)(s))
++#define EV_RES(ev) ((ev)[2] & 0xFFFFFFu)
++#define EV_EP(ev)  (((ev)[3] >> 16) & 0x1Fu)
++
++static int t_ep_idx, t_ep_cycle;
++static uint32_t rd8(uint32_t a) { return (uint32_t)mem_read(&M, a, 1); }
++static void zero_range(uint32_t base, uint32_t len) {
++    for (uint32_t a = base; a < base + len; a += 4) ram_wr32(a, 0);
++}
++
++static void ep_enqueue(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) {
++    uint32_t b = EP0RING + (uint32_t)t_ep_idx * 16;
++    ram_wr32(b + 0, d0); ram_wr32(b + 4, d1); ram_wr32(b + 8, d2);
++    ram_wr32(b + 12, d3 | (uint32_t)t_ep_cycle);
++    t_ep_idx++;
++    if (t_ep_idx >= 255) {
++        ram_wr32(EP0RING + 255 * 16 + 0, EP0RING);
++        ram_wr32(EP0RING + 255 * 16 + 12, (6u << 10) | (1u << 1) | (uint32_t)t_ep_cycle);
++        t_ep_idx = 0;
++        t_ep_cycle ^= 1;
++    }
++}
++
++static void build_address_input(uint32_t mps0) {
++    zero_range(INCTX, 0x400); zero_range(DEVCTX, 0x400); zero_range(EP0RING, 0x1000);
++    ram_wr32(EP0RING + 255 * 16 + 0, EP0RING);
++    ram_wr32(EP0RING + 255 * 16 + 12, (6u << 10) | (1u << 1) | 1u);
++    ram_wr32(INCTX + 4, 0x3);                                   /* Add A0|A1 */
++    ram_wr32(INCTX + 32 + 0, (3u << 20) | (1u << 27));          /* speed HS, 1 entry */
++    ram_wr32(INCTX + 32 + 4, (1u << 16));                       /* root port 1 */
++    ram_wr32(INCTX + 64 + 4, (3u << 1) | (4u << 3) | (mps0 << 16));
++    ram_wr32(INCTX + 64 + 8, EP0RING | 1u);                     /* dequeue|DCS */
++    ram_wr32(INCTX + 64 + 16, 8);
++}
++
++static uint32_t do_address(uint32_t ev[4]) {
++    cmd_submit(TRB_CMD(9), ev);                                 /* Enable Slot */
++    uint32_t slot = EV_SLOT(ev);
++    ram_wr32(DCBAA_ADDR + slot * 8, DEVCTX);
++    ram_wr32(DCBAA_ADDR + slot * 8 + 4, 0);
++    build_address_input(64);
++    cmd_submit_p(TRB_CMD(11) | (slot << 24), INCTX, 0, ev);
++    t_ep_idx = 0; t_ep_cycle = 1;
++    return slot;
++}
++
++static void ctl_transfer(uint32_t slot, uint32_t s0, uint32_t s1, int have_data,
++                         int data_in, uint32_t dlen, uint32_t ev[4]) {
++    uint32_t trt = have_data ? (data_in ? 3u : 2u) : 0u;
++    ep_enqueue(s0, s1, 8, (2u << 10) | (1u << 6) | (trt << 16));         /* IDT */
++    if (have_data)
++        ep_enqueue(DATABUF, 0, dlen,
++                   (3u << 10) | (1u << 2) | (data_in ? (1u << 16) : 0));  /* ISP */
++    ep_enqueue(0, 0, 0,
++               (4u << 10) | (1u << 5) | ((!have_data || !data_in) ? (1u << 16) : 0));
++    wr32(DBS(slot), 1);
++    next_event(ev);
++}
++#define SETUP_LO(rt, rq, wv) ((uint32_t)(rt) | ((uint32_t)(rq) << 8) | ((uint32_t)(wv) << 16))
++#define SETUP_HI(wi, wl)     ((uint32_t)(wi) | ((uint32_t)(wl) << 16))
++#define GET_DESC(slot_, type_, idx_, len_, ev_) \
++    ctl_transfer((slot_), SETUP_LO(0x80, 6, ((type_) << 8) | (idx_)), \
++                 SETUP_HI(0, len_), 1, 1, (len_), (ev_))
++
++/* ---- v_address: Address Device + the guest's slot-state gate ----------- */
++static void v_address(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    uint32_t slot = do_address(ev);
++    EXPECT(EV_CC(ev) == 1 && slot == 1, "Address Device cc=1 (cc=%u slot=%u)", EV_CC(ev), slot);
++    uint32_t d3 = ram_rd32(DEVCTX + 12);
++    EXPECT((d3 >> 27) == 2, "output Slot State = Addressed (got %u)", d3 >> 27);
++    EXPECT((d3 & 0xFFu) == slot, "hardware device address reads back");
++    EXPECT((ram_rd32(DEVCTX + 32) & 7u) == 1, "output EP0 State = Running");
++    EXPECT((ram_rd32(DEVCTX + 32 + 8) & ~0xFu) == EP0RING, "output EP0 dequeue echoed");
++    EXPECT(ram_rd32(DEVCTX + 0) == ((3u << 20) | (1u << 27)), "slot ctx dwords copied");
++    cmd_submit_p(TRB_CMD(11) | (slot << 24), INCTX, 0, ev);
++    EXPECT(EV_CC(ev) == 1, "re-Address succeeds");
++    cmd_submit(TRB_CMD(10) | (slot << 24), ev);                 /* Disable */
++    cmd_submit_p(TRB_CMD(11) | (slot << 24), INCTX, 0, ev);
++    EXPECT(EV_CC(ev) == 11, "Address after Disable -> cc 11 (got %u)", EV_CC(ev));
++    if (fails == f0) printf("ok address: slot Addressed in output ctx, EP0 Running, refusals\n");
++}
++
++/* ---- v_control_desc: descriptors over EP0, short-packet residue -------- */
++static void v_control_desc(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    uint32_t slot = do_address(ev);
++    GET_DESC(slot, 1, 0, 18, ev);
++    EXPECT(EV_TYPE(ev) == 32 && EV_CC(ev) == 1, "GET_DESCRIPTOR device: Transfer Event cc=1 (cc=%u)", EV_CC(ev));
++    EXPECT(EV_EP(ev) == 1 && EV_SLOT(ev) == slot, "event stamped slot+EP0");
++    EXPECT(rd8(DATABUF + 0) == 18 && rd8(DATABUF + 1) == 1, "device descriptor header");
++    EXPECT(rd8(DATABUF + 7) == 64, "bMaxPacketSize0 = 64");
++    EXPECT(rd8(DATABUF + 8) == 0x25 && rd8(DATABUF + 9) == 0x05, "VID 0525 (the shared stick)");
++    EXPECT(rd8(DATABUF + 10) == 0xA5 && rd8(DATABUF + 11) == 0xA4, "PID a4a5");
++    GET_DESC(slot, 1, 0, 8, ev);                                 /* MPS discovery read */
++    EXPECT(EV_CC(ev) == 1 && EV_RES(ev) == 0, "8-byte discovery read exact");
++    GET_DESC(slot, 2, 0, 9, ev);
++    EXPECT(EV_CC(ev) == 1 && rd8(DATABUF + 2) == 32, "config header: wTotalLength 32");
++    GET_DESC(slot, 2, 0, 256, ev);                               /* variable-length read */
++    EXPECT(EV_CC(ev) == 13, "256-byte ask on 32-byte config -> cc 13 Short Packet (got %u)", EV_CC(ev));
++    EXPECT(EV_RES(ev) == 256 - 32, "residue = untransferred bytes (got %u)", EV_RES(ev));
++    EXPECT(rd8(DATABUF + 9) == 9 && rd8(DATABUF + 10) == 4, "interface descriptor landed intact");
++    GET_DESC(slot, 3, 2, 255, ev);
++    EXPECT(EV_CC(ev) == 13 && rd8(DATABUF + 0) == 18 && rd8(DATABUF + 2) == 'U',
++           "string 2 'USB DISK' short read");
++    /* SET_CONFIGURATION / GET_CONFIGURATION / GET_STATUS round-trip */
++    ctl_transfer(slot, SETUP_LO(0x00, 9, 1), SETUP_HI(0, 0), 0, 0, 0, ev);
++    EXPECT(EV_CC(ev) == 1, "SET_CONFIGURATION 1 cc=1");
++    ctl_transfer(slot, SETUP_LO(0x80, 8, 0), SETUP_HI(0, 1), 1, 1, 1, ev);
++    EXPECT(EV_CC(ev) == 1 && rd8(DATABUF) == 1, "GET_CONFIGURATION reads back 1");
++    ctl_transfer(slot, SETUP_LO(0x80, 0, 0), SETUP_HI(0, 2), 1, 1, 2, ev);
++    EXPECT(EV_CC(ev) == 1 && rd8(DATABUF) == 0 && rd8(DATABUF + 1) == 0, "GET_STATUS 0");
++    ctl_transfer(slot, SETUP_LO(0xA1, 0xFE, 0), SETUP_HI(0, 1), 1, 1, 1, ev);
++    EXPECT(EV_CC(ev) == 1 && rd8(DATABUF) == 0, "GET_MAX_LUN 0");
++    if (fails == f0) printf("ok control: descriptors exact, cc13+residue on short reads, config r/w\n");
++}
++
++/* ---- v_control_stall: Stall halts; Reset + Set Dequeue recovers -------- */
++static void v_control_stall(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    uint32_t slot = do_address(ev);
++    GET_DESC(slot, 0xFF, 0, 64, ev);                             /* no such descriptor */
++    EXPECT(EV_CC(ev) == 6, "unknown descriptor -> cc 6 Stall (got %u)", EV_CC(ev));
++    EXPECT((ram_rd32(DEVCTX + 32) & 7u) == 2, "EP0 Halted in output context");
++    /* a fresh TD queues but cannot move while Halted */
++    ep_enqueue(SETUP_LO(0x80, 6, 0x100), SETUP_HI(0, 18), 8, (2u << 10) | (1u << 6) | (3u << 16));
++    ep_enqueue(DATABUF, 0, 18, (3u << 10) | (1u << 2) | (1u << 16));
++    ep_enqueue(0, 0, 0, (4u << 10) | (1u << 5));
++    wr32(DBS(slot), 1);
++    EXPECT((ram_rd32(EVTRING + (uint32_t)t_ev_idx * 16 + 12) & 1u) != (uint32_t)t_ev_cycle,
++           "no event while the endpoint is Halted");
++    /* the guest's recovery: Reset Endpoint, then Set TR Dequeue to the
++     * producer's enqueue point with the producer cycle */
++    cmd_submit(TRB_CMD(15) | (1u << 16) | (slot << 24), ev);
++    EXPECT(EV_CC(ev) == 1, "Reset Endpoint cc=1");
++    uint32_t deq = (EP0RING + (uint32_t)t_ep_idx * 16) | (uint32_t)t_ep_cycle;
++    cmd_submit_p(TRB_CMD(16) | (1u << 16) | (slot << 24), deq, 0, ev);
++    EXPECT(EV_CC(ev) == 1, "Set TR Dequeue cc=1");
++    GET_DESC(slot, 1, 0, 18, ev);
++    EXPECT(EV_CC(ev) == 1 && rd8(DATABUF + 1) == 1, "control transfers run again");
++    if (fails == f0) printf("ok stall: cc6 halts EP0, queue frozen, Reset+SetDequeue recovers\n");
++}
++
++/* ---- v_configure_eval: Configure Endpoint + Evaluate w/o dequeue move -- */
++static void v_configure_eval(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    uint32_t slot = do_address(ev);
++    /* Configure a bulk OUT endpoint (ep_id 2) */
++    zero_range(INCTX, 0x400); zero_range(EPXRING, 0x1000);
++    ram_wr32(EPXRING + 255 * 16 + 0, EPXRING);
++    ram_wr32(EPXRING + 255 * 16 + 12, (6u << 10) | (1u << 1) | 1u);
++    ram_wr32(INCTX + 4, (1u << 2) | 1u);                          /* Add A2|A0 */
++    ram_wr32(INCTX + 32 + 0, (3u << 20) | (2u << 27));            /* entries=2 */
++    ram_wr32(INCTX + 32 + 4, (1u << 16));
++    ram_wr32(INCTX + 96 + 4, (3u << 1) | (2u << 3) | (512u << 16));  /* bulk OUT 512 */
++    ram_wr32(INCTX + 96 + 8, EPXRING | 1u);
++    ram_wr32(INCTX + 96 + 16, 512);
++    cmd_submit_p(TRB_CMD(12) | (slot << 24), INCTX, 0, ev);
++    EXPECT(EV_CC(ev) == 1, "Configure Endpoint cc=1 (got %u)", EV_CC(ev));
++    EXPECT((ram_rd32(DEVCTX + 64) & 7u) == 1, "EP2 Running in output context");
++    EXPECT(((ram_rd32(DEVCTX + 12) >> 27) & 0x1Fu) == 3, "slot state Configured");
++    /* Evaluate: move EP0's consumer first, then prove Evaluate didn't */
++    GET_DESC(slot, 1, 0, 18, ev);
++    EXPECT(EV_CC(ev) == 1, "pre-Evaluate transfer ok");
++    zero_range(INCTX, 0x400);
++    ram_wr32(INCTX + 4, 0x2);                                     /* A1 only */
++    ram_wr32(INCTX + 64 + 4, (3u << 1) | (4u << 3) | (32u << 16));   /* MPS 32 */
++    ram_wr32(INCTX + 64 + 8, EP0RING | 1u);                       /* guest shape: base|cycle */
++    ram_wr32(INCTX + 64 + 16, 8);
++    cmd_submit_p(TRB_CMD(13) | (slot << 24), INCTX, 0, ev);
++    EXPECT(EV_CC(ev) == 1, "Evaluate Context cc=1 (got %u)", EV_CC(ev));
++    EXPECT(((ram_rd32(DEVCTX + 32 + 4) >> 16) & 0xFFFFu) == 32, "EP0 MPS updated to 32");
++    GET_DESC(slot, 1, 0, 18, ev);
++    EXPECT(EV_CC(ev) == 1, "consumer unmoved by Evaluate (next TD answers)");
++    /* refusals */
++    cmd_submit_p(TRB_CMD(13) | (2u << 24), INCTX, 0, ev);         /* slot 2 never enabled */
++    EXPECT(EV_CC(ev) == 11, "Evaluate on unenabled slot -> cc 11 (got %u)", EV_CC(ev));
++    cmd_submit(TRB_CMD(15) | (5u << 16) | (slot << 24), ev);      /* EP5 not configured */
++    EXPECT(EV_CC(ev) == 14, "Reset of unconfigured EP -> cc 14 (got %u)", EV_CC(ev));
++    if (fails == f0) printf("ok configure/evaluate: EP2 Running, slot Configured, MPS swap keeps ring\n");
+ }
+ 
+ int main(void) {
+@@ -416,6 +620,10 @@ int main(void) {
+     v_cmd_wrap();
+     v_enable_slot();
+     v_cmd_unknown();
++    v_address();
++    v_control_desc();
++    v_control_stall();
++    v_configure_eval();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

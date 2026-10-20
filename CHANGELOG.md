@@ -7,6 +7,163 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Added — patch 0081 (XHCI X5: INTx + ports) — XHCI plan complete
+
+- **The interrupt pin is live**: IRQ 10 (INTA#) is asserted while
+  IMAN.IP & IMAN.IE & USBCMD.INTE hold, level-driven on change, and
+  dropped by either of the guest's ack paths (IMAN RW1C, ERDP-EHB);
+  IE=0 or INTE=0 masks the pin without losing the latched IP, and
+  re-enabling re-asserts -- all pinned by vectors against the PIC's
+  own line state. HCRST deasserts.
+- **Root ports have a device**: the shared stick sits on port 1
+  whenever a disk image is attached -- CCS and High-Speed on
+  PORTSC, CSC latched as the controller starts running, and a Port
+  Status Change event (type 34, port id in the Parameter) posted to
+  the event ring, which is exactly what the guest's hotplug
+  interrupt handler peeks the ring head for. Port Reset completes
+  synchronously (PR never reads back set; PED and PRC come up; a
+  second status-change event follows), and the PORTSC RW1C clear
+  path deferred since X1 now has something to latch -- and a vector.
+- **Determinism, proven**: the same doorbell script replayed after
+  HCRST yields a byte-identical event stream.
+- **XHCI plan COMPLETE (X0–X5, patches 0076–0081)**: from "no
+  class 0x0C/03/30 function on bus 0" to a QEMU-parity controller
+  with register file, command ring, contexts, control/bulk/interrupt
+  transfers, ports and INTx -- 22 vector groups, five per-phase
+  negative controls (58/24/39/32/21), every phase behind the full
+  gate set. Stated limits: INTx only (the guest is INTx), one
+  device on port 1, no HID source on any bus, isochronous queued.
+
+### Added — patch 0080 (XHCI X4: bulk + interrupt transfers)
+
+- **The stick now speaks BOT over xHCI**: bulk endpoints run
+  Normal-TRB chains (CH on all but the last, IOC on the last, one
+  Transfer Event per chain -- the guest's exact issue pattern)
+  against the U1–U5 mass-storage model, which gained an exported
+  front door, `usb_stick_serve(m, ctl, pid, total, buf)` in
+  `devices.h`, plus a third per-controller BOT state
+  (snapshot-tagged `dev.usb.bot.xhci`). Direction comes from the
+  endpoint context; a short IN chain completes cc 13 with the byte
+  residue, OUT chains take their bytes. The guest's three BOT phases
+  (CBW, data, CSW) land as three transfers, so INQUIRY / READ
+  CAPACITY / READ(10) / TEST UNIT READY behave byte-identically to
+  the EHCI and UHCI lanes -- including FAILED without medium, PHASE
+  on a malformed CBW, and CSW residues that agree with the event's.
+- **Interrupt rings without fiction**: the guest's HID path arms one
+  TRB and polls non-blockingly, where "no event" is the idle answer.
+  This machine has no HID device model on any bus (keyboard is PS/2),
+  so an armed interrupt TRB stays armed -- NAK semantics, never a
+  fabricated zero report -- while the rest of the controller keeps
+  working. The vector pins that contract.
+- **Vectors**: two new groups (19 total) drive a full BOT dialogue
+  sector-for-sector against a known disk image. NC: engine reverted
+  to X3 -> 32 failures.
+
+### Added — patch 0079 (XHCI X3: contexts + EP0 control transfers)
+
+- **Slots become devices**: Address Device (11) consumes the guest's
+  Input Context (32-byte contexts) and writes the Output Device
+  Context its driver gates on -- Slot State = Addressed with the
+  hardware address in slot dword3 -- bringing EP0 up from the input's
+  dequeue/DCS/MaxPacket fields. Configure Endpoint (12) adds and
+  drops endpoint contexts and moves the slot to Configured; Stop (14),
+  Reset Endpoint (15) and Set TR Dequeue (16) complete the shape.
+  Evaluate Context (13) refreshes Max Packet Size and EP Type only:
+  the input's dequeue field carries ring base + producer cycle in the
+  guest's reprogramming path, and applying it would rewind the
+  consumer -- a vector moves the ring first, evaluates, and proves
+  the next TD still answers.
+- **Control transfers run**: a Setup/Data/Status TD completes at the
+  slot's doorbell and posts exactly one Transfer Event (the guest
+  takes the first matching event and parks the rest). EP0 answers for
+  the same USB stick the UHCI/EHCI models expose (0525:a4a5):
+  device/configuration/string descriptors, SET/GET_CONFIGURATION,
+  GET_STATUS, GET_MAX_LUN. Short IN reads complete **cc 13 Short
+  Packet** with the untransferred-byte count in the event's residue
+  field -- the only form the guest trusts -- never a padded Success.
+- **Stall halts, honestly**: a refused request (a descriptor index the
+  device does not have) completes cc 6 and halts EP0; queued TDs stay
+  frozen until the guest's own recovery sequence -- Reset Endpoint
+  then Set TR Dequeue to its enqueue point -- runs, after which
+  transfers answer again. Refusals keep spec codes (11 slot not
+  enabled, 14 endpoint not enabled).
+- **Vectors**: four new `tests/test_xhci.c` groups (17 total) replay
+  the guest's own context construction and recovery code field for
+  field. NC: engine reverted to X2 -> 39 failures. Bulk/interrupt
+  rings and port presence remain X4/X5, stated as such.
+
+### Added — patch 0078 (XHCI X2: command ring engine)
+
+- **The command ring runs**: doorbell 0 walks the guest's ring under
+  measured Cycle-bit ownership (Link TRBs flip the consumer cycle on
+  TC), executes No Op (23), Enable Slot (9) and Disable Slot (10), and
+  posts Command Completion events (type 33) whose Parameter echoes the
+  command TRB's physical address, completion code at Status[31:24],
+  slot id at Control[31:24] -- exactly the fields the guest reads.
+  Completion is synchronous at doorbell time (the guest polls the event
+  ring after ringing, XHCI_PLAN 1a), so runs stay deterministic.
+- **Event ring producer**: ERST segments walked from guest memory,
+  producer/consumer positions tracked as absolute counts (cycle of
+  event *n* derives from *n*), a full ring drops rather than
+  overwrites; ERDP writes advance the consumer mirror and the EHB
+  write clears IMAN.IP (USBSTS.EINT mirrors it) -- the discipline the
+  guest's consumer performs after every event.
+- **Refusals keep spec codes**: No Slots Available (9) at the
+  CONFIG.MaxSlotsEn gate, Slot Not Enabled (11) on a double Disable,
+  TRB Error (5) for slot 0/>32 and for the X3 commands (Address Device
+  et al.) that land next phase -- the ring keeps working after each.
+  A TRB the consumer does not own (cycle flipped) is left untouched,
+  and a doorbell while stopped queues silently until RUN.
+- **Vectors**: four new `tests/test_xhci.c` groups, including the
+  guest's own U1 gate re-hosted -- 256/256 No Ops across a Link wrap
+  with exact Parameter echoes and producer cycles. NC: engine reverted
+  to X1 -> 24 failures.
+
+### Added — patch 0077 (XHCI X1: PCI identity + register file)
+
+- **The xHCI controller exists on the bus**: PCI 0:20.0 **1b36:000d**
+  rev 01 (QEMU `qemu-xhci` parity; class 0x0C/0x03/0x30, subsystem
+  1af4:1100, INTA# on the measured-free IRQ 10). BAR0 is a 64-bit
+  64 KiB MMIO window seeded at 0xFEB20000 (clear of EHCI/AHCI/e1000),
+  with the AHCI-style sizing probe (0xFFFF0004) and firmware-relocation
+  rebind.
+- **The full register file** (`src/xhci.c`): capability block
+  (0x01000040; 32 slots / 1 interrupter / 4 ports; no scratchpads;
+  AC64, CSZ=0, PPC=0; DBOFF 0x1000, RTSOFF 0x800), operational
+  registers with the HCRST handshake (programmed state wiped, HCRST
+  self-clears, CNR=0), CONFIG/DCBAAP/CRCR/DNCTRL stores, PORTSC
+  empty-port semantics (PP=1 under PPC=0, wake bits store, writes
+  fabricate nothing), interrupter-0 ERST/ERDP/IMAN/IMOD stores, and
+  doorbells accepted (the ring engine is X2). State serializes through
+  `xhci_snap`.
+- **Vectors** (`tests/test_xhci.c`, 9 groups): identity/BAR probe/caps/
+  reset/programming/ports/interrupter/doorbell pins plus a miniature
+  replay of the guest's measured 11-step bring-up. Presence is
+  unconditional and measured receipt-neutral: `make test` and
+  `make test-sanitize` green, every historical lane byte-identical,
+  both SeaBIOS ISO lanes green. **NC**: devices wiring reverted ->
+  58 failures.
+
+### Added — patch 0076 (XHCI X0: measured baseline + plan)
+
+- **`docs/plans/XHCI_PLAN.md`**: the plan for the north-star USB 3.0
+  host controller (audit 2026-10-19 candidate #1), phases X0–X5. The X0
+  baseline is measured, not assumed: the full device contract is read
+  out of the driver that must run on it (AuraLite-OS@main
+  `drivers/usb/xhci.c`) -- the class 0x0C/0x03/0x30 probe with legacy
+  INTx (cfg 0x3C; no MSI needed), the capability/operational/runtime/
+  doorbell/port register map, the exact 11-step bring-up (HCRST/CNR,
+  DCBAA + scratchpads, CRCR with a cycle-carrying Link TRB, ERST/
+  IMAN/IMOD, port power, INTE|RUN, RW1C-strict PORTSC scan), the
+  command/event/transfer TRB set (No Op .. Set TR Dequeue; completion
+  polled after the doorbell, so deterministic synchronous completion is
+  contract-legal), and the guest receipt strings the X5 lane pins.
+  QEMU identity measured (`docs/specs/pci-ids`): `qemu-xhci` =
+  1b36:000d rev 01, prog-if 30. Our machine today has no xHCI-class
+  function (baseline receipt: the guest prints `[xhci] no xHCI
+  controller found`); defect ledger D1–D7 maps to phases X1 (register
+  file) – X5 (interrupter/ports/close-out).
+
 ### Added — patch 0075 (FPU F4: integration gates -- the plan closes)
 
 - **`--kernel=` freestanding x87 payload receipts pair (determinism x2)**:

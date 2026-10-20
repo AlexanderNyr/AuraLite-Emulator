@@ -836,6 +836,102 @@
   test-sanitize`, diff-fuzz 512/12 288 all-match, both SeaBIOS ISO
   lanes green. The plan is closed.
 
+- XHCI X0 (`patches/0076-XHCI-X0-measured-baseline-and-plan.patch`, plan:
+  `docs/plans/XHCI_PLAN.md`): the measured baseline for the plan the
+  2026-10-19 audit names first. The contract is measured from the driver
+  that must run on the machine -- AuraLite-OS@main `drivers/usb/xhci.c`
+  (90 KB, real command/event/transfer rings): class 0x0C/0x03/0x30 probe
+  with **legacy INTx** (cfg 0x3C, no MSI), the CAPLENGTH/HCSPARAMS/
+  HCCPARAMS/DBOFF/RTSOFF reads, the 11-step bring-up (halt -> HCRST ->
+  CNR -> CONFIG -> DCBAA/scratchpads -> CRCR with a cycle-carrying Link
+  TRB -> ERST/IMAN/IMOD -> port power -> INTE|RUN -> INTx registration
+  -> PORTSC scan with strict RW1C discipline), the TRB/command/event set
+  (No Op .. Set TR Dequeue; the guest polls the event ring after the
+  doorbell, so deterministic synchronous completion is legal), and the
+  receipt strings X5 pins. QEMU identity measured: `qemu-xhci` =
+  **1b36:000d** rev 01 (prog-if 30). Our machine today: no class
+  0x0C/0x03/0x30 function on bus 0 -- the baseline receipt is the
+  guest's `[xhci] no xHCI controller found`; defect ledger D1-D7 mapped
+  to phases X1-X5 (register file -> command ring -> contexts/control ->
+  bulk/interrupt -> interrupter/ports/close-out). Docs-only; gates
+  unchanged green.
+
+- XHCI X1 (`patches/0077-XHCI-X1-register-file.patch`): the controller
+  exists. PCI 0:20.0 **1b36:000d** rev 01 (class 0C/03/30, subsystem
+  1af4:1100, INTA# on measured-free IRQ 10) with a 64-bit 64 KiB BAR0 at
+  0xFEB20000 (sizing probe 0xFFFF0004, firmware relocation rebinds --
+  the AHCI BAR5 pattern) and the full register file in `src/xhci.c`:
+  capability block (dword 0x01000040, HCSPARAMS1 32 slots/1 interrupter/
+  4 ports, no scratchpads, HCCPARAMS1 AC64 with CSZ=0/PPC=0, DBOFF
+  0x1000, RTSOFF 0x800), operational registers with the HCRST handshake
+  (state wiped, HCRST self-clears, CNR=0 immediately), CONFIG/DCBAAP/
+  CRCR/DNCTRL stores, PORTSC with PPC=0 power (empty port reads PP=1,
+  wake bits store, writes fabricate no change bits), interrupter-0
+  ERSTSZ/ERSTBA/ERDP/IMOD/IMAN stores, doorbells accepted (engine is
+  X2). Vectors: `tests/test_xhci.c` 9 groups through the real
+  0xCF8/0xCFC + MMIO paths, incl. a miniature replay of the guest's
+  measured 11-step `xhci_init` (0 devices until X4 binds the sticks);
+  NC (wiring reverted) red with 58 failures. Presence is unconditional
+  (the UHCI-default pattern): `make test` and `make test-sanitize`
+  green with every historical receipt byte-identical, both SeaBIOS ISO
+  lanes green. State rides snapshots via `xhci_snap` ("dev.xhci").
+- XHCI X2 (`patches/0078-XHCI-X2-command-ring.patch`): the command ring
+  engine. Doorbell 0 walks the ring under guest-measured Cycle-bit
+  ownership (Link TRBs flip the consumer cycle on TC), executes No Op /
+  Enable Slot / Disable Slot and posts Command Completion events
+  (Parameter = the command TRB's address, cc at Status[31:24], slot at
+  Control[31:24]) into the ERST-described event ring; ERDP writes
+  advance the consumer mirror and the EHB write clears IMAN.IP, with
+  USBSTS.EINT mirroring it. Vectors pin the guest's own U1 gate --
+  256/256 No Ops across a ring wrap, params and producer cycles exact --
+  plus slot alloc/free/reuse with the spec refusal codes (9 no slots,
+  11 slot not enabled, 5 TRB error) and the honest edges (X3 commands
+  refused with cc 5, unowned TRBs untouched, a stopped doorbell queues).
+  NC (engine reverted to X1) red with 24 failures. Gates: `make test`,
+  `make test-sanitize`, both SeaBIOS ISO lanes green.
+- XHCI X3 (`patches/0079-XHCI-X3-contexts-ep0.patch`): device contexts
+  and EP0 control transfers. Address Device writes the output Slot
+  Context the guest gates on (Slot State Addressed, hardware address =
+  slot id) and brings EP0 up from the guest's input context; Configure
+  Endpoint adds/drops endpoint contexts and marks the slot Configured;
+  Evaluate Context refreshes Max Packet Size only -- the guest's input
+  dequeue field carries ring-base|cycle and must not move the consumer
+  (vector proves it); Reset/Stop Endpoint and Set TR Dequeue complete
+  the command set. Control TDs run at doorbell time against the shared
+  MSC stick's descriptors (0525:a4a5): exactly one Transfer Event per
+  TD (the guest parks later events), short IN reads complete cc 13
+  Short Packet with the untransferred-byte residue the guest believes,
+  and a refused request completes cc 6 and halts EP0 until the guest's
+  Reset + Set-Dequeue recovery. NC (engine at X2) red with 39 failures.
+  Gates: `make test`, `make test-sanitize`, both SeaBIOS ISO lanes
+  green.
+- XHCI X4 (`patches/0080-XHCI-X4-bulk-interrupt.patch`): bulk and
+  interrupt transfer rings. A Normal-TRB chain (CH/IOC discipline as
+  the guest issues it) runs against the shared MSC stick through a new
+  exported front door, `usb_stick_serve` (`devices.h`), with its own
+  third BOT state (snapshot-tagged `dev.usb.bot.xhci`) -- the guest's
+  three BOT phases map onto three transfers; vectors pin TUR
+  medium-present/absent, INQUIRY, READ CAPACITY, a 2-sector READ(10)
+  across a chain under exactly one event, short-read cc13 + CSW
+  residue agreement, and the PHASE-error CSW for a malformed CBW.
+  Interrupt endpoints follow the guest's non-blocking poll contract:
+  the machine has no HID model on any bus, so an armed interrupt TRB
+  NAKs forever (no fabricated reports) while EP0 keeps answering. NC
+  (engine at X3) red with 32 failures. Gates green as usual.
+- XHCI X5 (`patches/0081-XHCI-X5-intx-ports-closeout.patch`) --
+  **XHCI plan COMPLETE (X0–X5)**. Interrupter pin: IRQ 10/INTA#
+  asserted while IMAN.IP & IMAN.IE & USBCMD.INTE hold (level, on
+  change), both guest ack paths honored (IMAN RW1C, ERDP-EHB), both
+  masks pinned by vectors. Ports: the stick lives on root port 1
+  with CCS + High-Speed; the RUN edge latches CSC and posts the Port
+  Status Change event the guest's hotplug handler peeks for; Port
+  Reset completes synchronously (PED + PRC + second PSC), and the
+  RW1C-clear vector deferred since X1 finally latches for real. A
+  replayed doorbell script gives a byte-identical event stream
+  (determinism x2). NC red with 21 failures; gates green.
+  **Totals for the XHCI arc**: patches `0076`–`0081`, 22 vector
+  groups in `tests/test_xhci.c`, NC counts 58/24/39/32/21.
+
 ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
 
 - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode

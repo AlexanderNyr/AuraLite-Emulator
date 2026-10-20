@@ -36,6 +36,7 @@ maps to exactly one plan below.
 | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
 | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
 | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -57,14 +58,15 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 
 ### Inventory (measured against the tree, not assumed)
 
-- 36 patches under `patches/` (`0066`–`0075` verified with format-patch
+- 37 patches under `patches/` (`0066`–`0081` verified with format-patch
   reverse-check + parent-check tree hash) on `feature/roadmap-next`. The
   deliverable diff `AuraLite-all-vs-github.patch` is generated as
   `git diff <current github main>..HEAD` and must be refreshed whenever
-  upstream `main` moves; as of this audit upstream `main` is `a7e9799`
-  ("N4, V5, Gui update" -- the squash of our `0066`–`0069` work, tree-
-  identical to `8ff63de`), so the patch carries the post-G1 work: GUI G2,
-  STORE S6, FPU F0–F4 and this audit.
+  upstream `main` moves; upstream `main` is now `1e7ff03`
+  ("F0-F4 update" -- the squash of our `0072`–`0075` work on top of
+  `a7e9799`, itself the squash of `0066`–`0069`; its tree matches our
+  `391a6bb` except this very ledger file), so the patch carries the
+  post-F4 work: the 2026-10-19 audit and the whole XHCI arc.
 - Every plan in the ledger above is **CLOSED** (CORE, CHIPSET, KERNEL-BOOT,
   STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4, PERF P0–P5, TOOLING T0–T5,
   COMPAT G0–G6, FPU F0–F4, GUI G1–G2).
@@ -99,7 +101,10 @@ either shipped or explicitly NO-GO (PERF P4).
    (the MSC path already exists); X4 USB2/USB3 protocol-speed and port
    routing (EHCI-companion coexistence); X5 end-to-end + hardening (both
    sticks byte-identical x2, matrix determinism). Each phase: measured
-   receipts, vectors, one NC, full gates, one patch.
+   receipts, vectors, one NC, full gates, one patch. **In progress: X0
+   (`0076`) + X1 register file (`0077`) + X2 command ring (`0078`)
+   + X3 contexts/EP0 (`0079`) + X4 bulk/interrupt (`0080`) + X5
+   INTx/ports close-out (`0081`) shipped -- **XHCI COMPLETE**.
 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
    MSI capability + address/data programming; M2 LAPIC MSI delivery

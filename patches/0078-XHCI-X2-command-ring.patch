@@ -1,0 +1,632 @@
+From d527ee56fa4c9161ff59b94f8555a91598121c4d Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 13:34:54 +0000
+Subject: [PATCH] XHCI X2: command ring engine + event producer
+
+Doorbell 0 walks the command ring under the consumer discipline
+measured from the AuraLite-OS xHCI driver (xhci.c:824-1010): Cycle-bit
+ownership, Link TRBs flipping the consumer cycle on TC, completion
+code read from Status[31:24] (the guest's control field), slot id
+from Control[31:24]. No Op (23) completes with the command TRB's
+physical address echoed as the event Parameter; Enable Slot (9)
+allocates the first free id under the CONFIG.MaxSlotsEn gate and
+Disable Slot (10) frees it; every other command (the X3 set) is
+refused with cc 5 and the ring keeps working. Refusal codes are the
+spec values the guest does not branch on beyond cc==1: 9 No Slots
+Available, 11 Slot Not Enabled, 5 TRB Error (slot 0/>32, unknown).
+Completion is synchronous at doorbell time (the guest polls the event
+ring after ringing, XHCI_PLAN 1a) so runs stay deterministic.
+
+The event-ring producer walks the ERST from guest memory and tracks
+producer/consumer as absolute counts (the producer cycle of event n
+derives from n); a full ring drops rather than overwrites. Posting
+latches IMAN.IP, USBSTS.EINT mirrors it, ERDP reads back with EHB set
+while an event is unacknowledged, and an ERDP write advances the
+consumer mirror while its EHB write-1 clears the latch -- exactly the
+consume discipline the guest performs after every event (its comment:
+"QEMU tolerates omitting this; real silicon stops"). CRCR writes
+restart the consumer (dequeue + RCS). The INTx pin itself is driven
+in X5.
+
+tests/test_xhci.c gains four groups: the No Op round-trip with the
+IP/EINT/EHB latch cycle; the guest's own U1 gate re-hosted -- 256/256
+No Ops across a Link wrap with exact Parameter echoes and producer
+cycles; slot alloc/free/reuse with the measured refusal codes; and
+the honest edges (X3 refusal, unowned TRB untouched, doorbell while
+stopped queues until RUN). NC: src/xhci.c reverted to X1 -> 24
+failures across the X2 groups. Gates: make test, make test-sanitize,
+both SeaBIOS ISO lanes green.
+
+Also repairs the XHCI_PLAN status line, which a same-file edit race
+left at "X1 queued" in 0077 while the phase table and section 1e
+already recorded X1 done.
+
+tests/fpu_payload.elf stays untracked (a generated F4 gate artifact).
+---
+ CHANGELOG.md            |  27 ++++++
+ ROADMAP.md              |   5 +-
+ docs/STATUS.md          |  14 ++++
+ docs/plans/XHCI_PLAN.md |  33 +++++++-
+ src/xhci.c              | 157 +++++++++++++++++++++++++++++++++--
+ tests/test_xhci.c       | 180 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 407 insertions(+), 9 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1643c35..f25c54c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,33 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0078 (XHCI X2: command ring engine)
++
++- **The command ring runs**: doorbell 0 walks the guest's ring under
++  measured Cycle-bit ownership (Link TRBs flip the consumer cycle on
++  TC), executes No Op (23), Enable Slot (9) and Disable Slot (10), and
++  posts Command Completion events (type 33) whose Parameter echoes the
++  command TRB's physical address, completion code at Status[31:24],
++  slot id at Control[31:24] -- exactly the fields the guest reads.
++  Completion is synchronous at doorbell time (the guest polls the event
++  ring after ringing, XHCI_PLAN 1a), so runs stay deterministic.
++- **Event ring producer**: ERST segments walked from guest memory,
++  producer/consumer positions tracked as absolute counts (cycle of
++  event *n* derives from *n*), a full ring drops rather than
++  overwrites; ERDP writes advance the consumer mirror and the EHB
++  write clears IMAN.IP (USBSTS.EINT mirrors it) -- the discipline the
++  guest's consumer performs after every event.
++- **Refusals keep spec codes**: No Slots Available (9) at the
++  CONFIG.MaxSlotsEn gate, Slot Not Enabled (11) on a double Disable,
++  TRB Error (5) for slot 0/>32 and for the X3 commands (Address Device
++  et al.) that land next phase -- the ring keeps working after each.
++  A TRB the consumer does not own (cycle flipped) is left untouched,
++  and a doorbell while stopped queues silently until RUN.
++- **Vectors**: four new `tests/test_xhci.c` groups, including the
++  guest's own U1 gate re-hosted -- 256/256 No Ops across a Link wrap
++  with exact Parameter echoes and producer cycles. NC: engine reverted
++  to X1 -> 24 failures.
++
+ ### Added — patch 0077 (XHCI X1: PCI identity + register file)
+ 
+ - **The xHCI controller exists on the bus**: PCI 0:20.0 **1b36:000d**
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 24f853c..3128670 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -36,7 +36,7 @@ maps to exactly one plan below.
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+-| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X1 done ✅; X2 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
++| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X2 done ✅; X3 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -101,7 +101,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    routing (EHCI-companion coexistence); X5 end-to-end + hardening (both
+    sticks byte-identical x2, matrix determinism). Each phase: measured
+    receipts, vectors, one NC, full gates, one patch. **In progress: X0
+-   (`0076`) + X1 register file (`0077`) shipped; X2 queued**.
++   (`0076`) + X1 register file (`0077`) + X2 command ring (`0078`)
++   shipped; X3 queued**.
+ 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 475cdd3..c58784a 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -875,6 +875,20 @@
+   (the UHCI-default pattern): `make test` and `make test-sanitize`
+   green with every historical receipt byte-identical, both SeaBIOS ISO
+   lanes green. State rides snapshots via `xhci_snap` ("dev.xhci").
++- XHCI X2 (`patches/0078-XHCI-X2-command-ring.patch`): the command ring
++  engine. Doorbell 0 walks the ring under guest-measured Cycle-bit
++  ownership (Link TRBs flip the consumer cycle on TC), executes No Op /
++  Enable Slot / Disable Slot and posts Command Completion events
++  (Parameter = the command TRB's address, cc at Status[31:24], slot at
++  Control[31:24]) into the ERST-described event ring; ERDP writes
++  advance the consumer mirror and the EHB write clears IMAN.IP, with
++  USBSTS.EINT mirroring it. Vectors pin the guest's own U1 gate --
++  256/256 No Ops across a ring wrap, params and producer cycles exact --
++  plus slot alloc/free/reuse with the spec refusal codes (9 no slots,
++  11 slot not enabled, 5 TRB error) and the honest edges (X3 commands
++  refused with cc 5, unowned TRBs untouched, a stopped doorbell queues).
++  NC (engine reverted to X1) red with 24 failures. Gates: `make test`,
++  `make test-sanitize`, both SeaBIOS ISO lanes green.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/XHCI_PLAN.md b/docs/plans/XHCI_PLAN.md
+index aebdf08..cb241a0 100644
+--- a/docs/plans/XHCI_PLAN.md
++++ b/docs/plans/XHCI_PLAN.md
+@@ -7,13 +7,13 @@
+ > slot addressing, endpoint contexts). The machine has UHCI + EHCI only;
+ > a class 0x0C/0x03/prog-if 0x30 scan of bus 0 finds nothing today.
+ 
+-**Status: X0 done ✅; X1 queued**
++**Status: X0–X2 done ✅; X3 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | X0 | Measured baseline: the guest contract, the QEMU identity, our topology, the defect ledger | ✅ done | this file (`patches/0076`) |
+ | X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ✅ done | `src/xhci.c` + `tests/test_xhci.c` (9 groups) (`patches/0077`) |
+-| X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ⬜ queued | command-ring gates |
++| X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ✅ done | `tests/test_xhci.c` X2 groups (13 total) (`patches/0078`) |
+ | X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ⬜ queued | control-transfer vectors |
+ | X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ⬜ queued | bulk/interrupt vectors + stick receipts |
+ | X5 | Interrupter + ports + close-out: IMAN/IMOD/ERST/ERDP, EINT/PCD, INTx delivery, hotplug (CSC / Port Status Change events), determinism x2, guest receipts where artifacts exist | ⬜ queued | close-out + docs |
+@@ -183,6 +183,35 @@ receipt.
+   its vector in X5, when hardware can latch CSC (in X1 writes cannot
+   set change bits, exactly as on silicon with empty ports).
+ 
++## 1f. X2 measured receipts (command ring)
++
++- **Engine discipline** pinned against the guest's consumer
++  (xhci.c:824–1010): completion code at spec Status[31:24] (the guest's
++  `control` field), TRB type at Control[15:10], slot id at
++  Control[31:24]; ownership by the Cycle bit only. The guest writes
++  ERDP|EHB back after every event ("QEMU tolerates omitting this; real
++  silicon stops delivering events"), so an ERDP write advances the
++  consumer mirror and its EHB bit clears IMAN.IP; ERDP reads back EHB
++  while an event is unacknowledged and USBSTS.EINT mirrors IP. A full
++  event ring drops (never overwrites) -- unreachable in the guest's
++  submit->poll flow.
++- **No Op round-trip**: the completion's Parameter echoes the command
++  TRB's physical address with cc=1; **256/256 No Ops across the Link
++  wrap** with exact params and producer cycles -- the guest's own U1
++  gate made ours (`[xhci] command ring: PASS — 256/256 No Ops across a
++  ring wrap` is its receipt string).
++- **Slots**: Enable allocates the first free id, Disable frees, reuse
++  takes the first free. Refusals use the spec codes (the guest branches
++  only on cc==1): double-Disable = 11 (Slot Not Enabled), slot 0/33 =
++  5 (TRB Error), CONFIG.MaxSlotsEn exhausted = 9 (No Slots Available).
++- **Honest X2 edges**: X3 commands (Address Device) complete with cc=5
++  and the ring keeps working; a TRB whose cycle the consumer does not
++  own is left untouched until handed over; a doorbell while RUN=0
++  moves nothing and the queued command lands on the next doorbell
++  once running. The INTx *pin* is driven in X5; IMAN.IP/EINT already
++  behave.
++- NC: `src/xhci.c` reverted to X1 → 24 failures, all in the X2 groups.
++
+ ## 2. Architecture decisions (X1)
+ 
+ - **PCI identity**: 1b36:000d, rev 01, class 0x0C/0x03/0x30, subsystem
+diff --git a/src/xhci.c b/src/xhci.c
+index 2a76711..e030340 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -37,6 +37,7 @@
+ #define CMD_LHCRST       (1u << 7)
+ /* USBSTS bits */
+ #define STS_HCH          (1u << 0)
++#define STS_EINT         (1u << 3)
+ #define STS_PCD          (1u << 4)
+ /* CRCR bits */
+ #define CRCR_CRR         (1u << 3)
+@@ -66,6 +67,14 @@ typedef struct {
+     uint32_t imod, erstsz;
+     uint64_t erstba, erdp;
+     int intx_level;         /* last level driven on XHCI_IRQ */
++    /* X2: command ring consumer + event ring producer.  ev_prod/ev_cons
++     * are absolute event counts; the ring position and producer cycle
++     * derive from them (cycle of event n = 1 while n < ring size). */
++    uint64_t cmd_deq;       /* next command TRB to fetch */
++    int cmd_ccs;            /* command consumer cycle state */
++    uint32_t slot_mask;     /* enabled slots (bit s-1 = slot s) */
++    uint64_t ev_prod, ev_cons;
++    int iman_ip;            /* interrupter pending latch (EINT mirror) */
+ } xhci_t;
+ 
+ static xhci_t g_xhci;
+@@ -89,6 +98,7 @@ static uint32_t op_read(xhci_t *x, uint32_t off) {
+     case OP_USBSTS: {
+         uint32_t v = 0;
+         if (!(x->usbcmd & CMD_RUN)) v |= STS_HCH;
++        if (x->iman_ip) v |= STS_EINT;
+         for (int p = 0; p < XHCI_MAX_PORTS; p++)
+             if (x->port_change[p]) { v |= STS_PCD; break; }
+         return v;
+@@ -126,9 +136,12 @@ static void op_write(xhci_t *x, uint32_t off, uint32_t val) {
+     case OP_DNCTRL:  x->dnctrl = val; return;
+     case OP_CRCR:
+         x->crcr = (x->crcr & 0xFFFFFFFF00000000ull) | (val & ~0x6u);
++        x->cmd_deq = x->crcr & ~0xFull;         /* X2: consumer restarts */
++        x->cmd_ccs = (int)(x->crcr & 1u);
+         return;
+     case OP_CRCR + 4:
+         x->crcr = (x->crcr & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        x->cmd_deq = x->crcr & ~0xFull;
+         return;
+     case OP_DCBAAP:
+         x->dcbaap = (x->dcbaap & 0xFFFFFFFF00000000ull) | (val & ~0x3Fu);
+@@ -152,38 +165,168 @@ static void op_write(xhci_t *x, uint32_t off, uint32_t val) {
+ 
+ static uint32_t rt_read(xhci_t *x, uint32_t off) {
+     switch (off) {
+-    case RT_IMAN:    return x->iman_ie ? IMAN_IE : 0;   /* IP: X5 */
++    case RT_IMAN:    return (x->iman_ie ? IMAN_IE : 0) | (x->iman_ip ? IMAN_IP : 0);
+     case RT_IMOD:    return x->imod;
+     case RT_ERSTSZ:  return x->erstsz;
+     case RT_ERSTBA:  return (uint32_t)x->erstba;
+     case RT_ERSTBA + 4: return (uint32_t)(x->erstba >> 32);
+-    case RT_ERDP:    return (uint32_t)x->erdp;
++    case RT_ERDP:    return (uint32_t)x->erdp | (x->iman_ip ? 0x8u : 0);  /* EHB */
+     case RT_ERDP + 4:   return (uint32_t)(x->erdp >> 32);
+     default:         return 0;   /* MFINDEX + interrupters 1.. (MaxIntrs=1) */
+     }
+ }
+ 
++static void ev_consume_update(xhci_t *x);
++
+ static void rt_write(xhci_t *x, uint32_t off, uint32_t val) {
+     switch (off) {
+-    case RT_IMAN:    x->iman_ie = (val & IMAN_IE) != 0; return;
++    case RT_IMAN:
++        if (val & IMAN_IP) x->iman_ip = 0;              /* RW1C */
++        x->iman_ie = (val & IMAN_IE) != 0;
++        return;
+     case RT_IMOD:    x->imod = val; return;
+     case RT_ERSTSZ:  x->erstsz = val & 0xFFFFu; return;
+     case RT_ERSTBA:
+         x->erstba = (x->erstba & 0xFFFFFFFF00000000ull) | (val & ~0x3Fu);
++        x->ev_prod = x->ev_cons = 0;                   /* X2: fresh table */
+         return;
+     case RT_ERSTBA + 4:
+         x->erstba = (x->erstba & 0xFFFFFFFFull) | ((uint64_t)val << 32);
+         return;
+     case RT_ERDP:
+-        x->erdp = (x->erdp & 0xFFFFFFFF00000000ull) | val;
++        x->erdp = (x->erdp & 0xFFFFFFFF00000000ull) | (val & ~0xFu);
++        if (val & 0x8u) x->iman_ip = 0;                 /* EHB write-1-clear */
++        ev_consume_update(x);
+         return;
+     case RT_ERDP + 4:
+         x->erdp = (x->erdp & 0xFFFFFFFFull) | ((uint64_t)val << 32);
++        ev_consume_update(x);
+         return;
+     default: return;
+     }
+ }
+ 
++/* =================== X2: command ring + event ring =====================
++ * The guest polls the event ring after ringing a doorbell (XHCI_PLAN
++ * section 1a), so completion is synchronous at doorbell-write time: the
++ * consumer walks the command ring while the Cycle bit matches the
++ * consumer cycle state, executes, and posts Command Completion events.
++ * Guest memory goes through mem_read/mem_write with physical addresses
++ * (the AHCI gdr/gdw pattern).  Completion codes are the spec values the
++ * guest branches on only as cc==1 vs not: 1 Success, 5 TRB Error,
++ * 9 No Slots Available, 11 Slot Not Enabled. */
++
++static uint32_t g_rd32(xhci_t *x, uint64_t pa) { return (uint32_t)mem_read(x->m, pa, 4); }
++static void g_wr32(xhci_t *x, uint64_t pa, uint32_t v) { mem_write(x->m, pa, 4, v); }
++
++/* total event-ring capacity in TRBs, walked from the guest's ERST */
++static uint32_t ev_total(xhci_t *x) {
++    uint32_t total = 0;
++    if (!x->erstba || !x->erstsz) return 0;
++    for (uint32_t i = 0; i < x->erstsz && i < 32; i++)
++        total += g_rd32(x, x->erstba + (uint64_t)i * 16 + 8);
++    return total;
++}
++
++/* physical address of ring position `pos` (linear across segments) */
++static uint64_t ev_addr(xhci_t *x, uint32_t pos) {
++    for (uint32_t i = 0; i < x->erstsz && i < 32; i++) {
++        uint64_t ent = x->erstba + (uint64_t)i * 16;
++        uint64_t base = (uint64_t)g_rd32(x, ent) | ((uint64_t)g_rd32(x, ent + 4) << 32);
++        uint32_t size = g_rd32(x, ent + 8);
++        if (pos < size) return base + (uint64_t)pos * 16;
++        pos -= size;
++    }
++    return 0;
++}
++
++/* consumer mirror: advance ev_cons to the ERDP the guest just wrote */
++static void ev_consume_update(xhci_t *x) {
++    uint32_t total = ev_total(x);
++    if (!total) return;
++    uint64_t deq = x->erdp & ~0xFull;
++    uint32_t pos = 0;
++    int found = 0;
++    for (uint32_t i = 0; i < x->erstsz && i < 32 && !found; i++) {
++        uint64_t ent = x->erstba + (uint64_t)i * 16;
++        uint64_t base = (uint64_t)g_rd32(x, ent) | ((uint64_t)g_rd32(x, ent + 4) << 32);
++        uint32_t size = g_rd32(x, ent + 8);
++        if (deq >= base && deq < base + (uint64_t)size * 16) {
++            pos += (uint32_t)((deq - base) / 16);
++            found = 1;
++        } else {
++            pos += size;
++        }
++    }
++    if (!found) return;
++    uint32_t cur = (uint32_t)(x->ev_cons % total);
++    x->ev_cons += (pos + total - cur) % total;
++}
++
++/* post one event TRB; -1 if the ring is unprogrammed or full (dropped) */
++static int ev_post(xhci_t *x, uint64_t param, uint32_t status, uint32_t control) {
++    uint32_t total = ev_total(x);
++    if (!total) return -1;
++    if (x->ev_prod - x->ev_cons >= total) return -1;   /* full: never overwrite */
++    uint32_t pos = (uint32_t)(x->ev_prod % total);
++    uint32_t cycle = ((x->ev_prod / total) & 1) ? 0 : 1;
++    uint64_t at = ev_addr(x, pos);
++    if (!at) return -1;
++    g_wr32(x, at + 0, (uint32_t)param);
++    g_wr32(x, at + 4, (uint32_t)(param >> 32));
++    g_wr32(x, at + 8, status);
++    g_wr32(x, at + 12, control | cycle);
++    x->ev_prod++;
++    x->iman_ip = 1;
++    return 0;
++}
++
++#define CC_SUCCESS        1u
++#define CC_TRB_ERROR      5u
++#define CC_NO_SLOTS       9u
++#define CC_SLOT_NOT_EN    11u
++
++static void cmd_process(xhci_t *x) {
++    if (!(x->usbcmd & CMD_RUN)) return;
++    for (int budget = 0; budget < 1024; budget++) {
++        uint32_t trb[4];
++        for (int i = 0; i < 4; i++) trb[i] = g_rd32(x, x->cmd_deq + 4 * i);
++        if ((trb[3] & 1u) != (uint32_t)x->cmd_ccs) break;   /* not owned */
++        uint32_t type = (trb[3] >> 10) & 0x3Fu;
++        uint64_t at = x->cmd_deq;
++        if (type == 6) {                                    /* Link TRB */
++            x->cmd_deq = (((uint64_t)trb[1] << 32) | trb[0]) & ~0xFull;
++            if (trb[3] & 2u) x->cmd_ccs ^= 1;               /* TC */
++            continue;
++        }
++        x->cmd_deq += 16;
++        uint32_t slot = (trb[3] >> 24) & 0xFFu, cc = CC_SUCCESS;
++        switch (type) {
++        case 23:                                            /* No Op */
++            slot = 0;
++            break;
++        case 9: {                                           /* Enable Slot */
++            uint32_t maxen = x->config & 0xFFu;
++            if (maxen > XHCI_MAX_SLOTS) maxen = XHCI_MAX_SLOTS;
++            uint32_t s = 1;
++            while (s <= maxen && (x->slot_mask & (1u << (s - 1)))) s++;
++            if (s > maxen) { cc = CC_NO_SLOTS; slot = 0; }
++            else { x->slot_mask |= (1u << (s - 1)); slot = s; }
++            break;
++        }
++        case 10:                                            /* Disable Slot */
++            if (slot == 0 || slot > XHCI_MAX_SLOTS) cc = CC_TRB_ERROR;
++            else if (!(x->slot_mask & (1u << (slot - 1)))) cc = CC_SLOT_NOT_EN;
++            else x->slot_mask &= ~(1u << (slot - 1));
++            break;
++        default:                                            /* X3+ commands */
++            cc = CC_TRB_ERROR;
++            break;
++        }
++        ev_post(x, at, cc << 24, (33u << 10) | (slot << 24));
++    }
++}
++
+ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+     if (off < X_CAP_LEN) {
+         switch (off) {
+@@ -201,9 +344,13 @@ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+ }
+ 
+ static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
++    (void)val;
+     if (off < X_CAP_LEN) return;                /* capability space is RO */
+     if (off >= X_RTSOFF && off < X_DBOFF) { rt_write(x, off - X_RTSOFF, val); return; }
+-    if (off >= X_DBOFF) return;                 /* doorbells: X2 rings the engine */
++    if (off >= X_DBOFF) {                       /* doorbells */
++        if (off == X_DBOFF) cmd_process(x);     /* DB0: command ring (X2) */
++        return;                                 /* slot DBs: X3/X4 */
++    }
+     op_write(x, off - X_CAP_LEN, val);
+ }
+ 
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index 10b277a..bddb422 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -224,6 +224,182 @@ static void v_guest_init(void) {
+     if (fails == f0) printf("ok guest init replay: steps 1-11 complete, 0 devices (X1 state)\n");
+ }
+ 
++/* ================= X2: command ring engine =============================
++ * The fixture programs the controller exactly as xhci_init does (XHCI_PLAN
++ * section 1a) and submits commands with the guest's own discipline: TRB
++ * written with the current cycle, Link TRB rewritten at the wrap, event
++ * consumed + ERDP|EHB written back after each command. */
++#define DCBAA_ADDR 0x00030000u
++#define CMDRING    0x00040000u
++#define EVTRING    0x00041000u
++#define ERST_ADDR  0x00042000u
++#define DB0        (XHCI_BAR + 0x1000u)
++
++static void ram_wr32(uint32_t a, uint32_t v) { mem_write(&M, a, 4, v); }
++static uint32_t ram_rd32(uint32_t a) { return (uint32_t)mem_read(&M, a, 4); }
++
++static int t_cmd_idx, t_cmd_cycle, t_ev_idx, t_ev_cycle;
++
++static void hc_program(int maxslots) {
++    for (uint32_t a = DCBAA_ADDR; a < DCBAA_ADDR + 0x1000; a += 4) ram_wr32(a, 0);
++    for (uint32_t a = CMDRING; a < CMDRING + 0x1000; a += 4) ram_wr32(a, 0);
++    for (uint32_t a = EVTRING; a < EVTRING + 0x1000; a += 4) ram_wr32(a, 0);
++    for (uint32_t a = ERST_ADDR; a < ERST_ADDR + 0x100; a += 4) ram_wr32(a, 0);
++    ram_wr32(CMDRING + 255 * 16 + 0, CMDRING);                       /* Link TRB */
++    ram_wr32(CMDRING + 255 * 16 + 12, (6u << 10) | (1u << 1) | 1u);  /* type|TC|cycle */
++    ram_wr32(ERST_ADDR + 0, EVTRING);
++    ram_wr32(ERST_ADDR + 8, 256);
++    wr32(OP(0x38), (uint32_t)maxslots);                              /* CONFIG */
++    wr32(OP(0x30), DCBAA_ADDR); wr32(OP(0x34), 0);                   /* DCBAAP */
++    wr32(OP(0x18), CMDRING | 1u); wr32(OP(0x1C), 0);                 /* CRCR|RCS */
++    wr32(RT(0x28), 1);                                               /* ERSTSZ */
++    wr32(RT(0x30), ERST_ADDR); wr32(RT(0x34), 0);                    /* ERSTBA */
++    wr32(RT(0x38), EVTRING); wr32(RT(0x3C), 0);                      /* ERDP */
++    wr32(RT(0x20), 2u); wr32(RT(0x24), 0);                           /* IMAN.IE, IMOD */
++    wr32(OP(0x00), 4u | 1u);                                         /* INTE|RUN */
++    t_cmd_idx = 0; t_cmd_cycle = 1; t_ev_idx = 0; t_ev_cycle = 1;
++}
++static void hc_reset_program(int maxslots) {
++    wr32(OP(0x00), 2u);                                              /* HCRST */
++    hc_program(maxslots);
++}
++
++/* one guest-shaped submit + consume; ev[] gets the raw event TRB */
++static uint32_t t_last_cmd_addr;
++static void cmd_submit(uint32_t flags, uint32_t ev[4]) {
++    uint32_t base = CMDRING + (uint32_t)t_cmd_idx * 16;
++    t_last_cmd_addr = base;
++    ram_wr32(base + 0, 0); ram_wr32(base + 4, 0); ram_wr32(base + 8, 0);
++    ram_wr32(base + 12, flags | (uint32_t)t_cmd_cycle);
++    t_cmd_idx++;
++    if (t_cmd_idx >= 255) {
++        ram_wr32(CMDRING + 255 * 16 + 0, CMDRING);
++        ram_wr32(CMDRING + 255 * 16 + 12, (6u << 10) | (1u << 1) | (uint32_t)t_cmd_cycle);
++        t_cmd_idx = 0;
++        t_cmd_cycle ^= 1;
++    }
++    wr32(DB0, 0);
++    uint32_t eb = EVTRING + (uint32_t)t_ev_idx * 16;
++    for (int i = 0; i < 4; i++) ev[i] = ram_rd32(eb + 4 * (uint32_t)i);
++    t_ev_idx++;
++    if (t_ev_idx >= 256) { t_ev_idx = 0; t_ev_cycle ^= 1; }
++    wr32(RT(0x38), (EVTRING + (uint32_t)t_ev_idx * 16) | 0x8u);      /* ERDP|EHB */
++    wr32(RT(0x3C), 0);
++}
++#define EV_CC(ev)    (((ev)[2] >> 24) & 0xFFu)
++#define EV_TYPE(ev)  (((ev)[3] >> 10) & 0x3Fu)
++#define EV_SLOT(ev)  (((ev)[3] >> 24) & 0xFFu)
++#define EV_CYCLE(ev) ((ev)[3] & 1u)
++#define TRB_CMD(type) ((uint32_t)(type) << 10)
++
++/* ---- v_cmd_noop: round-trip + IP/EINT latch ---------------------------- */
++static void v_cmd_noop(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    cmd_submit(TRB_CMD(23) | (1u << 5) /* IOC */, ev);
++    EXPECT(EV_TYPE(ev) == 33, "completion event type 33 (got %u)", EV_TYPE(ev));
++    EXPECT(EV_CC(ev) == 1, "No Op cc=1 (got %u)", EV_CC(ev));
++    EXPECT(ev[0] == CMDRING && ev[1] == 0, "event param = command TRB addr");
++    EXPECT(EV_CYCLE(ev) == 1, "event cycle = producer cycle 1");
++    EXPECT(EV_SLOT(ev) == 0, "No Op completion slot 0");
++    /* submit one more without consuming through the helper to see the latch */
++    ram_wr32(CMDRING + 1 * 16 + 12, TRB_CMD(23) | 1u);
++    wr32(DB0, 0);
++    EXPECT(rd32(RT(0x20)) & 1u, "IMAN.IP set after an unconsumed event");
++    EXPECT(rd32(OP(0x04)) & (1u << 3), "USBSTS.EINT mirrors IP");
++    EXPECT(rd32(RT(0x38)) & 0x8u, "ERDP.EHB reads set while pending");
++    wr32(RT(0x38), (EVTRING + 2 * 16) | 0x8u); wr32(RT(0x3C), 0);    /* consume it */
++    EXPECT(!(rd32(RT(0x20)) & 1u), "ERDP|EHB write clears IP");
++    EXPECT(!(rd32(OP(0x04)) & (1u << 3)), "EINT clears with IP");
++    if (fails == f0) printf("ok cmd noop: cc=1 round-trip, param echo, IP/EINT latch + EHB clear\n");
++}
++
++/* ---- v_cmd_wrap: 256 No Ops across a ring wrap (the guest U1 gate) ----- */
++static void v_cmd_wrap(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    int ok = 0;
++    for (int i = 0; i < 256; i++) {
++        uint32_t ev[4];
++        int want_cycle = t_ev_cycle;
++        cmd_submit(TRB_CMD(23) | (1u << 5), ev);
++        if (EV_TYPE(ev) != 33 || EV_CC(ev) != 1) break;
++        if (ev[0] != t_last_cmd_addr) break;
++        if ((int)EV_CYCLE(ev) != want_cycle) break;
++        ok++;
++    }
++    EXPECT(ok == 256, "256/256 No Ops across a ring wrap (got %d)", ok);
++    /* and the ring still works after the wrap */
++    uint32_t ev[4];
++    cmd_submit(TRB_CMD(23), ev);
++    EXPECT(EV_CC(ev) == 1 && ev[0] == t_last_cmd_addr, "ring alive after wrap");
++    if (fails == f0) printf("ok cmd wrap: 256/256 No Ops, params+cycles exact\n");
++}
++
++/* ---- v_enable_slot: allocate / free / reuse / refuse ------------------- */
++static void v_enable_slot(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_CC(ev) == 1 && EV_SLOT(ev) == 1, "Enable Slot -> 1 (cc=%u slot=%u)", EV_CC(ev), EV_SLOT(ev));
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_SLOT(ev) == 2, "Enable Slot -> 2");
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_SLOT(ev) == 3, "Enable Slot -> 3");
++    cmd_submit(TRB_CMD(10) | (2u << 24), ev);
++    EXPECT(EV_CC(ev) == 1 && EV_SLOT(ev) == 2, "Disable Slot 2 ok");
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_SLOT(ev) == 2, "Enable Slot reuses first free (2)");
++    cmd_submit(TRB_CMD(10) | (2u << 24), ev);
++    EXPECT(EV_CC(ev) == 1, "Disable Slot 2 again ok");
++    cmd_submit(TRB_CMD(10) | (2u << 24), ev);
++    EXPECT(EV_CC(ev) == 11, "Disable of disabled slot -> cc 11 Slot Not Enabled (got %u)", EV_CC(ev));
++    cmd_submit(TRB_CMD(10) | (0u << 24), ev);
++    EXPECT(EV_CC(ev) == 5, "Disable slot 0 -> cc 5 TRB Error (got %u)", EV_CC(ev));
++    cmd_submit(TRB_CMD(10) | (33u << 24), ev);
++    EXPECT(EV_CC(ev) == 5, "Disable slot 33 -> cc 5 (got %u)", EV_CC(ev));
++    /* CONFIG.MaxSlotsEn=1 gates allocation (No Slots Available, cc 9) */
++    hc_reset_program(1);
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_CC(ev) == 1 && EV_SLOT(ev) == 1, "MaxSlotsEn=1: first Enable ok");
++    cmd_submit(TRB_CMD(9), ev);
++    EXPECT(EV_CC(ev) == 9, "MaxSlotsEn=1: second Enable -> cc 9 (got %u)", EV_CC(ev));
++    if (fails == f0) printf("ok slots: alloc/free/reuse, cc 11/5 refusals, CONFIG gate cc 9\n");
++}
++
++/* ---- v_cmd_unknown + stopped: honest refusals, ring survives ----------- */
++static void v_cmd_unknown(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    cmd_submit(TRB_CMD(11) | (1u << 24), ev);        /* Address Device: X3 */
++    EXPECT(EV_CC(ev) == 5, "X3 command in X2 -> cc 5 TRB Error (got %u)", EV_CC(ev));
++    cmd_submit(TRB_CMD(23), ev);
++    EXPECT(EV_CC(ev) == 1, "ring keeps working after a refused command");
++    /* a TRB the consumer does not own yet (cycle flipped) is left alone */
++    uint32_t base = CMDRING + (uint32_t)t_cmd_idx * 16;
++    ram_wr32(base + 12, TRB_CMD(23) | (uint32_t)(t_cmd_cycle ^ 1));
++    uint32_t eb = EVTRING + (uint32_t)t_ev_idx * 16;
++    wr32(DB0, 0);
++    EXPECT((ram_rd32(eb + 12) & 1u) != (uint32_t)t_ev_cycle, "unowned TRB not consumed");
++    ram_wr32(base + 12, TRB_CMD(23) | (uint32_t)t_cmd_cycle);       /* hand it over */
++    wr32(DB0, 0);
++    EXPECT((ram_rd32(eb + 12) & 1u) == (uint32_t)t_ev_cycle, "owned TRB consumed on next doorbell");
++    /* doorbell while stopped: nothing moves */
++    hc_reset_program(32);
++    ram_wr32(CMDRING + 12, TRB_CMD(23) | 1u);
++    wr32(OP(0x00), 0);                                               /* stop */
++    wr32(DB0, 0);
++    EXPECT((ram_rd32(EVTRING + 12) & 1u) == 0, "no event while RUN=0");
++    wr32(OP(0x00), 4u | 1u);                                         /* run again */
++    wr32(DB0, 0);
++    EXPECT((ram_rd32(EVTRING + 12) & 1u) == 1, "event lands once running");
++    EXPECT(((ram_rd32(EVTRING + 8) >> 24) & 0xFFu) == 1, "and it is the queued No Op");
++    if (fails == f0) printf("ok cmd edges: X3 refusal cc5, cycle ownership, stopped doorbell\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -236,6 +412,10 @@ int main(void) {
+     v_interrupter();
+     v_doorbell();
+     v_guest_init();
++    v_cmd_noop();
++    v_cmd_wrap();
++    v_enable_slot();
++    v_cmd_unknown();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

@@ -34,4 +34,11 @@ void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at 
 /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
 uint16_t usb_msc_be16(const uint8_t *p);
 
+/* XHCI X4: the shared MSC stick's transfer engine (devices.c usb_serve,
+ * U1-U5).  ctl selects the per-controller BOT state (0 EHCI, 1 UHCI,
+ * 2 XHCI) -- one stick instance per controller, as UHCI/EHCI already
+ * do.  pid: 0 OUT, 1 IN, 2 SETUP.  Returns bytes moved into the guest
+ * buffer for IN transfers. */
+uint32_t usb_stick_serve(machine_t *m, int ctl, int pid, uint32_t total, uint32_t buf);
+
 #endif

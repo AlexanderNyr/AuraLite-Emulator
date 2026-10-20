@@ -1,0 +1,518 @@
+From 382bfc199fcf942699f330e19ab16d8c9051b084 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 17:46:32 +0000
+Subject: [PATCH] XHCI X4: bulk + interrupt transfer rings
+
+Bulk endpoints (EP context type 2 OUT / 6 IN) execute Normal-TRB
+chains on their doorbell: CH-linked TRBs stream through the U1-U5
+mass-storage model and the chain completes with exactly one Transfer
+Event, as the guest issues it (xhci.c:1636-1727 -- IOC on the last
+TRB only). A short IN chain stops serving further TRBs and completes
+cc 13 Short Packet with byte residue; OUT chains take their bytes.
+Direction is the endpoint type (Normal TRBs carry none).
+
+The BOT engine in devices.c gains an exported front door,
+usb_stick_serve(m, ctl, pid, total, buf) in devices.h, with ctl
+selecting per-controller state (0 EHCI, 1 UHCI, 2 XHCI -- a new third
+instance, snapshot-tagged dev.usb.bot.xhci). The guest's BOT dialogue
+is three bulk transfers (CBW OUT 31, data, CSW IN 13), so xHCI now
+answers TEST UNIT READY, INQUIRY, READ CAPACITY and READ(10)/(12)
+byte-identically to the EHCI/UHCI lanes, inherited limits included
+(medium-absent FAILED, PHASE on a malformed CBW, no WRITE opcodes).
+Endpoint dequeue pointers are mirrored into the output contexts.
+
+Interrupt endpoints follow the guest's non-blocking poll contract
+(xhci.c:1731-1868): it arms one Normal TRB and treats "no event" as
+the idle answer. This machine has no HID device model on any bus
+(the keyboard is PS/2), so an interrupt TRB stays armed and
+unconsumed -- NAK, never a fabricated report -- while the other
+endpoints keep answering; isochronous TRBs likewise remain queued
+(the guest's isoch lane is U9, our X5+ ledger).
+
+tests/test_xhci.c gains two groups (19 total): a full BOT dialogue
+against a known 8-sector image (TUR absent/present, INQUIRY vendor,
+READ CAPACITY geometry, a 2-sector READ(10) across a CH chain with
+the single-event property asserted, short-read cc13 + CSW residue
+agreement, malformed-CBW PHASE) and the armed-interrupt contract.
+NC: src/xhci.c reverted to X3 -> 32 failures. Gates: make test,
+make test-sanitize, both SeaBIOS ISO lanes green.
+---
+ CHANGELOG.md            |  25 ++++++
+ ROADMAP.md              |   5 +-
+ docs/STATUS.md          |  13 +++
+ docs/plans/XHCI_PLAN.md |  32 +++++++-
+ src/devices.c           |  10 +++
+ src/devices.h           |   7 ++
+ src/xhci.c              |  68 +++++++++++++++-
+ tests/test_xhci.c       | 171 ++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 325 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9f3e7b4..677e2be 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,31 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0080 (XHCI X4: bulk + interrupt transfers)
++
++- **The stick now speaks BOT over xHCI**: bulk endpoints run
++  Normal-TRB chains (CH on all but the last, IOC on the last, one
++  Transfer Event per chain -- the guest's exact issue pattern)
++  against the U1–U5 mass-storage model, which gained an exported
++  front door, `usb_stick_serve(m, ctl, pid, total, buf)` in
++  `devices.h`, plus a third per-controller BOT state
++  (snapshot-tagged `dev.usb.bot.xhci`). Direction comes from the
++  endpoint context; a short IN chain completes cc 13 with the byte
++  residue, OUT chains take their bytes. The guest's three BOT phases
++  (CBW, data, CSW) land as three transfers, so INQUIRY / READ
++  CAPACITY / READ(10) / TEST UNIT READY behave byte-identically to
++  the EHCI and UHCI lanes -- including FAILED without medium, PHASE
++  on a malformed CBW, and CSW residues that agree with the event's.
++- **Interrupt rings without fiction**: the guest's HID path arms one
++  TRB and polls non-blockingly, where "no event" is the idle answer.
++  This machine has no HID device model on any bus (keyboard is PS/2),
++  so an armed interrupt TRB stays armed -- NAK semantics, never a
++  fabricated zero report -- while the rest of the controller keeps
++  working. The vector pins that contract.
++- **Vectors**: two new groups (19 total) drive a full BOT dialogue
++  sector-for-sector against a known disk image. NC: engine reverted
++  to X3 -> 32 failures.
++
+ ### Added — patch 0079 (XHCI X3: contexts + EP0 control transfers)
+ 
+ - **Slots become devices**: Address Device (11) consumes the guest's
+diff --git a/ROADMAP.md b/ROADMAP.md
+index eb66df0..62e0a9b 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -36,7 +36,7 @@ maps to exactly one plan below.
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+-| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X3 done ✅; X4 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
++| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0–X4 done ✅; X5 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -102,7 +102,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    sticks byte-identical x2, matrix determinism). Each phase: measured
+    receipts, vectors, one NC, full gates, one patch. **In progress: X0
+    (`0076`) + X1 register file (`0077`) + X2 command ring (`0078`)
+-   + X3 contexts/EP0 (`0079`) shipped; X4 queued**.
++   + X3 contexts/EP0 (`0079`) + X4 bulk/interrupt (`0080`) shipped;
++   X5 (interrupter/ports close-out) queued**.
+ 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index fb38ae2..efa619a 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -905,6 +905,19 @@
+   Reset + Set-Dequeue recovery. NC (engine at X2) red with 39 failures.
+   Gates: `make test`, `make test-sanitize`, both SeaBIOS ISO lanes
+   green.
++- XHCI X4 (`patches/0080-XHCI-X4-bulk-interrupt.patch`): bulk and
++  interrupt transfer rings. A Normal-TRB chain (CH/IOC discipline as
++  the guest issues it) runs against the shared MSC stick through a new
++  exported front door, `usb_stick_serve` (`devices.h`), with its own
++  third BOT state (snapshot-tagged `dev.usb.bot.xhci`) -- the guest's
++  three BOT phases map onto three transfers; vectors pin TUR
++  medium-present/absent, INQUIRY, READ CAPACITY, a 2-sector READ(10)
++  across a chain under exactly one event, short-read cc13 + CSW
++  residue agreement, and the PHASE-error CSW for a malformed CBW.
++  Interrupt endpoints follow the guest's non-blocking poll contract:
++  the machine has no HID model on any bus, so an armed interrupt TRB
++  NAKs forever (no fabricated reports) while EP0 keeps answering. NC
++  (engine at X3) red with 32 failures. Gates green as usual.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/XHCI_PLAN.md b/docs/plans/XHCI_PLAN.md
+index 5281a0d..25f6133 100644
+--- a/docs/plans/XHCI_PLAN.md
++++ b/docs/plans/XHCI_PLAN.md
+@@ -7,7 +7,7 @@
+ > slot addressing, endpoint contexts). The machine has UHCI + EHCI only;
+ > a class 0x0C/0x03/prog-if 0x30 scan of bus 0 finds nothing today.
+ 
+-**Status: X0–X3 done ✅; X4 queued**
++**Status: X0–X4 done ✅; X5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -15,7 +15,7 @@
+ | X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ✅ done | `src/xhci.c` + `tests/test_xhci.c` (9 groups) (`patches/0077`) |
+ | X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ✅ done | `tests/test_xhci.c` X2 groups (13 total) (`patches/0078`) |
+ | X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ✅ done | `tests/test_xhci.c` X3 groups (17 total) (`patches/0079`) |
+-| X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ⬜ queued | bulk/interrupt vectors + stick receipts |
++| X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ✅ done | `tests/test_xhci.c` X4 groups (19 total) (`patches/0080`) |
+ | X5 | Interrupter + ports + close-out: IMAN/IMOD/ERST/ERDP, EINT/PCD, INTx delivery, hotplug (CSC / Port Status Change events), determinism x2, guest receipts where artifacts exist | ⬜ queued | close-out + docs |
+ 
+ Each phase ships one `.patch` under `patches/` with measured receipts, a
+@@ -249,6 +249,34 @@ receipt.
+   reaches the built-in device -- port presence (CCS) joins in X5.
+ - NC: `src/xhci.c` reverted to X2 → 39 failures.
+ 
++## 1h. X4 measured receipts (bulk + interrupt)
++
++- **Bulk shape** (guest xhci.c:1636–1727): a transfer is a Normal-TRB
++  chain -- <= 64 KiB chunks, no 64 KiB boundary crossing, **CH on all
++  but the last, IOC on the last only** -> exactly one Transfer Event
++  per chain. Direction is the endpoint context type (2 OUT / 6 IN);
++  Normal TRBs have no direction bit. Residue discipline identical to
++  control (cc13-believed only). BOT runs as three such transfers:
++  CBW (OUT 31), data phase, CSW (IN 13).
++- **Shared stick**: `devices.c`'s BOT engine (`usb_serve`, U1–U5) got a
++  public front door `usb_stick_serve(m, ctl, pid, total, buf)` with a
++  third BOT state instance (EHCI/UHCI keep theirs); it is snapshot-
++  tagged `dev.usb.bot.xhci`. Vectors drive the real thing: TUR
++  without medium -> CSW FAILED, with medium -> OK; INQUIRY vendor
++  "AURALITE"; READ CAPACITY 7+512; READ(10) of 2 sectors through a
++  2-TRB CH chain (one event asserted), pattern exact; short READ at
++  the image end -> cc13 residue 512 *and* CSW residue 512; malformed
++  CBW signature -> CSW PHASE. The stick's limits are inherited as-is
++  by design (no WRITE opcodes -- it answers FAILED like everywhere).
++- **Interrupt**: the guest arms one Normal TRB and polls non-blockingly
++  (xhci.c:1731–1868) -- no event means "nothing yet", and a zero-filled
++  completion is exactly the forgery U2 deleted from the guest.  This
++  machine has no HID device model on *any* bus (the keyboard is PS/2),
++  so an interrupt TRB stays armed forever: no event, not consumed,
++  other endpoints unaffected.  Vector pins that contract rather than
++  inventing reports.
++- NC: `src/xhci.c` reverted to X3 → 32 failures.
++
+ ## 2. Architecture decisions (X1)
+ 
+ - **PCI identity**: 1b36:000d, rev 01, class 0x0C/0x03/0x30, subsystem
+diff --git a/src/devices.c b/src/devices.c
+index 109f0a4..4e74271 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -635,6 +635,15 @@ typedef struct {
+ 
+ static uhci_t g_uhci;
+ 
++/* XHCI X4 (src/xhci.c): its BOT state, served through the same stick
++ * engine -- exported via devices.h for the xHCI bulk rings. */
++static bot_state_t g_bot_xhci;
++
++uint32_t usb_stick_serve(machine_t *m, int ctl, int pid, uint32_t total, uint32_t buf) {
++    bot_state_t *st = ctl == 2 ? &g_bot_xhci : ctl == 1 ? &g_uhci.bot : &g_st.bot;
++    return usb_serve(m, st, pid, total, buf);
++}
++
+ /* The stick sits behind the shared connector: both the EHCI port and its
+  * UHCI companion see the one image (single-device model, two host sides --
+  * the guest's scan order (UHCI first, measured) binds MSC to the UHCI
+@@ -1480,6 +1489,7 @@ void devices_snap(machine_t *m, snap_t *s) {
+     { ehci_t t = g_ehci; if (!snap_loading(s)) { t.regs = NULL; t.m = NULL; } snap_bytes(s, "dev.ehci", &t, sizeof t);
+       if (snap_loading(s)) { t.regs = g_ehci.regs; t.m = g_ehci.m; g_ehci = t; } }
+     snap_bytes(s, "dev.usb.bot", &g_st, sizeof g_st);
++    snap_bytes(s, "dev.usb.bot.xhci", &g_bot_xhci, sizeof g_bot_xhci);
+     { uhci_t t = g_uhci; if (!snap_loading(s)) t.m = NULL; snap_bytes(s, "dev.uhci", &t, sizeof t);
+       if (snap_loading(s)) { t.m = g_uhci.m; g_uhci = t; } }
+     xhci_snap(m, s);   /* XHCI X1 */
+diff --git a/src/devices.h b/src/devices.h
+index 96754e1..7fbec7f 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -34,4 +34,11 @@ void devices_tick(machine_t *m);            /* USB U3: async-schedule sample at
+ /* Decode the big-endian 16-bit fields used by SCSI READ(10). */
+ uint16_t usb_msc_be16(const uint8_t *p);
+ 
++/* XHCI X4: the shared MSC stick's transfer engine (devices.c usb_serve,
++ * U1-U5).  ctl selects the per-controller BOT state (0 EHCI, 1 UHCI,
++ * 2 XHCI) -- one stick instance per controller, as UHCI/EHCI already
++ * do.  pid: 0 OUT, 1 IN, 2 SETUP.  Returns bytes moved into the guest
++ * buffer for IN transfers. */
++uint32_t usb_stick_serve(machine_t *m, int ctl, int pid, uint32_t total, uint32_t buf);
++
+ #endif
+diff --git a/src/xhci.c b/src/xhci.c
+index 6169da3..bbe2ca4 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -11,6 +11,7 @@
+ #include <string.h>
+ #include "xhci.h"
+ #include "pci.h"
++#include "devices.h"        /* X4: usb_stick_serve (shared MSC model) */
+ 
+ /* capability register values (BAR0-relative dword reads) */
+ #define X_CAP_LEN        0x40u
+@@ -657,6 +658,67 @@ static void ep0_process(xhci_t *x, uint32_t slot) {
+     }
+ }
+ 
++/* ==================== X4: bulk transfers =============================
++ * A Normal-TRB chain (CH on all but the last, IOC on the last, ISP set)
++ * runs against the shared MSC stick (usb_stick_serve, ctl 2) and posts
++ * one Transfer Event per chain, as the guest's bulk path expects
++ * (xhci.c:1636-1727).  Direction comes from the endpoint context type
++ * (2 Bulk OUT / 6 Bulk IN) -- Normal TRBs carry no direction bit.  An
++ * IN shortfall ends the chain early with cc 13 and the byte residue,
++ * the only form the guest trusts (it discards residues off cc 13).
++ * Interrupt endpoints have no device behind them on this machine
++ * (there is no HID model on any bus), so their armed TRB simply stays
++ * armed -- NAK, no event -- which is exactly the guest's non-blocking
++ * poll contract (xhci.c:1731-1868): an idle HID poll returns 0. */
++
++static void ep_out_sync(xhci_t *x, uint64_t out, uint32_t epid, const xhci_ep_t *ep) {
++    if (!out) return;
++    uint64_t o = out + (uint64_t)epid * CTX;
++    g_wr32(x, o + 8, (uint32_t)ep->deq | (uint32_t)ep->ccs);
++    g_wr32(x, o + 12, (uint32_t)(ep->deq >> 32));
++}
++
++static void bulk_process(xhci_t *x, uint32_t slot, uint32_t epid) {
++    xhci_ep_t *ep = &x->slots[slot - 1].ep[epid - 1];
++    if (ep->state != 1) return;
++    if (ep->type != 2 && ep->type != 6) return;  /* intr: armed forever; isoch: X5+ */
++    int pid_in = (ep->type == 6);
++    uint64_t out = devctx_base(x, slot);
++    for (int budget = 0; budget < 64 && ep->state == 1; budget++) {
++        uint32_t trb[4];
++        uint64_t last = 0;
++        if (!ep_next(x, ep, trb, &last)) break;
++        if (((trb[3] >> 10) & 0x3Fu) != 1) {    /* not a Normal TRB */
++            tr_event(x, slot, epid, last, CC_TRB_ERROR, 0);
++            continue;
++        }
++        uint32_t len_sum = 0, moved_sum = 0;
++        int short_hit = 0;
++        for (;;) {
++            uint32_t len = trb[2] & 0x1FFFFu;
++            uint64_t buf = (uint64_t)trb[0] | ((uint64_t)trb[1] << 32);
++            len_sum += len;
++            if (!short_hit && len) {
++                uint32_t mv = usb_stick_serve(x->m, 2, pid_in ? 1 : 0, len, (uint32_t)buf);
++                if (pid_in) {
++                    moved_sum += mv;
++                    if (mv < len) short_hit = 1;
++                } else {
++                    moved_sum += len;           /* OUT: device took the bytes */
++                }
++            } else if (!pid_in) {
++                moved_sum += len;
++            }
++            if (!(trb[3] & (1u << 4))) break;   /* !CH: chain end */
++            if (!ep_next(x, ep, trb, &last)) break;     /* half-queued chain */
++            if (((trb[3] >> 10) & 0x3Fu) != 1) { short_hit = 1; break; }
++        }
++        uint32_t cc = (pid_in && moved_sum < len_sum) ? CC_SHORT_PACKET : CC_SUCCESS;
++        tr_event(x, slot, epid, last, cc, len_sum - moved_sum);
++    }
++    ep_out_sync(x, out, epid, ep);
++}
++
+ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+     if (off < X_CAP_LEN) {
+         switch (off) {
+@@ -682,8 +744,10 @@ static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
+         uint32_t slot = (off - X_DBOFF) / 4;
+         uint32_t epid = val & 0xFFu;            /* guest: db_wr(slot, ep) */
+         if ((x->usbcmd & CMD_RUN) && slot >= 1 && slot <= XHCI_MAX_SLOTS
+-            && x->slots[slot - 1].addressed && epid == 1)
+-            ep0_process(x, slot);               /* X3: EP0; bulk/intr X4 */
++            && x->slots[slot - 1].addressed) {
++            if (epid == 1) ep0_process(x, slot);
++            else if (epid >= 2 && epid < 32) bulk_process(x, slot, epid);
++        }
+         return;
+     }
+     op_write(x, off - X_CAP_LEN, val);
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index d2287a7..1f0f2ea 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -604,6 +604,175 @@ static void v_configure_eval(void) {
+     if (fails == f0) printf("ok configure/evaluate: EP2 Running, slot Configured, MPS swap keeps ring\n");
+ }
+ 
++/* ================= X4: bulk (BOT) + interrupt rings ==================== */
++#define OUTRING  0x00048000u
++#define INRING   0x00049000u
++#define INTRRING 0x0004A000u
++#define BOTBUF   0x0004B000u
++#define BOTDATA  0x0004C000u
++
++typedef struct { uint32_t base; int idx, cyc; } tring_t;
++static void tring_init(tring_t *r, uint32_t base) {
++    zero_range(base, 0x1000);
++    ram_wr32(base + 255 * 16 + 0, base);
++    ram_wr32(base + 255 * 16 + 12, (6u << 10) | (1u << 1) | 1u);
++    r->base = base; r->idx = 0; r->cyc = 1;
++}
++static void tring_push(tring_t *r, uint32_t buf, uint32_t len, uint32_t flags) {
++    uint32_t b = r->base + (uint32_t)r->idx * 16;
++    ram_wr32(b + 0, buf); ram_wr32(b + 4, 0); ram_wr32(b + 8, len);
++    ram_wr32(b + 12, flags | (uint32_t)r->cyc);
++    r->idx++;
++    if (r->idx >= 255) {
++        ram_wr32(r->base + 255 * 16 + 0, r->base);
++        ram_wr32(r->base + 255 * 16 + 12, (6u << 10) | (1u << 1) | (uint32_t)r->cyc);
++        r->idx = 0;
++        r->cyc ^= 1;
++    }
++}
++#define NORMAL_FLAGS(ioc, ch) ((1u << 10) | (1u << 2) | /* ISP */ \
++                               ((ioc) ? (1u << 5) : 0) | ((ch) ? (1u << 4) : 0))
++
++static void cfg_ep(uint32_t slot, uint32_t epid, uint32_t type, uint32_t ring,
++                   uint32_t mps, uint32_t entries, uint32_t ev[4]) {
++    zero_range(INCTX, 0x400);
++    ram_wr32(INCTX + 4, (1u << epid) | 1u);
++    ram_wr32(INCTX + 32 + 0, (3u << 20) | (entries << 27));
++    ram_wr32(INCTX + 32 + 4, (1u << 16));
++    uint32_t e = INCTX + (1 + epid) * 32;
++    ram_wr32(e + 4, (3u << 1) | (type << 3) | (mps << 16));
++    ram_wr32(e + 8, ring | 1u);
++    ram_wr32(e + 16, mps);
++    cmd_submit_p(TRB_CMD(12) | (slot << 24), INCTX, 0, ev);
++}
++
++static tring_t r_out, r_in;
++static uint32_t g_slot;
++static void bot_cbw(uint32_t tag, uint32_t xlen, uint8_t flags,
++                    const uint8_t *cb, int cblen, uint32_t ev[4]) {
++    zero_range(BOTBUF, 64);
++    ram_wr32(BOTBUF + 0, 0x43425355u);                /* 'USBC' */
++    ram_wr32(BOTBUF + 4, tag);
++    ram_wr32(BOTBUF + 8, xlen);
++    mem_write(&M, BOTBUF + 12, 1, flags);
++    mem_write(&M, BOTBUF + 14, 1, (uint32_t)cblen);
++    for (int i = 0; i < cblen; i++) mem_write(&M, BOTBUF + 15 + i, 1, cb[i]);
++    tring_push(&r_out, BOTBUF, 31, NORMAL_FLAGS(1, 0));
++    wr32(DBS(g_slot), 2);
++    next_event(ev);
++}
++static void bot_data_in(uint32_t len, uint32_t ev[4]) {
++    tring_push(&r_in, BOTDATA, len, NORMAL_FLAGS(1, 0));
++    wr32(DBS(g_slot), 3);
++    next_event(ev);
++}
++static void bot_csw(uint32_t tag, uint32_t status, uint32_t residue, uint32_t ev[4]) {
++    zero_range(BOTDATA, 16);
++    bot_data_in(13, ev);
++    EXPECT(EV_CC(ev) == 1, "CSW transfer cc=1");
++    EXPECT(ram_rd32(BOTDATA) == 0x53425355u, "CSW signature USBS");
++    EXPECT(ram_rd32(BOTDATA + 4) == tag, "CSW tag echoed");
++    EXPECT(ram_rd32(BOTDATA + 8) == residue, "CSW residue %u (got %u)", residue, ram_rd32(BOTDATA + 8));
++    EXPECT(rd8(BOTDATA + 12) == status, "CSW status %u (got %u)", status, rd8(BOTDATA + 12));
++}
++
++/* ---- v_bulk_bot: the shared MSC stick over Normal-TRB chains ---------- */
++static uint8_t img[8 * 512];
++static void v_bulk_bot(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    g_slot = do_address(ev);
++    tring_init(&r_out, OUTRING);
++    tring_init(&r_in, INRING);
++    cfg_ep(g_slot, 2, 2, OUTRING, 512, 2, ev);        /* bulk OUT */
++    EXPECT(EV_CC(ev) == 1, "bulk OUT configured");
++    cfg_ep(g_slot, 3, 6, INRING, 512, 3, ev);         /* bulk IN */
++    EXPECT(EV_CC(ev) == 1, "bulk IN configured");
++    /* no medium: TEST UNIT READY fails honestly end-to-end */
++    static const uint8_t tur[6] = { 0x00, 0, 0, 0, 0, 0 };
++    bot_cbw(0xA0, 0, 0x00, tur, 6, ev);
++    EXPECT(EV_CC(ev) == 1 && EV_EP(ev) == 2, "CBW transfer event on EP2");
++    bot_csw(0xA0, 1 /* FAILED */, 0, ev);
++    /* medium attached */
++    for (int s = 0; s < 8; s++)
++        for (int i = 0; i < 512; i++) img[s * 512 + i] = (uint8_t)(0x10 + s);
++    img[510] = 0x55; img[511] = 0xAA;
++    M.disk = img; M.disk_len = sizeof img;
++    bot_cbw(0xA1, 0, 0x00, tur, 6, ev);
++    bot_csw(0xA1, 0, 0, ev);
++    /* INQUIRY */
++    static const uint8_t inq[6] = { 0x12, 0, 0, 0, 36, 0 };
++    bot_cbw(0xA2, 36, 0x80, inq, 6, ev);
++    bot_data_in(36, ev);
++    EXPECT(EV_CC(ev) == 1 && EV_RES(ev) == 0, "INQUIRY data exact");
++    char vend[9] = { 0 };
++    for (int i = 0; i < 8; i++) vend[i] = (char)rd8(BOTDATA + 8 + i);
++    EXPECT(strcmp(vend, "AURALITE") == 0, "INQUIRY vendor (got %.8s)", vend);
++    bot_csw(0xA2, 0, 0, ev);
++    /* READ CAPACITY(10) */
++    static const uint8_t cap[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++    bot_cbw(0xA3, 8, 0x80, cap, 10, ev);
++    bot_data_in(8, ev);
++    EXPECT(rd8(BOTDATA + 3) == 7 && rd8(BOTDATA + 6) == 0x02, "last LBA 7, 512-byte blocks");
++    bot_csw(0xA3, 0, 0, ev);
++    /* READ(10) LBA2, 2 blocks, as one CH-chained transfer: ONE event */
++    static const uint8_t rd2[10] = { 0x28, 0, 0, 0, 0, 2, 0, 0, 2, 0 };
++    bot_cbw(0xA4, 1024, 0x80, rd2, 10, ev);
++    tring_push(&r_in, BOTDATA, 512, NORMAL_FLAGS(0, 1) /* CH, no IOC */);
++    tring_push(&r_in, BOTDATA + 512, 512, NORMAL_FLAGS(1, 0));
++    wr32(DBS(g_slot), 3);
++    next_event(ev);
++    EXPECT(EV_CC(ev) == 1 && EV_RES(ev) == 0, "chained READ cc=1");
++    EXPECT((ram_rd32(EVTRING + (uint32_t)t_ev_idx * 16 + 12) & 1u) != (uint32_t)t_ev_cycle,
++           "one event for the whole chain");
++    EXPECT(rd8(BOTDATA) == 0x12 && rd8(BOTDATA + 511) == 0x12 &&
++           rd8(BOTDATA + 512) == 0x13 && rd8(BOTDATA + 1023) == 0x13,
++           "both sectors streamed across the chain");
++    bot_csw(0xA4, 0, 0, ev);
++    /* short data phase: last sector only, 2 asked -> cc13 + CSW residue */
++    static const uint8_t rd_short[10] = { 0x28, 0, 0, 0, 0, 7, 0, 0, 2, 0 };
++    bot_cbw(0xA5, 1024, 0x80, rd_short, 10, ev);
++    bot_data_in(1024, ev);
++    EXPECT(EV_CC(ev) == 13 && EV_RES(ev) == 512, "short READ -> cc13 residue 512 (cc=%u res=%u)",
++           EV_CC(ev), EV_RES(ev));
++    EXPECT(rd8(BOTDATA) == 0x17, "sector 7 content arrived");
++    bot_csw(0xA5, 0, 512, ev);
++    /* malformed CBW -> PHASE error CSW (the shared model's verdict) */
++    zero_range(BOTBUF, 64);
++    ram_wr32(BOTBUF, 0xDEADBEEFu);
++    ram_wr32(BOTBUF + 4, 0xA6);
++    tring_push(&r_out, BOTBUF, 31, NORMAL_FLAGS(1, 0));
++    wr32(DBS(g_slot), 2);
++    next_event(ev);
++    bot_csw(0xA6, 2 /* PHASE */, 0, ev);
++    M.disk = NULL; M.disk_len = 0;
++    if (fails == f0) printf("ok bulk BOT: TUR/INQUIRY/CAP/READ over chains, short+phase honest\n");
++}
++
++/* ---- v_interrupt_idle: an armed TRB with no source stays armed -------- */
++static void v_interrupt_idle(void) {
++    int f0 = fails;
++    hc_reset_program(32);
++    uint32_t ev[4];
++    g_slot = do_address(ev);
++    tring_init(&r_in, INTRRING);
++    cfg_ep(g_slot, 5, 7 /* interrupt IN */, INTRRING, 8, 5, ev);
++    EXPECT(EV_CC(ev) == 1, "interrupt IN configured");
++    /* the guest's HID arm: one TRB + doorbell, non-blocking expectation */
++    tring_push(&r_in, BOTDATA, 8, NORMAL_FLAGS(1, 0));
++    wr32(DBS(g_slot), 5);
++    EXPECT((ram_rd32(EVTRING + (uint32_t)t_ev_idx * 16 + 12) & 1u) != (uint32_t)t_ev_cycle,
++           "no event for an endpoint nobody talks on (NAK)");
++    wr32(DBS(g_slot), 5);
++    EXPECT((ram_rd32(EVTRING + (uint32_t)t_ev_idx * 16 + 12) & 1u) != (uint32_t)t_ev_cycle,
++           "TRB still armed after a second doorbell");
++    /* and the rest of the controller is unaffected */
++    GET_DESC(g_slot, 1, 0, 18, ev);
++    EXPECT(EV_CC(ev) == 1 && EV_EP(ev) == 1, "EP0 answers while the intr TRB waits");
++    if (fails == f0) printf("ok interrupt: armed TRB NAKs forever without a source, no fake reports\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -624,6 +793,8 @@ int main(void) {
+     v_control_desc();
+     v_control_stall();
+     v_configure_eval();
++    v_bulk_bot();
++    v_interrupt_idle();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

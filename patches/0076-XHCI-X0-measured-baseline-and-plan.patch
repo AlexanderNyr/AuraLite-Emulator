@@ -1,0 +1,347 @@
+From 8bf0edc7e478fec0b01632b5ad4c6015ed8f3441 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Mon, 19 Oct 2026 19:35:57 +0000
+Subject: [PATCH] XHCI X0: measured baseline + docs/plans/XHCI_PLAN.md
+
+Phase X0 of the plan the 2026-10-19 audit names first (the north-star
+USB 3.0 host controller). Docs-only; the baseline is measured, not
+assumed.
+
+The device contract is read out of the driver that must run on the
+machine -- AuraLite-OS@main drivers/usb/xhci.c (90 KB, real
+command/event/transfer rings): the class 0x0C/0x03/0x30 probe with
+legacy INTx (PCI cfg 0x3C; no MSI), the CAPLENGTH/HCSPARAMS/
+HCCPARAMS/DBOFF/RTSOFF register map, the exact 11-step bring-up
+(halt -> HCRST -> CNR -> CONFIG -> DCBAA/scratchpads -> CRCR with a
+cycle-carrying Link TRB -> ERST/IMAN/IMOD -> port power -> INTE|RUN ->
+INTx registration -> PORTSC scan with strict RW1C discipline), the
+command/event/transfer TRB set (No Op .. Set TR Dequeue; the guest
+polls the event ring after the doorbell, so deterministic synchronous
+completion is contract-legal), and the guest receipt strings the X5
+lane pins.
+
+QEMU identity measured (docs/specs/pci-ids + lspci): qemu-xhci =
+1b36:000d rev 01, prog-if 30. Our machine today: no xHCI-class
+function on bus 0 (baseline receipt: the guest prints "[xhci] no xHCI
+controller found"); the defect ledger D1-D7 maps to phases X1
+(register file) .. X5 (interrupter/ports/close-out).
+
+Gates: make test rc=0, both SeaBIOS ISO lanes green (docs-only change;
+the phase boundary rule stands). STATUS/ROADMAP/CHANGELOG updated in
+this commit; patch 0076 follows.
+---
+ CHANGELOG.md            |  20 ++++
+ ROADMAP.md              |   4 +-
+ docs/STATUS.md          |  20 ++++
+ docs/plans/XHCI_PLAN.md | 215 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 258 insertions(+), 1 deletion(-)
+ create mode 100644 docs/plans/XHCI_PLAN.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c6e51d6..7670499 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,26 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0076 (XHCI X0: measured baseline + plan)
++
++- **`docs/plans/XHCI_PLAN.md`**: the plan for the north-star USB 3.0
++  host controller (audit 2026-10-19 candidate #1), phases X0–X5. The X0
++  baseline is measured, not assumed: the full device contract is read
++  out of the driver that must run on it (AuraLite-OS@main
++  `drivers/usb/xhci.c`) -- the class 0x0C/0x03/0x30 probe with legacy
++  INTx (cfg 0x3C; no MSI needed), the capability/operational/runtime/
++  doorbell/port register map, the exact 11-step bring-up (HCRST/CNR,
++  DCBAA + scratchpads, CRCR with a cycle-carrying Link TRB, ERST/
++  IMAN/IMOD, port power, INTE|RUN, RW1C-strict PORTSC scan), the
++  command/event/transfer TRB set (No Op .. Set TR Dequeue; completion
++  polled after the doorbell, so deterministic synchronous completion is
++  contract-legal), and the guest receipt strings the X5 lane pins.
++  QEMU identity measured (`docs/specs/pci-ids`): `qemu-xhci` =
++  1b36:000d rev 01, prog-if 30. Our machine today has no xHCI-class
++  function (baseline receipt: the guest prints `[xhci] no xHCI
++  controller found`); defect ledger D1–D7 maps to phases X1 (register
++  file) – X5 (interrupter/ports/close-out).
++
+ ### Added — patch 0075 (FPU F4: integration gates -- the plan closes)
+ 
+ - **`--kernel=` freestanding x87 payload receipts pair (determinism x2)**:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 69e2e3b..8447912 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -36,6 +36,7 @@ maps to exactly one plan below.
+ | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
++| [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | 🚧 **IN PROGRESS** (X0 done ✅; X1 queued) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -99,7 +100,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    (the MSC path already exists); X4 USB2/USB3 protocol-speed and port
+    routing (EHCI-companion coexistence); X5 end-to-end + hardening (both
+    sticks byte-identical x2, matrix determinism). Each phase: measured
+-   receipts, vectors, one NC, full gates, one patch.
++   receipts, vectors, one NC, full gates, one patch. **Started: X0
++   shipped (`patches/0076`)**.
+ 2. **MSI_PLAN (M0–M4)** — the modern interrupt model real OSes prefer:
+    M0 baseline (who would use it: AHCI/e1000/xHCI capabilities); M1 PCI
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3930a72..1b215bd 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -836,6 +836,26 @@
+   test-sanitize`, diff-fuzz 512/12 288 all-match, both SeaBIOS ISO
+   lanes green. The plan is closed.
+ 
++- XHCI X0 (`patches/0076-XHCI-X0-measured-baseline-and-plan.patch`, plan:
++  `docs/plans/XHCI_PLAN.md`): the measured baseline for the plan the
++  2026-10-19 audit names first. The contract is measured from the driver
++  that must run on the machine -- AuraLite-OS@main `drivers/usb/xhci.c`
++  (90 KB, real command/event/transfer rings): class 0x0C/0x03/0x30 probe
++  with **legacy INTx** (cfg 0x3C, no MSI), the CAPLENGTH/HCSPARAMS/
++  HCCPARAMS/DBOFF/RTSOFF reads, the 11-step bring-up (halt -> HCRST ->
++  CNR -> CONFIG -> DCBAA/scratchpads -> CRCR with a cycle-carrying Link
++  TRB -> ERST/IMAN/IMOD -> port power -> INTE|RUN -> INTx registration
++  -> PORTSC scan with strict RW1C discipline), the TRB/command/event set
++  (No Op .. Set TR Dequeue; the guest polls the event ring after the
++  doorbell, so deterministic synchronous completion is legal), and the
++  receipt strings X5 pins. QEMU identity measured: `qemu-xhci` =
++  **1b36:000d** rev 01 (prog-if 30). Our machine today: no class
++  0x0C/0x03/0x30 function on bus 0 -- the baseline receipt is the
++  guest's `[xhci] no xHCI controller found`; defect ledger D1-D7 mapped
++  to phases X1-X5 (register file -> command ring -> contexts/control ->
++  bulk/interrupt -> interrupter/ports/close-out). Docs-only; gates
++  unchanged green.
++
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+ - G2 brought the BIOS path to AuraLite Stage 2 after correcting the real-mode
+diff --git a/docs/plans/XHCI_PLAN.md b/docs/plans/XHCI_PLAN.md
+new file mode 100644
+index 0000000..ded89ff
+--- /dev/null
++++ b/docs/plans/XHCI_PLAN.md
+@@ -0,0 +1,215 @@
++# XHCI Plan — a real USB 3.0 host controller
++
++> Companion to `ROADMAP.md` (audit 2026-10-19 candidate #1) and to the
++> closed `docs/plans/USB_PLAN.md` (EHCI U3 + UHCI U4). The north star
++> names xHCI: AuraLite OS speaks UHCI/OHCI/EHCI/xHCI and drives all four
++> from `drivers/usb/xhci.c` (90 KB -- real command/event/transfer rings,
++> slot addressing, endpoint contexts). The machine has UHCI + EHCI only;
++> a class 0x0C/0x03/prog-if 0x30 scan of bus 0 finds nothing today.
++
++**Status: X0 done ✅; X1 queued**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| X0 | Measured baseline: the guest contract, the QEMU identity, our topology, the defect ledger | ✅ done | this file (`patches/0076`) |
++| X1 | PCI + register file: identity/BAR/MMIO map, capability + operational + runtime + doorbell + port registers, HCRST/CNR handshake, port power + RW1C discipline | ⬜ queued | `tests/test_xhci.c` register-file vectors |
++| X2 | Command ring engine: CRCR/Link/cycle discipline, No Op round-trip + ring wrap, Enable/Disable Slot, Command Completion events | ⬜ queued | command-ring gates |
++| X3 | Contexts + Address Device + EP0 control transfers: DCBAA/slot/EP contexts (CSZ=0), SETUP/DATA/STATUS stages, Transfer Events, Evaluate/Configure/Reset/Stop + Set TR Dequeue | ⬜ queued | control-transfer vectors |
++| X4 | Bulk + interrupt transfers through the shared device model (the U1–U5 MSC/HID sticks) | ⬜ queued | bulk/interrupt vectors + stick receipts |
++| X5 | Interrupter + ports + close-out: IMAN/IMOD/ERST/ERDP, EINT/PCD, INTx delivery, hotplug (CSC / Port Status Change events), determinism x2, guest receipts where artifacts exist | ⬜ queued | close-out + docs |
++
++Each phase ships one `.patch` under `patches/` with measured receipts, a
++regression vector, one once-per-phase negative control, green gates and
++the docs update in the same commit (the `ROADMAP.md` standing rules).
++
++## 1. Measured baseline (X0)
++
++### 1a. The guest contract (AuraLite-OS@main `drivers/usb/xhci.c` + `xhci.h`)
++
++Everything the machine must model, measured from the driver that must
++run on it. Line numbers refer to that file (90,246 bytes, fetched
++2026-10-19).
++
++**Probe** (xhci.c:443–468): bus-0 scan for class 0x0C / subclass 0x03 /
++prog-if 0x30 -- any vendor/device; `pci_enable_bus_master`; BAR0 mapped
++64 KiB (`paging_map` per 4 KiB page), 64-bit BARs accepted (BAR type
++0x4 -> BAR1 is the upper dword). No vendor/device filtering at all, so
++the PCI identity is free -- we take QEMU's (see 1b). Interrupt: PCI cfg
++`0x3C` line registered through `irq_register_handler` (xhci.c:688–698)
++-- **legacy INTx, not MSI**; a line >= 16 degrades to a 500 ms hotplug
++poll.
++
++**Capability registers** (xhci.c:43–68, 492–508) -- offsets from BAR0:
++
++| off | reg | fields the guest consumes |
++|-----|-----|---------------------------|
++| 0x00 | CAPLENGTH / HCIVERSION | one dword read (`cap_rd32(0)`); CAPLENGTH in bits 7:0 -> op base; HCIVERSION in bits 31:16, printed `%x.%02x` |
++| 0x04 | HCSPARAMS1 | MaxSlots 7:0, MaxIntrs 15:8, MaxPorts 31:24 ("QEMU's xHCI uses bits 24-31 for MaxPorts") |
++| 0x08 | HCSPARAMS2 | scratchpad lo 19:15 + hi 25:21 (10-bit count) |
++| 0x0C | HCSPARAMS3 | read, unused |
++| 0x10 | HCCPARAMS1 | AC64 bit0, CSZ bit2 (0 = 32-byte contexts), PPC bit3 |
++| 0x14 | DBOFF | doorbell array base |
++| 0x18 | RTSOFF | runtime base |
++| 0x1C | HCCPARAMS2 | read, unused |
++
++**Operational registers** (xhci.c:78–109, at BAR0+CAPLENGTH): USBCMD
++0x00 (RUN bit0, HCRST bit1, INTE bit2), USBSTS 0x04 (HCH bit0, EINT
++bit3 RW1C, PCD bit4, CNR bit11), PAGESIZE 0x08, DNCTRL 0x14, CRCR 0x18
++(RCS bit0, CS bit1, CA bit2, CRR bit3; pointer bits 63:3), DCBAAP 0x30
++(64-bit), CONFIG 0x38 (MaxSlotsEn 7:0).
++
++**Ports** (xhci.c:125–149, 324–329): PORTSC at op+0x400, stride 0x10.
++Bits consumed: CCS0, PED1, OCA3, PR4, PLS 8:5, PP9, SPEED 13:10
++(1=FS 2=LS 3=HS 4=SS), LWS16, CSC17, PEC18, WRC19, OCC20, PRC21, PLC22,
++CEC23, WCE25, WDE26, WOE27, DR30, WPR31. The driver is strict about
++RW1C: change bits (CSC/PEC/WRC/OCC/PRC/PLC/CEC) must clear on write-1
++and must never be acknowledged accidentally (xhci.c:712–727).
++
++**Runtime / interrupter 0** (xhci.c:113–120, 645–650): IMAN 0x20 (IP
++bit0 RW1C, IE bit1), IMOD 0x24, ERSTSZ 0x28, ERSTBA 0x30 (64-bit),
++ERDP 0x38 (64-bit). Interrupter *n* at 0x20 + 0x20*n*.
++
++**Init sequence** (xhci.c:517–747) -- the exact bring-up the machine
++must survive:
++
++1. USBCMD=0, wait USBSTS.HCH;
++2. USBCMD=HCRST, wait HCRST clear (1e6 spin budget);
++3. wait USBSTS.CNR clear after reset;
++4. CONFIG=MaxSlotsEn;
++5. DCBAA = (MaxSlots+1)*8 bytes (entry 0 = scratchpad array);
++6. scratchpads if HCSPARAMS2 says so;
++7. DCBAAP lo/hi written as two dwords (DMA below 4 GiB);
++8. command ring: 1 page (256 TRBs), Link TRB at [255] carrying the
++   *current* cycle + TC (the guest's own U1 fix); CRCR = ring_phys|RCS(1);
++9. event ring: 1 page (256 TRBs) + ERST[0] {addr_lo, addr_hi, size=256};
++   interrupter 0: ERSTSZ=1, ERSTBA lo/hi, ERDP lo/hi, IMAN=IE, IMOD=0;
++10. port power: write PP to every port regardless of PPC (RW1C-safe
++    single-bit write), 20 ms settle;
++11. USBCMD=INTE|RUN; wake enables WCE|WDE on every port (RW1C-safe);
++    register the INTx line; wait HCH clear ("controller running");
++    100 ms settle; PORTSC scan (CCS/SPEED) acknowledging change bits
++    deliberately.
++
++**Rings and TRBs** (xhci.c:172–206, 842–1010): 16-byte TRBs, type in
++bits 15:10 of the spec Control dword, cycle bit 0. The guest's struct
++names (`param,status,control,flags`) sit at spec offsets 0/4/8/12 --
++its `flags` field IS the spec Control dword. Commands used: No Op (23),
++Enable Slot (9), Disable Slot (10), Address Device (11), Configure
++Endpoint (12), Evaluate Context (13), Reset Endpoint (15), Set TR
++Dequeue (16); events: Command Completion (33, slot id in the Control
++dword's high byte), Transfer (32), Port Status Change (34); transfer:
++Normal (1), Setup/Data/Status Stage (2/3/4), Isoch (5), Link (6, TC
++bit1). Submission writes the TRB with the current cycle, rings doorbell
++0 (`db_wr(0,0)`) and **polls the event ring** (xhci_poll_event_type) --
++so deterministic synchronous completion at doorbell time is legal and
++the IRQ is only the hotplug/take path (U8). Completion codes: 1 =
++Success; the driver distinguishes "never answered" (its own timeout
++diagnostic) from "answered with cc != 1".
++
++**Receipts** (kprintf strings X5 pins): `[xhci] controller at PCI
++%u:%u.%u`, `[xhci] HCI version %x.%02x, %d ports, %d slots, %d
++scratchpads, 64-bit=%d, context=%d bytes, PPC=%d`, `[xhci] IRQ line %u
++registered (INTE=1, IMAN.IE=1)`, `[xhci] controller running`,
++`[xhci] starting port scan: %d ports`, `[xhci] port %d: device attached
++(%s) (PORTSC=0x%08x)`, `[xhci] %d device(s) ready`, `[xhci] command
++ring: No Op -> Success (cc=1)`, `[xhci] command ring: PASS — 256/256
++No Ops across a ring wrap`, `[xhci] slot %u addressed (root port %u,
++route=0x%05x, tier=%d, ...)`, `[xhci] configured ep 0x%02x slot=%u
++ep_id=%d maxpkt=%u`. The guest's own gates: `test_xhci_control`,
++`test_xhci_bulk` (1 MiB verified pattern), `test_xhci_interrupt`,
++`test_xhci_address`, `test_usb_msc` over xHCI bulk.
++
++### 1b. QEMU identity
++
++`qemu-xhci` is PCI **1b36:000d** ("PCI xhci usb host adapter"; QEMU
++`docs/specs/pci-ids`, `lspci`: "Red Hat, Inc. QEMU XHCI Host Controller
++[1b36:000d] (rev 01) (prog-if 30 [XHCI])"). The guest's QEMU lanes
++(`-device qemu-xhci`) are the X5 parity oracle. The guest never checks
++the identity (class match only), so identity parity costs nothing and
++keeps full-receipt comparisons possible.
++
++### 1c. Our machine today (measured)
++
++PCI topology (`src/devices.c:1287–1421`): 0:0.0 host-bridge 8086:29c0;
++0:1.0 pci-bridge-misc 8086:0101; 0:1.2 UHCI 8086:7020 (0C/03/00);
++0:2.0 igpu 8086:0412; 0:3.0 EHCI 8086:1E26 (0C/03/20); 0:31.0 LPC;
++0:31.2 AHCI 8086:1E03; 0:31.3 AHCI2 8086:2922 (with `--ahci2`). There
++is no xHCI model in `src/` (grep), no class 0x0C/0x03/0x30 function on
++bus 0, and the guest on this machine ends `xhci_init` with
++`[xhci] no xHCI controller found` (xhci.c:464) -- the X0 baseline
++receipt.
++
++### 1d. Defect ledger
++
++| # | Defect (measured absence) | Consequence | Phase |
++|---|---------------------------|-------------|-------|
++| D1 | no PCI function with class 0x0C/0x03/0x30 | probe returns -1, no controller | X1 |
++| D2 | no capability/operational/runtime/doorbell/port register file | nothing to program | X1 |
++| D3 | no HCRST/CNR handshake | init stalls at step 2/3 | X1 |
++| D4 | no command ring engine (CRCR/Link/cycle, doorbell 0) | no command completes | X2 |
++| D5 | no DCBAA / slot / endpoint contexts | no devices addressable | X3 |
++| D6 | no transfer rings / transfer events | no enumeration, no data | X3/X4 |
++| D7 | no interrupter / INTx / Port Status Change events | hotplug dead, U8 receipts impossible | X5 |
++
++## 2. Architecture decisions (X1)
++
++- **PCI identity**: 1b36:000d, rev 01, class 0x0C/0x03/0x30, subsystem
++  1af4:1100 (QEMU receipt parity).
++- **Slot**: 0:14.0 -- the modern Intel xHCI slot; nothing lives there
++  today, and dev/func scan order (used by `pci_find_class_after`) keeps
++  every historical receipt intact.
++- **BAR0**: 64-bit MMIO, 64 KiB window (the guest maps 64 KiB
++  unconditionally). X1 pins a base that cannot collide with AHCI ABAR
++  `0xFEB10000`, AHCI2 `0xFEB12000`, ECAM `0xB0000000`, LAPIC
++  `0xFEE00000` (the kload/ACPI windows publish these).
++- **Capability values** (ours; the guest reads them all dynamically):
++  HCIVERSION 0x0100, CAPLENGTH 0x40; HCSPARAMS1 = MaxSlots 32 |
++  MaxIntrs 1 << 8 | MaxPorts 4 << 24 (guest API bounds are 32/32; one
++  interrupter is all the guest programs); HCSPARAMS2 = 0 (no
++  scratchpads -- the guest skips step 6); HCCPARAMS1 = AC64 (0x1) --
++  CSZ=0 (32-byte contexts), PPC=0 like QEMU (the guest powers ports
++  unconditionally). DBOFF/RTSOFF chosen inside the window and pinned:
++  ops at CAPLENGTH 0x40, ports at op+0x400 (stride 0x10), runtime at
++  0x800 (interrupter 0 only), doorbells at 0x1000 (33 dwords).
++- **Work model**: process rings **at doorbell write** (the AHCI
++  "doorbell" precedent; the guest polls the event ring after ringing,
++  so completion is deterministic at instruction level). The INTx line
++  (cfg 0x3C/0x3D, one dedicated PIC line -- X1 measures the free one)
++  asserts per IMAN.IP & IE & USBCMD.INTE, the e1000 N4 / AHCI S5
++  pattern.
++- **Ports**: 4 root ports in two protocol groups (2x USB2: FS/LS/HS,
++  2x USB3: SS) with the PORTSC.SPEED field per group; the U1–U5 sticks
++  (AURALUSB FS, AURALEHC HS) bind to the USB2 group in the X5 machine
++  shape; SS ports stay empty until a SuperSpeed device model exists
++  (honest emptiness, not a stub).
++- **Determinism**: all xHCI state (slots, ring indices, port regs,
++  IMAN/ERDP) is plain machine state and must ride snapshots byte-stably
++  (the F4 x87-file lesson: no run-dependent bytes anywhere in the raw
++  dump).
++
++## 3. Definition of done (every phase)
++
++1. Measured first: host probe or a guest-contract line ref in the
++   receipts table above; nothing is claimed from assumption.
++2. Fix + regression vector in the same patch; one once-per-phase
++   negative control (revert the phase's core change, watch its vectors
++   redden).
++3. `make test` and `make test-sanitize` green; historical lanes
++   byte-identical.
++4. No guest-visible contract changes outside this plan's rows.
++5. Docs (this file's status row + `docs/STATUS.md` + `CHANGELOG.md`) in
++   the same commit; one `.patch` per phase under `patches/`.
++
++## 4. Test gate
++
++- `tests/test_xhci.c` (in `make test-unit` and `make test-sanitize`):
++  X1 register-file vectors (identity, caps, HCRST/CNR, RW1C discipline,
++  port power), X2 command-ring vectors (No Op cc=1, 256/256 wrap,
++  Enable/Disable Slot), X3 context/control vectors, X4 bulk/interrupt
++  vectors.
++- Integration: a `tests/integration/` lane (X5) running the xHCI
++  machine shape end to end with determinism x2 and the guest receipts
++  above; SKIP-gated on the frozen AuraLite-OS KERNEL/INITRD artifacts
++  like every other guest lane.
++- NC per phase (once): `git revert`-style removal of the phase's core
++  change reddens that phase's vectors.
+-- 
+2.47.3
+
