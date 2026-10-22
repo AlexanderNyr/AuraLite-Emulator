@@ -33,6 +33,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess  # used by open_state_dir (was missing: latent NameError)
 import sys
 import time
 import tkinter as tk
@@ -177,15 +178,19 @@ class MonitorClient:
         self.sock = None
         self.buf = b""
 
-    def connect(self, port, timeout=5.0):
+    def connect(self, port, timeout=5.0, token=None):
         s = socket.create_connection(("127.0.0.1", int(port)), timeout=timeout)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        req = ("GET /ws HTTP/1.1\r\n"
+        # UPKEEP U7: present the per-run monitor capability the Machine
+        # handed the emulator in its environment; the token in the path
+        # is the monitor's simplest carrier for a raw-socket client.
+        path = "/ws?token=%s" % token if token else "/ws"
+        req = ("GET %s HTTP/1.1\r\n"
                "Host: 127.0.0.1:%d\r\n"
                "Upgrade: websocket\r\n"
                "Connection: Upgrade\r\n"
                "Sec-WebSocket-Key: %s\r\n"
-               "Sec-WebSocket-Version: 13\r\n\r\n" % (port, key))
+               "Sec-WebSocket-Version: 13\r\n\r\n" % (path, port, key))
         s.sendall(req.encode("ascii"))
         buf = b""
         while b"\r\n\r\n" not in buf:
@@ -724,6 +729,33 @@ class App:
             "8080/8081/8082 (AURALITE_TAP_PORT) — см. docs/plans/NET_PLAN.md.")).pack(
             anchor="w", pady=8)
 
+        # UPKEEP U7: the remote-access credential for the web launcher,
+        # managed here in the GUI -- no terminal is ever needed to see or
+        # rotate it. Plaintext-transport warning included on purpose.
+        tokbox = ttk.LabelFrame(self.tab_net, text="Удалённый доступ (веб-GUI)",
+                                padding=6)
+        tokbox.pack(fill="x", pady=(8, 2))
+        row = ttk.Frame(tokbox)
+        row.pack(fill="x")
+        ttk.Label(row, text="Токен доступа:").pack(side="left")
+        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir)
+        self.access_token_var = tk.StringVar(value=tok)
+        ttk.Entry(row, textvariable=self.access_token_var, width=52,
+                  state="readonly").pack(side="left", padx=4)
+        ttk.Button(row, text="Копировать",
+                   command=self.on_copy_access_token).pack(side="left")
+        ttk.Button(row, text="Заменить токен",
+                   command=self.on_rotate_access_token).pack(side="left", padx=4)
+        ttk.Label(tokbox, foreground="#666", wraplength=640, justify="left",
+                  text=("Нужен, когда веб-GUI (launcher) запущен на сетевом адресе "
+                        "вне этого компьютера: вводится один раз на странице входа. "
+                        "Замена подействует при следующем старте веб-GUI. Внимание: "
+                        "соединение веб-GUI не шифруется (HTTP) — токен пересекает "
+                        "сеть открытым текстом; не открывайте доступ в недоверенных "
+                        "сетях. Доступ только с этого компьютера токен не требует — "
+                        "он встроен в страницу автоматически.")).pack(
+                  anchor="w", pady=4)
+
     def _build_log_tab(self):
         bar = ttk.Frame(self.tab_log)
         bar.pack(fill="x")
@@ -913,7 +945,8 @@ class App:
         if not port:
             return
         try:
-            self.mon.connect(port, timeout=1.0)
+            self.mon.connect(port, timeout=1.0,
+                             token=self.machine.monitor_token)
         except OSError:
             return
         self.badge_mon.configure(text="монитор: на связи", bg="#2f7d32")
@@ -1146,6 +1179,25 @@ class App:
     def on_tap_stop(self):
         self.machine.responder_stop()
         self.tap_status.configure(text="респондер остановлен")
+
+    # -- UPKEEP U7: remote-access credential (see _build_net_tab) --------
+    def on_copy_access_token(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.access_token_var.get())
+        self.status.configure(text="токен доступа скопирован в буфер обмена")
+
+    def on_rotate_access_token(self):
+        if not messagebox.askokcancel(
+                APP_TITLE,
+                "Создать новый токен удалённого доступа?\n\n"
+                "Старый токен перестанет приниматься при следующем старте "
+                "веб-GUI; браузеры, где он уже введён, попросят новый."):
+            return
+        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir,
+                                                           force_new=True)
+        self.access_token_var.set(tok)
+        self.status.configure(
+            text="токен доступа заменён (подействует при следующем старте веб-GUI)")
 
     def open_state_dir(self):
         try:

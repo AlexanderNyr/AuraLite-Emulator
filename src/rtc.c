@@ -13,11 +13,16 @@
 #define RTC_UIE 0x10                /* register B bit4 */
 #define RTC_PFBIT 0x40              /* register C bit6: periodic flag   */
 #define RTC_PIE 0x40                /* register B bit6: periodic enable */
+#define RTC_SET 0x80                /* register B bit7: inhibit update  */
+#define RTC_DM  0x04                /* register B bit2: 1=binary, 0=BCD */
+#define RTC_24H 0x02                /* register B bit1: 1=24h, 0=12h    */
+#define RTC_EPOCH_2026 1767225600LL /* 2026-01-01 00:00:00 UTC          */
 
 static uint8_t bin2bcd(unsigned v) { return (uint8_t)((v / 10 << 4) | (v % 10)); }
 
 void rtc_init(machine_t *m) {
     memset(&m->rtc, 0, sizeof m->rtc);
+    m->rtc.base_sec = RTC_EPOCH_2026;   /* U1: the pinned power-on epoch */
     m->rtc.instr_per_tick = PIT_DEFAULT_IPT; /* K7: stay pinned to the PIT pin
                                               * (12->384): one coherent virtual
                                               * CPU frequency across time sources */
@@ -65,7 +70,8 @@ void rtc_tick(machine_t *m) {
     m->rtc.ticks += m->rtc.accum / m->rtc.instr_per_tick;
     m->rtc.accum %= m->rtc.instr_per_tick;
     uint64_t after = m->rtc.ticks / RTC_TICKS_PER_SEC;
-    if (after != before) {                    /* seconds boundary: update-ended */
+    if (after != before && !(m->rtc.ram[0x0B] & RTC_SET)) {
+        /* seconds boundary: update-ended (inhibited in SET mode, U1) */
         m->rtc.flags_c |= RTC_UFBIT;
         if (m->rtc.ram[0x0B] & RTC_UIE) {
             m->rtc.flags_c |= RTC_IRQFBIT;
@@ -98,9 +104,12 @@ static unsigned mdays(unsigned y, unsigned mo) {
 }
 
 /* Civil fields of "committed" virtual time: the MC146818 update phase
- * keeps showing the PREVIOUS second while UIP is up. Also reports UIP. */
+ * keeps showing the PREVIOUS second while UIP is up. Also reports UIP.
+ * U1: absolute time is base_sec (Unix seconds) + the tick count, so a
+ * guest-set date before the 2026 power-on anchor is representable. */
 static void rtc_civil(machine_t *m, unsigned *sec, unsigned *min, unsigned *hr,
-                      unsigned *day, unsigned *mon, unsigned *yr, int *uip) {
+                      unsigned *dow, unsigned *day, unsigned *mon,
+                      unsigned *yr, int *uip) {
     uint64_t t = m->rtc.ticks;
     uint64_t s = t / RTC_TICKS_PER_SEC;
     uint64_t in_sec = t % RTC_TICKS_PER_SEC;
@@ -108,13 +117,86 @@ static void rtc_civil(machine_t *m, unsigned *sec, unsigned *min, unsigned *hr,
      * UIP_TICKS ticks of each second (after the very first one), and the
      * clock commits when the window closes */
     *uip = t >= RTC_TICKS_PER_SEC ? in_sec < RTC_UIP_TICKS : 0;
-    uint64_t committed = (*uip && s > 0) ? s - 1 : s;
+    uint64_t committed = (uint64_t)m->rtc.base_sec + s;
+    if (*uip && committed > 0) committed--;
     *sec = (unsigned)(committed % 60); committed /= 60;
     *min = (unsigned)(committed % 60); committed /= 60;
     *hr  = (unsigned)(committed % 24); committed /= 24;
-    unsigned y = 2026, mo = 1; uint64_t days = committed;
-    while (days >= mdays(y, mo)) { days -= mdays(y, mo); if (++mo > 12) { mo = 1; y++; } }
+    uint64_t days = committed;
+    *dow = 1 + (unsigned)((4 + days) % 7);      /* 1970-01-01: Thursday */
+    unsigned y = 1970;
+    while (days >= 365u + (unsigned)leap(y)) { days -= 365u + (unsigned)leap(y); y++; }
+    unsigned mo = 1;
+    while (days >= mdays(y, mo)) { days -= mdays(y, mo); mo++; }
     *day = 1 + (unsigned)days; *mon = mo; *yr = y;
+}
+
+/* Register-B format conversion (DM: 1=binary else BCD; 24H bit). */
+static uint8_t rtc_to_reg(machine_t *m, unsigned v) {
+    return (m->rtc.ram[0x0B] & RTC_DM) ? (uint8_t)v : bin2bcd(v);
+}
+static unsigned rtc_from_reg(machine_t *m, uint8_t v) {
+    if (m->rtc.ram[0x0B] & RTC_DM) return v;
+    return (v >> 4) * 10u + (v & 0x0Fu);
+}
+static uint8_t rtc_hour_to_reg(machine_t *m, unsigned hr24) {
+    if (m->rtc.ram[0x0B] & RTC_24H) return rtc_to_reg(m, hr24);
+    unsigned h = hr24 % 12u ? hr24 % 12u : 12u;
+    return rtc_to_reg(m, h) | (hr24 >= 12u ? 0x80u : 0u);   /* PM bit */
+}
+static unsigned rtc_hour_from_reg(machine_t *m, uint8_t v) {
+    unsigned h = rtc_from_reg(m, v & 0x7Fu);
+    if (!(m->rtc.ram[0x0B] & RTC_24H)) {
+        h %= 12u;
+        if (v & 0x80u) h += 12u;
+    }
+    return h;
+}
+
+/* SET rising edge: snapshot the live date into the register bytes in
+ * the format Register B currently selects (so partial field writes
+ * and an untouched century stay coherent), like QEMU's update of
+ * CMOS to the stopping time.  SET falling edge: parse the staged
+ * bytes under that same (old) format and, if they name a real date,
+ * move base_sec; the sub-second phase is kept.  Invalid fields log
+ * and leave the clock alone rather than manufacturing civil state. */
+static void rtc_seed_staged(machine_t *m) {
+    unsigned sec, min, hr, dow, day, mon, yr; int uip;
+    rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
+    m->rtc.ram[0x00] = rtc_to_reg(m, sec);
+    m->rtc.ram[0x02] = rtc_to_reg(m, min);
+    m->rtc.ram[0x04] = rtc_hour_to_reg(m, hr);
+    m->rtc.ram[0x06] = rtc_to_reg(m, dow);
+    m->rtc.ram[0x07] = rtc_to_reg(m, day);
+    m->rtc.ram[0x08] = rtc_to_reg(m, mon);
+    m->rtc.ram[0x09] = rtc_to_reg(m, yr % 100);
+    m->rtc.ram[0x32] = rtc_to_reg(m, yr / 100);
+}
+
+static void rtc_commit_staged(machine_t *m) {
+    unsigned sec = rtc_from_reg(m, m->rtc.ram[0x00]);
+    unsigned min = rtc_from_reg(m, m->rtc.ram[0x02]);
+    unsigned hr  = rtc_hour_from_reg(m, m->rtc.ram[0x04]);
+    unsigned day = rtc_from_reg(m, m->rtc.ram[0x07]);
+    unsigned mon = rtc_from_reg(m, m->rtc.ram[0x08]);
+    unsigned yr  = rtc_from_reg(m, m->rtc.ram[0x09]);
+    unsigned cen = rtc_from_reg(m, m->rtc.ram[0x32]);
+    unsigned year = cen ? cen * 100u + yr : 2000u + yr;
+    if (sec > 59 || min > 59 || hr > 23 || mon < 1 || mon > 12 ||
+        year < 1970 || year > 9999 || day < 1 || day > mdays(year, mon)) {
+        mlog(&m->log, "[rtc] SET exits with invalid date fields "
+             "(%04u-%02u-%02u %02u:%02u:%02u): clock unchanged",
+             year, mon, day, hr, min, sec);
+        return;
+    }
+    uint64_t days = 0;
+    for (unsigned y = 1970; y < year; y++) days += 365u + (unsigned)leap(y);
+    for (unsigned mo = 1; mo < mon; mo++) days += mdays(year, mo);
+    days += day - 1;
+    m->rtc.base_sec = (int64_t)(days * 86400ull + hr * 3600u + min * 60u + sec);
+    m->rtc.ticks %= RTC_TICKS_PER_SEC;
+    mlog(&m->log, "[rtc] clock set to %04u-%02u-%02u %02u:%02u:%02u UTC",
+         year, mon, day, hr, min, sec);
 }
 
 /* ---------------------------------------------------------------- ports */
@@ -122,25 +204,30 @@ static void rtc_civil(machine_t *m, unsigned *sec, unsigned *min, unsigned *hr,
 static uint32_t rtc_data_read(machine_t *m) {
     rtc_tick(m);
     unsigned sel = m->rtc.idx & 0x7F;
-    unsigned sec, min, hr, day, mon, yr; int uip;
+    int setting = (m->rtc.ram[0x0B] & RTC_SET) != 0;
+    unsigned sec, min, hr, dow, day, mon, yr; int uip;
     switch (sel) {
-    case 0x00: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(sec);
-    case 0x02: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(min);
-    case 0x04: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(hr);
-    case 0x06: { /* day of week: 2026-01-01 was a Thursday (5, 1=Sun) */
-        uint64_t t = m->rtc.ticks, s = t / RTC_TICKS_PER_SEC;
-        int u = t >= RTC_TICKS_PER_SEC ? (t % RTC_TICKS_PER_SEC) < RTC_UIP_TICKS : 0;
-        if (u && s > 0) s--;                      /* same commit rule */
-        return 1 + (uint8_t)((4 + s / 86400) % 7); }
-    case 0x07: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(day);
-    case 0x08: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(mon);
-    case 0x09: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(yr % 100);
-    case 0x0A: { rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip);
-                 return (m->rtc.ram[0x0A] & 0x7F) | (uip ? 0x80 : 0); }
+    /* In SET mode the staged register bytes read back verbatim;
+     * otherwise the computed clock in Register B's format. */
+    case 0x00: case 0x02: case 0x04: case 0x06:
+    case 0x07: case 0x08: case 0x09: case 0x32:
+        if (setting) return m->rtc.ram[sel];
+        rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
+        switch (sel) {
+        case 0x00: return rtc_to_reg(m, sec);
+        case 0x02: return rtc_to_reg(m, min);
+        case 0x04: return rtc_hour_to_reg(m, hr);
+        case 0x06: return rtc_to_reg(m, dow);
+        case 0x07: return rtc_to_reg(m, day);
+        case 0x08: return rtc_to_reg(m, mon);
+        case 0x09: return rtc_to_reg(m, yr % 100);
+        default:   return rtc_to_reg(m, yr / 100);
+        }
+    case 0x0A: { rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
+                 return (m->rtc.ram[0x0A] & 0x7F) | ((uip && !setting) ? 0x80 : 0); }
     case 0x0B: return m->rtc.ram[0x0B];
     case 0x0C: { uint8_t v = m->rtc.flags_c; m->rtc.flags_c = 0; return v; }
     case 0x0D: return 0x80;
-    case 0x32: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(yr / 100);
     default: return m->rtc.ram[sel & 0x7F];
     }
 }
@@ -149,11 +236,20 @@ static void rtc_data_write(machine_t *m, uint8_t v) {
     rtc_tick(m);
     unsigned sel = m->rtc.idx & 0x7F;
     switch (sel) {
-    case 0x00: case 0x02: case 0x04: case 0x06: case 0x07: case 0x08: case 0x09:
-    case 0x0C: case 0x0D: case 0x32:
-        return;                             /* computed/read-only: documented */
+    case 0x0C: case 0x0D:
+        return;                             /* read-only */
     case 0x0A: m->rtc.ram[0x0A] = v & 0x7F; return;   /* UIP is read-only */
-    default:   m->rtc.ram[sel & 0x7F] = v;  return;
+    case 0x0B: {                            /* U1: the SET edges */
+        uint8_t old = m->rtc.ram[0x0B];
+        if ((v & RTC_SET) && !(old & RTC_SET)) {
+            rtc_seed_staged(m);
+            v &= (uint8_t)~RTC_UIE;         /* datasheet: SET clears UIE */
+        } else if (!(v & RTC_SET) && (old & RTC_SET)) {
+            rtc_commit_staged(m);           /* parses under the old format */
+        }
+        m->rtc.ram[0x0B] = v;
+        return; }
+    default:   m->rtc.ram[sel & 0x7F] = v;  return;   /* dates stage here */
     }
 }
 

@@ -398,7 +398,10 @@ function toast(msg, err){const t=$('#toast');t.textContent=msg;t.className='toas
   clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast', err?6500:3200);}
 
 async function api(path, method='GET', body){
-  const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},
+  /* UPKEEP U7: the launcher injects the capability token into this page;
+     every API call and the WS upgrade present it (cookie rides too). */
+  const r=await fetch(path,{method,headers:{'Content-Type':'application/json',
+    'X-X86emu-Token':window.X86EMU_TOKEN||''},
     body: body!==undefined?JSON.stringify(body):undefined});
   let j={};try{j=await r.json()}catch(_e){}
   if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
@@ -462,7 +465,7 @@ function cfgToForm(c){
 /* ---------------- WebSocket (протокол монитора) ---------------- */
 function wsURL(){
   const proto=location.protocol==='https:'?'wss://':'ws://';
-  return proto+location.host+'/ws';
+  return proto+location.host+'/ws?token='+encodeURIComponent(window.X86EMU_TOKEN||'');
 }
 function connectWS(){
   if(ws){try{ws.close()}catch(_e){}}
@@ -606,7 +609,7 @@ async function refreshArtifacts(){
     const a=await api('/api/artifacts');
     $('#artRows').innerHTML=a.entries.map(e=>
       `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
-      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Скачать</button></a></td></tr>`).join('')
+      <td><a href="/api/artifact/${encodeURIComponent(e.name)}?token=${encodeURIComponent(window.X86EMU_TOKEN||'')}"><button class="small">Скачать</button></a></td></tr>`).join('')
       ||'<tr><td colspan="4">— нет файлов —</td></tr>';
   }catch(e){}
 }

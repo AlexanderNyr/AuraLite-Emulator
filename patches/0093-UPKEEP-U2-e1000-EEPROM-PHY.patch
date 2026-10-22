@@ -1,0 +1,688 @@
+From ed6f51019d9a4d486e1d5edd18aa6779c5a83894 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 18:35:28 +0000
+Subject: [PATCH] Upkeep U2: e1000 EEPROM (EERD) + PHY register file (MDIC)
+
+Upkeep U0 measured that EERD (0x14) and MDIC were generic
+storage cells: the frozen guest's EEPROM probe for words 0-2
+polled a DONE bit that could never set -- three 100,000-poll
+timeouts on every probe, with the MAC then arriving from
+RAL/RAH -- and MDIC only echoed the fictional command dword
+to any driver that probed the PHY.
+
+The device now has the hardware behind both registers,
+measured from QEMU hw/net/e1000.c, e1000x_common.c and
+Intel's e1000x_regs.h, per this model's QEMU-parity ground
+rule:
+
+- EEPROM: the 64-word e1000_eeprom_template prepared
+  e1000x_core_prepare_eeprom-style (MAC 52:54:00:12:34:56 in
+  words 0-2, 0x100E in words 11/13, word 0x3F closing the sum
+  to 0xBABA), once at device add.  EERD stores are plain;
+  the read mirrors flash_eerd_read (synchronous DONE on the
+  first poll, unmasked address shift, addresses past 0x3F
+  complete with the stored data field).  The expected guest
+  receipt change is that its probe now names the EEPROM as
+  the MAC source; the address is the same.
+- PHY: a 32-register M88E1000 file at MDIC PHY address 1
+  under QEMU's phy_regcap table, seeded with phy_reg_init
+  (PHYID2 0x0C20 for the 82540EM) at the autonegotiation-
+  done steady state QEMU reaches through its 500ms timer.
+  Our link is permanently up (STATUS.LU from reset), so
+  ANRESTART completes synchronously; no link flap is
+  fabricated.  MDIC mirrors set_mdic branch for branch:
+  READY on every store; ERROR for read-only/unimplemented
+  registers and for a wrong PHY address (echoing the
+  previous MDIC value); BMCR through set_phy_ctrl's mask
+  (RESET/ANRESTART self-clear, the file not reset);
+  INT_EN raises the MDAC cause onto the N4 INTx wire.
+- The MDIC register moved to Intel's offset 0x20; N0's
+  0x200 was a typo no consumer could observe.
+
+The EECD Microwire bit-bang stays a plain register (no
+measured consumer touches it), and machine_t does not move:
+the new state lives in e1000_t and --tap runs already refuse
+snapshots.
+
+Vectors (tests/test_net.c, 2 new groups): the guest's exact
+EERD probe returns the MAC with first-poll DONE; identity
+words; the 64-word 0xBABA sum read back through EERD;
+out-of-range and START-clear behaviour; EEPROM surviving
+CTRL.RST.  MDIC ID/status/template values, RW round-trips,
+OP=0/OP=3 branch order, ERROR paths (read-only,
+unimplemented, wrong PHY with previous-value echo), the
+BMCR mask with the file intact, MDAC onto the INTx pin,
+and reset restoring the PHY template.  All pre-U2 groups
+and the N1/N2/N3 lanes pass unchanged.  NC: e1000.c at U1
+-- behavioural abort at the EERD DONE assert after the full
+100,000-poll timeout.  Gates: make test (incl. network e2e)
+and make test-sanitize green; both SeaBIOS ISO lanes green
+for real.
+---
+ CHANGELOG.md              |  26 +++++
+ docs/STATUS.md            |  16 +++
+ docs/plans/UPKEEP_PLAN.md |  46 ++++++++-
+ src/e1000.c               | 201 +++++++++++++++++++++++++++++++++++++-
+ tests/test_net.c          | 162 +++++++++++++++++++++++++++++-
+ 5 files changed, 443 insertions(+), 8 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f33fbed..e69e2a1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,32 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0093 (Upkeep U2: e1000 EEPROM + PHY)
++
++- **The 82540EM has its EEPROM** (`src/e1000.c`): EERD reads a
++  64-word image (QEMU template; MAC in words 0–2; `0x100E`/
++  `0x8086` identity words; word `0x3F` closes the sum to
++  `0xBABA`) and completes synchronously on the read, like
++  QEMU's `flash_eerd_read`. The guest's EEPROM probe — three
++  100,000-poll timeouts before this patch — now returns the
++  same `52:54:00:12:34:56` on the first poll, so its boot
++  receipt will name the EEPROM as the MAC source instead of
++  RAL/RAH (same address, preferred source).
++- **The PHY answers on MDIC**: a 32-register M88E1000 file at
++  PHY address 1 with QEMU's capability table and
++  `phy_reg_init` values at the autonegotiation-done steady
++  state (PHY ID `0141:0C20`, link up, AN complete), READY/
++  ERROR semantics including the wrong-PHY previous-value
++  echo, `set_phy_ctrl`'s BMCR mask, and the MDAC interrupt
++  cause on the existing INTx wire. MDIC also moved to
++  Intel's real offset `0x20` (was an unobservable `0x200`
++  typo in the N0 define). The EECD bit-bang interface
++  remains a plain register — no measured consumer uses it.
++- 2 new groups in `tests/test_net.c`; NC = e1000.c at
++  patch 0092 (behavioural abort on the EERD DONE assert).
++  Snapshot layout unchanged (new state is device-local;
++  `--tap` runs already refuse snapshots).
++
+ ### Added — patch 0092 (Upkeep U1: settable RTC clock)
+ 
+ - **The MC146818 clock can be set** (`src/rtc.c`): Register B's
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 47806cc..8e60727 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1056,6 +1056,22 @@
+   pre-U1 snapshots are refused by the layout check. NC: rtc at
+   U0 aborts on the first staged readback. Power-on behaviour,
+   UIP phases and periodic IRQ8 are byte-identical canaries.
++- Upkeep U2 (`patches/0093-UPKEEP-U2-e1000-EEPROM-PHY.patch`):
++  the e1000's two storage-cell command registers got their
++  hardware. EERD now reads a real 64-word EEPROM (QEMU
++  template, MAC in words 0–2, 0x100E/0x8086 identity words,
++  0xBABA checksum) with DONE on the first poll — the frozen
++  guest's probe gets the same MAC from the EEPROM and its
++  receipt names that source instead of RAL/RAH. MDIC (offset
++  corrected 0x200 → Intel's 0x20) drives a 32-register
++  M88E1000 PHY at address 1 with QEMU's capability table,
++  READY/ERROR, BMCR mask and the MDAC cause on the INTx wire,
++  seeded at the autonegotiation-done steady state (link here
++  is permanently up). EECD bit-bang stays an honest stub.
++  NC: e1000 at U1 aborts on the EERD DONE assert after the
++  guest's full 100k-poll timeout. `machine_t` does not move:
++  the new state is `e1000_t`-only and `--tap` runs refuse
++  snapshots anyway. N1/N2/N3 network lanes byte-identical.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index bfaaadf..40500ec 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -4,13 +4,13 @@
+ > XHCI, MSI and PM are complete; this plan takes the remaining
+ > site-documented gaps in dependency/risk order.
+ 
+-**Status: U0+U1 done ✅; U2 queued**
++**Status: U0+U1+U2 done ✅; U3 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | U0 | Measured baseline for all seven row-4 items, defect ledger, decisions and phase split | ✅ done | this file (`patches/0091`) |
+ | U1 | RTC: a settable MC146818 clock/calendar without changing the pinned power-on behaviour | ✅ done | `tests/test_rtc.c` vectors (`patches/0092`) |
+-| U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ⬜ queued | `tests/test_net.c` vectors |
++| U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ✅ done | `tests/test_net.c` vectors (`patches/0093`) |
+ | U3 | gdbstub: publish and accept the real x87 register/control state in `g`/`G`/`p`/`P` | ⬜ queued | `tests/test_gdbstub.py` vectors |
+ | U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ⬜ queued | `tests/test_lapic.c` vectors |
+ | U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ⬜ queued | `tests/test_chipset.c` vectors |
+@@ -239,7 +239,7 @@ AuraLite-OS KERNEL/INITRD artifacts.
+ | D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | U4 |
+ | D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | U5 |
+ | D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | ~~U1~~ **resolved in U1** (SET-staged writes commit to `base_sec`; DM/24H govern both directions) |
+-| D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | U2 |
++| D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | ~~U2~~ **resolved in U2** (64-word EEPROM + synchronous DONE; 32-register PHY with cap table, READY/ERROR, MDAC; MDIC offset corrected 0x200 → 0x20) |
+ | D5 | Responder TCP appends/acks payload without sequence validation, sends no SACK and has incomplete duplicate-close states | loss/reordering corrupts the DNS stream and acknowledgement state instead of eliciting retransmission | U6 |
+ | D6 | gdbstub advertises x87 registers but reports zeros/all-empty and ignores writes | FPU debugging displays a machine that is not the one executing | U3 |
+ | D7 | Launcher API, launcher WebSocket proxy and direct monitor are unauthenticated and do not authorize Host/Origin | local cross-origin/process access and any opted-in remote bind get full machine control | U7 |
+@@ -323,6 +323,46 @@ contract includes it; prove device reset restores the template
+ while MAC, RAL/RAH and rings remain consistent. Record the
+ expected guest MAC-source receipt change.
+ 
++**U2 receipts.** Shipped with QEMU's semantics and values
++(measured from `hw/net/e1000.c`, `e1000x_common.c`,
++`e1000x_regs.h`): the 64-word `e1000_eeprom_template` prepared
++`e1000x_core_prepare_eeprom`-style (MAC in words 0–2, device
++id `0x100E` in words 11/13, word `0x3F` closing the image to
++a `0xBABA` sum), prepared once at device add; EERD writes are
++plain stores and the read mirrors `flash_eerd_read` (synchronous
++DONE, unmasked address shift, out-of-range past `0x3F` completes
++with the stored data field). MDIC mirrors `set_mdic` branch for
++branch at PHY address 1 over QEMU's `phy_regcap` table: READY
++on every store, ERROR on read-only/unimplemented accesses and
++for a wrong PHY address (with QEMU's previous-value echo),
++MDAC (`ICR` bit 9) when INT_EN survives — driven onto the N4
++INTx wire. BMCR stores through `set_phy_ctrl`'s mask (RESET /
++ANRESTART / reserved self-clear; the file is not reset, as in
++QEMU). The PHY is seeded at QEMU's post-autonegotiation steady
++state (`phy_reg_init` + BMSR.AN_COMP + ANLPAR.ACK,
++PHYID2=`0x0C20`): QEMU reaches it through a 500 ms virtual
++timer because its link can be down; this model's link is
++permanently up, so ANRESTART completes synchronously and no
++link flap is fabricated. Found and fixed in passing: the N0
++MDIC define was `0x200`; Intel's offset is `0x20` (unobservable
++until now — the register was a storage cell and the guest
++never writes it). The EECD Microwire bit-bang stays a storage
++stub, out of this phase's measured scope (the frozen guest
++never touches EECD). Snapshot strategy is empty by construction:
++new state lives in `e1000_t` (not `machine_t`) and `--tap` runs
++already refuse snapshot save/load, so the layout does not move.
++Expected guest receipt change, recorded in advance: the frozen
++driver's probe now gets `52:54:00:12:34:56` from the EEPROM and
++its serial line names the EEPROM as the MAC source instead of
++RAL/RAH; the value is bit-identical. Two new groups in
++`tests/test_net.c` (EEPROM probe with first-poll DONE +
++checksum + out-of-range + reset survival; MDIC ID/status/RW,
++OP=0/OP=3 branch order, ERROR paths, BMCR mask, MDAC wire,
++reset restores the template); all pre-U2 groups pass
++unmodified, and `make test`'s N1/N2/N3 network lanes are
++unchanged. NC: e1000.c at U1 — behavioural abort at the
++EERD DONE assert after the guest's full 100,000-poll timeout.
++
+ ### U3 — gdbstub x87
+ 
+ Run a known FPU payload to a breakpoint; prove `g` and `p`
+diff --git a/src/e1000.c b/src/e1000.c
+index ff57ba6..80f1129 100644
+--- a/src/e1000.c
++++ b/src/e1000.c
+@@ -3,7 +3,10 @@
+  *   - TAP socket: UDP datagrams = Ethernet frames, the fixed endpoint
+  *     127.0.0.1:8080 (the emulator connects; the host-side responder binds).
+  *   - MAC: the QEMU default 52:54:00:12:34:56, pre-loaded into RAL/RAH like
+- *     QEMU's e1000_reset (RAH.AV set) -- the guest prefers it over EEPROM.
++ *     QEMU's e1000_reset (RAH.AV set) and, since U2, also present in EEPROM
++ *     words 0-2 -- the guest probes the EEPROM first (UPKEEP U0 measured
++ *     three DONE timeouts per probe against the old storage cell), so the
++ *     same address now arrives through its preferred source.
+  *   - The device is OPT-IN (--tap=): no PCI function exists without the
+  *     flag, so every historical lane (K0-K8, firmware, U5 tapes) keeps its
+  *     byte-for-byte receipts.
+@@ -20,7 +23,18 @@
+  * process_tx_desc / txdesc_writeback, and the guest side from
+  * AuraLite-OS@0ed0d29 drivers/e1000/e1000.c e1000_send() (cmd 0x0B =
+  * EOP|IFCS|RS, TDT tail doorbell, spin on status.DD, TDH read back for
+- * the timeout receipt). */
++ * the timeout receipt).
++ *
++ * U2 (UPKEEP_PLAN) gives the two command registers N0 left as storage
++ * cells their hardware behind them: EERD reads a real 64-word EEPROM
++ * (QEMU's template, the device MAC in words 0-2, 0xBABA checksum) with
++ * DONE completing synchronously on the read, and MDIC drives a
++ * 32-register M88E1000 PHY file at PHY address 1 with QEMU's capability
++ * table, READY/ERROR semantics and the MDAC cause.  Values are measured
++ * from QEMU hw/net/e1000.c (set_mdic, flash_eerd_read, phy_reg_init,
++ * e1000_eeprom_template), e1000x_common.c (e1000x_core_prepare_eeprom)
++ * and e1000x_regs.h (bit constants); the guest side is the frozen
++ * driver's EERD probe (words 0-2, DONE poll). */
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -42,12 +56,16 @@
+ #define E1000_CTRL        0x00000
+ #define E1000_STATUS      0x00008
+ #define E1000_EERD        0x00014
++#define E1000_MDIC        0x00020   /* U2: Intel's offset (e1000x_regs.h
++                                     * E1000_MDIC 0x00020).  N0's 0x200 was a
++                                     * typo no consumer could observe: MDIC
++                                     * was a storage cell and the guest
++                                     * never writes it                        */
+ #define E1000_ICR         0x000C0
+ #define E1000_ICS         0x000C8
+ #define E1000_IMS         0x000D0
+ #define E1000_IMC         0x000D8
+ #define E1000_RCTL        0x00100
+-#define E1000_MDIC        0x00200
+ #define E1000_TCTL        0x00400
+ #define E1000_RDBAL       0x02800
+ #define E1000_RDBAH       0x02804
+@@ -82,6 +100,9 @@
+ #define ICR_TXQE          (1u << 7)   /* TX queue empty (QEMU: same bit slot,
+                                        * distinct cause -- start_xmit always
+                                        * raises it, the guest unmasks it)    */
++#define ICR_MDAC          (1u << 9)   /* U2: MDI/O access complete (Intel
++                                       * E1000_ICR_MDAC 0x200; set_mdic raises
++                                       * it when MDIC INT_EN survives)          */
+ #define RXD_STAT_DD       0x01
+ 
+ /* N1: legacy TX descriptor (Intel 8254x SDM, 16 bytes).  lower.data =
+@@ -147,6 +168,12 @@ typedef struct {
+      * pic_set_irq is driven on CHANGE, the AHCI S5 convention -- correct for
+      * both edge- and level-triggered PIC configurations. */
+     int      intx;
++    /* U2: the 64-word EEPROM image behind EERD and the 32-register PHY
++     * file behind MDIC.  Host-side device state only: the e1000 exists
++     * solely in --tap runs (which snapshot save/load refuses) and e1000_t
++     * is not part of machine_t, so the snapshot layout does not move. */
++    uint16_t eeprom[64];
++    uint16_t phy[0x20];
+ } e1000_t;
+ static e1000_t g_e1000;
+ 
+@@ -164,6 +191,161 @@ static void e1000_intx_update(e1000_t *e) {
+     }
+ }
+ 
++/* ===================== U2: EEPROM (EERD) + PHY (MDIC) =====================
++ * Measured from QEMU hw/net/e1000.c + e1000x_common.c (the N0 ground rule
++ * pins this device to QEMU behaviour) with Intel's e1000x_regs.h constants.
++ *
++ * EEPROM: QEMU's e1000_eeprom_template with the device id 0x100E inserted
++ * in words 11/13 and the MAC in words 0-2, closed by the word-0x3F
++ * checksum that makes all 64 words sum to 0xBABA
++ * (e1000x_core_prepare_eeprom).  Like QEMU it is prepared once at device
++ * add, not rebuilt by CTRL.RST -- and nothing can write it: there is no
++ * EEWR, and the EECD Microwire bit-bang stays an honest stub (the frozen
++ * guest probes through EERD and never touches EECD).  An EERD write is a
++ * plain store; the read completes the transaction synchronously
++ * (flash_eerd_read): START set -> DONE with the word in bits 31:16, an
++ * address past the checksum word 0x3F -> DONE with the stored data field,
++ * START clear -> the stored value, so the guest's DONE poll retires on
++ * its first iteration instead of timing out 100,000 times per word.
++ *
++ * PHY: the M88E1000 register file at MDIC PHY address 1, reset to QEMU's
++ * phy_reg_init with PHYID2 = 0x0C20 (E1000_PHY_ID2_8254xx_DEFAULT, the
++ * 82540EM row of QEMU's device table).  QEMU's link can be down, so it
++ * reaches link-up through a 500 ms virtual autonegotiation timer; this
++ * model's link is permanently up (STATUS.LU from reset, RX always live),
++ * so the file is seeded at the steady state that timer settles into
++ * (e1000x_update_regs_on_autoneg_done: BMSR.AN_COMP, ANLPAR.ACK) and a
++ * BMCR.ANRESTART write completes synchronously -- there is no link flap
++ * to observe, and none is fabricated.  MDIC mirrors set_mdic exactly:
++ * READY is set by every store; ERROR for a wrong PHY address (which also
++ * echoes the PREVIOUS MDIC value rather than the rejected command), for
++ * a capability the register does not have (the phy_regcap table), and the
++ * MDAC cause whenever INT_EN survives into the final value.  BMCR stores
++ * through set_phy_ctrl's mask: reserved bits 5:0 and the RESET /
++ * ANRESTART bits self-clear, and QEMU does not reset the register file
++ * on BMCR.RESET, so neither do we. */
++#define EERD_START        (1u << 0)
++#define EERD_DONE         (1u << 4)   /* Intel E1000_EEPROM_RW_REG_DONE 0x10 */
++#define MDIC_OP_WRITE     (1u << 26)
++#define MDIC_OP_READ      (1u << 27)
++#define MDIC_READY        (1u << 28)
++#define MDIC_INT_EN       (1u << 29)
++#define MDIC_ERROR        (1u << 30)
++
++static const uint16_t e1000_eeprom_template[64] = {
++    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000,
++    0x3000, 0x1000, 0x6403, 0x0000, 0x8086, 0x0000, 0x8086, 0x3040,
++    0x0008, 0x2000, 0x7e14, 0x0048, 0x1000, 0x00d8, 0x0000, 0x2700,
++    0x6cc9, 0x3150, 0x0722, 0x040b, 0x0984, 0x0000, 0xc000, 0x0706,
++    0x1008, 0x0000, 0x0f04, 0x7fff, 0x4d01, 0xffff, 0xffff, 0xffff,
++    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++    0x0100, 0x4000, 0x121c, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000,
++};
++
++/* e1000x_core_prepare_eeprom for the one identity this model has: the QEMU
++ * default MAC (the same bytes reset preloads into RAL/RAH -- the two must
++ * never disagree, or the guest's address would depend on which source its
++ * driver happened to ask first) and device id 0x100E. */
++static void e1000_prepare_eeprom(void) {
++    static const uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++    memcpy(g_e1000.eeprom, e1000_eeprom_template,
++           sizeof e1000_eeprom_template);
++    for (int i = 0; i < 3; i++)
++        g_e1000.eeprom[i] =
++            (uint16_t)(mac[2 * i] | ((unsigned)mac[2 * i + 1] << 8));
++    g_e1000.eeprom[11] = g_e1000.eeprom[13] = 0x100E;
++    uint16_t sum = 0;
++    for (int i = 0; i < 0x3F; i++)          /* EEPROM_CHECKSUM_REG */
++        sum = (uint16_t)(sum + g_e1000.eeprom[i]);
++    g_e1000.eeprom[0x3F] = (uint16_t)(0xBABA - sum);   /* EEPROM_SUM */
++}
++
++enum { PHY_R = 1, PHY_W = 2, PHY_RW = PHY_R | PHY_W };
++static const uint8_t e1000_phy_cap[0x20] = {   /* QEMU phy_regcap */
++    [0]  = PHY_RW,    /* BMCR                          */
++    [1]  = PHY_R,     /* BMSR                          */
++    [2]  = PHY_R,     /* PHYID1                        */
++    [3]  = PHY_R,     /* PHYID2                        */
++    [4]  = PHY_RW,    /* ANAR                          */
++    [5]  = PHY_R,     /* ANLPAR                        */
++    [6]  = PHY_R,     /* ANER                          */
++    [9]  = PHY_RW,    /* CTRL1000                      */
++    [10] = PHY_R,     /* STAT1000                      */
++    [16] = PHY_RW,    /* M88E1000_PHY_SPEC_CTRL        */
++    [17] = PHY_R,     /* M88E1000_PHY_SPEC_STATUS      */
++    [20] = PHY_RW,    /* M88E1000_EXT_PHY_SPEC_CTRL    */
++    [21] = PHY_R,     /* M88E1000_RX_ERR_CNTR          */
++};
++
++/* QEMU phy_reg_init at its autonegotiation-done steady state (see the
++ * section comment): BMSR carries AN_COMP and ANLPAR carries ACK over the
++ * raw init values, everything else is the init table verbatim. */
++static const uint16_t e1000_phy_init[0x20] = {
++    [0]  = 0x1140,    /* BMCR: SPEED1000 | FD | AUTOEN                 */
++    [1]  = 0x796D,    /* BMSR: 10/100 caps | EXTSTAT | MFPS | AN_COMP
++                       *       | AUTONEG | LINK_ST | EXTCAP            */
++    [2]  = 0x0141,    /* PHYID1                                        */
++    [3]  = 0x0C20,    /* PHYID2: E1000_PHY_ID2_8254xx_DEFAULT          */
++    [4]  = 0x0DE1,    /* ANAR: pause(+asym) | 100/10 FD+HD | CSMA/CD   */
++    [5]  = 0x41E0,    /* ANLPAR: ACK | 100/10 FD+HD                    */
++    [9]  = 0x0E00,    /* CTRL1000: MASTER | PORT(DTE) | FULL           */
++    [10] = 0x3C00,    /* STAT1000: LOK | ROK | FULL | HALF             */
++    [16] = 0x0360,    /* M88E1000_PHY_SPEC_CTRL                        */
++    [17] = 0xAC00,    /* M88E1000_PHY_SPEC_STATUS                      */
++    [20] = 0x0D60,    /* M88E1000_EXT_PHY_SPEC_CTRL                    */
++};
++
++/* flash_eerd_read: the transaction completes on the read itself.  QEMU
++ * shifts the stored command right by 8 unmasked (data bits a guest wrote
++ * into 31:16 become part of the index and simply land out of range) and
++ * ORs the result over the stored command minus START; both quirks are
++ * kept so a guest sees QEMU's register, not an idealised one. */
++static uint32_t e1000_eerd_read(e1000_t *e) {
++    uint32_t v = e->regs[E1000_EERD / 4];
++    if (!(v & EERD_START))
++        return v;
++    uint32_t r = v & ~EERD_START;
++    unsigned index = r >> 8;                    /* E1000_EEPROM_RW_ADDR_SHIFT */
++    if (index > 0x3Fu)                          /* EEPROM_CHECKSUM_REG */
++        return r | EERD_DONE;
++    return ((uint32_t)e->eeprom[index] << 16) | EERD_DONE | r;
++}
++
++/* set_mdic, branch for branch (see the section comment).  The QEMU op
++ * tests are bit tests in read-then-write order, so OP=2'b11 reads and
++ * OP=2'b00 stores the command untouched apart from READY. */
++static void e1000_set_mdic(e1000_t *e, uint32_t val) {
++    uint32_t data = val & 0xFFFFu;
++    unsigned reg = (val >> 16) & 0x1Fu;         /* MDIC_REG */
++    if (((val >> 21) & 0x1Fu) != 1) {           /* MDIC_PHY: the PHY is #1 */
++        val = e->regs[E1000_MDIC / 4] | MDIC_ERROR;
++    } else if (val & MDIC_OP_READ) {
++        if (!(e1000_phy_cap[reg] & PHY_R))
++            val |= MDIC_ERROR;
++        else
++            val = (val ^ data) | e->phy[reg];
++    } else if (val & MDIC_OP_WRITE) {
++        if (!(e1000_phy_cap[reg] & PHY_W)) {
++            val |= MDIC_ERROR;
++        } else if (reg == 0) {
++            /* set_phy_ctrl: bits 5:0 reserved, RESET (15) and ANRESTART
++             * (9) self-clearing.  QEMU would restart its negotiation
++             * timer on ANRESTART here; this link never goes down, so the
++             * completed state above already IS the restart's outcome. */
++            e->phy[0] = (uint16_t)(data & ~(0x3Fu | (1u << 15) | (1u << 9)));
++        } else {
++            e->phy[reg] = (uint16_t)data;
++        }
++    }
++    e->regs[E1000_MDIC / 4] = val | MDIC_READY;
++    if (val & MDIC_INT_EN) {                    /* QEMU: set_ics(MDAC) */
++        e->regs[E1000_ICR / 4] |= ICR_MDAC;
++        e->regs[E1000_ICS / 4] |= ICR_MDAC;
++        e1000_intx_update(e);
++    }
++}
++
+ static void e1000_reset_regs(void) {
+     memset(g_e1000.regs, 0, sizeof g_e1000.regs);
+     /* N1: the TX assembly state and the wire counters are device state, so a
+@@ -173,6 +355,9 @@ static void e1000_reset_regs(void) {
+     g_e1000.tx_busy = 0;
+     g_e1000.tx_frames = 0;
+     g_e1000.tx_dropped = 0;
++    /* U2: QEMU's e1000_reset reseeds the PHY file; the EEPROM image is
++     * add-time state and survives (e1000_prepare_eeprom). */
++    memcpy(g_e1000.phy, e1000_phy_init, sizeof e1000_phy_init);
+     g_e1000.regs[E1000_STATUS / 4] = STATUS_LU;    /* link up on attach */
+     /* 52:54:00:12:34:56 -> RAL = 0x12005452, RAH = AV | 0x5634 */
+     g_e1000.regs[E1000_RA / 4] = 0x12005452u;
+@@ -317,6 +502,8 @@ uint64_t e1000_mmio_read(void *ctx, uint64_t addr, int size) {
+         e1000_intx_update(e);               /* N4: clearing the cause drops the line */
+         return v;
+     }
++    if (off == E1000_EERD)                  /* U2: completes on the read */
++        return e1000_eerd_read(e);
+     return e->regs[off / 4];
+ }
+ 
+@@ -373,10 +560,15 @@ void e1000_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+         e->regs[E1000_TDT / 4] &= 0xFFFFu;              /* QEMU set_tctl */
+         e1000_start_xmit(e->m);
+         return;
++    case E1000_MDIC:
++        e1000_set_mdic(e, (uint32_t)val);               /* U2: QEMU set_mdic */
++        return;
+     default:
+         break;
+     }
+-    e->regs[off / 4] = (uint32_t)val;       /* RAL/RAH, rings, RCTL, ... */
++    /* RAL/RAH, rings, RCTL, ... and EERD (U2: a plain store like QEMU's
++     * putreg -- the EEPROM transaction completes on the read). */
++    e->regs[off / 4] = (uint32_t)val;
+ }
+ 
+ /* ============================ RX ring ingress ============================== */
+@@ -415,6 +607,7 @@ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len) {
+ static void e1000_add(machine_t *m) {
+     g_e1000.m = m;
+     g_e1000.attached = 1;
++    e1000_prepare_eeprom();   /* U2: QEMU prepares the EEPROM at realize */
+     e1000_reset_regs();
+     /* PCI 8086:100E + the BAR0 register file.  BAR0 is seeded into config
+      * space (the house pattern, cf. EHCI/UHCI/AHCI): the guest maps the
+diff --git a/tests/test_net.c b/tests/test_net.c
+index b47cc3e..606d6d8 100644
+--- a/tests/test_net.c
++++ b/tests/test_net.c
+@@ -5,7 +5,10 @@
+  *   - PCI 8086:100E, BAR0 128 KiB register file;
+  *   - CTRL.RST (bit 26) self-clears after the register reset;
+  *   - RAL/RAH preloaded with the QEMU default MAC 52:54:00:12:34:56
+- *     (RAH.AV set) -- the guest prefers it over EEPROM;
++ *     (RAH.AV set); since U2 the same MAC also sits in EEPROM words
++ *     0-2, the source the guest's probe actually asks first (the N0
++ *     header's "prefers it over EEPROM" measured the fallback order
++ *     backwards -- U0 found EERD first, RAL/RAH only on timeout);
+  *   - RXCSUM reads 0 after reset (QEMU compat);
+  *   - RX ring ingress: frame DMA into the head buffer, DD status, RDH
+  *     advance, ICR.RXT0; RCTL.EN gates the receiver, RDH==RDT drops.
+@@ -22,6 +25,19 @@
+  *   - ICR gets TXDW (bit 0) for RS descriptors and TXQE (bit 7) for every
+  *     completed walk;
+  *   - a frame without CMD.EOP accumulates: no wire, no DD, no TXDW.
++ *
++ * U2 adds the EEPROM + PHY vectors (QEMU hw/net/e1000.c set_mdic /
++ * flash_eerd_read / phy_reg_init, e1000x_core_prepare_eeprom):
++ *   - the guest's exact EERD probe (START | word<<8, DONE poll, data in
++ *     bits 31:16) returns the RAL/RAH MAC from words 0-2 with DONE on
++ *     the first poll, the identity words read 0x100E/0x8086, all 64
++ *     words sum to 0xBABA, out-of-range completes with zero data, and
++ *     CTRL.RST leaves the image alone;
++ *   - MDIC reaches the PHY file at address 1: ID/status/template
++ *     values, RW round-trips, ERROR on read-only / unimplemented /
++ *     wrong-PHY accesses (with QEMU's previous-value echo), the BMCR
++ *     store mask (RESET/ANRESTART self-clear, file not reset), the
++ *     MDAC cause onto the INTx wire, and reset restoring the template.
+  */
+ #include <assert.h>
+ #include <stdint.h>
+@@ -447,6 +463,148 @@ static void test_tx_link_gate(void) {
+     printf("ok e1000 tx link gate + CTRL.RST resets the TX ring\n");
+ }
+ 
++/* ============================ U2: EEPROM ================================== */
++/* The guest's exact EEPROM transaction (AuraLite-OS@0ed0d29
++ * drivers/e1000/e1000.c): write START | word<<8 to EERD, poll DONE
++ * (bit 4) -- the guest budgets 100,000 polls per word and falls back
++ * to RAL/RAH on timeout -- then take the data from bits 31:16. */
++static uint16_t eerd_read(fx_t *f, unsigned word, int *polls) {
++    wr(f, 0x0014, 1u | (word << 8));                     /* EERD START */
++    uint32_t v = 0;
++    int n = 0;
++    do { v = rd(f, 0x0014); n++; } while (!(v & (1u << 4)) && n < 100000);
++    if (polls) *polls = n;
++    assert(v & (1u << 4));                               /* DONE arrived */
++    return (uint16_t)(v >> 16);
++}
++
++static void test_eeprom_eerd(void) {
++    fx_t f; fx_init(&f);
++    /* The north-star probe: words 0-2 must yield the same MAC the
++     * RAL/RAH fallback used to provide, DONE on the first poll. */
++    static const uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++    for (int i = 0; i < 3; i++) {
++        int polls = 0;
++        uint16_t w = eerd_read(&f, (unsigned)i, &polls);
++        assert(polls == 1);                              /* no timeout walk */
++        assert((w & 0xFF) == mac[2 * i] && (w >> 8) == mac[2 * i + 1]);
++    }
++    /* ... byte for byte the RAL/RAH preload the guest used to settle for. */
++    assert(rd(&f, 0x5400) == 0x12005452u);
++    assert(rd(&f, 0x5404) == 0x80005634u);
++    /* Identity words (QEMU template + prepare): subsystem / device ids. */
++    assert(eerd_read(&f, 0x0A, 0) == 0x6403);
++    assert(eerd_read(&f, 0x0B, 0) == 0x100E);            /* subsystem device */
++    assert(eerd_read(&f, 0x0C, 0) == 0x8086);            /* subsystem vendor */
++    assert(eerd_read(&f, 0x0D, 0) == 0x100E);            /* device id */
++    assert(eerd_read(&f, 0x0E, 0) == 0x8086);            /* vendor id */
++    /* Word 0x3F closes the image: all 64 words sum to 0xBABA. */
++    uint16_t sum = 0;
++    for (unsigned i = 0; i < 64; i++)
++        sum = (uint16_t)(sum + eerd_read(&f, i, 0));
++    assert(sum == 0xBABA);
++    /* START clear: the stored command reads back, nothing completes. */
++    wr(&f, 0x0014, (2u << 8));
++    assert(rd(&f, 0x0014) == (2u << 8));
++    /* Out of range completes with the written (zero) data field: QEMU's
++     * cap is the checksum word 0x3F, not the 8-bit address field. */
++    assert(eerd_read(&f, 0x40, 0) == 0);
++    assert(eerd_read(&f, 0xFF, 0) == 0);
++    /* CTRL.RST does not rebuild the EEPROM (QEMU prepares it at add). */
++    wr(&f, 0x0000, (1u << 26));
++    assert(eerd_read(&f, 0, 0) == 0x5452);
++    fx_done(&f);
++    printf("ok e1000 EEPROM via EERD (MAC words, identity, 0xBABA checksum, first-poll DONE)\n");
++}
++
++/* ============================= U2: PHY ==================================== */
++#define MDIC_CMD(op, phy, reg, data) \
++    (((uint32_t)(op) << 26) | ((uint32_t)(phy) << 21) | \
++     ((uint32_t)(reg) << 16) | (uint32_t)(uint16_t)(data))
++
++static uint16_t mdic_read(fx_t *f, unsigned reg) {
++    wr(f, 0x0020, MDIC_CMD(2, 1, reg, 0));               /* OP=read, PHY 1 */
++    uint32_t v = rd(f, 0x0020);
++    assert(v & (1u << 28));                              /* READY */
++    assert(!(v & (1u << 30)));                           /* no ERROR */
++    return (uint16_t)v;
++}
++static void mdic_write(fx_t *f, unsigned reg, uint16_t data) {
++    wr(f, 0x0020, MDIC_CMD(1, 1, reg, data));            /* OP=write, PHY 1 */
++    uint32_t v = rd(f, 0x0020);
++    assert(v & (1u << 28));
++    assert(!(v & (1u << 30)));
++}
++
++static void test_phy_mdic(void) {
++    fx_t f; fx_init(&f);
++    const uint32_t line_bit = 1u << 3;                   /* ISA IRQ11, slave */
++    /* Identity and the autonegotiation-done steady state (QEMU
++     * phy_reg_init + the values its link-up path settles into). */
++    assert(mdic_read(&f, 2) == 0x0141);                  /* PHYID1 */
++    assert(mdic_read(&f, 3) == 0x0C20);                  /* PHYID2, 82540EM */
++    assert(mdic_read(&f, 0) == 0x1140);                  /* BMCR 1000/FD/AUTOEN */
++    assert(mdic_read(&f, 1) == 0x796D);                  /* BMSR link+AN done */
++    assert(mdic_read(&f, 4) == 0x0DE1);                  /* ANAR */
++    assert(mdic_read(&f, 5) == 0x41E0);                  /* ANLPAR + ACK */
++    assert(mdic_read(&f, 9) == 0x0E00);                  /* CTRL1000 */
++    assert(mdic_read(&f, 10) == 0x3C00);                 /* STAT1000 */
++    assert(mdic_read(&f, 16) == 0x0360);                 /* spec ctrl */
++    assert(mdic_read(&f, 17) == 0xAC00);                 /* spec status */
++    assert(mdic_read(&f, 20) == 0x0D60);                 /* ext spec ctrl */
++    /* RW registers round-trip. */
++    mdic_write(&f, 4, 0x05E1);
++    assert(mdic_read(&f, 4) == 0x05E1);
++    mdic_write(&f, 16, 0x0260);
++    assert(mdic_read(&f, 16) == 0x0260);
++    /* OP=0 is not a transaction: READY, no ERROR, data stored verbatim,
++     * no register touched.  OP=3 reads (QEMU tests the read bit first). */
++    wr(&f, 0x0020, MDIC_CMD(0, 1, 4, 0xBEEF));
++    uint32_t v = rd(&f, 0x0020);
++    assert((v & (1u << 28)) && !(v & (1u << 30)) && (v & 0xFFFF) == 0xBEEF);
++    assert(mdic_read(&f, 4) == 0x05E1);
++    wr(&f, 0x0020, MDIC_CMD(3, 1, 4, 0));
++    assert((rd(&f, 0x0020) & 0xFFFF) == 0x05E1);         /* read won */
++    /* A write to a read-only register: ERROR+READY, value unchanged. */
++    wr(&f, 0x0020, MDIC_CMD(1, 1, 1, 0xFFFF));
++    v = rd(&f, 0x0020);
++    assert((v & (1u << 30)) && (v & (1u << 28)));
++    assert(mdic_read(&f, 1) == 0x796D);
++    /* Outside the capability table: ERROR on read and on write. */
++    wr(&f, 0x0020, MDIC_CMD(2, 1, 7, 0));
++    assert(rd(&f, 0x0020) & (1u << 30));
++    wr(&f, 0x0020, MDIC_CMD(1, 1, 31, 0x1234));
++    assert(rd(&f, 0x0020) & (1u << 30));
++    /* The wrong PHY address echoes the PREVIOUS MDIC value with ERROR
++     * (QEMU's set_mdic), not the rejected command. */
++    uint32_t prev = rd(&f, 0x0020);
++    wr(&f, 0x0020, MDIC_CMD(2, 2, 2, 0));
++    assert(rd(&f, 0x0020) == (prev | (1u << 30) | (1u << 28)));
++    /* BMCR stores through set_phy_ctrl's mask: reserved 5:0 + RESET +
++     * ANRESTART never stick, and the file is NOT reset by BMCR.RESET. */
++    mdic_write(&f, 0, 0xFFFF);
++    assert(mdic_read(&f, 0) == 0x7DC0);
++    assert(mdic_read(&f, 4) == 0x05E1);                  /* ANAR untouched */
++    assert(mdic_read(&f, 2) == 0x0141);                  /* identity untouched */
++    /* INT_EN raises the MDAC cause onto the INTx wire. */
++    assert(!(f.m.pic.slave.lines & line_bit));
++    (void)rd(&f, 0x00C0);                                /* drain ICR */
++    wr(&f, 0x00D0, (1u << 9));                           /* IMS.MDAC */
++    wr(&f, 0x0020, MDIC_CMD(2, 1, 2, 0) | (1u << 29));   /* read + INT_EN */
++    assert(rd(&f, 0x0020) & (1u << 28));
++    assert(f.m.pic.slave.lines & line_bit);              /* pin high */
++    assert(rd(&f, 0x00C0) == (1u << 9));                 /* ICR.MDAC, clears */
++    assert(!(f.m.pic.slave.lines & line_bit));           /* pin dropped */
++    /* Device reset restores the PHY template; both MAC paths consistent. */
++    wr(&f, 0x0000, (1u << 26));
++    assert(mdic_read(&f, 0) == 0x1140);
++    assert(mdic_read(&f, 4) == 0x0DE1);
++    assert(eerd_read(&f, 0, 0) == 0x5452);               /* EEPROM intact */
++    assert(rd(&f, 0x5400) == 0x12005452u);               /* RAL intact */
++    fx_done(&f);
++    printf("ok e1000 PHY via MDIC (ID/status, RW, ERROR paths, BMCR mask, MDAC wire, reset)\n");
++}
++
+ int main(void) {
+     test_pci_reset_contract();
+     test_rx_ingress();
+@@ -456,6 +614,8 @@ int main(void) {
+     test_interrupt_register_semantics();
+     test_intx_line();
+     test_tx_link_gate();
++    test_eeprom_eerd();
++    test_phy_mdic();
+     printf("test-net: all tests passed\n");
+     return 0;
+ }
+-- 
+2.47.3
+

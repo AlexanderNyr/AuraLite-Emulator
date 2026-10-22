@@ -15,8 +15,13 @@
 
 #define P92_A20   0x02
 #define P92_RST   0x01
-#define CF9_RST_CPU  0x02
-#define CF9_SYS_RST  0x04
+/* Intel PCH RST_CNT (U5 bit-role correction, measured in the PCH
+ * register databases: SYS_RST is the TYPE bit, RST_CPU the trigger
+ * edge -- pre-U5 code carried the two names swapped, with identical
+ * hard-reset outcomes but no INIT# anywhere). */
+#define CF9_SYS_RST   0x02   /* bit1: type -- 0 soft (INIT#), 1 hard */
+#define CF9_RST_CPU   0x04   /* bit2: trigger, fires on the 0->1 edge */
+#define CF9_FULL_RST  0x08   /* bit3: hard reset becomes a power cycle */
 
 /* ------------------------------------------------------------ A20 */
 
@@ -38,12 +43,24 @@ void chipset_set_a20_kbc(machine_t *m, int on) {
 /* ------------------------------------------------------------ reset */
 
 void chipset_request_reset(machine_t *m, const char *src) {
-    if (!m->chipset.reset_pending) {
-        m->chipset.reset_pending = 1;
+    if (m->chipset.reset_pending != RESET_KIND_FULL) {
+        /* fresh request, or an upgrade of a pending CPU INIT: the
+         * coalesced boundary outcome is the full reset, so its src
+         * replaces the INIT's in the pending record */
+        m->chipset.reset_pending = RESET_KIND_FULL;
         snprintf(m->chipset.reset_src, sizeof m->chipset.reset_src,
                  "%s", src ? src : "unknown");
     }
     /* back-to-back pulses before the boundary merge (documented) */
+}
+
+void chipset_request_cpu_init(machine_t *m, const char *src) {
+    if (!m->chipset.reset_pending) {
+        m->chipset.reset_pending = RESET_KIND_CPU_INIT;
+        snprintf(m->chipset.reset_src, sizeof m->chipset.reset_src,
+                 "%s", src ? src : "unknown");
+    }
+    /* behind a pending full reset the INIT is absorbed by it */
 }
 
 void machine_reset(machine_t *m) {
@@ -67,6 +84,22 @@ void machine_reset(machine_t *m) {
          (unsigned long long)m->chipset.resets, src);
     /* RTC rides through (battery-backed), RAM/ROM and board topology
      * preserved -- see chipset.h. */
+}
+
+/* U5: the INIT# counterpart. Every vCPU takes the INIT state (BSP
+ * runnable at the reset vector, APs in wait-for-SIPI -- all of it in
+ * lapic.c); nothing else on the board is reset, re-enumerated or
+ * even told. `resets` counts full resets only, so it stays put. */
+void machine_cpu_init(machine_t *m) {
+    char src[sizeof m->chipset.reset_src];
+    memcpy(src, m->chipset.reset_src, sizeof src);
+    if (!src[0]) snprintf(src, sizeof src, "host call");
+    m->chipset.reset_pending = 0;
+    m->chipset.reset_src[0] = 0;
+
+    perf_tlb_flush(m);    /* INIT invalidates the TLBs (SDM 9.1) */
+    lapic_broadcast_init(m);
+    mlog(&m->log, "[chipset] CPU INIT (%s) -> F000:FFF0, devices untouched", src);
 }
 
 /* ------------------------------------------------------------ ports */
@@ -106,11 +139,18 @@ static void cf9_write(void *ctx, uint16_t port, int size, uint32_t val) {
              (unsigned long long)m->cpu.rip, (unsigned long long)m->vtime_instr);
     uint8_t old = m->chipset.cf9;
     m->chipset.cf9 = (uint8_t)val;
-    /* Hard reset: SYS_RST rises while RST_CPU is set (0x06/0x0E, also
-     * 0x02-then-0x06). 0x02 alone = CPU INIT, not modeled. */
-    if ((val & (CF9_SYS_RST | CF9_RST_CPU)) == (CF9_SYS_RST | CF9_RST_CPU) &&
-        !(old & CF9_SYS_RST))
-        chipset_request_reset(m, "port 0xCF9");
+    /* PCH RST_CNT (U5): the type is read at the RST_CPU 0->1 edge:
+     * SYS_RST set then -> hard reset (0x06/0x0E single-shot, or the
+     * 0x02-then-0x06 staging), SYS_RST clear -> INIT# asserted (the
+     * 0x04 soft reset). No edge, no action: the type bit alone (0x02),
+     * FULL_RST alone and repeated writes with RST_CPU already set are
+     * all plain storage. */
+    if (!(old & CF9_RST_CPU) && (val & CF9_RST_CPU)) {
+        if (val & CF9_SYS_RST)
+            chipset_request_reset(m, "port 0xCF9 hard reset");
+        else
+            chipset_request_cpu_init(m, "port 0xCF9 RST_CPU (INIT#)");
+    }
 }
 
 /* ------------------------------------------------------------ init */

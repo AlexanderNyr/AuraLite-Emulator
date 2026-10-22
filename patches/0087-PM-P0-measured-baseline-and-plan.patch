@@ -1,0 +1,220 @@
+From 431773cbb31d4691b50b2f7f7d1f0d96c77132ad Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 13:12:19 +0000
+Subject: [PATCH] PM P0: measured baseline + plan (docs/plans/PM_PLAN.md)
+
+Opens audit candidate #3 after XHCI and MSI closed.  Baseline,
+measured 2026-10-21: the kernel lane fabricates only
+RSDP/RSDT/XSDT/MADT -- there is no FADT and no DSDT anywhere, so PM
+is undiscoverable from ACPI except through SeaBIOS' own tables.
+The G5 PM block models exactly one register (24-bit PM Timer at
+PMBASE+8, deterministic from vtime); PM1_STS/EN read 0, PM1_CNT
+sleep writes are swallowed, which means an ACPI power-off from a
+SeaBIOS-lane guest hangs after "Power down" today.  Nobody drives
+SCI (IRQ 9 is free).  The north star consumes no PM (its ACPI use
+is MADT enumeration for SMP), like it consumes no MSI: the audience
+is other guests and surface honesty.  The machine does have the
+S5 endpoint ready-made (stop_requested, currently debugger-only)
+and reset (0xCF9).
+
+Ledger D1-D5 maps to P1 (PM1 registers, SCI, S5), P2 (FADT +
+minimal DSDT _S5 + GPE0), P3 (S1).  Decisions: sleep types are
+table-driven and the P2 DSDT publishes exactly what P1 decodes;
+SCI is a level on IRQ 9 by the fleet convention; TMR_STS latches
+on the true 24-bit overflow in pm_advance; SMI_CMD stays 0 (no
+fabricated SMM); the S1 fork (real parking vs zero-duration wake)
+is recorded for a P2 measurement.  Docs only, no behaviour change.
+---
+ CHANGELOG.md          |  16 ++++++
+ ROADMAP.md            |   6 ++-
+ docs/STATUS.md        |  10 ++++
+ docs/plans/PM_PLAN.md | 112 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 143 insertions(+), 1 deletion(-)
+ create mode 100644 docs/plans/PM_PLAN.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5ebcff1..5631d0f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,22 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0087 (PM P0: measured baseline + plan)
++
++- `docs/plans/PM_PLAN.md` opens audit candidate #3 with the measured
++  baseline: the kernel lane fabricates no FADT/DSDT at all, and the
++  G5 PM block models only the PM Timer — PM1_STS/PM1_EN are dead,
++  PM1_CNT sleep writes are swallowed, so an ACPI power-off from any
++  guest on the SeaBIOS FADT hangs the machine instead of stopping
++  it; nobody drives SCI. The plan records the ledger (D1 sleep
++  decode/S5, D2 PM1 event semantics, D3 GPE0, D4 kernel-lane tables,
++  D5 an S-state machine) and the decisions: S5 rides the existing
++  deterministic stop path, SCI becomes a level on IRQ 9 like the
++  rest of the fleet, TMR_STS latches on the real 24-bit overflow,
++  SMI stays honestly absent (SMI_CMD=0), and the S1 parking-vs-
++  zero-duration fork is measured at P2 before P3 takes it. Docs
++  only; no behaviour change.
++
+ ### Added — patch 0086 (MSI M4: close-out) — MSI plan complete
+ 
+ - **Snapshot-proved, not assumed**: MSI/MSI-X state rides the tags
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 77aa9ba..0c326b1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -121,7 +121,11 @@ either shipped or explicitly NO-GO (PERF P4).
+ 3. **PM_PLAN (P0–P3)** — complete the ACPI surface the G5 note leaves
+    open: PM1_STS/PM1_EN/PM1_CNT semantics, GPE0 block, SMI# as an honest
+    no-op or a measured vector, and at least S1 with a deterministic
+-   machine state (snapshot-compatible).
++   machine state (snapshot-compatible). **In progress: P0 (`0087`)
++   shipped** — measured: no FADT/DSDT on the kernel lane at all, the PM
++   block is Timer-only with every PM1 write swallowed (an ACPI
++   power-off hangs any SeaBIOS-lane guest), `stop_requested` is the
++   ready-made S5 endpoint, the north star consumes no PM today.
+ 4. **Upkeep patch** — the row-4 small gaps in one measured pass (the
+    house recipe), scheduled around whichever plan touches those files.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index a087ea1..42b45d3 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -984,6 +984,16 @@
+   failures; gates green. **Arc totals**: patches `0082`–`0086`, new
+   `test-msi` lane (5 groups) + `v_msix_*` (3 groups, test-xhci) +
+   `test_msi_line` (test_ahci), NC counts 13/9/(5+assert)/3.
++- PM P0 (`patches/0087-PM-P0-measured-baseline-and-plan.patch`):
++  baseline for audit candidate #3 (`docs/plans/PM_PLAN.md`). Measured:
++  the kernel lane has no FADT/DSDT at all (RSDP/MADT only); the G5 PM
++  block is Timer-only — PM1_STS/EN dead, PM1_CNT sleep writes
++  swallowed, so an ACPI power-off hangs any SeaBIOS-lane guest whose
++  FADT points at our block; nobody drives SCI (IRQ 9 free); the
++  ready-made S5 endpoint is `stop_requested`. Ledger D1–D5 mapped to
++  P1 (registers+SCI+S5), P2 (FADT/DSDT+GPE0), P3 (S1, with the
++  parking-vs-zero-duration fork recorded for a P2 measurement). The
++  north-star guest consumes no PM today (its ACPI is MADT-only).
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/PM_PLAN.md b/docs/plans/PM_PLAN.md
+new file mode 100644
+index 0000000..1ddb615
+--- /dev/null
++++ b/docs/plans/PM_PLAN.md
+@@ -0,0 +1,112 @@
++# PM Plan — a real ACPI power-management surface
++
++> Audit 2026-10-19 candidate #3 (after XHCI and MSI, both complete).
++> Companion to `ROADMAP.md` §"Next-block candidates", to COMPAT G5
++> (`src/pm.{h,c}` — the Timer block this plan completes) and
++> KERNEL-BOOT K3 (`src/acpi.c` — RSDP/MADT only today).
++
++**Status: P0 done ✅; P1 queued**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| P0 | Measured baseline: the current PM/ACPI surface, who consumes PM, the defect ledger, decisions | ✅ done | this file (`patches/0087`) |
++| P1 | PM1 register block: PM1_STS/EN (W1C, TMR_STS overflow), PM1_CNT (SCI_EN store, sleep decode), SCI line, S5 power-off | ⬜ queued | `tests/test_pm.c` vectors |
++| P2 | Tables + GPE: FADT + minimal DSDT (\_S5) on the kernel lane, GPE0 STS/EN registers, SCI aggregate; SMI_CMD stays an honest no-SMI | ⬜ queued | table vectors + GPE vectors |
++| P3 | S1 + close-out: a deterministic, snapshot-compatible suspend state; wake sources; docs | ⬜ queued | close-out + docs |
++
++Each phase ships one `.patch` under `patches/` with measured receipts, a
++regression vector, one once-per-phase negative control, green gates and
++the docs update in the same commit (the `ROADMAP.md` standing rules).
++
++## 1. Measured baseline (P0)
++
++### 1a. Our machine today
++
++- **Tables** (`src/acpi.c`, 117 lines): RSDP/RSDT/XSDT/MADT only, built
++  for the kernel lane. **There is no FADT and no DSDT anywhere** — a
++  guest that wants PM from ACPI on that lane finds nothing to parse.
++  On the SeaBIOS lane the firmware publishes its own FADT, so guests
++  there do find PM registers (at SeaBIOS' PMBASE, 0xB000).
++- **PM block** (`src/pm.c`, 100 lines, COMPAT G5): a 0x40-byte I/O block
++  at PMBASE (default 0xB000, relocated by the LPC cfg hook like on
++  Q35). Exactly one register lives: the 24-bit PM Timer at +0x08,
++  deterministic from `vtime_instr` at 3×PIT (3.579545 MHz). Everything
++  else reads 0 and swallows writes — the file says so itself: "PM1_STS
++  would be W1C and PM1_CNT a sleep transition, neither of which this
++  behavioural model implements."
++- **Interrupt**: nobody drives SCI (the ACPI IRQ, conventionally IRQ 9;
++  the line is free — in use today: 0,1,8,10,11,14,15).
++- **State transitions**: reset exists (port 0xCF9 → `machine_reset`);
++  *power-off does not* — `m->stop_requested` is set only by the
++  debugger. A guest writing SLP_TYP(S5)+SLP_EN to PM1_CNT today is
++  writing into the void.
++- Measurements of what the block must contain are the ACPI spec's
++  fixed register map against the one anchor we already match: ICH9
++  PMBASE layout (PM1_STS +0x00/2, PM1_EN +0x02/2, PM1_CNT +0x04/2,
++  PM_TMR +0x08/4, GPE0_STS +0x20/4, GPE0_EN +0x24/4 on ICH9) — the
++  block is already 0x40 bytes, so all of it fits where it sits.
++
++### 1b. The consumer side
++
++- **SeaBIOS** uses the PM Timer (G5's whole reason to exist) and
++  publishes the FADT guests then trust: any ACPI OS on that lane
++  drives PM1_CNT for power-off and PM1_STS/EN + SCI for events. Today
++  a Linux poweroff hangs after "Power down" — the SLP write is
++  swallowed (D1 below).
++- **AuraLite-OS** (the north star) consumes no PM today either
++  (measured: its ACPI use is RSDP→MADT enumeration for SMP in
++  `boot/bios/stage2/acpi.inc`; no FADT/PM/sleep code in the tree). As
++  with MSI, the audience is every other guest plus surface honesty.
++- `tests/test_pm.c` exists (in `test-unit`) pinning the Timer — the
++  P1 vectors extend it.
++
++### 1c. Defect ledger
++
++| # | Defect (measured) | Consequence | Phase |
++|---|-------------------|-------------|-------|
++| D1 | PM1_CNT writes swallowed; no sleep decode | ACPI power-off never stops the machine | P1 |
++| D2 | PM1_STS/PM1_EN dead: TMR_STS never sets on 24-bit overflow, no W1C; no SCI source | timer-overflow events and event enables are fiction-free zeros — guests polling STS spin | P1 |
++| D3 | GPE0 block reads zero; no SCI aggregate | general-purpose events cannot exist | P2 |
++| D4 | no FADT/DSDT on the kernel lane | PM is undiscoverable except via SeaBIOS' tables | P2 |
++| D5 | no S-state machine at all (S1 included) | suspend is unrepresentable | P3 |
++
++## 2. Architecture decisions (P0)
++
++- **S5 is `stop_requested`**: SLP_EN with the S5 type stops the run
++  deterministically at the next loop boundary (the debugger's stop
++  path, plus a `[pm] S5 power-off` log line and a distinct reason a
++  test can assert). No new shutdown machinery.
++- **Sleep types are table-driven, not guessed**: the encoding an OS
++  writes comes from _S5 (SeaBIOS' DSDT on that lane; ours on the
++  kernel lane from P2). The register layer accepts the Q35/PIIX4
++  conventional encoding (SLP_TYP 7 = S5, 0/1 = S0/S1 family) and P2's
++  DSDT publishes exactly what P1 decodes — the two phases pin each
++  other. Unknown types log and do nothing.
++- **SCI is a level like the rest of the fleet**: raised while
++  (PM1_STS & PM1_EN) or (GPE0_STS & GPE0_EN) is nonzero and SCI_EN is
++  set, on IRQ 9 through `pic_set_irq` (the AHCI/XHCI convention),
++  recomputed at every write that can change the expression.
++- **TMR_STS on the real overflow**: set when the 24-bit counter wraps
++  in `pm_advance` (it already knows the delta), W1C clear — guests get
++  the ~4.7 s periodic event real hardware gives them.
++- **SMI stays absent, honestly**: FADT.SMI_CMD = 0 and no SMI
++  machinery is fabricated (there is no SMM in this machine; the audit
++  allowed "an honest no-op or a measured vector" — the no-op is the
++  spec-legal answer when SMI_CMD is 0).
++- **S1 (P3) has an open design fork, recorded now**: real parking
++  (vCPUs halted, devices ticking, wake on RTC/keyboard/PM event) vs
++  zero-duration S1 (WAK_STS latched, run continues). QEMU implements
++  the former via VM suspension; our deterministic single-thread loop
++  makes the latter trivially snapshot-safe and the former a scheduler
++  change. P2 measures what guests actually require to resume sanely;
++  P3 takes the fork with that receipt in hand.
++- **Snapshot**: PM state is small and lives in `pm_t` inside
++  `machine_t`; new fields ride the existing machine snapshot
++  composition (checked at each phase like MSI M4 did).
++
++## 3. Gates (standing rules)
++
++Per phase: `tests/test_pm.c` (extends the existing Timer vectors),
++`tests/test_acpi.c` for P2's tables, one NC, `make test` +
++`make test-sanitize` + both SeaBIOS ISO lanes (the G5 ich9 boot lane
++is the canary — the PM block must never re-break SeaBIOS' pmtimer).
+-- 
+2.47.3
+

@@ -1,0 +1,287 @@
+From c80d397960a72c1fef338bd1b5b2f76ae847b878 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 12:53:33 +0000
+Subject: [PATCH] MSI M4: close-out -- snapshot + determinism receipts
+
+No production code was missing here, and the close-out proves it
+rather than assuming it.  MSI/MSI-X state already rides the existing
+snapshot composition: both controller structs go whole (dev.xhci,
+dev.ahciN) and the Message Control bits ride the per-function
+256-byte PCI config records.  v_msix_snapshot (test-xhci, last group
+by necessity -- a load rewrites the machine) programmes entry 0 and
+Enable, saves, vandalises the live state (disable, scribble the
+entry, HCRST), loads, and asserts all three layers back: cfg bit,
+table contents, and live delivery of the next message with the pin
+silent.  test-msi gains the message-script determinism replay x2.
+
+(The test-xhci link line gains src/snapshot.c for the save/load API.)
+
+NC: MSI-X state dropped at snapshot load -> 3 failures.  Gates:
+make test, make test-sanitize, both SeaBIOS ISO lanes green.
+
+This closes the MSI plan (M0-M4, patches 0082-0086): QEMU-parity
+MSI-X on the xHCI, an x86 delivery core on the proven LAPIC sink,
+ICH-parity MSI on both AHCIs, edge routing with INTx fallback
+preserved byte-for-byte, and snapshot/determinism receipts.
+---
+ CHANGELOG.md           | 18 ++++++++++++++++++
+ Makefile               |  2 +-
+ ROADMAP.md             |  8 ++++----
+ docs/STATUS.md         |  9 +++++++++
+ docs/plans/MSI_PLAN.md | 34 ++++++++++++++++++++++++++++++++--
+ tests/test_msi.c       | 24 ++++++++++++++++++++++++
+ tests/test_xhci.c      | 35 +++++++++++++++++++++++++++++++++++
+ 7 files changed, 123 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2427bbe..5ebcff1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,24 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0086 (MSI M4: close-out) — MSI plan complete
++
++- **Snapshot-proved, not assumed**: MSI/MSI-X state rides the tags
++  that already exist (whole controller structs + per-function PCI
++  config records), and the M4 vector proves the composition end to
++  end -- programme a vector and enable the capability, save,
++  vandalise the live state (disable, scribble the entry, HCRST),
++  load, and watch the very next completion arrive as the restored
++  message with the pin still silent. The message-script determinism
++  vector replays an identical delivery stream twice.
++- **MSI plan COMPLETE (M0–M4, patches 0082–0086)**: QEMU-parity
++  MSI-X on the xHCI, an x86 message-delivery core on the proven
++  LAPIC sink, ICH-parity MSI on both AHCIs, edge routing with a
++  byte-identical INTx fallback, and snapshot/determinism receipts.
++  Stated limits: one vector in use (one interrupter), no pending-bit
++  accumulation, Lowest Priority degenerates to Fixed,
++  SMI/NMI/INIT/ExtINT messages refused, e1000 INTx-only by design.
++
+ ### Added — patch 0085 (MSI M3: per-device routing, AHCI MSI)
+ 
+ - **Interrupts now choose their transport**: each controller already
+diff --git a/Makefile b/Makefile
+index 62e4df0..59bdf3f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -156,7 +156,7 @@ test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/sna
+ 
+ # XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
+ test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-xhci -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-xhci -lm
+ 	./test-xhci
+ 	rm -f test-xhci
+ 
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 25804d3..77aa9ba 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -37,7 +37,7 @@ maps to exactly one plan below.
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+-| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M3 done ✅; M4 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
++| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -111,9 +111,9 @@ either shipped or explicitly NO-GO (PERF P4).
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+    fallback preserved (historical lanes byte-identical); M4 close-out.
+-   **In progress: M0 (`0082`) + M1 MSI-X capability on the xHCI
+-   (`0083`) + M2 LAPIC delivery core (`0084`) + M3 device routing
+-   (`0085`) shipped** -- measured:
++   **Shipped: M0 (`0082`) + M1 MSI-X capability on the xHCI (`0083`)
++   + M2 LAPIC delivery core (`0084`) + M3 device routing (`0085`)
++   + M4 close-out (`0086`) -- MSI COMPLETE** -- measured:
+    the north star is INTx/IOAPIC-only,
+    qemu-xhci parity is MSI-X-only (cap @0x90, 16 entries, table
+    BAR0+0x3000), zero capabilities existed before M1, the LAPIC
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 7f045c7..a087ea1 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -975,6 +975,15 @@
+   completions); NCs red on both routers (5 FAIL / pin assert). Gates
+   green; no suite lane enables MSI, so every historical receipt is
+   untouched.
++- MSI M4 (`patches/0086-MSI-M4-closeout.patch`) — **MSI plan COMPLETE
++  (M0–M4)**. Close-out receipts: snapshot round-trip proved by
++  composition (state rides the existing whole-struct tags plus the
++  per-function cfg records — vector programmes, saves, vandalises,
++  loads, and watches the next message deliver); message-script
++  determinism x2. NC (MSI-X state dropped on load) red with 3
++  failures; gates green. **Arc totals**: patches `0082`–`0086`, new
++  `test-msi` lane (5 groups) + `v_msix_*` (3 groups, test-xhci) +
++  `test_msi_line` (test_ahci), NC counts 13/9/(5+assert)/3.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/MSI_PLAN.md b/docs/plans/MSI_PLAN.md
+index b9cf32d..80c1af8 100644
+--- a/docs/plans/MSI_PLAN.md
++++ b/docs/plans/MSI_PLAN.md
+@@ -4,7 +4,7 @@
+ > `ROADMAP.md` §"Next-block candidates" and to `docs/plans/XHCI_PLAN.md`
+ > (the xHCI INTx delivery this plan generalises).
+ 
+-**Status: M0–M3 done ✅; M4 queued**
++**Status: M0–M4 done ✅ COMPLETE**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -12,7 +12,7 @@
+ | M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ✅ done | `tests/test_xhci.c` `v_msix_cap` (23 groups) (`patches/0083`) |
+ | M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ✅ done | `tests/test_msi.c` (4 groups, new `test-msi` lane) (`patches/0084`) |
+ | M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ✅ done | `v_msix_route` (test-xhci) + `test_msi_line` (test_ahci) (`patches/0085`) |
+-| M4 | Close-out: snapshots, determinism, docs, ledger | ⬜ queued | close-out + docs |
++| M4 | Close-out: snapshots, determinism, docs, ledger | ✅ done | `v_msix_snapshot` + `v_determinism` (`patches/0086`) |
+ 
+ Each phase ships one `.patch` under `patches/` with measured receipts, a
+ regression vector, one once-per-phase negative control, green gates and
+@@ -147,6 +147,36 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+   fallback expectations still pass there, by design); AHCI router
+   branch stubbed → the msi_line group asserts on the raised pin.
+ 
++## 1h. M4 measured receipts (snapshots, determinism) + close-out
++
++- **Snapshots**: no new code was needed and that is worth recording --
++  both state copies already ride whole-struct snapshot tags
++  (`xhci_t` in `dev.xhci`, `ahci_t` in `dev.ahciN`), and the PCI cfg
++  side (Message Control bits) rides the per-function 256-byte
++  `pci.BB.DD.F` records. The M4 vector proves the composition instead
++  of assuming it: programme entry 0 + Enable, save, vandalise
++  (disable, scribble the entry, HCRST), load — cfg enable bit, table
++  contents and *live delivery of the next message* all restored.
++- **Determinism**: a fixed message script (physical, fallback,
++  illegal, logical) replayed against `msi_deliver` yields identical
++  intack streams twice.
++- NC: MSI-X state dropped on snapshot load → 3 failures.
++
++### Close-out
++
++M0–M4 complete (`patches/0082`–`0086`): from zero PCI capabilities to
++a QEMU-parity MSI-X on the xHCI (16 entries, entry 0 in use), a
++shared x86 message-delivery core on the IOAPIC's LAPIC sink, an
++ICH-parity MSI on both AHCIs, per-device edge routing with
++byte-identical INTx fallback, and snapshot/determinism receipts.
++Ledger D1–D3 closed by M1/M2/M3. Stated limits: one MSI-X vector in
++use (one interrupter exists), no PBA accumulation (level-source
++re-evaluation), Lowest Priority degenerates to Fixed (no arbitration
++fabric), SMI/NMI/INIT/ExtINT messages refused, no interrupt
++remapping, e1000 stays INTx-only by silicon parity, and the
++north-star guest still prefers INTx -- which now has a modern
++sibling waiting for whoever asks.
++
+ ## 2. Architecture decisions (M0)
+ 
+ - **XHCI gets MSI-X in the QEMU shape**: capability at cfg 0x90 (id 0x11,
+diff --git a/tests/test_msi.c b/tests/test_msi.c
+index f6ba50d..e402d09 100644
+--- a/tests/test_msi.c
++++ b/tests/test_msi.c
+@@ -86,6 +86,29 @@ static void v_shape(void) {
+     if (fails == f0) printf("ok shape: driver-programmed addr/data land verbatim\n");
+ }
+ 
++/* ---- v_determinism: the same script lands identically twice ---------- */
++static void v_determinism(void) {
++    int f0 = fails;
++    static const struct { uint64_t a; uint32_t d; } script[5] = {
++        { 0xFEE00000ull, 0x60 }, { 0xFEE00000ull, 0x61 },
++        { 0xFEE04000ull, 0x22 },                    /* dest 4: BSP fallback */
++        { 0xFEE00000ull, 0x08 },                    /* illegal vector */
++        { 0xFEE00004ull, 0x63 },                    /* logical, dest 0 */
++    };
++    int got[2][5];
++    for (int r = 0; r < 2; r++) {
++        M.lapic.esr = 0;
++        for (int i = 0; i < 5; i++) {
++            msi_deliver(&M, script[i].a, script[i].d);
++            got[r][i] = take();
++        }
++    }
++    EXPECT(memcmp(got[0], got[1], sizeof got[0]) == 0,
++           "identical message scripts -> identical intack streams");
++    EXPECT(got[0][0] == 0x60 && got[0][3] < 0, "script sanity (illegal vec dropped)");
++    if (fails == f0) printf("ok determinism: message script replayed x2 identically\n");
++}
++
+ int main(void) {
+     devices_init_common(&M);
+     M.lapic.svr |= 0x100u;   /* APIC software-enable, as any OS does first */
+@@ -93,6 +116,7 @@ int main(void) {
+     v_modes();
+     v_logical();
+     v_shape();
++    v_determinism();
+     if (fails) { printf("test-msi: %d FAILED\n", fails); return 1; }
+     printf("test-msi: all vectors passed\n");
+     return 0;
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index bed86ef..2cfab74 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -13,6 +13,7 @@
+ #include <string.h>
+ #include "devices.h"
+ #include "harness.h"
++#include "snapshot.h"     /* MSI M4: save/load round-trip */
+ 
+ static int fails;
+ #define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+@@ -976,6 +977,39 @@ static void v_msix_route(void) {
+     if (fails == f0) printf("ok msix route: edge-once messages, mask/unmask release, INTx fallback\n");
+ }
+ 
++/* ---- v_msix_snapshot: capability + table + router survive save/load -- */
++/* Runs last on purpose: snap_load rewrites the whole machine image. */
++static void v_msix_snapshot(void) {
++    int f0 = fails;
++    M.lapic.svr |= 0x100u;
++    hc_reset_program(32);
++    uint32_t T = XHCI_BAR + 0x3000u;
++    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x71u); wr32(T + 12, 0);
++    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);        /* MSI-X Enable */
++    static const snap_cfg_t CFG = { "Haswell", 0, 0 };
++    const char *path = "m4_snap_tmp.bin";
++    EXPECT(snap_save(&M, path, &CFG) == 0, "snapshot saves");
++    /* vandalise everything the snapshot is supposed to preserve */
++    pci_wr32(20, 0x90, 0x11u);
++    wr32(T + 8, 0x22u); wr32(T + 12, 1u);
++    hc_reset_program(32);
++    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0x8000u) == 0, "live state really off");
++    EXPECT(rd32(T + 8) == 0x22u, "table scribble is live");
++    EXPECT(snap_load(&M, path, &CFG) == 0, "snapshot loads");
++    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0x8000u) != 0, "MSI-X Enable back (pci cfg tag)");
++    EXPECT(rd32(T + 8) == 0x71u && rd32(T + 12) == 0, "vector entry back (dev.xhci tag)");
++    /* RAM came from the snapshot too: re-sync the fixture's own counters
++     * to the save-time ones and prove the router is live, not just stored */
++    t_cmd_idx = 0; t_cmd_cycle = 1; t_ev_idx = 0; t_ev_cycle = 1;
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(lapic_intack(&M) == 0x71, "message delivered right after load");
++    lapic_eoi();
++    EXPECT(!(M.pic.slave.lines & (1u << 2)), "pin still silent after load");
++    remove(path);
++    if (fails == f0) printf("ok msix snapshot: enable+table+router survive save/load\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -1003,6 +1037,7 @@ int main(void) {
+     v_determinism();
+     v_msix_cap();
+     v_msix_route();
++    v_msix_snapshot();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

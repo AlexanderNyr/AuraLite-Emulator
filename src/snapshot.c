@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include "snapshot.h"
 #include "cpu.h"
+#include "lapic.h"
 #include "pci.h"
 #include "platform.h"
 
@@ -252,9 +253,13 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
     if (s->loading && !s->failed) { cpu_devtick_set(cs[0]); if (cs[1]) cpu_dbg_knob_resolve(); }
     sio_sparse(&s->pub, "ram", m->ram, RAM_SIZE);
     /* Restore device decode state before comparing the MMIO map: the guest
-     * can relocate AHCI BAR5, and ahci_snap rebinds that live window. */
+     * can relocate AHCI BAR5, and ahci_snap rebinds that live window. The
+     * LAPIC window likewise mirrors IA32_APIC_BASE (U4), already restored
+     * by machine_rec above -- rebind it here so a snapshot taken with the
+     * LAPIC relocated or globally disabled loads equivalently. */
     pci_snap(m, &s->pub);
     ahci_snap(m, &s->pub);
+    if (s->loading && !s->failed) lapic_sync_mmio(m);
     mmio_rec(m, s);
     devices_snap(m, &s->pub);
     if (m->disk) sio_sparse(&s->pub, "disk.usb", m->disk, m->disk_len);

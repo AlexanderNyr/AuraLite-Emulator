@@ -7,6 +7,9 @@ Lanes:
      framebuffer marker, keyboard commands, quit, and non-perturbation receipts.
   B  endless ROM: async pause, single-step and quit while running/stopped.
   G  GDB owns run control: monitor continue must be rejected; GDB can still quit.
+  U  UPKEEP U7 authorization: a tokened monitor refuses missing/wrong
+     capabilities (401), rebinding Host and cross-Origin upgrades (403),
+     and a non-loopback bind without a token is refused at startup.
 """
 import argparse
 import http.client
@@ -187,14 +190,50 @@ class WSClient:
         return self.pixel0 == rgb
 
 
-def start_monitor(args, monitor_port=None, gdb_port=None, cwd=None, host="127.0.0.1"):
+def start_monitor(args, monitor_port=None, gdb_port=None, cwd=None, host="127.0.0.1",
+                  env_extra=None):
     mp = monitor_port or free_port()
     full = [X86EMU] + list(args)
     if gdb_port is not None: full.append("--gdb=127.0.0.1:%d" % gdb_port)
     spec = "%s:%d" % (host, mp) if host else str(mp)
     full.append("--monitor=" + spec)
-    p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    env = None
+    if env_extra is not None:
+        env = dict(os.environ)
+        env.update(env_extra)
+    p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env)
     return p, mp
+
+
+def raw_status_line(port, request):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(request.encode())
+    s.settimeout(5)
+    out = b""
+    try:
+        while b"\r\n" not in out:
+            d = s.recv(4096)
+            if not d:
+                break
+            out += d
+    except OSError:
+        pass
+    s.close()
+    return out.decode(errors="replace").splitlines()[0] if out else ""
+
+
+def ws_status_line(port, path="/ws", host=None, origin=None, extra=()):
+    lines = ["GET %s HTTP/1.1" % path,
+             "Host: %s" % (host or "127.0.0.1:%d" % port),
+             "Upgrade: websocket", "Connection: Upgrade",
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+             "Sec-WebSocket-Version: 13"]
+    if origin is not None:
+        lines.append("Origin: %s" % origin)
+    lines.extend(extra)
+    time.sleep(0.05)          # one client at a time; let closes land
+    return raw_status_line(port, "\r\n".join(lines) + "\r\n\r\n")
 
 
 def assert_http_and_handshake(port, require_accept=True):
@@ -475,9 +514,95 @@ def lane_framing():
         p.communicate()
 
 
+def lane_auth():
+    """UPKEEP U7: authorization evidence on the wire. RFC 6455 s4.2.2
+    requires an HTTP error (403 named) when the server refuses by Origin;
+    s10.1 is why the token exists at all next to Origin."""
+    tok = "u7-lane-capability"
+    p, port = start_monitor(["--max-instr=1000000000"],
+                            env_extra={"X86EMU_MONITOR_TOKEN": tok})
+    try:
+        status, _body = wait_http(port)
+        check(status == 200, "U7 page stays fetchable with a local Host")
+        line = raw_status_line(port, "GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        check("403" in line, "U7 page refuses a DNS-rebinding Host (403)")
+        check("401" in ws_status_line(port),
+              "U7 tokenless WebSocket upgrade is 401")
+        check("401" in ws_status_line(port, "/ws?token=wrong"),
+              "U7 wrong-token WebSocket upgrade is 401")
+        check("101" in ws_status_line(port, "/ws?token=" + tok),
+              "U7 ?token= carrier upgrades")
+        check("101" in ws_status_line(port, "/ws",
+                                      extra=("X-X86emu-Token: " + tok,)),
+              "U7 X-X86emu-Token header carrier upgrades")
+        check("101" in ws_status_line(port, "/ws",
+                                      extra=("Authorization: Bearer " + tok,)),
+              "U7 Authorization: Bearer carrier upgrades")
+        check("403" in ws_status_line(port, "/ws?token=" + tok,
+                                      origin="http://evil.example"),
+              "U7 cross-Origin upgrade is 403 even with the token")
+        check("101" in ws_status_line(port, "/ws?token=" + tok,
+                                      origin="http://127.0.0.1:%d" % port),
+              "U7 same-Origin upgrade with the token passes")
+        check("403" in ws_status_line(port, "/ws?token=" + tok,
+                                      host="evil.example"),
+              "U7 rebinding Host upgrade is 403")
+    finally:
+        if p.poll() is None: p.kill(); p.wait()
+        p.communicate()
+
+    # --monitor-token= is the explicit CLI carrier for direct use. The
+    # try keeps the pre-U7 negative control readable: a binary without
+    # the flag exits on it, and every remaining vector must still run.
+    p, port = start_monitor(["--max-instr=1000000000", "--monitor-token=" + tok],
+                            env_extra={"X86EMU_MONITOR_TOKEN": ""})
+    try:
+        try:
+            wait_http(port)
+            cli_line = ws_status_line(port)
+            cli_up = ws_status_line(port, "/ws?token=" + tok)
+        except Exception:
+            cli_line = cli_up = ""
+        check("401" in cli_line,
+              "U7 --monitor-token= engages the capability check")
+        check("101" in cli_up, "U7 --monitor-token= value upgrades")
+    finally:
+        if p.poll() is None: p.kill(); p.wait()
+        p.communicate()
+
+    # A non-loopback bind with no token anywhere is not configurable.
+    env = dict(os.environ)
+    env.pop("X86EMU_MONITOR_TOKEN", None)
+    p = subprocess.Popen([X86EMU, "--max-instr=1000000000",
+                          "--monitor=0.0.0.0:%d" % free_port()],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        _out, err = p.communicate(timeout=15)
+        check(p.returncode != 0 and b"refusing to listen unauthenticated" in err,
+              "U7 non-loopback bind without a token is refused at startup")
+    except subprocess.TimeoutExpired:
+        p.kill(); p.wait()
+        check(False, "U7 non-loopback bind without a token is refused at startup")
+
+    # With a token the LAN bind serves, and the plaintext warning fires.
+    p, port = start_monitor(["--max-instr=1000000000"], host="0.0.0.0",
+                            env_extra={"X86EMU_MONITOR_TOKEN": tok})
+    try:
+        wait_http(port)
+        check("401" in ws_status_line(port),
+              "U7 tokened LAN monitor still refuses a bare upgrade")
+        check("101" in ws_status_line(port, "/ws?token=" + tok),
+              "U7 tokened LAN monitor upgrades with the capability")
+    finally:
+        if p.poll() is None: p.kill(); p.wait()
+        _out, err = p.communicate()
+    check(b"plaintext" in err,
+          "U7 non-loopback startup carries the plaintext warning")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lane", choices=("all", "handshake", "boot", "pause", "gdb", "framing"), default="all")
+    parser.add_argument("--lane", choices=("all", "handshake", "boot", "pause", "gdb", "framing", "auth"), default="all")
     args = parser.parse_args()
     lanes = {
         "handshake": lane_handshake,
@@ -485,6 +610,7 @@ def main():
         "pause": lane_pause_step_quit,
         "gdb": lane_gdb_readonly,
         "framing": lane_framing,
+        "auth": lane_auth,
     }
     selected = list(lanes) if args.lane == "all" else [args.lane]
     for name in selected:

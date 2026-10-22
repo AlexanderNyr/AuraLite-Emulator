@@ -1,0 +1,456 @@
+From 8a3024857f07cc2b276712a47828d6b3b6a1c45b Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 13:45:47 +0000
+Subject: [PATCH] PM P2: FADT, DSDT and GPE0 (PM_PLAN P2)
+
+The kernel lane can now find PM: acpi.c grows a revision-4
+FADT (field offsets taken from the ACPICA definition) and a
+DSDT whose only object is \_S5 = Package(7,0) -- the exact
+sleep type P1 decodes, pinned byte-for-byte by the vector.
+The FADT advertises exactly what pm.c implements: SCI on
+IRQ9, PM1a EVT/CNT/TMR and GPE0 at PM_DEFAULT_BASE with
+agreeing 64-bit GAS mirrors, block lengths 4/2/4/8,
+SMI_CMD=0 (no SMM exists here), 24-bit timer, RESET_REG at
+the 0xCF9 port the chipset decodes with value 0x0E. RSDT
+and XSDT list FACP then APIC; the old one-pointer vectors
+were updated to the new contract and the tamper loop now
+covers all five tables.
+
+GPE0 joins the block: STS W1C and EN stored at +0x20/+0x24,
+added to the level-SCI expression. No GPE sources exist yet
+-- the vector pokes the latch directly to prove the wire;
+sources arrive with their consumers.
+
+NC: pm.c+acpi.c reverted to P1 under the P2 header -- both
+suites abort behaviourally (GPE0_EN store; RSDT length).
+Gates: make test + sanitize green; both SeaBIOS ISO lanes
+green with the stock bios.bin present (P1's gate had run in
+skip mode -- recorded in the plan). The S1 fork is measured
+for P3 (no consumer needs real parking; zero-duration is
+spec-legal) in PM_PLAN.md 2c. Docs: PM_PLAN.md (P2 receipts,
+D3/D4 resolved), STATUS.md, CHANGELOG.md.
+---
+ CHANGELOG.md          | 19 +++++++++++
+ docs/STATUS.md        | 13 ++++++++
+ docs/plans/PM_PLAN.md | 43 ++++++++++++++++++++++---
+ src/acpi.c            | 74 +++++++++++++++++++++++++++++++++++++++----
+ src/pm.c              | 12 ++++++-
+ src/pm.h              |  4 +++
+ tests/test_acpi.c     | 55 ++++++++++++++++++++++++++------
+ tests/test_pm.c       | 21 ++++++++++++
+ 8 files changed, 221 insertions(+), 20 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 49dd9db..b545bdc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,25 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0089 (PM P2: FADT, DSDT, GPE0)
++
++- **FADT + DSDT on the kernel lane** (`src/acpi.c`): a revision-4
++  FACP (field offsets from the ACPICA definition) advertising the
++  PM block exactly as implemented — SCI on IRQ9, PM1a
++  EVT/CNT/TMR and GPE0 at 0xB000 with agreeing 64-bit GAS mirrors,
++  `SMI_CMD=0` (there is no SMM here), 24-bit timer, RESET_REG at
++  0xCF9 with value 0x0E — plus a DSDT containing exactly
++  `\_S5 = Package(7,0)`, the sleep type patch 0088 decodes. The
++  two are pinned to each other by `tests/test_acpi.c`. RSDT/XSDT
++  now list FACP before APIC.
++- **GPE0 registers** (`src/pm.c`): STS (W1C) + EN at
++  PMBASE+0x20/0x24, feeding the same level SCI as PM1; no GPE
++  sources exist yet (the wire is proved, sources arrive with
++  their consumers).
++- NCs: pm.c + acpi.c reverted to patch 0088 — both suites abort
++  behaviourally. Gates: `make test` + sanitize green; both
++  SeaBIOS ISO lanes green with the stock BIOS present.
++
+ ### Added — patch 0088 (PM P1: PM1 registers, SCI, S5)
+ 
+ - **PM1 block implemented** (`src/pm.c`): PM1_STS is a W1C latch over
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index c38be91..83b1e6e 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1006,6 +1006,19 @@
+   `tests/test_pm.c`; NC = pm.c/pm.h at P0 (vectors use only pre-P1
+   symbols): abort at the first EN-store assert. Timer behaviour
+   byte-identical (canary vector passes unmodified).
++- PM P2 (`patches/0089-PM-P2-FADT-DSDT-and-GPE0.patch`): the kernel
++  lane can now *find* PM. `acpi.c` adds a revision-4 FADT (offsets
++  from ACPICA, not memory: SCI=9, SMI_CMD=0 honest no-SMM,
++  PM1a/TMR/GPE0 at PMBASE with 64-bit GAS mirrors, 24-bit timer
++  flag, RESET_REG=0xCF9/0x0E the chipset decodes) and a 12-byte-AML
++  DSDT whose only object is `\_S5 = Package(7,0)` — the exact type
++  P1 decodes, pinned byte-for-byte. RSDT/XSDT list {FACP, APIC}.
++  GPE0 STS/EN (W1C/stored at +0x20/+0x24) join the SCI expression;
++  no GPE sources exist yet. NC: pm.c+acpi.c at P1 — behavioural
++  aborts in both suites. Both SeaBIOS ISO lanes run for real
++  (`bios.bin` present; P1's gate had skipped them). The S1 fork is
++  measured for P3: zero-duration, spec-legal, no consumer needs
++  real parking.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/PM_PLAN.md b/docs/plans/PM_PLAN.md
+index 577edc4..04a7a67 100644
+--- a/docs/plans/PM_PLAN.md
++++ b/docs/plans/PM_PLAN.md
+@@ -5,13 +5,13 @@
+ > (`src/pm.{h,c}` — the Timer block this plan completes) and
+ > KERNEL-BOOT K3 (`src/acpi.c` — RSDP/MADT only today).
+ 
+-**Status: P0+P1 done ✅; P2 queued**
++**Status: P0–P2 done ✅; P3 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | P0 | Measured baseline: the current PM/ACPI surface, who consumes PM, the defect ledger, decisions | ✅ done | this file (`patches/0087`) |
+ | P1 | PM1 register block: PM1_STS/EN (W1C, TMR_STS overflow), PM1_CNT (SCI_EN store, sleep decode), SCI line, S5 power-off | ✅ done | `tests/test_pm.c` vectors (`patches/0088`) |
+-| P2 | Tables + GPE: FADT + minimal DSDT (\_S5) on the kernel lane, GPE0 STS/EN registers, SCI aggregate; SMI_CMD stays an honest no-SMI | ⬜ queued | table vectors + GPE vectors |
++| P2 | Tables + GPE: FADT + minimal DSDT (\_S5) on the kernel lane, GPE0 STS/EN registers, SCI aggregate; SMI_CMD stays an honest no-SMI | ✅ done | table + GPE vectors (`patches/0089`) |
+ | P3 | S1 + close-out: a deterministic, snapshot-compatible suspend state; wake sources; docs | ⬜ queued | close-out + docs |
+ 
+ Each phase ships one `.patch` under `patches/` with measured receipts, a
+@@ -66,8 +66,8 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+ |---|-------------------|-------------|-------|
+ | D1 | PM1_CNT writes swallowed; no sleep decode | ACPI power-off never stops the machine | ~~P1~~ **resolved in P1** (SLP_TYP=7+SLP_EN → `stop_requested`) |
+ | D2 | PM1_STS/PM1_EN dead: TMR_STS never sets on 24-bit overflow, no W1C; no SCI source | timer-overflow events and event enables are fiction-free zeros — guests polling STS spin | ~~P1~~ **resolved in P1** (W1C STS, stored EN, TMR_STS on wrap, level SCI on IRQ9) |
+-| D3 | GPE0 block reads zero; no SCI aggregate | general-purpose events cannot exist | P2 |
+-| D4 | no FADT/DSDT on the kernel lane | PM is undiscoverable except via SeaBIOS' tables | P2 |
++| D3 | GPE0 block reads zero; no SCI aggregate | general-purpose events cannot exist | ~~P2~~ **resolved in P2** (GPE0 STS/EN live at +0x20/+0x24, joined to SCI; no sources yet) |
++| D4 | no FADT/DSDT on the kernel lane | PM is undiscoverable except via SeaBIOS' tables | ~~P2~~ **resolved in P2** (FACP rev 4 + DSDT \\_S5 in the kernel-lane set, listed in RSDT/XSDT) |
+ | D5 | no S-state machine at all (S1 included) | suspend is unrepresentable | P3 |
+ 
+ ## 2. Architecture decisions (P0)
+@@ -125,6 +125,41 @@ only pre-P1 symbols, so the revert compiles and fails
+ behaviourally, not at link time). Gates: `make test` + sanitize
+ green, ISO lane green.
+ 
++## 2c. P2 receipts
++
++`src/acpi.c` now builds the kernel-lane set as RSDP → RSDT/XSDT
++{FACP, APIC} → FADT (rev 4, 244 bytes at set+0x900, after the
++largest 255-CPU MADT) → DSDT (set+0xA00). The FADT fields were
++taken from the ACPICA structure definition (Linux `actbl.h`), not
++memory: SCI_INT=9, SMI_CMD=0, PM1a_EVT/CNT/TMR and GPE0 pointing at
++`PM_DEFAULT_BASE` + offsets with the 64-bit GAS mirrors in
++agreement, block lengths 4/2/4/8, flags = WBINVD|C1|RESET_REG
++(24-bit timer), RESET_REG = the 0xCF9 port the chipset decodes,
++RESET_VALUE 0x0E (SYS_RST|RST_CPU), boot flags legacy-devices +
++8042. The DSDT is 12 bytes of hand-encoded AML: `\_S5 =
++Package(7, 0)` — the same type P1 decodes, pinned byte-for-byte by
++the vector. GPE0 (pm.c): STS W1C + EN stored at +0x20/+0x24, joined
++into the SCI expression; nothing latches GPE bits yet (the vector
++pokes the latch directly to prove the wire). NC: pm.c+acpi.c
++reverted to their P1 versions with the P2 header kept — both
++suites abort behaviourally (GPE0_EN store; RSDT length). The
++SeaBIOS lanes were run with the stock `bios.bin` present (`make
++test` alone skips them when it is absent — P1's ISO gate had run
++in skip mode; both lanes green for real in P2).
++
++**The S1 fork, measured (for P3).** No consumer exists today that
++requires real parking: the north-star guest has no ACPI sleep at
++all, and no other suite drives PM1_CNT. A zero-duration S1 — the
++sleep write latches WAK_STS and the run continues — is spec-legal
++(a wake event may be pending when the sleep is entered), trivially
++deterministic and snapshot-safe, and is what a guest's
++resume path exercises anyway (it must tolerate an immediate-wake
++system). Real parking would additionally require a vCPU/device
++scheduler pause that no consumer exercises. **Recommendation for
++P3: zero-duration S1 with the limit stated plainly**, publishing
++`\_S1` only with the type P3 decodes; real parking becomes a
++separate, consumer-driven plan if one ever appears.
++
+ ## 3. Gates (standing rules)
+ 
+ Per phase: `tests/test_pm.c` (extends the existing Timer vectors),
+diff --git a/src/acpi.c b/src/acpi.c
+index 2b043da..63bda87 100644
+--- a/src/acpi.c
++++ b/src/acpi.c
+@@ -5,6 +5,7 @@
+ // type-1 entry + type-2 ISO overrides).
+ #include <string.h>
+ #include "acpi.h"
++#include "pm.h"          /* PM_DEFAULT_BASE: the FADT must advertise it */
+ 
+ #define LE16(p, v)  do { (p)[0]=(uint8_t)(v); (p)[1]=(uint8_t)((v)>>8); } while(0)
+ #define LE32(p, v)  do { (p)[0]=(uint8_t)(v); (p)[1]=(uint8_t)((v)>>8); (p)[2]=(uint8_t)((v)>>16); (p)[3]=(uint8_t)((v)>>24); } while(0)
+@@ -48,6 +49,29 @@ uint32_t acpi_madt_len_for(int ncpus) {
+ #define RSDT_OFF 0x040
+ #define XSDT_OFF 0x080
+ #define MADT_OFF 0x0C0
++/* PM P2: FADT after the largest MADT (255 CPUs end at 0x8FA). */
++#define FADT_OFF 0x900
++#define DSDT_OFF 0xA00
++#define FADT_LEN 244u           /* revision 4 (ACPI 5.0 shape) */
++
++/* The DSDT carries exactly one object: \_S5 = Package(7, 0), publishing
++ * the sleep-type encoding src/pm.c decodes (PM P1).  Hand-encoded AML:
++ * 08 _S5_ 12 06 02 0A 07 0A 00 -- NameOp, NameSeg, PackageOp
++ * (PkgLength 6, NumElements 2, ByteConst 7, ByteConst 0). */
++static const uint8_t DSDT_AML[] = {
++    0x08, '_', 'S', '5', '_', 0x12, 0x06, 0x02, 0x0A, 0x07, 0x0A, 0x00
++};
++#define DSDT_LEN (36u + (uint32_t)sizeof DSDT_AML)
++
++/* One Generic Address Structure pointing at an I/O port register. */
++static void gas_io(uint8_t *g, unsigned width_bits, uint64_t addr) {
++    memset(g, 0, 12);
++    g[0] = 1;                    /* System I/O space */
++    g[1] = (uint8_t)width_bits;
++    g[2] = 0;                    /* bit offset */
++    g[3] = width_bits == 8 ? 1 : width_bits == 16 ? 2 : width_bits == 32 ? 3 : 4;
++    LE64(g + 4, addr);
++}
+ 
+ uint64_t acpi_build_table_set(uint8_t *ram, uint64_t ram_size, uint64_t base) {
+     return acpi_build_table_set_smp(ram, ram_size, base, 1);
+@@ -61,8 +85,8 @@ uint64_t acpi_build_table_set_smp(uint8_t *ram, uint64_t ram_size,
+     uint8_t *w = ram + base;
+     memset(w, 0, ACPI_SET_SIZE);
+ 
+-    uint32_t rsdt_len = 36 + 4;
+-    uint32_t xsdt_len = 36 + 8;
++    uint32_t rsdt_len = 36 + 2 * 4;    /* FACP, APIC (PM P2) */
++    uint32_t xsdt_len = 36 + 2 * 8;
+ 
+     /* MADT: header + LAPIC x ncpus + IOAPIC(1@0xFEC00000, GSI base 0)
+      *       + ISO(IRQ0 -> GSI2). */
+@@ -81,16 +105,54 @@ uint64_t acpi_build_table_set_smp(uint8_t *ram, uint64_t ram_size,
+     p[0] = 2; p[1] = 10; p[2] = 0; p[3] = 0; LE32(p + 4, 2); p += 10;   /* IRQ0 -> GSI2, default flags */
+     acpi_checksum(madt, madt_len);
+ 
+-    /* RSDT: one pointer (MADT). */
++    /* PM P2: DSDT (just \_S5) and the FADT that points at it. The FADT
++     * advertises exactly what pm.c implements: PM1a EVT/CNT + PM Timer
++     * + GPE0, SCI on IRQ9, SMI_CMD=0 (no SMM exists here -- the honest
++     * no-op), 24-bit timer, C2/C3 unsupported latencies, and the 0xCF9
++     * reset register the chipset already decodes (0x0E = SYS_RST |
++     * RST_CPU). Offsets per the revision-4 FADT layout. */
++    uint8_t *dsdt = w + DSDT_OFF;
++    hdr(dsdt, "DSDT", DSDT_LEN, 1);
++    memcpy(dsdt + 36, DSDT_AML, sizeof DSDT_AML);
++    acpi_checksum(dsdt, DSDT_LEN);
++
++    uint8_t *fadt = w + FADT_OFF;
++    hdr(fadt, "FACP", FADT_LEN, 4);
++    const uint64_t pb = PM_DEFAULT_BASE;
++    LE32(fadt + 40, (uint32_t)(base + DSDT_OFF));        /* DSDT (32-bit) */
++    LE16(fadt + 46, 9);                                  /* SCI_INT       */
++    LE32(fadt + 56, (uint32_t)pb);                       /* PM1a_EVT_BLK  */
++    LE32(fadt + 64, (uint32_t)(pb + 4));                 /* PM1a_CNT_BLK  */
++    LE32(fadt + 76, (uint32_t)(pb + 8));                 /* PM_TMR_BLK    */
++    LE32(fadt + 80, (uint32_t)(pb + 0x20));              /* GPE0_BLK      */
++    fadt[88] = 4; fadt[89] = 2;                          /* EVT/CNT bytes */
++    fadt[91] = 4;                                        /* TMR bytes     */
++    fadt[92] = 8;                                        /* GPE0: 4+4     */
++    LE16(fadt + 96, 0x0FFF);                             /* C2 latency: no*/
++    LE16(fadt + 98, 0x0FFF);                             /* C3 latency: no*/
++    LE16(fadt + 109, 0x0003);            /* legacy devices + 8042 present */
++    LE32(fadt + 112, 0x00000405u);       /* WBINVD | C1 | RESET_REG      */
++    gas_io(fadt + 116, 8, 0xCF9);                        /* RESET_REG     */
++    fadt[128] = 0x0E;                                    /* RESET_VALUE   */
++    LE64(fadt + 140, base + DSDT_OFF);                   /* X_DSDT        */
++    gas_io(fadt + 148, 32, pb);                          /* X_PM1a_EVT    */
++    gas_io(fadt + 172, 16, pb + 4);                      /* X_PM1a_CNT    */
++    gas_io(fadt + 208, 32, pb + 8);                      /* X_PM_TMR      */
++    gas_io(fadt + 220, 64, pb + 0x20);                   /* X_GPE0        */
++    acpi_checksum(fadt, FADT_LEN);
++
++    /* RSDT: FACP first (the PM discovery path), then MADT. */
+     uint8_t *rsdt = w + RSDT_OFF;
+     hdr(rsdt, "RSDT", rsdt_len, 1);
+-    LE32(rsdt + 36, base + MADT_OFF);
++    LE32(rsdt + 36, base + FADT_OFF);
++    LE32(rsdt + 40, base + MADT_OFF);
+     acpi_checksum(rsdt, rsdt_len);
+ 
+-    /* XSDT: one pointer (MADT). */
++    /* XSDT: the same pair in 64-bit. */
+     uint8_t *xsdt = w + XSDT_OFF;
+     hdr(xsdt, "XSDT", xsdt_len, 1);
+-    LE64(xsdt + 36, base + MADT_OFF);
++    LE64(xsdt + 36, base + FADT_OFF);
++    LE64(xsdt + 44, base + MADT_OFF);
+     acpi_checksum(xsdt, xsdt_len);
+ 
+     /* RSDP rev 2: to remain livable for rev-0 parsers RsdtAddress is
+diff --git a/src/pm.c b/src/pm.c
+index e80a673..cf8e6de 100644
+--- a/src/pm.c
++++ b/src/pm.c
+@@ -23,7 +23,8 @@
+  * any enabled event latches (PM1 now, GPE0 joins in P2). */
+ static void pm_sci_update(machine_t *m) {
+     pm_t *p = &m->pm;
+-    int lvl = ((p->cnt & PM1_CNT_SCI_EN) && (p->sts & p->en)) ? 1 : 0;
++    int lvl = ((p->cnt & PM1_CNT_SCI_EN) &&
++               ((p->sts & p->en) || (p->gpe_sts & p->gpe_en))) ? 1 : 0;
+     if (lvl != p->sci_level) {
+         p->sci_level = lvl;
+         pic_set_irq(m, PM_SCI_IRQ, lvl);
+@@ -82,6 +83,10 @@ static uint32_t pm_read_byte_stream(machine_t *m, uint16_t off, int size) {
+             b = (uint8_t)(regs[a / 2] >> (8 * (a & 1u)));
+         else if (a >= PM_TMR_OFF && a < PM_TMR_OFF + 3)
+             b = (uint8_t)(tmr >> (8 * (a - PM_TMR_OFF)));
++        else if (a >= 0x20 && a < 0x24)   /* GPE0_STS (PM P2) */
++            b = (uint8_t)(m->pm.gpe_sts >> (8 * (a - 0x20)));
++        else if (a >= 0x24 && a < 0x28)   /* GPE0_EN */
++            b = (uint8_t)(m->pm.gpe_en >> (8 * (a - 0x24)));
+         v |= (uint32_t)b << (8 * i);
+     }
+     return v;
+@@ -131,6 +136,11 @@ static void pm_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
+         } else if (a == 5) {            /* PM1_CNT high: SLP_TYP/SLP_EN */
+             uint32_t hi = b << 8;
+             if (hi & PM1_SLP_EN) pm_sleep(m, PM1_SLP_TYP(hi));
++        } else if (a >= 0x20 && a < 0x24) {   /* GPE0_STS: W1C (PM P2) */
++            m->pm.gpe_sts &= ~(b << (8 * (a - 0x20)));
++        } else if (a >= 0x24 && a < 0x28) {   /* GPE0_EN: stored */
++            unsigned sh = 8 * (a - 0x24);
++            m->pm.gpe_en = (m->pm.gpe_en & ~(0xFFu << sh)) | (b << sh);
+         }
+     }
+     pm_sci_update(m);
+diff --git a/src/pm.h b/src/pm.h
+index 32d580e..542fb1e 100644
+--- a/src/pm.h
++++ b/src/pm.h
+@@ -35,9 +35,13 @@ typedef struct pm {
+     uint16_t en;        /* PM1_EN                                          */
+     uint16_t cnt;       /* PM1_CNT stored bits (SCI_EN, BM_RLD)            */
+     int sci_level;      /* last level driven on the SCI line (IRQ9)        */
++    uint32_t gpe_sts;   /* GPE0_STS latch at +0x20 (W1C; PM P2)           */
++    uint32_t gpe_en;    /* GPE0_EN at +0x24                               */
+ } pm_t;
+ 
+ #define PM_SCI_IRQ 9
++#define PM_DEFAULT_BASE 0xB000   /* Q35/SeaBIOS PMBASE; the FADT
++                                    advertises this address (PM P2) */
+ 
+ /* Reset the block and decode it at the Q35/SeaBIOS default base 0xb000. */
+ void pm_init(struct machine *m);
+diff --git a/tests/test_acpi.c b/tests/test_acpi.c
+index 6571a07..89e58d8 100644
+--- a/tests/test_acpi.c
++++ b/tests/test_acpi.c
+@@ -43,18 +43,54 @@ int main(void) {
+     assert(le32(rsdp + 20) == 36);
+     assert(le64(rsdp + 24) == base + 0x080);
+ 
+-    /* RSDT / XSDT: one MADT pointer each, valid checksums */
++    /* RSDT / XSDT: FACP then MADT (PM P2), valid checksums */
+     const uint8_t *rsdt = w + 0x040;
+     assert(memcmp(rsdt, "RSDT", 4) == 0);
+-    assert(le32(rsdt + 4) == 40);
+-    assert(sum8(rsdt, 40) == 0);
+-    assert(le32(rsdt + 36) == base + 0x0C0);
++    assert(le32(rsdt + 4) == 44);
++    assert(sum8(rsdt, 44) == 0);
++    assert(le32(rsdt + 36) == base + 0x900);
++    assert(le32(rsdt + 40) == base + 0x0C0);
+ 
+     const uint8_t *xsdt = w + 0x080;
+     assert(memcmp(xsdt, "XSDT", 4) == 0);
+-    assert(le32(xsdt + 4) == 44);
+-    assert(sum8(xsdt, 44) == 0);
+-    assert(le64(xsdt + 36) == base + 0x0C0);
++    assert(le32(xsdt + 4) == 52);
++    assert(sum8(xsdt, 52) == 0);
++    assert(le64(xsdt + 36) == base + 0x900);
++    assert(le64(xsdt + 44) == base + 0x0C0);
++
++    /* PM P2: the FADT advertises exactly what pm.c implements */
++    const uint8_t *fadt = w + 0x900;
++    assert(memcmp(fadt, "FACP", 4) == 0);
++    assert(le32(fadt + 4) == 244 && fadt[8] == 4);
++    assert(sum8(fadt, 244) == 0);
++    assert(le32(fadt + 40) == base + 0xA00);       /* DSDT pointer    */
++    assert(le64(fadt + 140) == base + 0xA00);      /* X_DSDT          */
++    assert((fadt[46] | (fadt[47] << 8)) == 9);     /* SCI_INT = IRQ9  */
++    assert(le32(fadt + 48) == 0);                  /* SMI_CMD: no SMM */
++    assert(le32(fadt + 56) == 0xB000);             /* PM1a_EVT_BLK    */
++    assert(le32(fadt + 64) == 0xB004);             /* PM1a_CNT_BLK    */
++    assert(le32(fadt + 76) == 0xB008);             /* PM_TMR_BLK      */
++    assert(le32(fadt + 80) == 0xB020);             /* GPE0_BLK        */
++    assert(fadt[88] == 4 && fadt[89] == 2 && fadt[91] == 4 && fadt[92] == 8);
++    assert((le32(fadt + 112) & 0x100) == 0);       /* 24-bit timer    */
++    assert((le32(fadt + 112) & 0x400) != 0);       /* RESET_REG_SUP   */
++    assert(fadt[116] == 1 && fadt[117] == 8 && le64(fadt + 120) == 0xCF9);
++    assert(fadt[128] == 0x0E);                     /* RESET_VALUE     */
++    /* the X_ GAS mirrors agree with the 32-bit fields */
++    assert(fadt[148] == 1 && le64(fadt + 152) == 0xB000);
++    assert(fadt[172] == 1 && le64(fadt + 176) == 0xB004);
++    assert(fadt[208] == 1 && le64(fadt + 212) == 0xB008);
++    assert(fadt[220] == 1 && le64(fadt + 224) == 0xB020);
++
++    /* and the DSDT is exactly \_S5 = Package(7, 0): type 7 is what
++     * pm.c (PM P1) decodes as S5 -- the two pin each other. */
++    const uint8_t *dsdt = w + 0xA00;
++    assert(memcmp(dsdt, "DSDT", 4) == 0);
++    assert(le32(dsdt + 4) == 48);
++    assert(sum8(dsdt, 48) == 0);
++    static const uint8_t s5_aml[12] = { 0x08, '_', 'S', '5', '_', 0x12,
++                                        0x06, 0x02, 0x0A, 0x07, 0x0A, 0x00 };
++    assert(memcmp(dsdt + 36, s5_aml, 12) == 0);
+ 
+     /* MADT walk: LAPIC(0), IOAPIC(1 @ 0xFEC00000, GSI 0), ISO(IRQ0 -> GSI2) */
+     const uint8_t *madt = w + 0x0C0;
+@@ -88,8 +124,9 @@ int main(void) {
+     assert(saw_lapic && saw_ioapic && saw_iso);
+ 
+     /* negative control: one flipped byte must break the table checksum */
+-    for (int t = 0; t < 3; t++) {
+-        uint8_t *tab = (uint8_t *)(t == 0 ? madt : t == 1 ? rsdt : xsdt);
++    for (int t = 0; t < 5; t++) {
++        uint8_t *tab = (uint8_t *)(t == 0 ? madt : t == 1 ? rsdt : t == 2 ? xsdt
++                                                           : t == 3 ? fadt : dsdt);
+         uint32_t  n  = le32(tab + 4);
+         uint8_t save = tab[n - 1];
+         tab[n - 1] ^= 0xA5;
+diff --git a/tests/test_pm.c b/tests/test_pm.c
+index 4e81c6d..868c029 100644
+--- a/tests/test_pm.c
++++ b/tests/test_pm.c
+@@ -206,6 +206,26 @@ static void test_s5_request(void) {
+     puts("ok   pm: PM1_CNT SLP_TYP=7 + SLP_EN stops the run (S5)");
+ }
+ 
++/* PM P2: GPE0 block at +0x20 (STS W1C) / +0x24 (EN), joining the SCI
++ * expression. Nothing latches GPE bits yet (no GPE sources exist);
++ * this vector pokes the latch directly to prove the wire. */
++static void test_gpe0(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m); pic_init(&m);
++    const uint16_t B = PM_DEFAULT_BASE;
++    io_write(&m, B + 0x24, 4, 0x00000005);            /* GPE0_EN stores  */
++    assert(io_read(&m, B + 0x24, 4) == 0x00000005u);
++    assert(io_read(&m, B + 0x20, 4) == 0);            /* nothing latched */
++    io_write(&m, B + 4, 1, 0x01);                     /* SCI_EN          */
++    m.pm.gpe_sts = 0x1;                               /* the "source"    */
++    pm_tick(&m);
++    assert((m.pic.slave.lines & 0x02) != 0);          /* GPE raises SCI  */
++    io_write(&m, B + 0x20, 4, 0x00000001);            /* W1C the bit     */
++    assert(io_read(&m, B + 0x20, 4) == 0);
++    assert((m.pic.slave.lines & 0x02) == 0);          /* SCI released    */
++    puts("ok   pm: GPE0 STS/EN live, W1C clears, GPE joins SCI");
++}
++
+ int main(void) {
+     test_default_window_and_rate();
+     test_24bit_wrap();
+@@ -216,6 +236,7 @@ int main(void) {
+     test_pm1_registers();
+     test_tmr_sts_and_sci();
+     test_s5_request();
++    test_gpe0();
+     puts("pm tests: ok");
+     return 0;
+ }
+-- 
+2.47.3
+

@@ -1,0 +1,881 @@
+From 27f7a04c2ac7fc38aa3adcb20ccf32a9a9abaef2 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.local>
+Date: Thu, 22 Oct 2026 13:23:20 +0000
+Subject: [PATCH] UPKEEP U5: CF9 soft reset asserts a real CPU INIT#
+
+Port 0xCF9 modeled only the hard reset; the soft write was
+inert, so a CPU-only INIT reboot path sailed past the write
+as though nothing had happened (D2). Measured first: the
+Intel PCH RST_CNT register defines SYS_RST(bit1, 0x02) as the
+reset TYPE and RST_CPU(bit2, 0x04) as the trigger whose 0->1
+edge forces INIT# when SYS_RST is 0 and a hard reset when it
+is 1 -- our code (and the U0 plan text following it) carried
+the two names swapped, with identical hard-reset outcomes.
+The missing transition is therefore the 0x04-from-clear
+write; 0x02 alone stays type staging, 0x06/0x0E and the
+0x02->0x06 dance keep hard-resetting exactly as before.
+
+The pending boundary request is now a kind in the existing
+field (1 full, 2 CPU INIT): an INIT upgraded by a full-reset
+source coalesces into the full reset, an INIT behind a
+pending full reset is absorbed. machine_cpu_init() broadcasts
+the INIT at the instruction boundary: every vCPU takes the
+INIT processor state, the BSP runs from the reset vector and
+every AP parks in wait-for-SIPI -- including an AP that did
+the writing, since the pin is platform-wide. No device, RTC,
+RAM or chipset port is touched and `resets` counts full
+resets only.
+
+The INIT state itself is one definition now, cpu_init_reset:
+SDM Vol.3A Table 9-1's INIT column, corroborated against
+QEMU do_cpu_init's init-save region (x87 bit patterns ride
+through with a FINIT-shaped control file, XMM/MXCSR and the
+software MSRs survive, EFER/FS_BASE/GS_BASE return to 0, the
+LAPIC file resets except its ID). The LAPIC INIT-IPI path is
+unified onto it, so the two INIT sources agree archivally.
+
+Vectors: four new groups in tests/test_chipset.c (guest-OUT
+ritual against PIC/PIT/KBC/RTC/RAM/port-storage sentinels
+with a boundary tombstone, INIT CPU-state preservation,
+trigger edge/repeat and request coalescing, SMP with BSP and
+AP writers) plus the CF9 predicates rewritten to the
+datasheet. NC: the new tests on the 0095 archive tree abort
+at the first CPU_INIT assertion. make test (stock SeaBIOS
+ISO lanes run) and make test-sanitize are green.
+---
+ CHANGELOG.md              |  26 +++++
+ docs/STATUS.md            |  18 +++
+ docs/plans/UPKEEP_PLAN.md |  42 ++++++-
+ src/chipset.c             |  58 ++++++++--
+ src/chipset.h             |  47 ++++++--
+ src/cpu.c                 |  62 +++++++++-
+ src/cpu.h                 |   4 +
+ src/lapic.c               |  76 +++++++++----
+ src/lapic.h               |   6 +
+ tests/test_chipset.c      | 234 ++++++++++++++++++++++++++++++++++++--
+ 10 files changed, 514 insertions(+), 59 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7630329..78aa1fd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,32 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0096 (Upkeep U5: CF9 CPU INIT)
++
++- **Port 0xCF9 knows two kinds of reset now** (`src/chipset.c`):
++  writing 0x04 (RST_CPU rising with the SYS_RST type bit clear)
++  asserts a platform INIT# — every vCPU takes the INIT processor
++  state at the next instruction boundary (BSP back at the reset
++  vector, APs parked in wait-for-SIPI, including an AP that did
++  the write) while devices, RAM, RTC and the chipset's own
++  ports ride through untouched and `resets` does not move. The
++  INIT state itself is SDM Table 9-1's INIT column (new
++  `cpu_init_reset`, now shared with the LAPIC INIT-IPI path):
++  x87/XMM register bits, MXCSR and the software-configured
++  MSRs survive; EFER/FS_BASE/GS_BASE return to 0; the LAPIC
++  file resets except its ID. The boundary request became a
++  kind (full/INIT) with source coalescing in the existing
++  field — no snapshot layout movement. The register's bit
++  names were also corrected to the PCH datasheet (SYS_RST =
++  type 0x02, RST_CPU = trigger 0x04); every pre-existing
++  hard-reset outcome (0x06, 0x0E, 0x02->0x06) is unchanged.
++- New vectors: four `tests/test_chipset.c` groups (guest-OUT
++  ritual with device sentinels and a boundary tombstone, INIT
++  CPU-state preservation, edge/repeat/coalesce, SMP with BSP
++  and AP writers) and the CF9 predicates rewritten to the
++  datasheet. NC = the new tests on the 0095 archive tree
++  (abort at the first CPU_INIT assertion).
++
+ ### Added — patch 0095 (Upkeep U4: LAPIC IA32_APIC_BASE)
+ 
+ - **The local APIC window now follows MSR 0x1B** (`src/lapic.c`,
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 8c45cf7..2159ea9 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1113,6 +1113,24 @@
+   at the first U4 assert on the 0094 tree and the snapshot
+   suite shows exactly the 9 U4 FAILs. A pre-existing spent
+   one-shot timer re-latch is recorded in the U4 receipts.
++- Upkeep U5 (`patches/0096-UPKEEP-U5-CF9-CPU-INIT.patch`):
++  CF9's soft reset exists. The Intel PCH register databases
++  fixed the bit roles first — SYS_RST(0x02) is the type,
++  RST_CPU(0x04) the trigger whose rising edge either hard-
++  resets (type=1: 0x06/0x0E/dance, unchanged) or forces
++  INIT# (type=0) — where pre-U5 code carried the names
++  swapped and let 0x04 fall on the floor. INIT# is a
++  boundary-consumed broadcast: every vCPU takes the SDM
++  Table 9-1 INIT state (corroborated by QEMU's init-save
++  region; the INIT-IPI path now shares the one definition),
++  APs park in wait-for-SIPI even when an AP holds the pen,
++  and no device, clock or chipset port notices. The pending
++  reset field became a kind (INIT upgrades/coalesces into a
++  full reset), so snapshot layout did not move. NC: the new
++  vectors abort at the first CPU_INIT assertion on the 0095
++  tree. Recorded not fixed: a reset-vector fetch with A20
++  deliberately shut misses the bus alias (unreachable for
++  guests on this board, where every reset source opens it).
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index cb435ac..34f1577 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -4,7 +4,7 @@
+ > XHCI, MSI and PM are complete; this plan takes the remaining
+ > site-documented gaps in dependency/risk order.
+ 
+-**Status: U0+U1+U2+U3+U4 done ✅; U5 queued**
++**Status: U0+U1+U2+U3+U4+U5 done ✅; U6 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -13,7 +13,7 @@
+ | U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ✅ done | `tests/test_net.c` vectors (`patches/0093`) |
+ | U3 | gdbstub: publish and accept the real x87 register/control state in `g`/`G`/`p`/`P` | ✅ done | `tests/test_gdbstub.py` vectors (`patches/0094`) |
+ | U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ✅ done | `tests/test_lapic.c` + `tests/test_snapshot.c` vectors (`patches/0095`) |
+-| U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ⬜ queued | `tests/test_chipset.c` vectors |
++| U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ✅ done | `tests/test_chipset.c` vectors (`patches/0096`) |
+ | U6 | TAP responder TCP: sequenced receive, SACK generation and complete close-state handling | ⬜ queued | `tests/test_tap_responder.py` vectors |
+ | U7 | GUI/monitor: capability authentication and browser-origin defences, then plan close-out | ⬜ queued | GUI/monitor vectors + close-out |
+ 
+@@ -237,7 +237,7 @@ AuraLite-OS KERNEL/INITRD artifacts.
+ | # | Defect (measured) | Consequence | Phase |
+ |---|-------------------|-------------|-------|
+ | D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | ~~U4~~ **resolved in U4** (live validated WRMSR: per-context window mirror, BSP strap seeded by role + preserved on writes, EN gates MMIO/timer/IPI/IOAPIC/MSI, snapshot rebinds the window) |
+-| D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | U5 |
++| D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | ~~U5~~ **resolved in U5** (the 0x04 soft write now broadcasts INIT# at the next boundary to every vCPU; the pending request is a kind with full-reset coalescing; device state rides through; the register's bit roles were also corrected to the PCH names — SYS_RST=type 0x02, RST_CPU=trigger 0x04) |
+ | D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | ~~U1~~ **resolved in U1** (SET-staged writes commit to `base_sec`; DM/24H govern both directions) |
+ | D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | ~~U2~~ **resolved in U2** (64-word EEPROM + synchronous DONE; 32-register PHY with cap table, READY/ERROR, MDAC; MDIC offset corrected 0x200 → 0x20) |
+ | D5 | Responder TCP appends/acks payload without sequence validation, sends no SACK and has incomplete duplicate-close states | loss/reordering corrupts the DNS stream and acknowledgement state instead of eliciting retransmission | U6 |
+@@ -474,7 +474,7 @@ one-shot LAPIC timer re-latches its vector on every tick once
+ at zero (pre-existing H6 behaviour; masked-LVT guests are
+ unaffected).
+ 
+-### U5 — CF9 CPU INIT
++### U5 — CF9 CPU INIT ✅
+ 
+ Prove `0x02` is consumed only at an instruction boundary;
+ sentinels distinguish CPU INIT from full reset across RAM,
+@@ -483,6 +483,40 @@ behaviour, `0x02 -> 0x06` coalescing, FADT `0x0E`, and all-vCPU
+ state under SMP. The implementation must not be an
+ active-context-only accident.
+ 
++**Receipts (U5):** primary-source measurement corrected the
++register's bit roles before any code moved: the Intel PCH
++register databases (two generations) define SYS_RST(bit1,
++0x02) as the reset *type* and RST_CPU(bit2, 0x04) as the
++trigger whose 0->1 edge forces INIT# (SYS_RST=0) or a hard
++reset (SYS_RST=1). The plan above and the pre-U5 code carried
++the two names swapped (with identical hard-reset outcomes);
++the missing INIT# transition is therefore the 0x04-from-clear
++write, not a literal 0x02 — recorded here per the U0 rule that
++the plan does not bless remembered constants. INIT# state is
++SDM Vol.3A Table 9-1's INIT column, corroborated field-for-
++field by QEMU `do_cpu_init`'s init-save region: x87 register
++patterns ride through with a FINIT-shaped control file, XMM/
++MXCSR/KERNEL_GS_BASE and the software MSRs stay (EFER/FS_BASE/
++GS_BASE take their reset 0), LAPIC file resets except its ID
++(10.4.7.3), APs park in wait-for-SIPI. The LAPIC INIT-IPI path
++was unified onto the same `cpu_init_reset`, so both INIT
++sources now agree archivally. The pending boundary request
++became a kind in the existing field (1=full, 2=INIT#; an INIT
++upgraded by a full source coalesces, an INIT behind a pending
++full is absorbed); no `machine_t` movement, so snapshots are
++untouched. Vectors: four new groups in `tests/test_chipset.c`
++(guest OUT ritual with tombstone byte + PIC/PIT/KBC/RTC/RAM/
++chipset-port sentinels, INIT CPU-state preservation, edge/
++repeat/coalesce/absorb, SMP with BSP-writer and AP-writer),
++plus the CF9 predicates vector rewritten to the datasheet
++truth (0x06, 0x0E and 0x02->0x06 hard outcomes unchanged).
++NC: the new test on `1acaf46` aborts at the first CPU_INIT
++assertion (134). Adjacent finding, recorded not fixed:
++fetching the reset vector with the A20 gate closed does not
++follow the bus alias (only reachable by INIT# with the gate
++deliberately shut; every reset source on this board opens it,
++and guests are unaffected).
++
+ ### U6 — responder TCP
+ 
+ Prove sequence arithmetic at and across 2^32 wrap, duplicate and
+diff --git a/src/chipset.c b/src/chipset.c
+index 719ff13..eff0193 100644
+--- a/src/chipset.c
++++ b/src/chipset.c
+@@ -15,8 +15,13 @@
+ 
+ #define P92_A20   0x02
+ #define P92_RST   0x01
+-#define CF9_RST_CPU  0x02
+-#define CF9_SYS_RST  0x04
++/* Intel PCH RST_CNT (U5 bit-role correction, measured in the PCH
++ * register databases: SYS_RST is the TYPE bit, RST_CPU the trigger
++ * edge -- pre-U5 code carried the two names swapped, with identical
++ * hard-reset outcomes but no INIT# anywhere). */
++#define CF9_SYS_RST   0x02   /* bit1: type -- 0 soft (INIT#), 1 hard */
++#define CF9_RST_CPU   0x04   /* bit2: trigger, fires on the 0->1 edge */
++#define CF9_FULL_RST  0x08   /* bit3: hard reset becomes a power cycle */
+ 
+ /* ------------------------------------------------------------ A20 */
+ 
+@@ -38,14 +43,26 @@ void chipset_set_a20_kbc(machine_t *m, int on) {
+ /* ------------------------------------------------------------ reset */
+ 
+ void chipset_request_reset(machine_t *m, const char *src) {
+-    if (!m->chipset.reset_pending) {
+-        m->chipset.reset_pending = 1;
++    if (m->chipset.reset_pending != RESET_KIND_FULL) {
++        /* fresh request, or an upgrade of a pending CPU INIT: the
++         * coalesced boundary outcome is the full reset, so its src
++         * replaces the INIT's in the pending record */
++        m->chipset.reset_pending = RESET_KIND_FULL;
+         snprintf(m->chipset.reset_src, sizeof m->chipset.reset_src,
+                  "%s", src ? src : "unknown");
+     }
+     /* back-to-back pulses before the boundary merge (documented) */
+ }
+ 
++void chipset_request_cpu_init(machine_t *m, const char *src) {
++    if (!m->chipset.reset_pending) {
++        m->chipset.reset_pending = RESET_KIND_CPU_INIT;
++        snprintf(m->chipset.reset_src, sizeof m->chipset.reset_src,
++                 "%s", src ? src : "unknown");
++    }
++    /* behind a pending full reset the INIT is absorbed by it */
++}
++
+ void machine_reset(machine_t *m) {
+     char src[sizeof m->chipset.reset_src];
+     memcpy(src, m->chipset.reset_src, sizeof src);
+@@ -69,6 +86,22 @@ void machine_reset(machine_t *m) {
+      * preserved -- see chipset.h. */
+ }
+ 
++/* U5: the INIT# counterpart. Every vCPU takes the INIT state (BSP
++ * runnable at the reset vector, APs in wait-for-SIPI -- all of it in
++ * lapic.c); nothing else on the board is reset, re-enumerated or
++ * even told. `resets` counts full resets only, so it stays put. */
++void machine_cpu_init(machine_t *m) {
++    char src[sizeof m->chipset.reset_src];
++    memcpy(src, m->chipset.reset_src, sizeof src);
++    if (!src[0]) snprintf(src, sizeof src, "host call");
++    m->chipset.reset_pending = 0;
++    m->chipset.reset_src[0] = 0;
++
++    perf_tlb_flush(m);    /* INIT invalidates the TLBs (SDM 9.1) */
++    lapic_broadcast_init(m);
++    mlog(&m->log, "[chipset] CPU INIT (%s) -> F000:FFF0, devices untouched", src);
++}
++
+ /* ------------------------------------------------------------ ports */
+ 
+ static uint32_t p92_read(void *ctx, uint16_t port, int size) {
+@@ -106,11 +139,18 @@ static void cf9_write(void *ctx, uint16_t port, int size, uint32_t val) {
+              (unsigned long long)m->cpu.rip, (unsigned long long)m->vtime_instr);
+     uint8_t old = m->chipset.cf9;
+     m->chipset.cf9 = (uint8_t)val;
+-    /* Hard reset: SYS_RST rises while RST_CPU is set (0x06/0x0E, also
+-     * 0x02-then-0x06). 0x02 alone = CPU INIT, not modeled. */
+-    if ((val & (CF9_SYS_RST | CF9_RST_CPU)) == (CF9_SYS_RST | CF9_RST_CPU) &&
+-        !(old & CF9_SYS_RST))
+-        chipset_request_reset(m, "port 0xCF9");
++    /* PCH RST_CNT (U5): the type is read at the RST_CPU 0->1 edge:
++     * SYS_RST set then -> hard reset (0x06/0x0E single-shot, or the
++     * 0x02-then-0x06 staging), SYS_RST clear -> INIT# asserted (the
++     * 0x04 soft reset). No edge, no action: the type bit alone (0x02),
++     * FULL_RST alone and repeated writes with RST_CPU already set are
++     * all plain storage. */
++    if (!(old & CF9_RST_CPU) && (val & CF9_RST_CPU)) {
++        if (val & CF9_SYS_RST)
++            chipset_request_reset(m, "port 0xCF9 hard reset");
++        else
++            chipset_request_cpu_init(m, "port 0xCF9 RST_CPU (INIT#)");
++    }
+ }
+ 
+ /* ------------------------------------------------------------ init */
+diff --git a/src/chipset.h b/src/chipset.h
+index 3ead93b..e524d22 100644
+--- a/src/chipset.h
++++ b/src/chipset.h
+@@ -19,11 +19,17 @@
+  *    bit0 = fast system reset on a 0->1 write edge (ICH INIT_NOW#).
+  *    Other bits are stored and read back, no behavior modeled.
+  *
+- *  - Port 0xCF9 (LPC Reset Control Register). The classic hard-reset
+- *    sequence: a write with SYS_RST(bit2) transitioning 0->1 while
+- *    RST_CPU(bit1) is set -- i.e. the canonical 0x06/0x0E, also the
+- *    Linux 0x02-then-0x06 dance. bit1 alone (0x02, CPU INIT) and
+- *    FULL_RST(bit3) alone do not reset; stored and read back.
++ *  - Port 0xCF9 (LPC Reset Control Register, Intel PCH RST_CNT).
++ *    Bit roles per the PCH register database: SYS_RST(bit1, 0x02)
++ *    picks the reset TYPE (0 = soft, 1 = hard), RST_CPU(bit2, 0x04)
++ *    is the trigger -- its 0->1 edge fires a soft reset (INIT#
++ *    forced active) when SYS_RST is 0 and a hard (PCI) reset when
++ *    SYS_RST is 1; FULL_RST(bit3, 0x08) further makes a hard reset
++ *    a full power cycle. The canonical reboot writes 0x06 / 0x0E
++ *    (or the Linux 0x02-then-0x06 dance) therefore hard-reset, while
++ *    0x04 alone asserts INIT# (UPKEEP U5). Values are stored and
++ *    read back; FULL_RST's power-cycle flavor is not observable
++ *    beyond storage on this board.
+  *
+  *  - Reset sources. 8042 0xFE pulse (kbc.c, still counted in
+  *    reset_pulses), 8042 output-port bit0 falling edge (0xD1 data with
+@@ -32,7 +38,11 @@
+  *    (cpu_step): the request models the real reset-line propagation
+  *    delay and keeps a reset out of the middle of an executing
+  *    instruction. Back-to-back pulses before a boundary merge into a
+- *    single reset, like the hardware line they drive.
++ *    single reset, like the hardware line they drive. The request is
++ *    a KIND, not a boolean (U5): a pending CPU INIT upgraded by a
++ *    full-reset source before the boundary coalesces into the full
++ *    reset; a CPU INIT requested behind a pending full reset is
++ *    absorbed by it.
+  *
+  * machine_reset() is the full warm reset, not a halt: CPU back to the
+  * reset vector, PIC/PIT/KBC/A20/port state returned to power-on
+@@ -42,6 +52,13 @@
+  * topology (PCI devices, MMIO windows, platform devices, serial stub)
+  * is not re-enumerated. `resets` counts performed resets for tests;
+  * `reset_src` remembers the first requester for the log line.
++ *
++ * machine_cpu_init() is the other consumer (U5): an INIT# broadcast --
++ * every CPU context takes the INIT processor state (SDM Table 9-1,
++ * via cpu_init_reset + the LAPIC after-INIT state), the BSP at the
++ * reset vector, APs parked in wait-for-SIPI. No device is reset or
++ * even notified, the chipset's own ports/A20 state ride through, and
++ * `resets` does not move.
+  */
+ #ifndef CHIPSET_H
+ #define CHIPSET_H
+@@ -49,15 +66,21 @@
+ 
+ struct machine;
+ 
++/* The pending boundary request is a kind (U5, no layout movement):
++ * 0 = none, 1 = full warm reset, 2 = CPU INIT#. */
++#define RESET_KIND_NONE      0
++#define RESET_KIND_FULL      1
++#define RESET_KIND_CPU_INIT  2
++
+ typedef struct chipset {
+     int      a20;          /* effective line: 1 = bit20 passes (open) */
+     int      a20_kbc;      /* 8042 output-port bit1 contribution */
+     int      a20_p92;      /* port 0x92 bit1 contribution */
+     uint8_t  p92;          /* System Control Port A register */
+     uint8_t  cf9;          /* LPC Reset Control Register */
+-    int      reset_pending;/* consumed by cpu_step at the boundary */
++    int      reset_pending;/* RESET_KIND_*, consumed by cpu_step boundary */
+     char     reset_src[48];/* first requester, for the log */
+-    uint64_t resets;       /* performed-resets counter (observability) */
++    uint64_t resets;       /* performed FULL resets (observability) */
+ } chipset_t;
+ 
+ /* Power-on/reset defaults: gate open (p92 = 0x02), ports cleared.
+@@ -71,11 +94,17 @@ void chipset_io_register(struct machine *m);
+ void chipset_set_a20_kbc(struct machine *m, int on);
+ 
+ /* Any reset source funnels here; first source before the boundary is
+- * remembered in reset_src for logging. */
++ * remembered in reset_src for logging. A full reset requested behind
++ * a pending CPU INIT upgrades (and re-sources) the request. */
+ void chipset_request_reset(struct machine *m, const char *src);
++/* The CPU-INIT counterpart: absorbed by a pending full reset. */
++void chipset_request_cpu_init(struct machine *m, const char *src);
+ 
+ /* Full warm reset (see header comment). Called by cpu_step when a
+  * request is pending; also directly usable by host code. */
+ void machine_reset(struct machine *m);
++/* INIT# broadcast to all vCPUs; devices untouched. cpu_step calls it
++ * when a CPU-INIT request is pending. */
++void machine_cpu_init(struct machine *m);
+ 
+ #endif
+diff --git a/src/cpu.c b/src/cpu.c
+index ac1d648..6db1aa8 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -925,6 +925,55 @@ void cpu_reset(cpu_t *c) {
+     }
+ }
+ 
++/* UPKEEP U5: the INIT# processor state (Intel SDM Vol.3A Table 9-1,
++ * the INIT column; implementation-measured against QEMU do_cpu_init's
++ * start_init_save..end_init_save region). Everything cpu_reset()
++ * does, EXCEPT the state silicon keeps over an INIT:
++ *   - x87 register BIT PATTERNS (the control file becomes the FINIT
++ *     state -- tags empty, FCW=037F, FIP/FDP/FOP=0 -- while the ST
++ *     bits underneath stay stale, exactly like FINIT itself),
++ *   - the XMM file and MXCSR,
++ *   - IA32_KERNEL_GS_BASE,
++ *   - the software-configured MSRs, except the three the INIT column
++ *     puts back at their reset 0: EFER, FS_BASE, GS_BASE.
++ * Emulator bookkeeping that machine_reset preserves too (the
++ * monotonic step counters and the debug trace flag) survives alike.
++ * Used by both INIT sources: the LAPIC INIT IPI and the chipset
++ * CF9 INIT#. */
++void cpu_init_reset(cpu_t *c) {
++    machine_t *mach = c->mach;
++    msr_entry_t keep_msr[MAX_MSR];
++    int keep_n = c->msr_count;
++    memcpy(keep_msr, c->msr, sizeof keep_msr);
++    long double keep_fst[8];
++    memcpy(keep_fst, c->fst, sizeof keep_fst);
++    uint64_t keep_xmm[16][2];
++    memcpy(keep_xmm, c->xmm, sizeof keep_xmm);
++    uint32_t keep_mxcsr = c->mxcsr;
++    uint64_t keep_kgs = c->kgs_base;
++    uint64_t keep_steps = c->executed_steps;
++    uint64_t keep_instr = c->instr_count;
++    int keep_trace = c->trace;
++
++    cpu_reset(c);
++
++    memcpy(c->msr, keep_msr, sizeof keep_msr);
++    c->msr_count = keep_n;
++    cpu_set_msr(c, 0xC0000080u, 0);        /* EFER: reset 0 */
++    cpu_set_msr(c, 0xC0000100u, 0);        /* IA32_FS_BASE */
++    cpu_set_msr(c, 0xC0000101u, 0);        /* IA32_GS_BASE */
++    memcpy(c->fst, keep_fst, sizeof keep_fst);
++    memcpy(c->xmm, keep_xmm, sizeof keep_xmm);
++    c->mxcsr = keep_mxcsr;
++    c->kgs_base = keep_kgs;
++    c->executed_steps = keep_steps;
++    c->instr_count = keep_instr;
++    c->trace = keep_trace;
++    /* cpu_reset synced the window to the reseeded default; the
++     * preserved IA32_APIC_BASE may say otherwise -- resync. */
++    if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
++}
++
+ /* ---------------------------------------------------------------- x87 (F1) --
+  * The x87 data and control layer (phase F1). The register file lives in
+  * fst[8] as host long double -- the ISA's own 80-bit extended format --
+@@ -2226,10 +2275,15 @@ int cpu_step(cpu_t *c) {
+      * on their own qTD array, measured) complete without MMIO kicks. */
+     if ((++s_devtick & 0xFFu) == 0 && cpu_devices_tick) cpu_devices_tick(m);
+ 
+-    /* ---- CHIPSET H5: a requested system reset (KBC 0xFE / output-port
+-     * bit0 / port 0x92 bit0 / port 0xCF9) takes effect at the next
+-     * instruction boundary, modeling reset-line propagation and keeping
+-     * a reset out of the middle of an executing instruction. */
++    /* ---- CHIPSET H5/U5: a requested system reset (KBC 0xFE /
++     * output-port bit0 / port 0x92 bit0 / port 0xCF9 hard) or CPU
++     * INIT# (port 0xCF9 soft) takes effect at the next instruction
++     * boundary, modeling reset-line propagation and keeping the
++     * event out of the middle of an executing instruction. */
++    if (m->chipset.reset_pending == RESET_KIND_CPU_INIT) {
++        machine_cpu_init(m);       /* clears the request itself */
++        return 0;
++    }
+     if (m->chipset.reset_pending) {
+         machine_reset(m);          /* clears the request via chipset_init */
+         return 0;
+diff --git a/src/cpu.h b/src/cpu.h
+index 6edc1c3..7c14359 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -130,6 +130,10 @@ typedef struct cpu {
+ } cpu_t;
+ 
+ void cpu_reset(cpu_t *c);
++/* UPKEEP U5: INIT# state -- cpu_reset for the core, with the x87/XMM
++ * files, MXCSR, KERNEL_GS_BASE and the software MSRs (minus
++ * EFER/FS_BASE/GS_BASE) carried over; see cpu.c for the SDM table. */
++void cpu_init_reset(cpu_t *c);
+ /* Executes exactly one instruction; returns 0 normally, -1 on fault or on a
+  * hlt+cli halt without progress.
+  *
+diff --git a/src/lapic.c b/src/lapic.c
+index 565683e..ee45829 100644
+--- a/src/lapic.c
++++ b/src/lapic.c
+@@ -254,42 +254,68 @@ void msi_deliver(machine_t *m, uint64_t addr, uint32_t data) {
+     lapic_set_irr_dest(m, 0, (int)vector);
+ }
+ 
+-/* K6: an INIT arriving at context idx (Intel MP spec s.8.4: INIT resets
+- * most architectural state and parks the cpu in wait-for-SIPI; the
+- * LAPIC keeps its ID).  INIT asserted at the RUNNING context is the
+- * "INIT self" case -- illegal on real silicon, we log-and-refuse. */
++/* U5: the LAPIC register file after an INIT (SDM 10.4.7.3: "the same
++ * as it is after a power-up or hardware reset, except that the APIC
++ * ID ... [is] not affected"). IA32_APIC_BASE rides inside the CPU's
++ * MSR store, preserved by cpu_init_reset. */
++static void lapic_state_after_init(lapic_t *l) {
++    uint32_t id = l->id;
++    memset(l, 0, sizeof *l);
++    l->id = id;
++    l->dfr = 0xFFFFFFFFu;
++    l->svr = 0x00FFu;
++    for (int i = 0; i < 6; i++) l->lvt[i] = LVT_MASKED;
++}
++
++/* K6: an INIT IPI arriving at context idx (Intel MP spec s.8.4: INIT
++ * resets most architectural state and parks the cpu in wait-for-SIPI;
++ * the LAPIC keeps its ID).  INIT asserted at the RUNNING context is
++ * the "INIT self" case -- illegal on real silicon, we log-and-refuse.
++ * CPU state goes through the one INIT definition, cpu_init_reset
++ * (SDM Table 9-1; U5 unified it with the chipset INIT# below). */
+ static void vcpu_take_init(machine_t *m, int idx) {
+     vcpu_slot_t *s = &m->vcpu[idx];
+     if (idx == m->cur_vcpu) {
+         mlog(&m->log, "[lapic] INIT at the RUNNING vcpu%d ignored (self)", idx);
+         return;
+     }
+-    uint64_t keep_steps = s->c.executed_steps;
+-    uint64_t keep_instr = s->c.instr_count;
+-    int keep_trace = s->c.trace;
+-    /* U4: IA32_APIC_BASE survives INIT (QEMU apic_init_reset leaves
+-     * apicbase untouched; SDM 10.4.7.3's "same as reset" covers the
+-     * APIC register state, not this MSR). */
+-    int ab_found;
+-    uint64_t ab_keep = cpu_get_msr(&s->c, LAPIC_MSR_APICBASE, &ab_found);
+-    cpu_reset(&s->c);
+-    if (ab_found) cpu_set_msr(&s->c, LAPIC_MSR_APICBASE, ab_keep);
+-    s->c.executed_steps = keep_steps;
+-    s->c.instr_count = keep_instr;
+-    s->c.trace = keep_trace;
+-    lapic_t keep = s->l;                 /* preserve the LAPIC ID value */
+-    lapic_t *ll = &s->l;
+-    uint32_t id = keep.id;
+-    memset(ll, 0, sizeof *ll);
+-    ll->id = id;
+-    ll->dfr = 0xFFFFFFFFu;
+-    ll->svr = 0x00FFu;
+-    for (int i = 0; i < 6; i++) ll->lvt[i] = LVT_MASKED;
++    cpu_init_reset(&s->c);
++    lapic_state_after_init(&s->l);
+     s->state = VCPU_WAIT_SIPI;
+     mlog(&m->log, "[lapic] vcpu%d took INIT: state reset, parked in "
+          "wait-for-SIPI", idx);
+ }
+ 
++/* U5: the chipset INIT# (CF9 RST_CPU with SYS_RST clear). Unlike an
++ * INIT IPI it is platform-wide and necessarily includes the RUNNING
++ * context (the pin is asserted at every processor, writer included):
++ * every context takes the INIT state, the BSP (context 0) stays
++ * runnable at the reset vector, and every AP parks in wait-for-SIPI
++ * (SDM 10.4.7.3 -- the BSP does not wait for a SIPI, APs do; QEMU
++ * apic_init_reset makes the same split). Devices never see it. */
++void lapic_broadcast_init(machine_t *m) {
++    int n = m->n_vcpus > 1 ? m->n_vcpus : 1;
++    for (int i = 0; i < n && i < EM_MAX_VCPU; i++) {
++        if (i == m->cur_vcpu || n == 1) {
++            cpu_init_reset(&m->cpu);
++            lapic_state_after_init(&m->lapic);
++            if (i != 0) {
++                /* the writing AP parks itself; halted so the scheduler
++                 * will not run its reset-vector state before a SIPI
++                 * (vcpu_take_sipi clears the flag again). */
++                m->vcpu[i].state = VCPU_WAIT_SIPI;
++                m->cpu.halted = 1;
++            }
++        } else {
++            vcpu_slot_t *s = &m->vcpu[i];
++            cpu_init_reset(&s->c);
++            lapic_state_after_init(&s->l);
++            s->state = (i == 0) ? VCPU_RUN : VCPU_WAIT_SIPI;
++        }
++    }
++    lapic_sync_mmio(m);   /* base/EN may ride the preserved MSR value */
++}
++
+ /* K6: SIPI lands only on a cpu parked in wait-for-SIPI (SDM Vol.3
+  * s.8.4.2: a SIPI at a cpu in any other state is discarded, which is
+  * also why the spec's duplicate SIPI is safe).  Execution starts in
+diff --git a/src/lapic.h b/src/lapic.h
+index 507d078..2ab0d9c 100644
+--- a/src/lapic.h
++++ b/src/lapic.h
+@@ -120,6 +120,12 @@ typedef struct lapic {
+ void lapic_init(struct machine *m);
+ void lapic_mmio_register(struct machine *m);
+ 
++/* UPKEEP U5: the platform INIT# (chipset CF9) delivered to every
++ * context -- BSP runnable at the reset vector, APs parked in
++ * wait-for-SIPI, LAPIC ID and IA32_APIC_BASE preserved; devices
++ * are not involved. See lapic.c. */
++void lapic_broadcast_init(struct machine *m);
++
+ /* UPKEEP U4: point the single "LAPIC" MMIO region at the CURRENT
+  * context's IA32_APIC_BASE decode (base + EN-driven enable). Called on
+  * an accepted WRMSR, on reset of the live cpu pair, on every vCPU
+diff --git a/tests/test_chipset.c b/tests/test_chipset.c
+index 9c4816f..17e70a3 100644
+--- a/tests/test_chipset.c
++++ b/tests/test_chipset.c
+@@ -1,4 +1,4 @@
+-/* tests/test_chipset.c -- CHIPSET H5 vectors: A20 gate + system reset.
++/* tests/test_chipset.c -- CHIPSET H5 (+ UPKEEP U5) vectors: A20 gate + system reset + CF9 CPU INIT.
+  *
+  * A20 vectors drive the real ports (0x92, KBC 0xD0/0xD1) and observe the
+  * physical-address consequences through mem_read/mem_write (the very bus
+@@ -171,21 +171,41 @@ static void test_reset_via_p92(void) {
+ 
+ static void test_reset_via_cf9_predicates(void) {
+     fx_t f; fx_init(&f);
+-    /* neither 0x02 (CPU INIT only) nor 0x04 (SYS_RST without RST_CPU)
+-     * alone resets; both are stored and read back */
++    /* PCH RST_CNT (U5 bit roles): bit1 SYS_RST = type, bit2 RST_CPU =
++     * the 0->1 trigger edge. The type bit alone is inert storage. */
+     io_write(&f.m, 0xCF9, 1, 0x02);
+     assert(f.m.chipset.resets == 0 && f.m.chipset.reset_pending == 0);
+     assert(io_read(&f.m, 0xCF9, 1) == 0x02);
++    /* 0x04 alone: RST_CPU rising with SYS_RST clear = INIT#, a CPU INIT
++     * request -- NOT a full reset */
+     io_write(&f.m, 0xCF9, 1, 0x04);
+-    assert(f.m.chipset.resets == 0 && f.m.chipset.reset_pending == 0);
++    assert(f.m.chipset.resets == 0);
++    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
+     assert(io_read(&f.m, 0xCF9, 1) == 0x04);
+-    /* the classic dance: 0x02 then 0x06 (SYS_RST rises with RST_CPU set) */
+-    io_write(&f.m, 0xCF9, 1, 0x02);
++    f.m.cpu.rip = 0x1234;                         /* somewhere non-reset */
++    assert(cpu_step(&f.m.cpu) == 0);              /* boundary consumption */
++    assert(f.m.chipset.resets == 0);
++    assert(f.m.chipset.reset_pending == 0);
++    assert(f.m.cpu.rip == 0xFFF0);                /* ...and the CPU took INIT */
++    assert(io_read(&f.m, 0xCF9, 1) == 0x04);      /* cf9 itself rides through */
++    /* single-shot hard reset: SYS_RST already set in the firing value */
++    io_write(&f.m, 0xCF9, 1, 0x00);
+     io_write(&f.m, 0xCF9, 1, 0x06);
+-    assert(f.m.chipset.reset_pending == 1);
+-    assert(f.m.chipset.resets == 0);              /* not until the boundary */
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+     assert(cpu_step(&f.m.cpu) == 0);
+     assert(f.m.chipset.resets == 1);
++    /* the value our own FADT advertises (P2): 0x0E full-flavor hard */
++    io_write(&f.m, 0xCF9, 1, 0x0E);
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
++    assert(cpu_step(&f.m.cpu) == 0);
++    assert(f.m.chipset.resets == 2);
++    /* the classic dance: 0x02 then 0x06 */
++    io_write(&f.m, 0xCF9, 1, 0x02);
++    io_write(&f.m, 0xCF9, 1, 0x06);
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
++    assert(f.m.chipset.resets == 2);              /* not until the boundary */
++    assert(cpu_step(&f.m.cpu) == 0);
++    assert(f.m.chipset.resets == 3);
+     assert(f.m.chipset.reset_pending == 0);
+     printf("ok: reset_via_cf9_predicates\n");
+ }
+@@ -228,6 +248,200 @@ static void test_reset_via_kbc_outport(void) {
+     printf("ok: reset_via_kbc_outport\n");
+ }
+ 
++/* --------------------------------------------------- UPKEEP U5 ----- */
++
++static const uint8_t TRIG_INIT[] = {    /* mov al,4; mov dx,0xCF9; out dx,al; tombstone; jmp $ */
++    0xB0,0x04, 0xBA,0xF9,0x0C, 0xEE, 0xC6,0x06,0x06,0x20,0xEE, 0xEB,0xFE };
++
++static void test_cpu_init_via_cf9_ritual(void) {
++    fx_t f; fx_init(&f);
++    install_reset_path(&f); dirty_machine(&f);
++    /* extra sentinels a full reset would clear and an INIT# must not */
++    f.m.pit.ch[0].cr = 0xBEEF;                    /* PIT reload value */
++    f.m.rtc.ram[0x40] = 0xA5;                     /* a battery-backed byte */
++    int64_t rtc_base = f.m.rtc.base_sec;
++    /* p92 storage with its A20 source OFF (a full reset re-seeds 0x02);
++     * keep the line itself open through the 8042 contribution so the
++     * reset-vector fetch takes the board's normal path */
++    io_write(&f.m, 0x64, 1, 0xD1);
++    io_write(&f.m, 0x60, 1, 0x03);                /* KBC A20 on, SRST# high */
++    io_write(&f.m, 0x92, 1, 0x00);                /* p92 source off */
++    assert(f.m.chipset.a20 == 1 && f.m.chipset.a20_kbc == 1 &&
++           f.m.chipset.a20_p92 == 0);
++
++    run_trigger(&f, TRIG_INIT, sizeof TRIG_INIT);
++    /* the CPU restarted at the reset vector, BETWEEN instructions */
++    assert(mem_read(&f.m, 0x2007, 1) == 1);
++    assert(mem_read(&f.m, 0x2006, 1) == 0);       /* tombstone never ran */
++    /* ...but no system reset happened and no device was re-initialised */
++    assert(f.m.chipset.resets == 0);
++    assert(f.m.chipset.reset_pending == 0);
++    assert(io_read(&f.m, 0x21, 1) == 0xFD);       /* PIC mask intact */
++    io_write(&f.m, 0x64, 1, 0x20);
++    assert(io_read(&f.m, 0x60, 1) == 0x45);       /* KBC command byte intact */
++    assert(f.m.pit.ch[0].cr == 0xBEEF);           /* PIT intact */
++    assert(f.m.rtc.ram[0x40] == 0xA5);            /* RTC CMOS intact */
++    assert(f.m.rtc.base_sec == rtc_base);
++    assert(mem_read(&f.m, 0x600, 1) == 0x42);     /* RAM intact */
++    assert(io_read(&f.m, 0x92, 1) == 0x00);       /* p92 NOT re-seeded to 0x02 */
++    assert(f.m.chipset.a20_kbc == 1 && f.m.chipset.a20_p92 == 0 &&
++           f.m.chipset.a20 == 1);                 /* gate line state intact */
++    assert(io_read(&f.m, 0xCF9, 1) == 0x04);      /* INIT is not a chipset reset */
++    printf("ok: cpu_init_via_cf9_ritual\n");
++}
++
++static void test_cpu_init_preserves_cpu_state(void) {
++    fx_t f; fx_init(&f);
++    cpu_t *c = &f.m.cpu;
++    int found;
++    /* SDM Table 9-1 INIT column: configure some "unchanged" state */
++    cpu_set_msr(c, 0xC0000081u, 0x1122334455667788ULL);   /* STAR */
++    cpu_set_msr(c, LAPIC_MSR_APICBASE, 0xFEE80900ULL);    /* relocated LAPIC */
++    cpu_set_msr(c, 0xC0000100u, 0xABCD0000ULL);           /* FS_BASE -> 0 by INIT */
++    c->efer = 0x500; cpu_set_msr(c, 0xC0000080u, 0x500);  /* EFER -> 0 */
++    c->kgs_base = 0x77770000ULL;
++    c->mxcsr = 0x3F80u;
++    c->xmm[3][0] = 0x1122334455667788ULL; c->xmm[3][1] = 0x99AABBCCDDEEFF00ULL;
++    c->fst[2] = -2.5L;                                    /* ST pattern, stale post-INIT */
++    c->fcw = 0x027F; c->ftop = 3;
++    c->gpr[0] = 0xDEAD;                                   /* EAX must reset */
++    f.m.cpu.rip = 0x1234;
++    uint64_t steps = c->executed_steps;
++
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
++    assert(cpu_step(c) == 0);
++
++    assert(c->rip == 0xFFF0 && c->seg[SEG_CS].sel == 0xF000 &&
++           c->seg[SEG_CS].base == 0xFFFF0000ULL);
++    assert(c->cr0 == 0x60000010ULL);
++    assert(c->gpr[0] == 0);
++    assert(cpu_get_msr(c, 0xC0000081u, &found) == 0x1122334455667788ULL && found);
++    assert(cpu_get_msr(c, LAPIC_MSR_APICBASE, &found) == 0xFEE80900ULL && found);
++    assert(cpu_get_msr(c, 0xC0000100u, &found) == 0);      /* FS_BASE reset */
++    assert(cpu_get_msr(c, 0xC0000080u, &found) == 0);      /* EFER reset */
++    assert(c->efer == 0);
++    assert(c->kgs_base == 0x77770000ULL);
++    assert(c->mxcsr == 0x3F80u);
++    assert(c->xmm[3][0] == 0x1122334455667788ULL && c->xmm[3][1] == 0x99AABBCCDDEEFF00ULL);
++    assert(c->fst[2] == -2.5L);                           /* stale bits ride through */
++    assert(c->fcw == 0x037F && c->ftw == 0xFFFF && c->fsw == 0 && c->ftop == 0);
++    assert(c->executed_steps == steps);                   /* monotonic bookkeeping */
++    printf("ok: cpu_init_preserves_cpu_state\n");
++}
++
++/* step until the reentry byte reaches n (the reset-vector stub has run n times) */
++static void run_until_entry(fx_t *f, uint32_t n) {
++    for (int i = 0; i < 256 && mem_read(&f->m, 0x2007, 1) < n; i++)
++        (void)cpu_step(&f->m.cpu);
++    assert(mem_read(&f->m, 0x2007, 1) == n);
++}
++
++static void test_cpu_init_edge_repeat_coalesce(void) {
++    fx_t f; fx_init(&f);
++    install_reset_path(&f);
++    cpu_reset(&f.m.cpu);                          /* power-on state, not a counted reset */
++    run_until_entry(&f, 1);                       /* power-on entry */
++    /* first INIT# */
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
++    run_until_entry(&f, 2);
++    assert(f.m.chipset.resets == 0);
++    /* the stored bit is still set: writing 0x04 again is no new edge */
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == 0);
++    for (int i = 0; i < 24; i++) (void)cpu_step(&f.m.cpu);
++    assert(mem_read(&f.m, 0x2007, 1) == 2);       /* nothing happened */
++    /* clear the trigger, set it again: a fresh edge, a fresh INIT# */
++    io_write(&f.m, 0xCF9, 1, 0x00);
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
++    run_until_entry(&f, 3);
++    /* coalescing: an INIT pending, then an 8042 reset pulse before the
++     * boundary upgrades it into exactly one FULL reset */
++    io_write(&f.m, 0x21, 1, 0xFD);                /* PIC sentinel */
++    io_write(&f.m, 0xCF9, 1, 0x00);
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
++    io_write(&f.m, 0x64, 1, 0xFE);
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
++    run_until_entry(&f, 4);
++    assert(f.m.chipset.resets == 1);
++    assert(io_read(&f.m, 0x21, 1) == 0xFF);       /* devices WERE reset */
++    /* ...and the reverse absorbs: an INIT behind a pending full reset */
++    io_write(&f.m, 0x64, 1, 0xFE);
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
++    io_write(&f.m, 0xCF9, 1, 0x04);
++    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
++    run_until_entry(&f, 5);
++    assert(f.m.chipset.resets == 2);
++    printf("ok: cpu_init_edge_repeat_coalesce\n");
++}
++
++static void smp_fx(fx_t *f) {
++    fx_init(f);
++    install_reset_path(f);
++    f->m.n_vcpus = 3;
++    f->m.vcpu[0].c = f->m.cpu; f->m.vcpu[0].l = f->m.lapic;
++    f->m.vcpu[0].state = VCPU_RUN;
++    for (int i = 1; i < 3; i++) {
++        f->m.vcpu[i].c.mach = &f->m;
++        cpu_reset(&f->m.vcpu[i].c);
++        f->m.vcpu[i].l = f->m.lapic;
++        f->m.vcpu[i].l.id = (uint32_t)i << 24;
++        f->m.vcpu[i].state = VCPU_RUN;
++    }
++    f->m.cur_vcpu = 0;
++}
++
++static void test_cpu_init_smp_all_contexts(void) {
++    /* (a) the writer is the BSP: every context takes INIT, APs park */
++    fx_t f; smp_fx(&f);
++    dirty_machine(&f);
++    f.m.vcpu[1].c.rip = 0x1234; f.m.vcpu[1].c.gpr[0] = 0xA1;
++    f.m.vcpu[2].l.tpr = 0x77;
++    cpu_set_msr(&f.m.vcpu[2].c, LAPIC_MSR_APICBASE, 0xFEE80800ULL); /* relocated */
++    run_trigger(&f, TRIG_INIT, sizeof TRIG_INIT);     /* executes on the BSP */
++    assert(mem_read(&f.m, 0x2007, 1) == 1);           /* BSP at reset vector */
++    assert(mem_read(&f.m, 0x2006, 1) == 0);           /* boundary respected */
++    assert(f.m.chipset.resets == 0);
++    for (int i = 1; i < 3; i++) {
++        assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
++        assert(f.m.vcpu[i].c.rip == 0xFFF0);
++        assert(f.m.vcpu[i].c.halted == 0);
++        assert(f.m.vcpu[i].l.id == ((uint32_t)i << 24));   /* ID kept */
++        assert(f.m.vcpu[i].l.svr == 0x00FFu);              /* regs reset */
++    }
++    int found;
++    assert(cpu_get_msr(&f.m.vcpu[2].c, LAPIC_MSR_APICBASE, &found) ==
++           0xFEE80800ULL && found);                     /* base kept */
++    assert(f.m.vcpu[2].l.tpr == 0);                     /* LVT/TPR wiped */
++    assert(io_read(&f.m, 0x21, 1) == 0xFD);             /* devices untouched */
++
++    /* (b) the writer is an AP: the INIT is still platform-wide -- the
++     * BSP restarts, the writing AP parks itself. */
++    fx_t g; smp_fx(&g);
++    vcpu_load(&g.m, 1);
++    g.m.cpu.seg[SEG_CS].sel = 0; g.m.cpu.seg[SEG_CS].base = 0; g.m.cpu.rip = 0;
++    memcpy(g.m.ram, TRIG_INIT, sizeof TRIG_INIT);
++    int parked = 0;
++    for (int i = 0; i < 32 && !parked; i++) {
++        (void)cpu_step(&g.m.cpu);
++        parked = (g.m.cpu.halted == 1 && g.m.chipset.reset_pending == 0);
++    }
++    assert(parked);
++    assert(g.m.vcpu[1].state == VCPU_WAIT_SIPI);        /* writer parked */
++    assert(g.m.cpu.halted == 1);                        /* and holds still */
++    assert(g.m.cpu.rip == 0xFFF0);
++    vcpu_store(&g.m, 1);
++    assert(g.m.vcpu[0].state == VCPU_RUN);              /* BSP did NOT park */
++    assert(g.m.vcpu[0].c.rip == 0xFFF0);                /* ...but was INIT'd */
++    assert(g.m.vcpu[2].state == VCPU_WAIT_SIPI);
++    assert(g.m.vcpu[2].c.rip == 0xFFF0);
++    vcpu_load(&g.m, 0);
++    printf("ok: cpu_init_smp_all_contexts\n");
++}
++
+ int main(void) {
+     test_a20_default_open();
+     test_a20_wrap_via_p92();
+@@ -237,6 +451,10 @@ int main(void) {
+     test_reset_via_cf9();
+     test_reset_via_kbc_fe();
+     test_reset_via_kbc_outport();
++    test_cpu_init_via_cf9_ritual();
++    test_cpu_init_preserves_cpu_state();
++    test_cpu_init_edge_repeat_coalesce();
++    test_cpu_init_smp_all_contexts();
+     printf("test_chipset: all vectors passed\n");
+     return 0;
+ }
+-- 
+2.47.3
+

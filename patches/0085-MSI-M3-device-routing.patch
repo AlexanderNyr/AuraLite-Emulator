@@ -1,0 +1,530 @@
+From c7af4e18d19f7d114872e0473793288dc3262538 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 20:14:14 +0000
+Subject: [PATCH] MSI M3: per-device routing (xHCI MSI-X live, AHCI gains MSI)
+
+Both controllers already had exactly one place computing their
+interrupt level; each becomes the router.  xHCI: xhci_intx_update now
+branches on the M1-programmed state -- MSI-X enabled forces the INTx
+pin silent (PCI rule) and sends one message from vector-table entry 0
+on the level's rising edge, re-armed when the guest's ack lowers the
+level; a masked interval (per-vector or Function Mask) delivers on
+the unmask write itself (router call sites added to table-MMIO writes
+and to the cfg-write canonicalisation).  Disabled, the pin path is
+byte-identical to X5.
+
+AHCI gains the MSI capability in the shape measured from two ICH
+lspci dumps ("[80] MSI: Count=1/1 Maskable- 64bit-"): ahci_pci_seed
+plants it at cfg 0x80 on both controllers (Status.Cap + pointer 0x80,
+one message, 32-bit address; a PM cap exists on silicon but belongs
+to PM_PLAN, not invented here).  cfg_write folds Enable/Address/Data
+into ahci_t with RO re-assertion, and its S5 intx_update routes by
+the same edge rule.
+
+Vectors: test-xhci v_msix_route walks enable -> message -> held-level
+exactly-once -> ack re-arm -> per-vector mask/unmask -> Function
+Mask/unmask -> disable/pin-return through the real LAPIC arbitration;
+test_ahci test_msi_line drives real command completions through both
+transports against a locally seeded pci_dev.  NCs: xHCI engine at M2
+-> 5 failures in the route group (its fallback expectations keep
+passing, by design); AHCI route branch stubbed -> pin asserts where a
+message was due.  Gates: make test, make test-sanitize, both SeaBIOS
+ISO lanes green; no lane anywhere enables MSI, so historical
+receipts are untouched by construction.
+---
+ CHANGELOG.md           | 23 +++++++++++++++
+ ROADMAP.md             |  5 ++--
+ docs/STATUS.md         | 13 +++++++++
+ docs/plans/MSI_PLAN.md | 33 ++++++++++++++++++++--
+ src/ahci.c             | 46 ++++++++++++++++++++++++++++++
+ src/ahci.h             |  1 +
+ src/devices.c          |  2 ++
+ src/xhci.c             | 43 ++++++++++++++++++++++------
+ tests/test_ahci.c      | 54 ++++++++++++++++++++++++++++++++++++
+ tests/test_xhci.c      | 63 ++++++++++++++++++++++++++++++++++++++++++
+ 10 files changed, 271 insertions(+), 12 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d5adc7a..2427bbe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,29 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0085 (MSI M3: per-device routing, AHCI MSI)
++
++- **Interrupts now choose their transport**: each controller already
++  had exactly one function computing its interrupt level; both became
++  routers. With MSI-X enabled, the xHCI silences its INTx pin (PCI
++  forbids asserting it then) and sends one message from vector-table
++  entry 0 on the level's rising edge -- re-armed when the guest's ack
++  drops the level, never duplicated while it holds. The AHCI gained
++  an MSI capability in the shape measured from ICH silicon
++  (cfg 0x80, one message, 32-bit address, no per-vector masking,
++  seeded on both controllers) and routes by the same rule. Turning
++  the capability off restores the pin byte-for-byte; every existing
++  lane, none of which enables MSI, is untouched.
++- **Masking releases, it doesn't lose**: with a per-vector mask or
++  the xHCI Function Mask up, the level pends silently; the unmask
++  write itself delivers the message. No pending-bit accumulation
++  anywhere, per the plan's level-source rule.
++- **Vectors**: `v_msix_route` (test-xhci) walks enable -> message ->
++  held-level exactly-once -> ack/re-arm -> mask/unmask -> disable/
++  pin-return through the real LAPIC; `test_msi_line` (test_ahci)
++  drives real command completions both ways. NCs: 5 failures with
++  the xHCI engine at M2, pin assertion with the AHCI route stubbed.
++
+ ### Added — patch 0084 (MSI M2: LAPIC message delivery)
+ 
+ - **`msi_deliver(machine, addr, data)`** (`src/lapic.c`): one PCI
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 18a45f5..25804d3 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -37,7 +37,7 @@ maps to exactly one plan below.
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+-| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M2 done ✅; M3 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
++| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M3 done ✅; M4 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -112,7 +112,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+    fallback preserved (historical lanes byte-identical); M4 close-out.
+    **In progress: M0 (`0082`) + M1 MSI-X capability on the xHCI
+-   (`0083`) + M2 LAPIC delivery core (`0084`) shipped** -- measured:
++   (`0083`) + M2 LAPIC delivery core (`0084`) + M3 device routing
++   (`0085`) shipped** -- measured:
+    the north star is INTx/IOAPIC-only,
+    qemu-xhci parity is MSI-X-only (cap @0x90, 16 entries, table
+    BAR0+0x3000), zero capabilities existed before M1, the LAPIC
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 93afb34..7f045c7 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -962,6 +962,19 @@
+   fabricated. New `test-msi` lane (4 groups) observes landings
+   through the real deliverable->intack->EOI arbitration; NC (delivery
+   stubbed) red with 9 failures. Gates green.
++- MSI M3 (`patches/0085-MSI-M3-device-routing.patch`): devices route.
++  Each controller's single interrupt-level site became the router:
++  MSI-X (xHCI entry 0) or MSI (AHCI, new capability in the measured
++  ICH shape at cfg 0x80 — one message, 32-bit, unmaskable) enabled ->
++  pin forced silent and exactly one message on the level's rising
++  edge, re-armed by the guest's ack; disabled -> the level pin,
++  byte-identical. xHCI mask sources (per-vector, Function Mask)
++  release a held level on the unmask write itself. Vectors:
++  `v_msix_route` (test-xhci, incl. mask/FMask/fallback cycle through
++  the real LAPIC) and `test_msi_line` (test_ahci, seeded cfg +
++  completions); NCs red on both routers (5 FAIL / pin assert). Gates
++  green; no suite lane enables MSI, so every historical receipt is
++  untouched.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/MSI_PLAN.md b/docs/plans/MSI_PLAN.md
+index 98bcc1f..b9cf32d 100644
+--- a/docs/plans/MSI_PLAN.md
++++ b/docs/plans/MSI_PLAN.md
+@@ -4,14 +4,14 @@
+ > `ROADMAP.md` §"Next-block candidates" and to `docs/plans/XHCI_PLAN.md`
+ > (the xHCI INTx delivery this plan generalises).
+ 
+-**Status: M0–M2 done ✅; M3 queued**
++**Status: M0–M3 done ✅; M4 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | M0 | Measured baseline: who consumes MSI, the QEMU capability shapes, our PCI/LAPIC mechanics, the defect ledger | ✅ done | this file (`patches/0082`) |
+ | M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ✅ done | `tests/test_xhci.c` `v_msix_cap` (23 groups) (`patches/0083`) |
+ | M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ✅ done | `tests/test_msi.c` (4 groups, new `test-msi` lane) (`patches/0084`) |
+-| M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ⬜ queued | routing vectors |
++| M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ✅ done | `v_msix_route` (test-xhci) + `test_msi_line` (test_ahci) (`patches/0085`) |
+ | M4 | Close-out: snapshots, determinism, docs, ledger | ⬜ queued | close-out + docs |
+ 
+ Each phase ships one `.patch` under `patches/` with measured receipts, a
+@@ -118,6 +118,35 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+   inject nothing; the vectors assert the ring stays empty for each.
+ - NC: `msi_deliver` body stubbed out → 9 failures across the 4 groups.
+ 
++## 1g. M3 measured receipts (per-device routing)
++
++- **One router per device**: both controllers already had exactly one
++  place computing the interrupt level (`xhci_intx_update`, AHCI's
++  `intx_update`); M3 turns each into the router. The level (xHCI:
++  IP&IE&INTE; AHCI: (PxIS&PxIE)|(IS&GHC.IE)) is untouched -- only its
++  *transport* is chosen: MSI(-X) enabled -> pin forced silent, one
++  message on the level's rising edge; disabled -> the level pin,
++  byte-identical to before. The guest's ack lowers the level and
++  re-arms the edge; a second completion under a held level sends
++  nothing (both vectors assert exactly-once).
++- **Mask release**: xHCI per-vector mask and Function Mask behave the
++  same -- pending rises silently, the unmask write itself releases
++  the message (router call sites added to table-MMIO writes and to
++  the cfg-write sync). No PBA accumulation anywhere (the §2 rule).
++- **AHCI capability shape** measured from two independent ICH `lspci`
++  dumps: **MSI at cfg 0x80, Count=1/1, Maskable-, 64bit-** -- one
++  message, 32-bit address, no per-vector masking; seeded by
++  `ahci_pci_seed` on both controllers (a PM cap, present on silicon
++  at 0x70, is PM_PLAN's, not invented here). RO fields re-asserted
++  after every cfg write, MME accepted but one message exists.
++- **Fallback proof**: both vectors end by disabling the capability
++  and watching the *same* completion drive the pin again; every
++  historical lane stayed green in `make test` (nothing enables MSI
++  anywhere in the suite).
++- NC: xHCI engine at M2 → 5 failures (the route group; the group's
++  fallback expectations still pass there, by design); AHCI router
++  branch stubbed → the msi_line group asserts on the raised pin.
++
+ ## 2. Architecture decisions (M0)
+ 
+ - **XHCI gets MSI-X in the QEMU shape**: capability at cfg 0x90 (id 0x11,
+diff --git a/src/ahci.c b/src/ahci.c
+index d219897..bd8220a 100644
+--- a/src/ahci.c
++++ b/src/ahci.c
+@@ -72,6 +72,8 @@ typedef struct {
+     uint32_t     ghc;
+     uint32_t     is;               /* controller HBA IS (aggregates PxIS, S5) */
+     int          intx;             /* S5: current board-line assertion state */
++    uint32_t     msi_addr, msi_data;  /* MSI M3: capability RW fields */
++    int          msi_enable, msi_sent;
+     port_regs_t  port[AHCI_HW_PORTS];
+ } ahci_t;
+ 
+@@ -144,6 +146,19 @@ static void intx_update(ahci_t *a) {
+         if ((a->port[p].is & a->port[p].ie) != 0) intr = 1;
+     }
+     if (a->is && (a->ghc & 2u)) intr = 1;   /* HBA IS & GHC.IE */
++    if (a->msi_enable) {   /* MSI M3: pin silent, message on the edge */
++        if (a->intx) {
++            a->intx = 0;
++            pic_set_irq(a->m, AHCI_IRQ0 + a->ctrl, 0);
++        }
++        if (intr && !a->msi_sent) {
++            a->msi_sent = 1;
++            if (a->m) msi_deliver(a->m, a->msi_addr, a->msi_data);
++        }
++        if (!intr) a->msi_sent = 0;
++        return;
++    }
++    a->msi_sent = 0;
+     if (intr != a->intx) {
+         a->intx = intr;
+         pic_set_irq(a->m, AHCI_IRQ0 + a->ctrl, intr);
+@@ -629,6 +644,22 @@ static ahci_t *ahci_pci_controller(pci_dev_t *d) {
+     return NULL;
+ }
+ 
++/* MSI M3: the MSI capability in the measured ICH-AHCI shape -- cap at
++ * 0x80, one message, 32-bit address, no per-vector masking (two
++ * independent ICH lspci dumps agree: "[80] MSI: Enable+ Count=1/1
++ * Maskable- 64bit-").  Seeded at device creation; RO fields are
++ * re-asserted in cfg_write.  A PM capability belongs to PM_PLAN. */
++void ahci_pci_seed(struct pci_dev *dev) {
++    pci_dev_t *d = dev;
++    if (!d) return;
++    d->cfg[0x06] |= 0x10;              /* Status: Capabilities List */
++    d->cfg[0x34] = 0x80;               /* Capabilities Pointer */
++    d->cfg[0x80] = 0x05;               /* Capability ID: MSI */
++    d->cfg[0x81] = 0x00;               /* Next: end of list */
++    d->cfg[0x82] = 0x00;               /* MC: Enable=0, MMC=0 (1 msg) */
++    d->cfg[0x83] = 0x00;               /* MC: 32-bit, no per-vector mask */
++}
++
+ uint64_t ahci_pci_cfg_read(struct pci_dev *dev, int reg, int size) {
+     pci_dev_t *d = dev;
+     ahci_t *a = ahci_pci_controller(d);
+@@ -676,6 +707,21 @@ void ahci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
+         d->cfg[0x27] = (uint8_t)(base >> 24);
+         ahci_set_abar(a, base);
+     }
++    /* MSI M3: fold the capability's RW fields into controller state,
++     * re-assert the RO shape, and re-route (an Enable flip retires or
++     * releases interrupts immediately). */
++    a->msi_enable = (d->cfg[0x82] & 1u) != 0;
++    a->msi_addr = (uint32_t)d->cfg[0x84] | ((uint32_t)d->cfg[0x85] << 8) |
++                  ((uint32_t)d->cfg[0x86] << 16) | ((uint32_t)d->cfg[0x87] << 24);
++    a->msi_data = (uint32_t)d->cfg[0x88] | ((uint32_t)d->cfg[0x89] << 8);
++    d->cfg[0x06] |= 0x10;
++    d->cfg[0x34] = 0x80;
++    d->cfg[0x80] = 0x05; d->cfg[0x81] = 0x00;
++    d->cfg[0x82] &= 0x71u;             /* Enable + MME writable; MMC RO 0 */
++    d->cfg[0x83] = 0;
++    d->cfg[0x84] &= 0xFCu;             /* address dword-aligned on the wire */
++    a->msi_addr &= ~3u;
++    intx_update(a);
+ }
+ 
+ void ahci_register_ctrl(machine_t *m, int ctrl) {
+diff --git a/src/ahci.h b/src/ahci.h
+index 68d2676..0a3c5f7 100644
+--- a/src/ahci.h
++++ b/src/ahci.h
+@@ -15,6 +15,7 @@
+ #include "machine.h"
+ 
+ struct pci_dev;
++void ahci_pci_seed(struct pci_dev *d);   /* MSI M3: capability bytes */
+ uint64_t ahci_pci_cfg_read(struct pci_dev *d, int reg, int size);
+ void ahci_pci_cfg_write(struct pci_dev *d, int reg, int size, uint64_t val);
+ 
+diff --git a/src/devices.c b/src/devices.c
+index ce8e1d9..2ce9ae2 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -1333,6 +1333,7 @@ void devices_init_common(machine_t *m) {
+     sata_pci->cfg[0x27] = (uint8_t)(AHCI_ABAR >> 24);
+     sata_pci->cfg_read = ahci_pci_cfg_read;
+     sata_pci->cfg_write = ahci_pci_cfg_write;
++    ahci_pci_seed(sata_pci);                          /* MSI M3 */
+     ahci_register(m);
+ 
+     /* GPU: dev2/func0 (real Intel iGPU convention) */
+@@ -1461,6 +1462,7 @@ void devices_add_ahci2(machine_t *m) {
+     p->cfg[0x27] = (uint8_t)(AHCI_ABAR2 >> 24);
+     p->cfg_read = ahci_pci_cfg_read;
+     p->cfg_write = ahci_pci_cfg_write;
++    ahci_pci_seed(p);                                 /* MSI M3 */
+     ahci_register_ctrl(m, 1);
+ }
+ 
+diff --git a/src/xhci.c b/src/xhci.c
+index 84bbff4..7a2bf35 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -109,19 +109,44 @@ typedef struct {
+     struct { uint32_t addr_lo, addr_hi, data, ctrl; } msix_table[16];
+     int msix_enable;        /* Message Control bit 15 */
+     int msix_fmask;         /* Message Control bit 14 */
++    int msix_sent;          /* M3: message for the current pending level sent */
+ } xhci_t;
+ 
+ static xhci_t g_xhci;
+ 
+-/* X5: the INTx pin.  Asserted while interrupter 0 has an unmasked
+- * pending event (IMAN.IP & IMAN.IE & USBCMD.INTE) -- level-driven, on
+- * change only (the AHCI S5 convention; pic_set_irq fans out to the
+- * I/O APIC board wire). */
++/* X5 + MSI M3: interrupt routing.  The interrupter condition (IMAN.IP &
++ * IMAN.IE & USBCMD.INTE) is a *level*; where it goes depends on the
++ * MSI-X state the guest programmed:
++ * - MSI-X disabled: the INTx pin (IRQ 10, level, on change) as in X5.
++ * - MSI-X enabled: the pin must stay silent (PCI forbids INTx then) and
++ *   the rising edge of the unmasked condition sends one message from
++ *   vector-table entry 0 (the only interrupter, MaxIntrs=1).  A masked
++ *   interval sends nothing; unmasking re-evaluates the level and sends
++ *   then -- no PBA accumulation (MSI_PLAN 2).  The guest's ack (EHB or
++ *   IMAN RW1C) lowers the level and re-arms the edge. */
+ static void xhci_intx_update(xhci_t *x) {
+-    int lvl = (x->iman_ip && x->iman_ie && (x->usbcmd & CMD_INTE)) ? 1 : 0;
+-    if (lvl != x->intx_level) {
+-        x->intx_level = lvl;
+-        if (x->m) pic_set_irq(x->m, XHCI_IRQ, lvl);
++    int want = (x->iman_ip && x->iman_ie && (x->usbcmd & CMD_INTE)) ? 1 : 0;
++    if (x->msix_enable) {
++        if (x->intx_level) {
++            x->intx_level = 0;
++            if (x->m) pic_set_irq(x->m, XHCI_IRQ, 0);
++        }
++        int unmasked = !x->msix_fmask && !(x->msix_table[0].ctrl & 1u);
++        if (want && unmasked && !x->msix_sent) {
++            x->msix_sent = 1;
++            if (x->m)
++                msi_deliver(x->m,
++                            ((uint64_t)x->msix_table[0].addr_hi << 32) |
++                                x->msix_table[0].addr_lo,
++                            x->msix_table[0].data);
++        }
++        if (!want) x->msix_sent = 0;
++        return;
++    }
++    x->msix_sent = 0;
++    if (want != x->intx_level) {
++        x->intx_level = want;
++        if (x->m) pic_set_irq(x->m, XHCI_IRQ, want);
+     }
+ }
+ 
+@@ -835,6 +860,7 @@ static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
+     if (off >= X_MSIX_TABLE && off < X_MSIX_TABLE + 16u * 16u) {
+         uint32_t *e = &x->msix_table[(off - X_MSIX_TABLE) / 16].addr_lo;
+         e[((off - X_MSIX_TABLE) % 16) / 4] = val;
++        xhci_intx_update(x);   /* M3: an unmask here may release a message */
+         return;
+     }
+     if (off >= X_MSIX_PBA && off < X_MSIX_PBA + 8u) return;  /* RO */
+@@ -969,6 +995,7 @@ void xhci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
+     d->cfg[0x93] = (uint8_t)((x->msix_enable ? 0x80 : 0) | (x->msix_fmask ? 0x40 : 0));
+     d->cfg[0x94] = 0x00; d->cfg[0x95] = 0x30; d->cfg[0x96] = 0; d->cfg[0x97] = 0;
+     d->cfg[0x98] = 0x00; d->cfg[0x99] = 0x38; d->cfg[0x9A] = 0; d->cfg[0x9B] = 0;
++    xhci_intx_update(x);   /* M3: enabling MSI-X retires/sends here */
+ }
+ 
+ void xhci_register(machine_t *m) {
+diff --git a/tests/test_ahci.c b/tests/test_ahci.c
+index b830081..4ac8e41 100644
+--- a/tests/test_ahci.c
++++ b/tests/test_ahci.c
+@@ -18,6 +18,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "machine.h"
++#include "pci.h"          /* MSI M3: pci_dev_t for the capability test */
+ #include "ahci.h"
+ #include "harness.h"
+ 
+@@ -842,6 +843,58 @@ static void test_intx_line(void) {
+     printf("ok intx line\n");
+ }
+ 
++/* MSI M3: the MSI capability (ICH shape at cfg 0x80) reroutes the S5
++ * interrupt condition to one LAPIC message on its rising edge; the pin
++ * stays silent while enabled and returns byte-identical when disabled. */
++static void run_one_cmd(fx_t *f) {
++    mem_write(&f->m, P(0, 0x00), 4, T_CLB);
++    t_hdr(&f->m, 1, 0);
++    t_fis(&f->m, 0x25, 0, 1);
++    t_prdt(&f->m, 0, T_BUF1, 512);
++    mem_write(&f->m, P(0, 0x38), 4, 1);
++    assert(mem_read(&f->m, P(0, 0x10), 4) & 1u);   /* DHRS latched */
++}
++
++static void test_msi_line(void) {
++    fx_t f; fx_init(&f);
++    lapic_init(&f.m);
++    lapic_mmio_register(&f.m);
++    f.m.lapic.svr |= 0x100u;
++    fx_attach_disk(&f, 0, 1024 * 1024);
++    pci_dev_t d;
++    memset(&d, 0, sizeof d);
++    d.bus = 0; d.dev = 31; d.func = 2;
++    ahci_pci_seed(&d);
++    assert((d.cfg[0x06] & 0x10) && d.cfg[0x34] == 0x80 && d.cfg[0x80] == 0x05);
++    assert(d.cfg[0x81] == 0 && d.cfg[0x82] == 0 && d.cfg[0x83] == 0);
++    ahci_pci_cfg_write(&d, 0x84, 4, 0xFEE00000u);
++    ahci_pci_cfg_write(&d, 0x88, 4, 0x45u);
++    ahci_pci_cfg_write(&d, 0x80, 4, 0x00010005u);        /* MC.Enable */
++    assert(d.cfg[0x82] & 1u);
++    /* completion on the PxIE path: message, no pin */
++    mem_write(&f.m, P(0, 0x14), 4, 1u);                  /* PxIE.DHRS */
++    run_one_cmd(&f);
++    assert(!(f.m.pic.slave.lines & (1u << 6)));          /* IRQ14 silent */
++    assert(lapic_intack(&f.m) == 0x45);                  /* one message */
++    mem_write(&f.m, 0xFEE000B0u, 4, 0);                  /* EOI */
++    /* condition still latched: second completion does not re-send */
++    run_one_cmd(&f);
++    assert(lapic_intack(&f.m) < 0);
++    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);         /* ack */
++    run_one_cmd(&f);
++    assert(lapic_intack(&f.m) == 0x45);                  /* re-armed */
++    mem_write(&f.m, 0xFEE000B0u, 4, 0);
++    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
++    /* MSI off: the pin path is back */
++    ahci_pci_cfg_write(&d, 0x80, 4, 0x00000005u);
++    run_one_cmd(&f);
++    assert(f.m.pic.slave.lines & (1u << 6));
++    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
++    assert(!(f.m.pic.slave.lines & (1u << 6)));
++    fx_done(&f);
++    printf("ok msi line\n");
++}
++
+ int main(void) {
+     test_global_regs();
+     test_dark_ports();
+@@ -867,6 +920,7 @@ int main(void) {
+     test_engine_write_128k();
+     test_writethrough();
+     test_intx_line();
++    test_msi_line();
+     printf("test_ahci: ALL PASS\n");
+     return 0;
+ }
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index c91b837..bed86ef 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -914,6 +914,68 @@ static void v_msix_cap(void) {
+     if (fails == f0) printf("ok msix cap: QEMU shape @0x90, RO held, table MMIO, HCRST-persistent\n");
+ }
+ 
++/* ---- v_msix_route: messages replace the pin, fallback restores it ---- */
++static void queue_noop(void) {
++    uint32_t b = CMDRING + (uint32_t)t_cmd_idx * 16;
++    ram_wr32(b + 0, 0); ram_wr32(b + 4, 0); ram_wr32(b + 8, 0);
++    ram_wr32(b + 12, TRB_CMD(23) | (uint32_t)t_cmd_cycle);
++    t_cmd_idx++;
++}
++static void lapic_eoi(void) { mem_write(&M, 0xFEE000B0u, 4, 0); }
++
++static void v_msix_route(void) {
++    int f0 = fails;
++    M.lapic.svr |= 0x100u;                       /* APIC software-enable */
++    hc_reset_program(32);
++    uint32_t ev[4];
++    uint32_t T = XHCI_BAR + 0x3000u;
++    /* arm entry 0 (vector 0x61 -> CPU0, unmasked) and enable MSI-X */
++    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x61u); wr32(T + 12, 0);
++    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(rd32(RT(0x20)) & 1u, "IP latched by the completion");
++    EXPECT(!(M.pic.slave.lines & (1u << 2)), "INTx pin silent under MSI-X");
++    EXPECT(lapic_intack(&M) == 0x61, "message vector 0x61 delivered");
++    lapic_eoi();
++    /* the level still pends: a second completion must not re-send */
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(lapic_intack(&M) < 0, "no duplicate message for a held level");
++    next_event(ev); next_event(ev);              /* consume + EHB ack */
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(lapic_intack(&M) == 0x61, "edge re-armed after the ack");
++    lapic_eoi();
++    next_event(ev);
++    /* per-vector mask: pending rises silently, unmask releases it */
++    wr32(T + 12, 1u);
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(lapic_intack(&M) < 0, "masked vector delivers nothing");
++    wr32(T + 12, 0);
++    EXPECT(lapic_intack(&M) == 0x61, "unmask releases the held level");
++    lapic_eoi();
++    next_event(ev);
++    /* Function Mask behaves the same at capability level */
++    pci_wr32(20, 0x90, (0xC000u << 16) | 0x11u);
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(lapic_intack(&M) < 0, "Function Mask delivers nothing");
++    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);
++    EXPECT(lapic_intack(&M) == 0x61, "function unmask releases it");
++    lapic_eoi();
++    next_event(ev);
++    /* MSI-X off: the pin returns, byte-identical fallback */
++    pci_wr32(20, 0x90, 0x11u);
++    queue_noop();
++    wr32(DB0, 0);
++    EXPECT(M.pic.slave.lines & (1u << 2), "INTx back with MSI-X disabled");
++    next_event(ev);
++    EXPECT(!(M.pic.slave.lines & (1u << 2)), "pin acked clean");
++    if (fails == f0) printf("ok msix route: edge-once messages, mask/unmask release, INTx fallback\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -940,6 +1002,7 @@ int main(void) {
+     v_irq_masking();
+     v_determinism();
+     v_msix_cap();
++    v_msix_route();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

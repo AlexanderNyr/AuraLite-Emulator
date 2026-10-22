@@ -1,0 +1,390 @@
+From 195ed0d97444fcf6b945b96bf0842e3bc38a51cc Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 19:44:55 +0000
+Subject: [PATCH] MSI M2: LAPIC MSI message-delivery core
+
+msi_deliver(m, addr, data) in src/lapic.c decodes one x86 MSI/MSI-X
+message and lands it on lapic_set_irr_dest -- the exact sink the
+IOAPIC already proves, so PPR arbitration, intack and EOI behave
+identically for both interrupt transports.
+
+Decode/measurement summary (all pinned by the new tests/test_msi.c
+lane, observed through deliverable -> intack -> EOI):
+- physical Fixed delivers as addressed; an unroutable destination id
+  falls back to the BSP (the IOAPIC's documented rule);
+- Lowest Priority degenerates to Fixed at the named destination --
+  there is no arbitration fabric to consult (RH only steers that
+  arbitration, so it is decoded and set aside);
+- flat logical destinations match LDR[31:24], first claimant wins,
+  unclaimed falls back to the BSP;
+- a vector below 16 latches ESR receive-illegal-vector and pends
+  nothing; a non-APIC address is ignored entirely;
+- level/trigger bits are advisory: a message is an edge by
+  construction, the source keeps its pending state (MSI_PLAN 2);
+- SMI/NMI/INIT/ExtINT and reserved delivery modes are logged and
+  dropped -- never fabricated into injections this core cannot honor.
+
+The lane is wired into make test / make test-sanitize / .PHONY /
+clean.  NC: msi_deliver stubbed -> 9 failures.  Gates: make test,
+make test-sanitize, both SeaBIOS ISO lanes green.  Nothing calls
+msi_deliver yet; device routing is M3.
+---
+ CHANGELOG.md           | 23 ++++++++++
+ Makefile               | 13 ++++--
+ ROADMAP.md             |  5 ++-
+ docs/STATUS.md         | 10 +++++
+ docs/plans/MSI_PLAN.md | 25 ++++++++++-
+ src/lapic.c            | 39 +++++++++++++++++
+ src/lapic.h            |  4 ++
+ tests/test_msi.c       | 99 ++++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 210 insertions(+), 8 deletions(-)
+ create mode 100644 tests/test_msi.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3d505cd..d5adc7a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,29 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0084 (MSI M2: LAPIC message delivery)
++
++- **`msi_deliver(machine, addr, data)`** (`src/lapic.c`): one PCI
++  MSI/MSI-X message decoded per the x86 format -- destination and
++  destination mode from the address, vector and delivery mode from
++  the data -- and landed on the same IRR sink the IOAPIC already
++  proves, so arbitration (PPR, intack, EOI) behaves identically for
++  both interrupt transports. Physical Fixed delivers as addressed
++  (with the IOAPIC's BSP fallback for unroutable ids); Lowest
++  Priority degenerates to Fixed because no arbitration fabric exists
++  to consult; flat logical destinations match against LDR[31:24];
++  vectors below 16 take the ESR receive-illegal-vector bit; a
++  non-APIC address is not a message at all.
++- **Refused modes fabricate nothing**: SMI, NMI, INIT, ExtINT and
++  the reserved delivery encodings log one line and drop -- no
++  half-true injections of kinds this core cannot honour. Level and
++  trigger bits are advisory: an MSI is an edge by construction and
++  the source keeps its own pending state.
++- **New lane `test-msi`** (4 groups) wired into `make test` and
++  `make test-sanitize`, observing landings through the real
++  deliverable -> intack -> EOI path. NC: delivery stubbed ->
++  9 failures.
++
+ ### Added — patch 0083 (MSI M1: MSI-X capability on the xHCI)
+ 
+ - **The xHCI wears QEMU's MSI-X shape**: Status.Capabilities set,
+diff --git a/Makefile b/Makefile
+index 1ae4afc..62e4df0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -160,6 +160,11 @@ test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+ 	./test-xhci
+ 	rm -f test-xhci
+ 
++test-msi: tests/test_msi.c src/lapic.c src/devices.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
++	./test-msi
++	rm -f test-msi
++
+ test-ring3: tests/test_ring3.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
+ 	./test-ring3
+@@ -371,7 +376,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -381,7 +386,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -430,4 +435,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index a289e54..18a45f5 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -37,7 +37,7 @@ maps to exactly one plan below.
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+-| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M1 done ✅; M2 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
++| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M2 done ✅; M3 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -112,7 +112,8 @@ either shipped or explicitly NO-GO (PERF P4).
+    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+    fallback preserved (historical lanes byte-identical); M4 close-out.
+    **In progress: M0 (`0082`) + M1 MSI-X capability on the xHCI
+-   (`0083`) shipped** -- measured: the north star is INTx/IOAPIC-only,
++   (`0083`) + M2 LAPIC delivery core (`0084`) shipped** -- measured:
++   the north star is INTx/IOAPIC-only,
+    qemu-xhci parity is MSI-X-only (cap @0x90, 16 entries, table
+    BAR0+0x3000), zero capabilities existed before M1, the LAPIC
+    delivery sink (`lapic_set_irr_dest`) is already proven.
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 60a59c7..93afb34 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -952,6 +952,16 @@
+   re-evaluates on unmask). MSI-X state is function state, surviving
+   HCRST. NC red with 13 failures; gates green. INTx delivery is
+   untouched until M3 — nothing routes yet.
++- MSI M2 (`patches/0084-MSI-M2-lapic-delivery.patch`): the delivery
++  core. `msi_deliver(m, addr, data)` in `src/lapic.c` decodes the x86
++  message format onto the IOAPIC's proven sink (`lapic_set_irr_dest`):
++  physical Fixed as addressed (BSP fallback for unroutable ids),
++  Lowest Priority degenerating to Fixed (no arbiter exists), flat
++  logical routing by LDR, ESR illegal-vector below 16, non-APIC
++  addresses ignored, SMI/NMI/INIT/ExtINT logged and dropped, never
++  fabricated. New `test-msi` lane (4 groups) observes landings
++  through the real deliverable->intack->EOI arbitration; NC (delivery
++  stubbed) red with 9 failures. Gates green.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/MSI_PLAN.md b/docs/plans/MSI_PLAN.md
+index bc36321..98bcc1f 100644
+--- a/docs/plans/MSI_PLAN.md
++++ b/docs/plans/MSI_PLAN.md
+@@ -4,13 +4,13 @@
+ > `ROADMAP.md` §"Next-block candidates" and to `docs/plans/XHCI_PLAN.md`
+ > (the xHCI INTx delivery this plan generalises).
+ 
+-**Status: M0–M1 done ✅; M2 queued**
++**Status: M0–M2 done ✅; M3 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | M0 | Measured baseline: who consumes MSI, the QEMU capability shapes, our PCI/LAPIC mechanics, the defect ledger | ✅ done | this file (`patches/0082`) |
+ | M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ✅ done | `tests/test_xhci.c` `v_msix_cap` (23 groups) (`patches/0083`) |
+-| M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ⬜ queued | delivery vectors |
++| M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ✅ done | `tests/test_msi.c` (4 groups, new `test-msi` lane) (`patches/0084`) |
+ | M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ⬜ queued | routing vectors |
+ | M4 | Close-out: snapshots, determinism, docs, ledger | ⬜ queued | close-out + docs |
+ 
+@@ -97,6 +97,27 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+   (the table rides `xhci_t`).
+ - NC: `src/xhci.c` + `src/devices.c` reverted to M0 → 13 failures.
+ 
++## 1f. M2 measured receipts (delivery core)
++
++- **`msi_deliver(m, addr, data)`** (`src/lapic.c`, next to its sink):
++  decodes the x86 message and lands on `lapic_set_irr_dest` -- the
++  same endpoint the IOAPIC proves every boot. The new `test-msi` lane
++  observes landings through the real arbitration
++  (deliverable -> intack -> EOI over MMIO), not through internals.
++- **Measured behaviours**: physical Fixed arrives and acks; an
++  unroutable physical dest falls back to the BSP (the IOAPIC's own
++  documented rule); a non-APIC address (0xFEC window) is ignored;
++  Lowest Priority degenerates to Fixed at the named destination (no
++  arbitration fabric exists to consult); flat-logical destinations
++  match LDR[31:24] with the same BSP fallback; a vector < 16 latches
++  the ESR receive-illegal-vector bit and pends nothing; the bare
++  (0xFEE00000, vector) pair a driver writes into an MSI-X entry lands
++  verbatim, with level/trigger bits advisory (one edge, no phantom).
++- **Refused, by decision**: delivery modes SMI/NMI/INIT/ExtINT and
++  reserved encodings are logged (`[msi] delivery mode N dropped`) and
++  inject nothing; the vectors assert the ring stays empty for each.
++- NC: `msi_deliver` body stubbed out → 9 failures across the 4 groups.
++
+ ## 2. Architecture decisions (M0)
+ 
+ - **XHCI gets MSI-X in the QEMU shape**: capability at cfg 0x90 (id 0x11,
+diff --git a/src/lapic.c b/src/lapic.c
+index b4cd43a..4c1d97b 100644
+--- a/src/lapic.c
++++ b/src/lapic.c
+@@ -132,6 +132,45 @@ void lapic_set_irr_dest(machine_t *m, uint32_t dest, int vector) {
+     map_set(vcpu_lapic(m, idx)->irr, vector);
+ }
+ 
++/* MSI M2: one PCI MSI/MSI-X message, decoded per the x86 message format
++ * (addr = 0xFEE00000 | dest[19:12] | RH[3] | DM[2]; data = trigger[15] |
++ * level[14] | delivery[10:8] | vector[7:0]) and landed on the same sink
++ * the IOAPIC uses.  Delivery is edge-shaped by construction: the source
++ * keeps its own pending state (MSI_PLAN 2), so trigger/level are
++ * advisory.  Fixed lands as addressed.  Lowest Priority has no arbiter
++ * to consult on this machine and degenerates to Fixed at the named
++ * destination.  SMI/NMI/INIT/ExtINT and reserved modes are logged and
++ * dropped -- never fabricated into injections this core cannot honour.
++ * RH (redirection hint) only steers Lowest Priority arbitration, so it
++ * is decoded and set aside with it. */
++void msi_deliver(machine_t *m, uint64_t addr, uint32_t data) {
++    if ((addr & 0xFFF00000ull) != 0xFEE00000ull) return;
++    uint32_t dest = (uint32_t)((addr >> 12) & 0xFFu);
++    int logical = (int)((addr >> 2) & 1u);
++    uint32_t vector = data & 0xFFu;
++    uint32_t dmode = (data >> 8) & 7u;
++    if (dmode != 0 && dmode != 1) {
++        mlog(&m->log, "[msi] delivery mode %u dropped (vec %u dest %u)",
++             dmode, vector, dest);
++        return;
++    }
++    if (!logical) {
++        lapic_set_irr_dest(m, dest, (int)vector);
++        return;
++    }
++    /* logical (flat): dest is a bitmask over LDR[31:24]; first claimant
++     * wins, nobody-claims-it falls back to the BSP like the IOAPIC. */
++    for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++) {
++        lapic_t *li = vcpu_lapic(m, i);
++        if (dest & (li->ldr >> 24)) {
++            if (vector < 16) { m->lapic.esr |= (1u << 6); return; }
++            map_set(li->irr, (int)vector);
++            return;
++        }
++    }
++    lapic_set_irr_dest(m, 0, (int)vector);
++}
++
+ /* K6: an INIT arriving at context idx (Intel MP spec s.8.4: INIT resets
+  * most architectural state and parks the cpu in wait-for-SIPI; the
+  * LAPIC keeps its ID).  INIT asserted at the RUNNING context is the
+diff --git a/src/lapic.h b/src/lapic.h
+index 814839a..c450cc0 100644
+--- a/src/lapic.h
++++ b/src/lapic.h
+@@ -94,6 +94,10 @@ void lapic_set_irr(struct machine *m, int vector);
+ /* K6: same, targeted at the context owning LAPIC-id `dest` (I/O APIC
+  * rte.hi, physical destination mode; unroutable dest falls back to BSP). */
+ void lapic_set_irr_dest(struct machine *m, uint32_t dest, int vector);
++/* MSI M2: deliver one PCI MSI/MSI-X message (addr/data as programmed
++ * into the capability or vector-table entry).  See lapic.c for the
++ * decode and the delivery-mode honesty rules. */
++void msi_deliver(struct machine *m, uint64_t addr, uint32_t data);
+ /* Timer: advance on virtual time; no-op until programmed. */
+ void lapic_tick(struct machine *m);
+ 
+diff --git a/tests/test_msi.c b/tests/test_msi.c
+new file mode 100644
+index 0000000..f6ba50d
+--- /dev/null
++++ b/tests/test_msi.c
+@@ -0,0 +1,99 @@
++/* tests/test_msi.c -- MSI M2 vectors: the LAPIC message-delivery core.
++ *
++ * msi_deliver() is driven with raw capability-shaped (addr, data) pairs
++ * and the landing is observed through the real LAPIC arbitration
++ * (deliverable -> intack -> EOI), exactly what a vCPU would see.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static machine_t M;
++
++static void eoi(void) { mem_write(&M, 0xFEE000B0u, 4, 0); }
++static int take(void) { int v = lapic_intack(&M); if (v >= 0) eoi(); return v; }
++
++#define MSG_ADDR(dest, logical) (0xFEE00000ull | ((uint64_t)(dest) << 12) | ((logical) ? 4ull : 0ull))
++#define MSG_DATA(vec, dmode)    ((uint32_t)(vec) | ((uint32_t)(dmode) << 8))
++
++/* ---- v_fixed: physical Fixed delivery --------------------------------- */
++static void v_fixed(void) {
++    int f0 = fails;
++    EXPECT(lapic_deliverable(&M) < 0, "ring empty at start");
++    msi_deliver(&M, MSG_ADDR(0, 0), MSG_DATA(0x42, 0));
++    EXPECT(lapic_deliverable(&M) == 0x42, "vector 0x42 pending (got %d)", lapic_deliverable(&M));
++    EXPECT(take() == 0x42, "intack returns 0x42");
++    EXPECT(lapic_deliverable(&M) < 0, "drained after ack+EOI");
++    /* an unroutable physical destination falls back to the BSP (IOAPIC rule) */
++    msi_deliver(&M, MSG_ADDR(0x55, 0), MSG_DATA(0x51, 0));
++    EXPECT(take() == 0x51, "dest 0x55 (nobody) still lands on the BSP");
++    /* a non-APIC address is not an MSI at all */
++    msi_deliver(&M, 0xFEC00000ull, MSG_DATA(0x60, 0));
++    EXPECT(lapic_deliverable(&M) < 0, "IOAPIC-window address ignored");
++    if (fails == f0) printf("ok fixed: physical delivery, BSP fallback, non-APIC ignored\n");
++}
++
++/* ---- v_modes: delivery-mode honesty ----------------------------------- */
++static void v_modes(void) {
++    int f0 = fails;
++    /* Lowest Priority: no arbiter on this machine -> lands as Fixed */
++    msi_deliver(&M, MSG_ADDR(0, 0), MSG_DATA(0x44, 1));
++    EXPECT(take() == 0x44, "Lowest Priority degenerates to Fixed here");
++    /* SMI(2), NMI(4), INIT(5), ExtINT(7), reserved(3,6): dropped, logged */
++    static const uint32_t dropped[5] = { 2, 3, 4, 5, 7 };
++    for (int i = 0; i < 5; i++) {
++        msi_deliver(&M, MSG_ADDR(0, 0), MSG_DATA(0x70 + i, dropped[i]));
++        EXPECT(lapic_deliverable(&M) < 0, "delivery mode %u fabricated nothing", dropped[i]);
++    }
++    /* illegal vector: ESR receive-illegal-vector, nothing pending */
++    msi_deliver(&M, MSG_ADDR(0, 0), MSG_DATA(0x08, 0));
++    EXPECT(lapic_deliverable(&M) < 0, "vector < 16 does not pend");
++    EXPECT(M.lapic.esr & (1u << 6), "ESR illegal-vector bit set");
++    M.lapic.esr = 0;
++    if (fails == f0) printf("ok modes: LP=Fixed, SMI/NMI/INIT/ExtINT dropped, ESR on vec<16\n");
++}
++
++/* ---- v_logical: flat logical destinations via LDR --------------------- */
++static void v_logical(void) {
++    int f0 = fails;
++    /* BSP claims logical id 0x02 (LDR[31:24]) */
++    mem_write(&M, 0xFEE000D0u, 4, 0x02000000u);
++    msi_deliver(&M, MSG_ADDR(0x02, 1), MSG_DATA(0x46, 0));
++    EXPECT(take() == 0x46, "logical dest matching LDR delivers");
++    /* no claimant for 0x40: BSP fallback, still lands (documented) */
++    msi_deliver(&M, MSG_ADDR(0x40, 1), MSG_DATA(0x47, 0));
++    EXPECT(take() == 0x47, "unclaimed logical dest falls back to the BSP");
++    mem_write(&M, 0xFEE000D0u, 4, 0);
++    if (fails == f0) printf("ok logical: LDR claimant wins, unclaimed falls back\n");
++}
++
++/* ---- v_shape: the exact values an OS programs for xHCI entry 0 -------- */
++static void v_shape(void) {
++    int f0 = fails;
++    /* What a driver writes into an MSI-X entry for "vector 0x61 to CPU0":
++     * addr 0xFEE00000 (possibly with the +0xC interrupt-remapping-free
++     * low bits clear), data = the bare vector.  Plus the level/trigger
++     * bits some stacks set on level-triggered sources: advisory only. */
++    msi_deliver(&M, 0xFEE00000ull, 0x61u);
++    EXPECT(take() == 0x61, "bare-vector message lands");
++    msi_deliver(&M, 0xFEE00000ull, 0x61u | (1u << 14) | (1u << 15));
++    EXPECT(take() == 0x61, "level/trigger bits are advisory, still one edge");
++    EXPECT(lapic_deliverable(&M) < 0, "no phantom second edge");
++    if (fails == f0) printf("ok shape: driver-programmed addr/data land verbatim\n");
++}
++
++int main(void) {
++    devices_init_common(&M);
++    M.lapic.svr |= 0x100u;   /* APIC software-enable, as any OS does first */
++    v_fixed();
++    v_modes();
++    v_logical();
++    v_shape();
++    if (fails) { printf("test-msi: %d FAILED\n", fails); return 1; }
++    printf("test-msi: all vectors passed\n");
++    return 0;
++}
+-- 
+2.47.3
+

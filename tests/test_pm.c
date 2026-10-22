@@ -148,6 +148,100 @@ static void test_lpc_config_hook_moves_base(void) {
     puts("ok   pm: LPC PMBASE (0x40 = 0xb000|1) lands on 0xb000");
 }
 
+/* PM P1: PM1_STS/EN/CNT at +0x00/+0x02/+0x04 -- W1C status, stored
+ * enables, SCI_EN gating, level SCI on IRQ9 (slave 8259 line 1). */
+static void test_pm1_registers(void) {
+    machine_t m; setup_machine(&m);
+    pit_init(&m); pm_init(&m); pic_init(&m);
+    const uint16_t B = PM_DEFAULT_BASE;
+    assert(io_read(&m, B + 0, 2) == 0 && io_read(&m, B + 2, 2) == 0 &&
+           io_read(&m, B + 4, 2) == 0);
+    io_write(&m, B + 2, 2, 0x8101);                /* PM1_EN stores   */
+    assert(io_read(&m, B + 2, 2) == 0x8101);
+    io_write(&m, B + 4, 1, 0x01);                  /* byte write CNT  */
+    assert(io_read(&m, B + 4, 2) == 0x0001);       /* SCI_EN stored   */
+    assert(io_read(&m, B + 4, 1) == 0x01);         /* byte reads work */
+    puts("ok   pm: PM1_EN/CNT store their bits (word and byte access)");
+}
+
+static void test_tmr_sts_and_sci(void) {
+    machine_t m; setup_machine(&m);
+    pit_init(&m); pm_init(&m); pic_init(&m);
+    const uint16_t B = PM_DEFAULT_BASE;
+    m.pm.count = 0x00FFFFFEu; m.pm.last_instr = m.vtime_instr;
+    m.vtime_instr += 3 * STEPS_PER_TMR;            /* 3 TMR ticks: wrap */
+    (void)io_read(&m, B + 8, 4);                   /* advance on read   */
+    assert((io_read(&m, B + 0, 2) & 0x0001) == 1); /* TMR_STS latched   */
+    assert((m.pic.slave.lines & 0x02) == 0);       /* EN=0: no SCI      */
+
+    io_write(&m, B + 0, 2, 0x0001);                /* W1C               */
+    assert((io_read(&m, B + 0, 2) & 0x0001) == 0);
+
+    m.pm.count = 0x00FFFFFEu; m.pm.last_instr = m.vtime_instr;
+    m.vtime_instr += 3 * STEPS_PER_TMR;
+    (void)io_read(&m, B + 8, 4);
+    assert((io_read(&m, B + 0, 2) & 0x0001) == 1);
+    io_write(&m, B + 0, 2, 0x8000);                /* clear WAK only    */
+    assert((io_read(&m, B + 0, 2) & 0x0001) == 1); /* TMR_STS survives  */
+
+    io_write(&m, B + 2, 2, 0x0001);                /* TMR_EN, SCI_EN=0  */
+    assert((m.pic.slave.lines & 0x02) == 0);
+    io_write(&m, B + 4, 1, 0x01);                  /* SCI_EN=1          */
+    assert((m.pic.slave.lines & 0x02) != 0);       /* IRQ9 asserted     */
+    io_write(&m, B + 0, 2, 0x0001);                /* W1C the event     */
+    assert((m.pic.slave.lines & 0x02) == 0);       /* level released    */
+    puts("ok   pm: TMR overflow latches TMR_STS, W1C clears, SCI gates");
+}
+
+static void test_s5_request(void) {
+    machine_t m; setup_machine(&m);
+    pit_init(&m); pm_init(&m);
+    const uint16_t B = PM_DEFAULT_BASE;
+    assert(m.stop_requested == 0);
+    io_write(&m, B + 4, 2, 0x2000);                /* SLP_EN + typ 0    */
+    assert(m.stop_requested == 0);                 /* not S5: no stop   */
+    io_write(&m, B + 4, 2, 0x3C00);                /* SLP_EN + typ 7    */
+    assert(m.stop_requested == 1);                 /* S5 stops the run  */
+    assert((io_read(&m, B + 4, 2) & 0x2000) == 0); /* SLP_EN reads 0    */
+    puts("ok   pm: PM1_CNT SLP_TYP=7 + SLP_EN stops the run (S5)");
+}
+
+/* PM P2: GPE0 block at +0x20 (STS W1C) / +0x24 (EN), joining the SCI
+ * expression. Nothing latches GPE bits yet (no GPE sources exist);
+ * this vector pokes the latch directly to prove the wire. */
+static void test_gpe0(void) {
+    machine_t m; setup_machine(&m);
+    pit_init(&m); pm_init(&m); pic_init(&m);
+    const uint16_t B = PM_DEFAULT_BASE;
+    io_write(&m, B + 0x24, 4, 0x00000005);            /* GPE0_EN stores  */
+    assert(io_read(&m, B + 0x24, 4) == 0x00000005u);
+    assert(io_read(&m, B + 0x20, 4) == 0);            /* nothing latched */
+    io_write(&m, B + 4, 1, 0x01);                     /* SCI_EN          */
+    m.pm.gpe_sts = 0x1;                               /* the "source"    */
+    pm_tick(&m);
+    assert((m.pic.slave.lines & 0x02) != 0);          /* GPE raises SCI  */
+    io_write(&m, B + 0x20, 4, 0x00000001);            /* W1C the bit     */
+    assert(io_read(&m, B + 0x20, 4) == 0);
+    assert((m.pic.slave.lines & 0x02) == 0);          /* SCI released    */
+    puts("ok   pm: GPE0 STS/EN live, W1C clears, GPE joins SCI");
+}
+
+/* PM P3: S1 is zero-duration by measured decision -- the write
+ * latches WAK_STS and the run continues; unknown types do nothing. */
+static void test_s1_zero_duration(void) {
+    machine_t m; setup_machine(&m);
+    pit_init(&m); pm_init(&m);
+    const uint16_t B = PM_DEFAULT_BASE;
+    io_write(&m, B + 4, 2, 0x2400);                /* SLP_EN + typ 1    */
+    assert(m.stop_requested == 0);                 /* still running     */
+    assert((io_read(&m, B + 0, 2) & 0x8000) != 0); /* WAK_STS latched   */
+    io_write(&m, B + 0, 2, 0x8000);                /* W1C               */
+    assert(io_read(&m, B + 0, 2) == 0);
+    io_write(&m, B + 4, 2, 0x3400);                /* SLP_EN + typ 5    */
+    assert(m.stop_requested == 0 && io_read(&m, B + 0, 2) == 0);
+    puts("ok   pm: S1 latches WAK_STS without stopping (zero-duration)");
+}
+
 int main(void) {
     test_default_window_and_rate();
     test_24bit_wrap();
@@ -155,6 +249,11 @@ int main(void) {
     test_other_registers_and_write_ignore();
     test_rebase();
     test_lpc_config_hook_moves_base();
+    test_pm1_registers();
+    test_tmr_sts_and_sci();
+    test_s5_request();
+    test_gpe0();
+    test_s1_zero_duration();
     puts("pm tests: ok");
     return 0;
 }

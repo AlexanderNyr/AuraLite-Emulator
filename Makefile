@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -156,9 +156,14 @@ test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/sna
 
 # XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
 test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-xhci -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-xhci -lm
 	./test-xhci
 	rm -f test-xhci
+
+test-msi: tests/test_msi.c src/lapic.c src/devices.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
+	./test-msi
+	rm -f test-msi
 
 test-ring3: tests/test_ring3.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_ring3.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-ring3 -lm
@@ -261,9 +266,10 @@ test-debug: x86emu firmware/firmware.bin disk/disk.img tests/integration/t2_debu
 test-dbg-nc: tests/integration/t2_dbg_nc.sh tests/test_dbg.c src/dbg.c
 	sh tests/integration/t2_dbg_nc.sh
 
-# TOOLING T3: gdbstub. test-gdbstub is the pure-socket RSP client (30
-# checks: session, Ctrl-C, protocol hygiene); test-gdb adds real `gdb -batch`
-# lanes (SKIP without gdb; the frozen-guest lane SKIPs without KERNEL/INITRD).
+# TOOLING T3: gdbstub. test-gdbstub is the pure-socket RSP client (57
+# checks: session, Ctrl-C, protocol hygiene, x87 state since UPKEEP U3);
+# test-gdb adds real `gdb -batch` lanes (SKIP without gdb; the
+# frozen-guest lane SKIPs without KERNEL/INITRD).
 test-gdbstub: x86emu firmware/firmware.bin disk/disk.img tests/test_gdbstub.py
 	X86EMU=./x86emu python3 tests/test_gdbstub.py
 
@@ -371,7 +377,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -381,7 +387,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
@@ -430,4 +436,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf

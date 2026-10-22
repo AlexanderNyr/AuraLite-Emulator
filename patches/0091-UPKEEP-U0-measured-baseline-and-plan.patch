@@ -1,0 +1,492 @@
+From 149f292bd01e93cef7138d520eaa9a6c83145a76 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 15:49:27 +0000
+Subject: [PATCH] Upkeep U0: measured baseline + plan (UPKEEP_PLAN U0)
+
+Open ROADMAP candidate #4 with a current-code and consumer
+audit of the seven site-documented gaps. The baseline finds
+that the shorthand "one upkeep patch" would combine unrelated
+CPU reset, device, TCP, debugger and web-security semantics,
+so it maps D1-D7 to U1-U7 with per-phase vectors, negative
+controls and canaries.
+
+Measured highlights: IA32_APIC_BASE is stored while LAPIC
+decode/delivery remains fixed and SMP slots seed BSP=1; CF9
+has full reset but no CPU-INIT request kind; the RTC has no
+representation for a guest-set date; the north-star e1000
+probe takes three EERD timeouts before RAL/RAH fallback;
+responder TCP acks/appends without sequence validation, so
+SACK cannot be honest yet; gdbstub zeroes now-real x87 state;
+and loopback is the GUI/monitor's only access control.
+
+Docs only. Targeted receipts: test-unit, test-tap-responder,
+test-gui, test-monitor and the 30-check pure-RSP gdb lane are
+green; real GNU gdb is absent on this host and is recorded
+as a U3 gate requirement rather than a receipt.
+---
+ CHANGELOG.md              |  15 ++
+ ROADMAP.md                |  11 +-
+ docs/STATUS.md            |  14 ++
+ docs/plans/UPKEEP_PLAN.md | 370 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 407 insertions(+), 3 deletions(-)
+ create mode 100644 docs/plans/UPKEEP_PLAN.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2fc2e06..25107cc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,21 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0091 (Upkeep U0: measured baseline + plan)
++
++- `docs/plans/UPKEEP_PLAN.md` opens ROADMAP candidate #4 with a
++  current-code and consumer audit of all seven documented gaps.
++  Measured scope corrections matter: an x2APIC decoder is not
++  implied by LAPIC MSR writes (CPUID does not advertise it);
++  the missing CF9 operation is `0x02` itself, while
++  `0x02 -> 0x06` already full-resets; and the TCP responder's
++  normal passive close correctly leaves TIME_WAIT to the guest,
++  so its real defects are unsequenced receive/SACK and duplicate
++  close segments. The plan splits the work into U1 RTC writes,
++  U2 e1000 EEPROM/PHY, U3 gdbstub x87, U4 LAPIC MSR, U5 CF9 INIT,
++  U6 responder TCP and U7 GUI/monitor capability authentication.
++  Docs only; no behaviour change.
++
+ ### Added — patch 0090 (PM P3: zero-duration S1 + close-out) — PM plan complete
+ 
+ - **S1** (`src/pm.c`, `src/acpi.c`): SLP_TYP=1 is a zero-duration
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 47bd141..1c5126b 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -85,7 +85,7 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ | 1 | **xHCI (USB 3.0 host controller).** The guest's USB stack speaks UHCI/EHCI/xHCI; the machine has UHCI (U4) + EHCI (U3) only | north star above; no xHCI symbol in `src/` | `docs/plans/XHCI_PLAN.md` (X0–X5, the USB_PLAN shape) |
+ | 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
+ | 3 | ~~**PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed~~ | ✅ **complete** (PM_PLAN P0–P3, patches 0087–0090: PM1 registers + SCI + S5, FADT/DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM) | `docs/plans/PM_PLAN.md` (P0–P3) |
+-| 4 | Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT triple-FD (`0x02`→`0x06`) not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and no TIME_WAIT model (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice) | as named | one "upkeep" patch, or folded into the plans above when touched |
++| 4 | Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice) | as named | `docs/plans/UPKEEP_PLAN.md` (U0–U7; U0 baseline shipped in `0091`) |
+ 
+ No unmeasured defects are known: the F4 lanes closed the last flake class
+ (run-dependent snapshot bytes), and the defect ledgers in each plan are
+@@ -124,8 +124,13 @@ either shipped or explicitly NO-GO (PERF P4).
+    zero-duration S1 (spec-legal immediate wake — no consumer needs
+    real parking; the fork and its measurement are in the plan §2c).
+    SMI stays honestly absent (SMI_CMD=0).
+-4. **Upkeep patch** — the row-4 small gaps in one measured pass (the
+-   house recipe), scheduled around whichever plan touches those files.
++4. **UPKEEP_PLAN (U0–U7)** — the row-4 gaps as one measured plan,
++   split by subsystem because their negative controls and canaries
++   are unrelated: RTC writes, e1000 EEPROM/PHY, gdbstub x87,
++   LAPIC MSR semantics, CF9 INIT, responder TCP sequencing/SACK,
++   and GUI/monitor capability authentication. **In progress: U0
++   (`0091`) shipped** — every item re-measured against current
++   code and consumers, with D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index f88248d..778797c 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1030,6 +1030,20 @@
+   both suites abort. Audit candidates #1–#3 are now all shipped;
+   the ROADMAP's next candidate is the single upkeep pass over the
+   small documented gaps.
++- Upkeep U0 (`patches/0091-UPKEEP-U0-measured-baseline-and-plan.patch`):
++  measured baseline for ROADMAP row 4 (`docs/plans/UPKEEP_PLAN.md`).
++  The seven “small” items are not one safe patch: MSR `0x1B` is
++  storage while LAPIC decode/delivery stay fixed (and all SMP
++  contexts seed BSP=1); CF9 has only full reset, no boundary
++  CPU-INIT kind; the RTC cannot represent a guest-set date; the
++  north-star e1000 probe takes three EERD timeouts before its
++  RAL/RAH fallback; responder TCP appends/acks without sequence
++  validation and therefore cannot honestly emit SACK; gdbstub
++  still zeroes now-real x87 state; and loopback is the GUI/
++  monitor's only access control. Ledger D1–D7 is split into
++  U1 RTC, U2 e1000, U3 gdb x87, U4 LAPIC, U5 CF9, U6 TCP and
++  U7 authenticated GUI/monitor. Docs only; targeted unit,
++  responder and 30-check RSP lanes green (real gdb absent).
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+new file mode 100644
+index 0000000..86d5035
+--- /dev/null
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -0,0 +1,370 @@
++# Upkeep Plan — the documented small gaps, measured one by one
++
++> `ROADMAP.md` measured-gaps row 4 and next-block candidate 4.
++> XHCI, MSI and PM are complete; this plan takes the remaining
++> site-documented gaps in dependency/risk order.
++
++**Status: U0 done ✅; U1 queued**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| U0 | Measured baseline for all seven row-4 items, defect ledger, decisions and phase split | ✅ done | this file (`patches/0091`) |
++| U1 | RTC: a settable MC146818 clock/calendar without changing the pinned power-on behaviour | ⬜ queued | `tests/test_rtc.c` vectors |
++| U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ⬜ queued | `tests/test_net.c` vectors |
++| U3 | gdbstub: publish and accept the real x87 register/control state in `g`/`G`/`p`/`P` | ⬜ queued | `tests/test_gdbstub.py` vectors |
++| U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ⬜ queued | `tests/test_lapic.c` vectors |
++| U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ⬜ queued | `tests/test_chipset.c` vectors |
++| U6 | TAP responder TCP: sequenced receive, SACK generation and complete close-state handling | ⬜ queued | `tests/test_tap_responder.py` vectors |
++| U7 | GUI/monitor: capability authentication and browser-origin defences, then plan close-out | ⬜ queued | GUI/monitor vectors + close-out |
++
++Each implementation phase ships one `.patch` under `patches/` with
++measured receipts, a regression vector, one once-per-phase negative
++control, green gates and the docs update in the same commit (the
++standing house rules). U0 changes documentation only.
++
++## 0. Measurement method and current receipts
++
++Baseline taken at emulator `dd536b1` after PM P3. The current code
++and its test contracts were inspected directly; the current
++AuraLite-OS source was inspected at `4450da7` for consumer use (it
++is a consumer clue, not a replacement for this repository's frozen
++guest receipts). QEMU's current `hw/net/e1000.c` was inspected for
++the EEPROM/PHY contrast in §1.4. Targeted current-tree receipts
++for U0:
++
++- `make test-unit`: green (includes LAPIC, chipset, RTC and e1000
++  register-file suites);
++- `make test-tap-responder`: green;
++- `make test-gui` and `make test-monitor`: green (the desktop
++  construction sub-lane skips without a display, as designed);
++- `make test-gdb`: green for the 30-check pure-RSP protocol lane;
++  the real-GNU-gdb lanes SKIP on this host because `gdb` is not
++  installed, which U3 must not mistake for a real-client receipt.
++
++No unmeasured runtime claim below depends on the absent
++AuraLite-OS KERNEL/INITRD artifacts.
++
++## 1. Measured baseline (U0)
++
++### 1.1 LAPIC `IA32_APIC_BASE` — stored, never decoded
++
++- `cpu_reset()` seeds MSR `0x1B` to `LAPIC_MSR_DEFAULT`
++  (`0xFEE00900`: base, global enable, BSP). Guest `WRMSR` uses the
++  generic sparse MSR store and executes no LAPIC side effect; the
++  header says relocation/disable is “stored only, documented.”
++- The MMIO window is registered exactly once at compile-time
++  `LAPIC_BASE = 0xFEE00000`, and both handlers subtract that
++  constant. A guest that writes a new base and then follows it
++  (AuraLite-OS reads MSR `0x1B` in every LAPIC helper) leaves the
++  live window behind and accesses whatever the normal decoder
++  finds at the new address, while the old window continues to work.
++- Delivery checks only `SVR` software-enable. Clearing
++  `IA32_APIC_BASE.EN` changes neither MMIO, timer progress, IRR
++  latching nor CPU delivery. CPUID leaf 1 does **not** advertise
++  x2APIC (ECX bit 21), so x2APIC-mode selection is not an implicit
++  sub-feature waiting for a decoder; it must remain rejected
++  unless a separate x2APIC plan changes the CPUID contract.
++- The SMP context machinery multiplies the problem rather than
++  hiding it: each slot has its own CPU/MSR and LAPIC state, but the
++  bus has one fixed registration. `cpu_reset()` also has no context
++  identity, so every AP slot is seeded with BSP=1 until some other
++  code corrects it. Snapshot restore additionally requires the
++  live MMIO list to match the saved base exactly, except for the
++  special runtime regions it already knows how to rebind.
++- The north-star guest reads but does not write MSR `0x1B`; the
++  consumers are firmware/OS paths (notably Linux APIC setup and
++  disable/re-enable flows) and architectural honesty.
++
++### 1.2 CF9 CPU INIT — only the full-reset half exists
++
++- `cf9_write()` stores every byte and requests the existing full
++  warm reset only when `SYS_RST` rises while `RST_CPU` is set.
++  `0x02` alone and `0x04` alone are explicitly pinned as no-reset
++  by `test_reset_via_cf9_predicates`. Thus the missing transition
++  is the `0x02` CPU-INIT write itself; the familiar
++  `0x02 -> 0x06` sequence already reaches a full reset on the
++  second write.
++- All reset sources collapse into one Boolean `reset_pending`,
++  consumed by `cpu_step()` at the next instruction boundary.
++  `machine_reset()` resets the active CPU/LAPIC plus PIC, PIT,
++  KBC, IOAPIC and chipset state. There is no pending-request kind
++  and no CPU-only boundary operation to reuse unchanged.
++- IPI INIT is related but not a drop-in substitute:
++  `vcpu_take_init()` resets a non-running slot and parks it in
++  wait-for-SIPI, while deliberately refusing INIT at the running
++  context. A chipset INIT# request necessarily originates from
++  the running context and has platform-wide target semantics.
++  U5 must measure those semantics from the chipset/CPU documents
++  instead of treating the IPI helper as the definition.
++- AuraLite-OS reboots through the 8042 `0xFE` pulse and has no CF9
++  consumer. The ACPI FADT shipped by PM P2 advertises reset value
++  `0x0E`, so U5 must preserve that as a full reset exactly.
++
++### 1.3 RTC — a deterministic clock that cannot be set
++
++- The clock is a pure function of monotonic virtual ticks from a
++  fixed 2026-01-01 00:00:00 anchor. `rtc_data_write()` discards
++  writes to seconds/minutes/hours/day-of-week/day/month/year and
++  the century byte. The existing test pins even that refusal.
++- Register B is stored, but only UIE/PIE have effects. Reads are
++  always emitted as BCD in 24-hour form regardless of Register
++  B's data-mode and hour-mode bits, and the SET bit does not stop
++  the update cycle or stage an initialization sequence.
++- The civil conversion starts at 2026 and walks forward from an
++  unsigned tick count, so simply “accept the fields and convert”
++  first needs a representation that can name dates before the
++  power-on anchor as well as after it. UIP/update-ended and the
++  later periodic-IRQ logic derive phases from the same ticks and
++  are canaries, not collateral.
++- AuraLite-OS only reads the epoch and writes Registers A/B to
++  run periodic IRQ8; firmware and general-purpose OSes are the
++  consumers that set the clock. A hardware-setting utility or
++  Linux `hwclock` operation currently appears to succeed at the
++  port and then reads back the untouched 2026-derived time.
++
++### 1.4 e1000 EERD/MDIC — two command registers are storage cells
++
++- `e1000_mmio_write()` has special cases for control, interrupt
++  and ring registers; EERD (`0x14`) and MDIC (`0x200`) fall into
++  the generic register store. No EEPROM array, PHY array, DONE/
++  READY completion, ERROR bit or MDAC cause exists in `e1000_t`.
++- This is on the north star's probe path. Its driver issues an
++  EERD read for EEPROM words 0, 1 and 2, polls DONE up to 100,000
++  times per word, and only then falls back to RAL/RAH. The current
++  stub therefore costs three timeouts during every probe and the
++  RAL/RAH preload is what makes the receipt say
++  `MAC from RAL/RAH`. If U2 does its job, the same MAC must arrive
++  through the EEPROM and that source-line change is an expected,
++  reviewed receipt change—not a reason to preserve the timeout.
++- The guest does not use MDIC. General drivers do use it for PHY
++  ID, reset, link and autonegotiation state. The contrast in
++  QEMU is a 64-word EEPROM plus a 32-register PHY file with
++  capability masks, synchronous EERD completion on read, MDIC
++  READY/ERROR handling and an optional MDAC interrupt. U2 will
++  pin the exact 82540EM values from primary/QEMU source at
++  implementation time rather than copying constants from memory.
++- The e1000 exists only with `--tap`; snapshot save/load refuses
++  TAP runs because the endpoint is host state. New EEPROM/PHY
++  state therefore does not need to invent a snapshot format in
++  U2, but reset behaviour does need a vector.
++
++### 1.5 TAP-responder TCP — SACK is negotiated, never spoken
++
++- The responder advertises SACK-permitted in its SYN-ACK and logs
++  whether the peer offered it, but does not retain that fact in
++  the connection record, never emits a SACK option, and
++  `tcp_segment()` always builds a 20-byte header.
++- More importantly, receive is not sequenced. For any known
++  tuple, `rcv_nxt += seglen` and payload bytes are appended to the
++  DNS buffer without comparing the segment sequence number.
++  A duplicate advances the acknowledgement twice; an
++  out-of-order segment is delivered to the application as if it
++  were contiguous; an out-of-order FIN consumes sequence space
++  at the same time. The current in-order guest/TAP lanes do not
++  expose this, but the state machine cannot generate an honest
++  SACK until it stops doing it.
++- AuraLite-OS's TCP stack can parse SACK blocks and use them to
++  mark its retransmission queue. It is therefore a real potential
++  consumer of responder-generated SACK, not merely an RFC reader.
++- The close path has a narrower defect than the ROADMAP's short
++  “no TIME_WAIT” wording suggests. In the only reachable normal
++  flow the guest closes first, the responder answers FIN|ACK and
++  enters LAST_ACK, and the guest—not the responder—is the side
++  that enters TIME_WAIT. Freeing the tuple on the final ACK is
++  architecturally right for that passive close. What is missing
++  is complete duplicate/crossing-segment behaviour: a duplicate
++  FIN while LAST_ACK currently frees the tuple, there is no
++  CLOSING/active-close path, and no bounded retained state can
++  answer late duplicates. U6 must implement the states that are
++  actually reachable and must not fabricate a passive-side
++  TIME_WAIT merely to match a checklist word.
++- The responder has no timers and its determinism tests require
++  replayed frames to produce identical replies. U6 therefore
++  cannot quietly introduce wall-clock ageing as guest-visible
++  behaviour; any retained tuple/TTL mechanism must be explicit,
++  bounded and replay-deterministic.
++
++### 1.6 gdbstub x87 — target description promises registers it zeroes
++
++- The target XML and packet layout already reserve registers
++  24–31 for `st0..st7` (10 bytes each) and 32–39 for x87
++  control/status. `reg_hex()` nevertheless emits zero for every
++  ST register, emits FCW but zero for FSW and pointer/opcode
++  fields, and hard-wires FTAG to all-empty. `reg_set()` silently
++  ignores all of them. The stale comment says “no x87 data
++  model”, but FPU F1–F4 has since given the CPU a full physical
++  register file, tags, TOP, status/control and last-instruction
++  pointers.
++- The hard part is not finding state; it is mapping it the way
++  GDB expects. CPU storage is physical `fst[8]` plus `ftop`,
++  host `long double` slots with normalized padding, and helper
++  converters private to `cpu.c`. U3 must measure GDB/QEMU's
++  logical-vs-physical register convention and control-field
++  widths before exposing bytes, then prove a write with an FPU
++  instruction after resume.
++- Current regression coverage parses the fixed-size `g` packet
++  but asserts no x87 value. Real GDB is unavailable on the U0
++  host, so the phase gate needs either a real client receipt or
++  an explicitly pinned protocol fixture measured from GDB's own
++  target conventions—not only self-consistent stub bytes.
++
++### 1.7 GUI/monitor — loopback is a default, not an authentication model
++
++- The desktop GUI is a local process, but it starts each machine
++  with an unauthenticated monitor on a free loopback port. The
++  web launcher defaults to loopback and its HTTP API can start/
++  stop machines, browse server-side files, download artifacts,
++  manage presets/snapshots and splice a browser WebSocket onto
++  the live monitor. The emulator monitor likewise accepts its
++  page/WebSocket upgrade with no credential, Origin or Host
++  authorization check.
++- Loopback stops ordinary remote hosts; it does not stop another
++  local process or a malicious web page attempting cross-origin
++  requests/DNS-rebinding against a predictable local service.
++  The launcher and monitor also allow an operator to bind
++  non-loopback addresses, at which point the same unauthenticated
++  control surface is network-facing. Existing README/STATUS text
++  correctly calls this an operator choice, but the product has
++  no safer authenticated choice to offer.
++- User experience is a constraint, not an excuse: the standing
++  requirement is that **no command line be needed**. U7's normal
++  desktop/web flow must remain one-click, generate and carry its
++  capability internally, and expose any remote-access secret
++  through the GUI—not require terminal or environment setup.
++
++### 1.8 Defect ledger
++
++| # | Defect (measured) | Consequence | Phase |
++|---|-------------------|-------------|-------|
++| D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | U4 |
++| D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | U5 |
++| D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | U1 |
++| D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | U2 |
++| D5 | Responder TCP appends/acks payload without sequence validation, sends no SACK and has incomplete duplicate-close states | loss/reordering corrupts the DNS stream and acknowledgement state instead of eliciting retransmission | U6 |
++| D6 | gdbstub advertises x87 registers but reports zeros/all-empty and ignores writes | FPU debugging displays a machine that is not the one executing | U3 |
++| D7 | Launcher API, launcher WebSocket proxy and direct monitor are unauthenticated and do not authorize Host/Origin | local cross-origin/process access and any opted-in remote bind get full machine control | U7 |
++
++## 2. Architecture decisions (U0)
++
++- **This is one plan, not one mega-patch.** The ROADMAP shorthand
++  says “one upkeep patch”, but the measured items span CPU reset
++  architecture, two devices, a Python protocol peer, debugger
++  serialization and web security. One commit would make the
++  required negative controls and canary receipts meaningless.
++  Each subsystem gets its own phase/patch; U7 closes the plan.
++- **Defaults are canaries.** Every phase must keep the current
++  no-feature-used path byte-identical where a receipt exists:
++  RTC power-on/UIP timing, e1000 MAC and data rings, register
++  packet size/order outside x87 values, LAPIC at the reset base,
++  full-reset sources, in-order TCP frames and local GUI startup.
++  Expected receipt changes (initially the e1000 MAC source line)
++  are called out in the phase commit, not discovered afterward.
++- **Encodings come from primary sources at implementation time.**
++  Intel SDM/ICH and MC146818 documents for U1/U4/U5, Intel
++  82540EM + QEMU behaviour for U2, GDB's i386 target conventions
++  and a real/protocol client for U3, RFC 9293/2018 plus the
++  guest parser for U6. U0 fixes scope and acceptance; it does not
++  bless register constants remembered by the plan author.
++- **Snapshot safety is explicit.** The snapshot header already
++  rejects different `machine_t`/`cpu_t` layouts. Phases should
++  first try to derive new behaviour from state already carried
++  (MSR store, RTC ticks, existing pending kind encodings). Any
++  layout growth is a stated snapshot-compatibility break with a
++  refusal vector, never a silent reinterpretation. LAPIC U4 in
++  particular must teach snapshot restore to rebind or refuse a
++  relocated window deliberately.
++- **No wall clocks enter deterministic models.** RTC remains on
++  `vtime_instr`; the TAP responder remains replay-deterministic.
++  Host time may exist in process startup/security-token lifetime
++  at U7, but it must not alter guest execution or wire receipts.
++- **No fake completeness.** x2APIC, RTC alarm delivery, EEPROM
++  programming/bit-bang access, TCP congestion/retransmission
++  timers/window scaling/IPv6 and TLS/account management are not
++  silently folded into these phases. If a phase's primary-source
++  measurement proves one is inseparable from the named defect,
++  the phase plan/receipts say so before code moves.
++
++## 3. Phase acceptance
++
++### U1 — RTC
++
++Prove the canonical set sequence (SET, field/century writes,
++clear SET) readback and continued advance; leap-day and year
++rollover; BCD vs binary and 12- vs 24-hour read/write conversion;
++no update/UIP while SET; invalid fields cannot hang or create
++out-of-range civil state; a warm reset preserves the set clock;
++snapshot split-run restores it; untouched power-on vectors and
++periodic IRQ8 remain exact.
++
++### U2 — e1000 EEPROM + PHY
++
++Prove the guest's exact EERD transaction for words 0–2 returns
++the same MAC without DONE timeout; pin checksum/identity words
++and out-of-range behaviour; prove MDIC PHY-1 read/write,
++READY/ERROR, PHY ID/status/reset and MDAC-to-INTx if the source
++contract includes it; prove device reset restores the template
++while MAC, RAL/RAH and rings remain consistent. Record the
++expected guest MAC-source receipt change.
++
++### U3 — gdbstub x87
++
++Run a known FPU payload to a breakpoint; prove `g` and `p`
++bytes for ST/control/tag/status against the measured GDB
++convention (including TOP rotation), then use `P` or `G` to
++change state and resume into an FPU store that proves the CPU
++consumed exactly those bytes. Packet lengths and every non-x87
++register remain unchanged. A non-80-bit-`long double` host must
++fail honestly rather than fabricate bytes.
++
++### U4 — LAPIC MSR
++
++Prove guest WRMSR relocation and return, old-window closure,
++global-disable/re-enable effects across MMIO, timer, IPI,
++IOAPIC and MSI sinks, invalid/reserved/x2APIC writes leaving
++state unchanged, and BSP-bit correctness in UP and SMP.
++Snapshot save/load must either restore a relocated LAPIC and
++continue equivalently or refuse with the measured reason the
++phase intentionally chooses; silently comparing against the
++fixed base is not acceptance.
++
++### U5 — CF9 CPU INIT
++
++Prove `0x02` is consumed only at an instruction boundary;
++sentinels distinguish CPU INIT from full reset across RAM,
++RTC, PIC/PIT/KBC/IOAPIC/PCI and device state; pin edge/repeat
++behaviour, `0x02 -> 0x06` coalescing, FADT `0x0E`, and all-vCPU
++state under SMP. The implementation must not be an
++active-context-only accident.
++
++### U6 — responder TCP
++
++Prove sequence arithmetic at and across 2^32 wrap, duplicate and
++partial-overlap trimming, bounded out-of-order queueing,
++contiguous-only application delivery, duplicate ACKs with up to
++four correctly ordered SACK blocks only when negotiated, and
++in-order FIN sequencing. Pin duplicate FIN in LAST_ACK, the
++final-ACK passive close, and any reachable CLOSING/TIME_WAIT
++transition with a deterministic retained-state bound. Existing
++in-order handshake/DNS replies stay byte-identical.
++
++### U7 — GUI/monitor authentication
++
++Define and test the threat model (malicious page, local
++process, explicit LAN bind). Prove missing/wrong capability,
++cross-origin mutation/WebSocket and DNS-rebinding Host requests
++are refused; the generated capability is carried internally by
++desktop and web GUI flows with no command line or manual token
++handling in the default path; a non-loopback bind requires an
++explicit GUI-managed credential and a plaintext warning.
++Direct-monitor behaviour must have an equally deliberate local
++bootstrap, not a second unauthenticated back door.
++
++## 4. Gates
++
++Per phase: its named suite, one behavioural negative control,
++`make test`, `make test-sanitize`, and both SeaBIOS ISO lanes
++with the stock BIOS actually present. Snapshot lanes are
++mandatory for U1/U4/U5, network end-to-end lanes for U2/U6,
++real-client or pinned-fixture GDB lanes for U3, and GUI +
++monitor lanes for U7. U0 is docs-only; its receipts are the
++targeted suites in §0 plus clean patch checks.
+-- 
+2.47.3
+

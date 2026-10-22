@@ -379,6 +379,51 @@ def g_tcp_syn_opts() -> bytes:
             + bytes((4, 2)) + bytes(2))
 
 
+def g_parse_tcp(frame: bytes):
+    """Read a reply frame back into a TCP dict, options included.  The
+    guest's filter below is what *accepts* a reply; this is what lets a
+    vector say which bytes were in it."""
+    return R.parse_tcp(R.ipv4_body(frame[14:], R.parse_ipv4(frame[14:])[3]))
+
+
+def g_parse_sack(opts: bytes):
+    """`tcpm6d_decode` (guest kernel/net/tcp_m6d.h), transcribed: END stops
+    the walk, NOP skips a byte, a SACK option needs olen >= 10 and
+    (olen - 2) % 8 == 0, at most TCPM6D_MAX_BLOCKS=4 blocks are taken, and
+    a block whose end does not follow its start in *signed* sequence space
+    ("accepting it would mark arbitrary queue entries acked") is skipped.
+    -> [(left, right), ...] in wire order."""
+    out = []
+    i = 0
+    while i < len(opts):
+        kind = opts[i]
+        if kind == 0:                       # TCPOPT_END
+            break
+        if kind == 1:                       # TCPOPT_NOP
+            i += 1
+            continue
+        if i + 1 >= len(opts):
+            break
+        olen = opts[i + 1]
+        if olen < 2 or i + olen > len(opts):
+            break
+        if kind == 5 and olen >= 10 and (olen - 2) % 8 == 0:
+            q = i + 2
+            for _ in range((olen - 2) // 8):
+                if len(out) >= 4:
+                    break
+                s, e = struct.unpack("!II", opts[q:q + 8])
+                q += 8
+                d = (e - s) & 0xFFFFFFFF
+                if d >= 0x80000000:
+                    d -= 0x100000000
+                if d <= 0:
+                    continue
+                out.append((s, e))
+        i += olen
+    return out
+
+
 def guest_accepts_tcp_segment(frame: bytes, sport: int, dport: int):
     """tcp.c:290 `tcp_recv_segment_timeout`, transcribed.  -> (ok, reason,
     flags, seq, ack, window, data).  The 4-tuple and the header length are all
@@ -934,6 +979,353 @@ def test_dns_over_tcp():
     check(r.stats["tcp"] == 1, "one handshake for the whole exchange")
 
 
+def test_tcp_sequencing():
+    """UPKEEP U6: the receiver validates sequence numbers instead of gluing
+    arrivals onto the stream.  The guest's own receiver never checks seq/ack
+    (see `guest_accepts_tcp_segment`), so the *consumer* of sequencing here
+    is the guest as a SENDER: its M6d code decodes SACK blocks to mark its
+    retransmission queue (`tcpm6d_mark`), picks the hole
+    (`tcpm6d_next_hole`), and counts duplicate ACKs per RFC 5681 s2 -- a
+    duplicate ACK that carries data or moves the window is NOT counted
+    (`tcpm6_on_ack` takes both as exclusions), which pins the shape of our
+    dup ACKs as firmly as any filter above.
+
+    RFC 9293 s3.10.7.4 is the rule: trim to the window (FIN included),
+    deliver only what begins at RCV.NXT, hold the rest, acknowledge the
+    unacceptable with <SEQ=SND.NXT><ACK=RCV.NXT>.  RFC 2018 s4 adds: SACK
+    blocks only when the peer's SYN offered SACK-permitted, first block the
+    one holding the segment that triggered the ACK.  Every assertion below
+    is on wire bytes (ack numbers, block edges, header lengths) because the
+    guest's accept filter would pass any of them -- it is the sequence
+    arithmetic itself that is on trial."""
+    M = 0xFFFFFFFF
+    qid = 0x51AC
+    msg = g_dns_message(qid, "example.com")
+    stream = struct.pack("!H", len(msg)) + msg
+    L = len(stream)
+    check(L == 31, "the framed test query is 31 bytes (prefix + message)")
+
+    r = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
+    DATA = R.TCP_ACK | R.TCP_PSH
+
+    def feed(sport, seq, ack, flags, data=b""):
+        return r.handle_many(g_tcp_segment(sport, 53, seq, ack, flags,
+                                           data=data))
+
+    def acked(frame):
+        # Tolerant on purpose: the negative control runs this same file
+        # against the pre-U6 responder, where several replies below are
+        # shorter (or absent) -- each shortened reply must record as a
+        # FAIL, not abort the file before the later signatures print.
+        try:
+            t = g_parse_tcp(frame)
+        except Exception:
+            t = None
+        if not t:
+            return {"flags": 0, "ack": 0, "seq": 0, "data": b"", "hdr": 0,
+                    "window": 0, "opts": b""}, []
+        return t, g_parse_sack(t["opts"])
+
+    def key(sport):
+        return (R.ip4(R.GUEST_IP), sport, R.ip4(R.DNS_IP), 53)
+
+    # ---- out-of-order tail: held, SACKed, contiguous-only delivery ------
+    ok, why, oisn = tcp_handshake(r, 45001, 0x10000)
+    check(ok, "sequencing connection opens (%s)" % why)
+    base, dns0 = 0x10001, r.stats["dns"]
+    out = feed(45001, base + 8, oisn + 1, DATA, stream[8:])
+    check(len(out) == 1, "an out-of-order segment gets exactly one dup ACK")
+    t, sack = acked(out[0])
+    okg, why_g = guest_accepts_tcp_segment(out[0], 45001, 53)[:2]
+    check(okg, "the SACK-carrying ACK passes the guest's filter, checksum "
+               "and header length included (%s)" % why_g)
+    check(t["flags"] == R.TCP_ACK and t["data"] == b"",
+          "the dup ACK carries no data (RFC 5681 s2: the guest would not "
+          "count it as a duplicate otherwise)")
+    check(t["ack"] == base, "the cumulative ACK did not move into the gap")
+    check(t["window"] == 64240,
+          "the advertised window is unchanged (a moved window un-counts a "
+          "duplicate ACK on the guest)")
+    check(sack == [(base + 8, base + L)],
+          "one SACK block covers exactly the held bytes (%s)" % (sack,))
+    check(t["hdr"] == 32,
+          "the 10-byte SACK option is padded to a 4-byte edge (hdr=%d)"
+          % t["hdr"])
+    check(r.stats["dns"] == dns0, "nothing reached DNS before the gap filled")
+    out = feed(45001, base, oisn + 1, DATA, stream[:8])
+    t, sack = acked(out[0])
+    check(len(out) == 1 and t["ack"] == base + L,
+          "filling the gap acknowledges the whole query in one step")
+    check(sack == [], "the queue is empty: no SACK rides the answer")
+    check(bool(t["data"]), "the gap fill produced the answer at last")
+    verdict, _a, _t = guest_dns_parse_response(t["data"][2:], "example.com",
+                                               qid)
+    check(verdict == "ANSWER", "the assembled answer parses (%s)" % verdict)
+    check(r.stats["dns"] == dns0 + 1, "the query was answered exactly once")
+    out = feed(45001, base, oisn + 1, DATA, stream[:8])
+    t, _s = acked(out[0])
+    check(t["flags"] == R.TCP_ACK and t["ack"] == base + L
+          and t["data"] == b"" and r.stats["dns"] == dns0 + 1,
+          "a retransmitted head is re-ACKed, never re-delivered")
+
+    # ---- partial overlap: only the new tail advances --------------------
+    ok, why, oisn = tcp_handshake(r, 45002, 0x20000)
+    check(ok, "overlap connection opens (%s)" % why)
+    base, dns0 = 0x20001, r.stats["dns"]
+    out = feed(45002, base, oisn + 1, DATA, stream[:6])
+    t, _s = acked(out[0])
+    check(t["ack"] == base + 6 and t["data"] == b"",
+          "the first six bytes are ACKed and held (incomplete message)")
+    out = feed(45002, base + 2, oisn + 1, DATA, stream[2:])
+    t, _s = acked(out[0])
+    check(t["ack"] == base + L and bool(t["data"])
+          and r.stats["dns"] == dns0 + 1,
+          "a straddling segment contributes only its new tail; the query "
+          "assembles exactly once")
+
+    # ---- two gaps: first-block rule, drain order ------------------------
+    ok, why, oisn = tcp_handshake(r, 45003, 0x30000)
+    check(ok, "two-gap connection opens (%s)" % why)
+    base = 0x30001
+    pieces = [(0, stream[0:6]), (6, stream[6:12]), (12, stream[12:18]),
+              (18, stream[18:24]), (24, stream[24:])]
+    out = feed(45003, base + 6, oisn + 1, DATA, pieces[1][1])
+    t, sack = acked(out[0])
+    check(sack == [(base + 6, base + 12)] and t["ack"] == base,
+          "the first gap piece is SACKed on its own")
+    out = feed(45003, base + 18, oisn + 1, DATA, pieces[3][1])
+    t, sack = acked(out[0])
+    check(sack == [(base + 18, base + 24), (base + 6, base + 12)],
+          "the first block holds the segment that triggered this ACK "
+          "(RFC 2018 s4), the older block follows (%s)" % (sack,))
+    out = feed(45003, base + 6, oisn + 1, DATA, pieces[1][1])
+    t, sack = acked(out[0])
+    check(sack[:1] == [(base + 6, base + 12)] and t["ack"] == base,
+          "a duplicate of queued data leads its dup ACK and changes nothing")
+    out = feed(45003, base, oisn + 1, DATA, pieces[0][1])
+    t, sack = acked(out[0])
+    check(t["ack"] == base + 12 and sack == [(base + 18, base + 24)]
+          and t["data"] == b"",
+          "filling gap one drains exactly what became contiguous")
+    out = feed(45003, base + 12, oisn + 1, DATA, pieces[2][1])
+    t, sack = acked(out[0])
+    check(t["ack"] == base + 24 and sack == [] and t["data"] == b"",
+          "filling gap two drains the rest of the queue, still no answer")
+    out = feed(45003, base + 24, oisn + 1, DATA, pieces[4][1])
+    t, _s = acked(out[0])
+    check(t["ack"] == base + L and bool(t["data"]),
+          "the final piece completes the query and gets the answer")
+
+    # ---- at most four blocks, however many runs are held -----------------
+    ok, why, oisn = tcp_handshake(r, 45004, 0x40000)
+    check(ok, "block-cap connection opens (%s)" % why)
+    base = 0x40001
+    out = []
+    for k in range(6):
+        out = feed(45004, base + 4 + 4 * k, oisn + 1, DATA, b"xx")
+    t, sack = acked(out[0])
+    check(len(sack) == 4 and sack == [(base + 24, base + 26),
+                                      (base + 4, base + 6),
+                                      (base + 8, base + 10),
+                                      (base + 12, base + 14)],
+          "six held runs are reported as four blocks: trigger first, then "
+          "ascending (%s)" % (sack,))
+    check(t["hdr"] == 56,
+          "four blocks + 2 pad bytes fit the 40-byte option space (hdr=%d)"
+          % t["hdr"])
+    check(t["ack"] == base, "none of the six runs moved the cumulative ACK")
+    r.handle_many(g_tcp_segment(45004, 53, base, oisn + 1, R.TCP_RST))
+
+    # ---- no SACK without the peer's SACK-permitted ----------------------
+    mss_only = bytes((2, 4)) + struct.pack("!H", 1460) + bytes(4)
+    out = r.handle_many(g_tcp_segment(45005, 53, 0x50000, 0, R.TCP_SYN,
+                                      opts=mss_only))
+    check(len(out) == 1, "an MSS-only SYN still gets an answer")
+    t = g_parse_tcp(out[0])
+    oisn5 = t["seq"]
+    check(R.tcp_parse_options(t["opts"]) == (1460, True),
+          "our SYN-ACK still offers SACK-permitted (that offer licenses "
+          "the *guest's* SACK blocks, not ours)")
+    check(feed(45005, 0x50001, oisn5 + 1, R.TCP_ACK) == [],
+          "the MSS-only handshake completes in silence")
+    base = 0x50001
+    out = feed(45005, base + 8, oisn5 + 1, DATA, stream[8:])
+    t, sack = acked(out[0])
+    check(t["hdr"] == 20 and sack == [] and t["ack"] == base,
+          "an unnegotiated peer gets a plain 20-byte dup ACK (RFC 2018 s4 "
+          "MUST NOT) -- queueing still happens, signalling does not")
+    out = feed(45005, base, oisn5 + 1, DATA, stream[:8])
+    t, _s = acked(out[0])
+    check(t["ack"] == base + L and bool(t["data"]),
+          "the unnegotiated connection still assembles and answers")
+
+    # ---- sequence space wraps mid-query ---------------------------------
+    ok, why, oisn = tcp_handshake(r, 45006, 0xFFFFFFF8)
+    check(ok, "wrap connection opens just below the seam (%s)" % why)
+    base = 0xFFFFFFF9
+    out = feed(45006, 0xFFFFFFFD, oisn + 1, DATA, stream[4:16])
+    t, sack = acked(out[0])
+    check(sack == [(0xFFFFFFFD, 9)],
+          "a block straddling the seam has right edge < left edge and the "
+          "guest's signed-length check still accepts it (%s)" % (sack,))
+    check(t["ack"] == base, "the ACK stayed below the seam")
+    out = feed(45006, base, oisn + 1, DATA, stream[:4])
+    t, _s = acked(out[0])
+    check(t["ack"] == 9 and t["data"] == b"",
+          "the fill drains across the seam to ack=%d" % t["ack"])
+    out = feed(45006, 9, oisn + 1, DATA, stream[16:])
+    t, _s = acked(out[0])
+    check(t["ack"] == (base + L) & M and bool(t["data"]),
+          "post-seam bytes complete the query (ack=%d)" % t["ack"])
+
+    # ---- an out-of-order FIN is sequenced, not consumed -----------------
+    ok, why, oisn = tcp_handshake(r, 45007, 0x60000)
+    check(ok, "OOO-FIN connection opens (%s)" % why)
+    base = 0x60001
+    out = feed(45007, base, oisn + 1, DATA, stream[:10])
+    t, _s = acked(out[0])
+    check(t["ack"] == base + 10, "ten contiguous bytes in")
+    out = feed(45007, base + L, oisn + 1, R.TCP_FIN | R.TCP_ACK)
+    t, sack = acked(out[0])
+    check(len(out) == 1 and t["flags"] == R.TCP_ACK
+          and t["ack"] == base + 10 and sack == [],
+          "a FIN past a gap earns a plain dup ACK, no close handshake, "
+          "and is not SACKed (SACK describes data bytes)")
+    check(key(45007) in r.tcp, "the tuple stays open while its FIN waits")
+    out = feed(45007, base + 10, oisn + 1, DATA, stream[10:])
+    check(len(out) == 2, "the gap fill yields the answer *and* the "
+                          "close (%d frames)" % len(out))
+    t1, _s = acked(out[0])
+    t2, _s = acked((out + [b""])[1])
+    check(bool(t1["data"]) and (t2["flags"] & (R.TCP_FIN | R.TCP_ACK))
+          == (R.TCP_FIN | R.TCP_ACK) and t2["ack"] == base + L + 1,
+          "the queued FIN is consumed exactly when the last data byte "
+          "lands (ack covers data + FIN)")
+    check(feed(45007, base + L + 1, (t2["seq"] + 1) & M, R.TCP_ACK) == [],
+          "the final ACK is met with silence")
+    check(key(45007) not in r.tcp, "the tuple is freed after the FIN dance")
+
+    # ---- duplicate FIN in LAST_ACK, then the tombstone ------------------
+    ok, why, oisn = tcp_handshake(r, 45008, 0x70000)
+    check(ok, "LAST_ACK connection opens (%s)" % why)
+    base = 0x70001
+    their_fin = g_tcp_segment(45008, 53, base, oisn + 1,
+                              R.TCP_FIN | R.TCP_ACK)
+    out = r.handle_many(their_fin)
+    t, _s = acked(out[0])
+    check(len(out) == 1 and (t["flags"] & (R.TCP_FIN | R.TCP_ACK))
+          == (R.TCP_FIN | R.TCP_ACK) and t["ack"] == base + 1,
+          "the close yields one FIN-ACK (the pinned pre-U6 shape)")
+    fseq = t["seq"]
+    for again in (1, 2):
+        out = r.handle_many(their_fin)
+        t, _s = acked(out[0]) if out else ({}, [])
+        check(len(out) == 1 and (t.get("flags", 0)
+                                 & (R.TCP_FIN | R.TCP_ACK))
+              == (R.TCP_FIN | R.TCP_ACK) and t.get("seq") == fseq
+              and t.get("ack") == base + 1,
+              "a duplicate FIN in LAST_ACK re-sends the same FIN-ACK "
+              "(attempt %d): the peer retransmits because it never saw "
+              "ours, and only acking our FIN may end this dance" % again)
+    check(key(45008) in r.tcp, "the tuple survives its duplicate FINs")
+    check(feed(45008, base + 1, (fseq + 1) & M, R.TCP_ACK) == [],
+          "the real final ACK closes quietly")
+    check(key(45008) not in r.tcp, "the tuple is freed by the final ACK")
+    out = r.handle_many(their_fin)
+    t, _s = acked(out[0]) if out else ({}, [])
+    check(len(out) == 1 and t.get("flags") == R.TCP_ACK
+          and t.get("seq") == (fseq + 1) & M and t.get("ack") == base + 1,
+          "a late duplicate FIN meets the tombstone: the final ACK again, "
+          "a plain ACK this time -- the FIN side was already proven seen")
+    check(feed(45008, base + 1, (fseq + 1) & M, DATA, b"x") == [],
+          "the tombstone answers only the FIN duplicate, nothing else")
+
+    # ---- beyond the window: discarded and honestly unSACKed -------------
+    ok, why, oisn = tcp_handshake(r, 45009, 0x80000)
+    check(ok, "window connection opens (%s)" % why)
+    base = 0x80001
+    out = feed(45009, base + 70000, oisn + 1, DATA, b"12345678")
+    t, sack = acked(out[0])
+    check(t["ack"] == base and sack == [],
+          "a wholly out-of-window segment is dup-ACKed, dropped, unSACKed")
+    out = feed(45009, base + 64200, oisn + 1, DATA, bytes(80))
+    t, sack = acked(out[0])
+    check(sack == [(base + 64200, base + 64240)],
+          "a segment straddling the right edge is trimmed to RCV.WND "
+          "before it is held (%s)" % (sack,))
+    out = feed(45009, base, oisn + 1, DATA, stream)
+    t, sack = acked(out[0])
+    check(bool(t["data"]) and t["ack"] == base + L
+          and sack == [(base + 64200, base + 64240)],
+          "the answer still advertises the run held across the remaining "
+          "gap (RFC 2018: SACK rides every ACK while data is held)")
+    r.handle_many(g_tcp_segment(45009, 53, base + L, oisn + 1, R.TCP_RST))
+
+    # ---- the queue bound is an honest refusal, not a silent merge --------
+    ok, why, oisn = tcp_handshake(r, 45010, 0x90000)
+    check(ok, "bound connection opens (%s)" % why)
+    base = 0x90001
+    t32 = t33 = None
+    for i in range(33):
+        out = feed(45010, base + 4 + 4 * i, oisn + 1, DATA, b"ab")
+        if i == 31:
+            t32 = acked(out[0])
+        if i == 32:
+            t33 = acked(out[0])
+    check(t32[1][:1] == [(base + 128, base + 130)],
+          "run 32 is held and leads its dup ACK (%s)" % (t32[1][:1],))
+    check(t33[0]["ack"] == base and (base + 132, base + 134) not in t33[1]
+          and t33[1][:1] == [(base + 4, base + 6)],
+          "run 33 breaks the 32-run bound: it is discarded whole and its "
+          "bytes are NOT SACKed (the sender must retransmit them later)")
+    out = feed(45010, base, oisn + 1, DATA, b"wxyz")
+    t, _s = acked(out[0])
+    check(t["ack"] == base + 6,
+          "four in-order bytes drain exactly the one run that became "
+          "contiguous (ack=%#x)" % t["ack"])
+    r.handle_many(g_tcp_segment(45010, 53, base + 6, oisn + 1, R.TCP_RST))
+
+    # ---- FIN piggybacked on the last data: pinned two-frame close -------
+    ok, why, oisn = tcp_handshake(r, 45011, 0xA0000)
+    check(ok, "FIN-with-data connection opens (%s)" % why)
+    base = 0xA0001
+    out = feed(45011, base, oisn + 1, DATA | R.TCP_FIN, stream)
+    check(len(out) == 2, "query + FIN in one segment: answer then FIN-ACK")
+    t1, _s = acked(out[0])
+    t2, _s = acked((out + [b""])[1])
+    check(bool(t1["data"]) and (t2["flags"] & (R.TCP_FIN | R.TCP_ACK))
+          == (R.TCP_FIN | R.TCP_ACK) and t2["ack"] == base + L + 1,
+          "the FIN behind data is acked only after the data, in order")
+    check(feed(45011, base + L + 1, (t2["seq"] + 1) & M, R.TCP_ACK) == [],
+          "and the closing ACK is silent")
+    check(key(45011) not in r.tcp, "the FIN-with-data tuple is freed")
+
+    # ---- the whole model replays deterministically (no clock) -----------
+    def script(rr):
+        _ok, _why, oi = tcp_handshake(rr, 45100, 0xB0000)
+        bx = 0xB0001
+        outs = [rr.handle_many(g_tcp_segment(45100, 53, bx + 10, oi + 1,
+                                             DATA, data=stream[10:])),
+                rr.handle_many(g_tcp_segment(45100, 53, bx, oi + 1,
+                                             DATA, data=stream[:10]))]
+        a0 = g_parse_tcp(outs[1][0])
+        snd = (a0["seq"] + len(a0["data"])) & M
+        fin = g_tcp_segment(45100, 53, bx + L, snd, R.TCP_FIN | R.TCP_ACK)
+        outs.append(rr.handle_many(fin))
+        outs.append(rr.handle_many(fin))                 # LAST_ACK dup
+        fsq = g_parse_tcp(outs[2][0])["seq"]
+        outs.append(rr.handle_many(g_tcp_segment(
+            45100, 53, bx + L + 1, (fsq + 1) & M, R.TCP_ACK)))
+        outs.append(rr.handle_many(fin))                 # tombstone
+        return outs
+
+    ra = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
+    rb = R.Responder(R.mac(R.GW_MAC_DEFAULT), quiet=True)
+    check(script(ra) == script(rb),
+          "two instances replay OOO + SACK + dup-FIN + tombstone "
+          "byte-identically: retention is a count, never a clock")
+
+
 def test_arp_for_the_whole_subnet():
     """`net_arp_resolve` ARPs the TARGET for an on-link address (net.c:405+)
     and only routes through the gateway for an off-subnet one, so the responder
@@ -1052,6 +1444,7 @@ def main():
                test_tcp_sixteen_concurrent,
                test_tcp_behaviours,
                test_dns_over_tcp,
+               test_tcp_sequencing,
                test_arp_for_the_whole_subnet,
                test_reply_goes_to_the_peer_not_to_the_endpoint,
                test_determinism_and_the_drop_lever,

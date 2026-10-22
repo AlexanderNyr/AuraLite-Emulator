@@ -13,6 +13,7 @@
 #include <string.h>
 #include "devices.h"
 #include "harness.h"
+#include "snapshot.h"     /* MSI M4: save/load round-trip */
 
 static int fails;
 #define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
@@ -873,6 +874,142 @@ static void v_determinism(void) {
     if (fails == f0) printf("ok determinism: full replay x2 byte-identical\n");
 }
 
+/* ================= MSI M1: MSI-X capability ============================ */
+/* ---- v_msix_cap: QEMU shape, RO discipline, table MMIO ---------------- */
+static void v_msix_cap(void) {
+    int f0 = fails;
+    EXPECT(pci_rd8(20, 0x06) & 0x10, "Status: Capabilities List present");
+    EXPECT(pci_rd8(20, 0x34) == 0x90, "Capabilities Pointer 0x90 (got %02x)", pci_rd8(20, 0x34));
+    EXPECT(pci_rd8(20, 0x90) == 0x11, "capability ID 0x11 (MSI-X)");
+    EXPECT(pci_rd8(20, 0x91) == 0x00, "next capability: none");
+    uint32_t MC = pci_rd32(20, 0x90) >> 16;
+    EXPECT((MC & 0x7FFu) == 15, "Table Size = 16 entries (MC=%04x)", MC);
+    EXPECT(pci_rd32(20, 0x94) == 0x3000u, "table BAR0+0x3000 BIR0 (got %08x)", pci_rd32(20, 0x94));
+    EXPECT(pci_rd32(20, 0x98) == 0x3800u, "PBA BAR0+0x3800 BIR0 (got %08x)", pci_rd32(20, 0x98));
+    /* RO discipline: a blast write moves only Enable/Function Mask */
+    pci_wr32(20, 0x90, 0xFFFFFFFFu);
+    pci_wr32(20, 0x94, 0xFFFFFFFFu);
+    pci_wr32(20, 0x98, 0xFFFFFFFFu);
+    uint32_t dw = pci_rd32(20, 0x90);
+    EXPECT((dw & 0xFFFFu) == 0x0011u, "ID/next survive the blast");
+    MC = dw >> 16;
+    EXPECT((MC & 0x7FFu) == 15 && (MC & 0x3800u) == 0, "Table Size + reserved bits RO");
+    EXPECT((MC & 0xC000u) == 0xC000u, "Enable + Function Mask took the write");
+    EXPECT(pci_rd32(20, 0x94) == 0x3000u && pci_rd32(20, 0x98) == 0x3800u, "offset/BIR dwords RO");
+    pci_wr32(20, 0x90, 0x00000011u);                       /* MC := 0 */
+    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0xC000u) == 0, "Enable/FMask clear again");
+    /* vector table MMIO: reset-masked, storage round-trips, PBA reads 0 */
+    uint32_t T = XHCI_BAR + 0x3000u;
+    EXPECT(rd32(T + 12) == 1, "entry 0 masked at power-on (Vector Control bit0)");
+    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x42u); wr32(T + 12, 0);
+    EXPECT(rd32(T + 0) == 0xFEE00000u && rd32(T + 8) == 0x42u && rd32(T + 12) == 0,
+           "entry 0 round-trips");
+    wr32(T + 15 * 16 + 8, 0x77u);
+    EXPECT(rd32(T + 15 * 16 + 8) == 0x77u, "entry 15 storage exists");
+    EXPECT(rd32(T + 16 * 16) == 0, "past the table reads 0");
+    EXPECT(rd32(XHCI_BAR + 0x3800u) == 0 && rd32(XHCI_BAR + 0x3804u) == 0,
+           "PBA reads 0 (v1: no pending accumulation)");
+    /* HCRST is an HC reset, not a PCI reset: MSI-X state persists */
+    hc_reset_program(32);
+    EXPECT(rd32(T + 8) == 0x42u && rd32(T + 12) == 0, "table survives HCRST");
+    if (fails == f0) printf("ok msix cap: QEMU shape @0x90, RO held, table MMIO, HCRST-persistent\n");
+}
+
+/* ---- v_msix_route: messages replace the pin, fallback restores it ---- */
+static void queue_noop(void) {
+    uint32_t b = CMDRING + (uint32_t)t_cmd_idx * 16;
+    ram_wr32(b + 0, 0); ram_wr32(b + 4, 0); ram_wr32(b + 8, 0);
+    ram_wr32(b + 12, TRB_CMD(23) | (uint32_t)t_cmd_cycle);
+    t_cmd_idx++;
+}
+static void lapic_eoi(void) { mem_write(&M, 0xFEE000B0u, 4, 0); }
+
+static void v_msix_route(void) {
+    int f0 = fails;
+    M.lapic.svr |= 0x100u;                       /* APIC software-enable */
+    hc_reset_program(32);
+    uint32_t ev[4];
+    uint32_t T = XHCI_BAR + 0x3000u;
+    /* arm entry 0 (vector 0x61 -> CPU0, unmasked) and enable MSI-X */
+    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x61u); wr32(T + 12, 0);
+    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(rd32(RT(0x20)) & 1u, "IP latched by the completion");
+    EXPECT(!(M.pic.slave.lines & (1u << 2)), "INTx pin silent under MSI-X");
+    EXPECT(lapic_intack(&M) == 0x61, "message vector 0x61 delivered");
+    lapic_eoi();
+    /* the level still pends: a second completion must not re-send */
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(lapic_intack(&M) < 0, "no duplicate message for a held level");
+    next_event(ev); next_event(ev);              /* consume + EHB ack */
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(lapic_intack(&M) == 0x61, "edge re-armed after the ack");
+    lapic_eoi();
+    next_event(ev);
+    /* per-vector mask: pending rises silently, unmask releases it */
+    wr32(T + 12, 1u);
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(lapic_intack(&M) < 0, "masked vector delivers nothing");
+    wr32(T + 12, 0);
+    EXPECT(lapic_intack(&M) == 0x61, "unmask releases the held level");
+    lapic_eoi();
+    next_event(ev);
+    /* Function Mask behaves the same at capability level */
+    pci_wr32(20, 0x90, (0xC000u << 16) | 0x11u);
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(lapic_intack(&M) < 0, "Function Mask delivers nothing");
+    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);
+    EXPECT(lapic_intack(&M) == 0x61, "function unmask releases it");
+    lapic_eoi();
+    next_event(ev);
+    /* MSI-X off: the pin returns, byte-identical fallback */
+    pci_wr32(20, 0x90, 0x11u);
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(M.pic.slave.lines & (1u << 2), "INTx back with MSI-X disabled");
+    next_event(ev);
+    EXPECT(!(M.pic.slave.lines & (1u << 2)), "pin acked clean");
+    if (fails == f0) printf("ok msix route: edge-once messages, mask/unmask release, INTx fallback\n");
+}
+
+/* ---- v_msix_snapshot: capability + table + router survive save/load -- */
+/* Runs last on purpose: snap_load rewrites the whole machine image. */
+static void v_msix_snapshot(void) {
+    int f0 = fails;
+    M.lapic.svr |= 0x100u;
+    hc_reset_program(32);
+    uint32_t T = XHCI_BAR + 0x3000u;
+    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x71u); wr32(T + 12, 0);
+    pci_wr32(20, 0x90, (0x8000u << 16) | 0x11u);        /* MSI-X Enable */
+    static const snap_cfg_t CFG = { "Haswell", 0, 0 };
+    const char *path = "m4_snap_tmp.bin";
+    EXPECT(snap_save(&M, path, &CFG) == 0, "snapshot saves");
+    /* vandalise everything the snapshot is supposed to preserve */
+    pci_wr32(20, 0x90, 0x11u);
+    wr32(T + 8, 0x22u); wr32(T + 12, 1u);
+    hc_reset_program(32);
+    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0x8000u) == 0, "live state really off");
+    EXPECT(rd32(T + 8) == 0x22u, "table scribble is live");
+    EXPECT(snap_load(&M, path, &CFG) == 0, "snapshot loads");
+    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0x8000u) != 0, "MSI-X Enable back (pci cfg tag)");
+    EXPECT(rd32(T + 8) == 0x71u && rd32(T + 12) == 0, "vector entry back (dev.xhci tag)");
+    /* RAM came from the snapshot too: re-sync the fixture's own counters
+     * to the save-time ones and prove the router is live, not just stored */
+    t_cmd_idx = 0; t_cmd_cycle = 1; t_ev_idx = 0; t_ev_cycle = 1;
+    queue_noop();
+    wr32(DB0, 0);
+    EXPECT(lapic_intack(&M) == 0x71, "message delivered right after load");
+    lapic_eoi();
+    EXPECT(!(M.pic.slave.lines & (1u << 2)), "pin still silent after load");
+    remove(path);
+    if (fails == f0) printf("ok msix snapshot: enable+table+router survive save/load\n");
+}
+
 int main(void) {
     setup_machine(&M);
     devices_init_common(&M);
@@ -898,6 +1035,9 @@ int main(void) {
     v_ports_live();
     v_irq_masking();
     v_determinism();
+    v_msix_cap();
+    v_msix_route();
+    v_msix_snapshot();
     devices_done(&M);
     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
     puts("test-xhci: all vectors passed");

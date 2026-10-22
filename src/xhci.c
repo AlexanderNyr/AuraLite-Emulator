@@ -103,19 +103,50 @@ typedef struct {
     uint64_t ev_prod, ev_cons;
     int iman_ip;            /* interrupter pending latch (EINT mirror) */
     xhci_slot_t slots[XHCI_MAX_SLOTS];   /* X3: slot s at [s-1] */
+    /* MSI M1: MSI-X vector table (BAR0+0x3000) + Message Control state.
+     * These live in PCI space, not HC space: HCRST must not wipe them
+     * (xhci_hw_reset preserves them like the BAR decode). */
+    struct { uint32_t addr_lo, addr_hi, data, ctrl; } msix_table[16];
+    int msix_enable;        /* Message Control bit 15 */
+    int msix_fmask;         /* Message Control bit 14 */
+    int msix_sent;          /* M3: message for the current pending level sent */
 } xhci_t;
 
 static xhci_t g_xhci;
 
-/* X5: the INTx pin.  Asserted while interrupter 0 has an unmasked
- * pending event (IMAN.IP & IMAN.IE & USBCMD.INTE) -- level-driven, on
- * change only (the AHCI S5 convention; pic_set_irq fans out to the
- * I/O APIC board wire). */
+/* X5 + MSI M3: interrupt routing.  The interrupter condition (IMAN.IP &
+ * IMAN.IE & USBCMD.INTE) is a *level*; where it goes depends on the
+ * MSI-X state the guest programmed:
+ * - MSI-X disabled: the INTx pin (IRQ 10, level, on change) as in X5.
+ * - MSI-X enabled: the pin must stay silent (PCI forbids INTx then) and
+ *   the rising edge of the unmasked condition sends one message from
+ *   vector-table entry 0 (the only interrupter, MaxIntrs=1).  A masked
+ *   interval sends nothing; unmasking re-evaluates the level and sends
+ *   then -- no PBA accumulation (MSI_PLAN 2).  The guest's ack (EHB or
+ *   IMAN RW1C) lowers the level and re-arms the edge. */
 static void xhci_intx_update(xhci_t *x) {
-    int lvl = (x->iman_ip && x->iman_ie && (x->usbcmd & CMD_INTE)) ? 1 : 0;
-    if (lvl != x->intx_level) {
-        x->intx_level = lvl;
-        if (x->m) pic_set_irq(x->m, XHCI_IRQ, lvl);
+    int want = (x->iman_ip && x->iman_ie && (x->usbcmd & CMD_INTE)) ? 1 : 0;
+    if (x->msix_enable) {
+        if (x->intx_level) {
+            x->intx_level = 0;
+            if (x->m) pic_set_irq(x->m, XHCI_IRQ, 0);
+        }
+        int unmasked = !x->msix_fmask && !(x->msix_table[0].ctrl & 1u);
+        if (want && unmasked && !x->msix_sent) {
+            x->msix_sent = 1;
+            if (x->m)
+                msi_deliver(x->m,
+                            ((uint64_t)x->msix_table[0].addr_hi << 32) |
+                                x->msix_table[0].addr_lo,
+                            x->msix_table[0].data);
+        }
+        if (!want) x->msix_sent = 0;
+        return;
+    }
+    x->msix_sent = 0;
+    if (want != x->intx_level) {
+        x->intx_level = want;
+        if (x->m) pic_set_irq(x->m, XHCI_IRQ, want);
     }
 }
 
@@ -129,15 +160,31 @@ static int port_attached(xhci_t *x, int p) {
 /* ---- host-controller reset: every software-visible register to its
  * power-on value (XHCI_PLAN X1; the guest's init step 2 waits on the
  * HCRST bit self-clearing and on CNR clearing, both immediate here). */
+/* MSI M1: power-on state of the vector table -- every entry masked
+ * (Vector Control bit 0 = 1), Enable/Function Mask clear. */
+static void msix_power_on(xhci_t *x) {
+    memset(x->msix_table, 0, sizeof x->msix_table);
+    for (int i = 0; i < 16; i++) x->msix_table[i].ctrl = 1;
+    x->msix_enable = 0;
+    x->msix_fmask = 0;
+}
+
 static void xhci_hw_reset(xhci_t *x) {
     machine_t *m = x->m;
     uint32_t base = x->base;
     int probe = x->bar_probe;
+    /* MSI-X state is PCI-function state: an HC reset does not touch it. */
+    __typeof__(x->msix_table) tbl;
+    memcpy(tbl, x->msix_table, sizeof tbl);
+    int msix_en = x->msix_enable, msix_fm = x->msix_fmask;
     if (x->intx_level && m) pic_set_irq(m, XHCI_IRQ, 0);
     memset(x, 0, sizeof *x);
     x->m = m;
     x->base = base;
     x->bar_probe = probe;
+    memcpy(x->msix_table, tbl, sizeof tbl);
+    x->msix_enable = msix_en;
+    x->msix_fmask = msix_fm;
 }
 
 static uint32_t op_read(xhci_t *x, uint32_t off) {
@@ -783,7 +830,17 @@ static void bulk_process(xhci_t *x, uint32_t slot, uint32_t epid) {
     ep_out_sync(x, out, epid, ep);
 }
 
+/* MSI M1: MSI-X vector table (BAR0+0x3000, 16 x 16 B) + PBA (+0x3800). */
+#define X_MSIX_TABLE 0x3000u
+#define X_MSIX_PBA   0x3800u
+
 static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+    if (off >= X_MSIX_TABLE && off < X_MSIX_TABLE + 16u * 16u) {
+        const uint32_t *e = &x->msix_table[(off - X_MSIX_TABLE) / 16].addr_lo;
+        return e[((off - X_MSIX_TABLE) % 16) / 4];
+    }
+    if (off >= X_MSIX_PBA && off < X_MSIX_PBA + 8u)
+        return 0;   /* v1: no pending accumulation (MSI_PLAN 2) */
     if (off < X_CAP_LEN) {
         switch (off) {
         case 0x00: return (X_HCI_VERSION << 16) | X_CAP_LEN;
@@ -800,7 +857,13 @@ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
 }
 
 static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
-    (void)val;
+    if (off >= X_MSIX_TABLE && off < X_MSIX_TABLE + 16u * 16u) {
+        uint32_t *e = &x->msix_table[(off - X_MSIX_TABLE) / 16].addr_lo;
+        e[((off - X_MSIX_TABLE) % 16) / 4] = val;
+        xhci_intx_update(x);   /* M3: an unmask here may release a message */
+        return;
+    }
+    if (off >= X_MSIX_PBA && off < X_MSIX_PBA + 8u) return;  /* RO */
     if (off < X_CAP_LEN) return;                /* capability space is RO */
     if (off >= X_RTSOFF && off < X_DBOFF) { rt_write(x, off - X_RTSOFF, val); return; }
     if (off >= X_DBOFF) {                       /* doorbells */
@@ -919,11 +982,26 @@ void xhci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
         for (int i = 0; i < 8; i++) d->cfg[0x10 + i] = (uint8_t)(stored >> (8 * i));
         xhci_set_base(x, base);
     }
+    /* MSI M1: re-assert the MSI-X capability's RO fields after any write
+     * (the default cfg path is fully writable), and fold the two RW
+     * Message Control bits into controller state, where M3 routes on
+     * them. */
+    x->msix_enable = (d->cfg[0x93] & 0x80) != 0;
+    x->msix_fmask  = (d->cfg[0x93] & 0x40) != 0;
+    d->cfg[0x06] |= 0x10;
+    d->cfg[0x34] = 0x90;
+    d->cfg[0x90] = 0x11; d->cfg[0x91] = 0x00;
+    d->cfg[0x92] = 15;
+    d->cfg[0x93] = (uint8_t)((x->msix_enable ? 0x80 : 0) | (x->msix_fmask ? 0x40 : 0));
+    d->cfg[0x94] = 0x00; d->cfg[0x95] = 0x30; d->cfg[0x96] = 0; d->cfg[0x97] = 0;
+    d->cfg[0x98] = 0x00; d->cfg[0x99] = 0x38; d->cfg[0x9A] = 0; d->cfg[0x9B] = 0;
+    xhci_intx_update(x);   /* M3: enabling MSI-X retires/sends here */
 }
 
 void xhci_register(machine_t *m) {
     xhci_t *x = &g_xhci;
     memset(x, 0, sizeof *x);
+    msix_power_on(x);
     x->m = m;
     x->base = XHCI_MMIO_BASE;
     mem_register_mmio(m, x->base, XHCI_MMIO_SIZE, xhci_mmio_read,

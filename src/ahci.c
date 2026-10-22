@@ -72,6 +72,8 @@ typedef struct {
     uint32_t     ghc;
     uint32_t     is;               /* controller HBA IS (aggregates PxIS, S5) */
     int          intx;             /* S5: current board-line assertion state */
+    uint32_t     msi_addr, msi_data;  /* MSI M3: capability RW fields */
+    int          msi_enable, msi_sent;
     port_regs_t  port[AHCI_HW_PORTS];
 } ahci_t;
 
@@ -144,6 +146,19 @@ static void intx_update(ahci_t *a) {
         if ((a->port[p].is & a->port[p].ie) != 0) intr = 1;
     }
     if (a->is && (a->ghc & 2u)) intr = 1;   /* HBA IS & GHC.IE */
+    if (a->msi_enable) {   /* MSI M3: pin silent, message on the edge */
+        if (a->intx) {
+            a->intx = 0;
+            pic_set_irq(a->m, AHCI_IRQ0 + a->ctrl, 0);
+        }
+        if (intr && !a->msi_sent) {
+            a->msi_sent = 1;
+            if (a->m) msi_deliver(a->m, a->msi_addr, a->msi_data);
+        }
+        if (!intr) a->msi_sent = 0;
+        return;
+    }
+    a->msi_sent = 0;
     if (intr != a->intx) {
         a->intx = intr;
         pic_set_irq(a->m, AHCI_IRQ0 + a->ctrl, intr);
@@ -629,6 +644,22 @@ static ahci_t *ahci_pci_controller(pci_dev_t *d) {
     return NULL;
 }
 
+/* MSI M3: the MSI capability in the measured ICH-AHCI shape -- cap at
+ * 0x80, one message, 32-bit address, no per-vector masking (two
+ * independent ICH lspci dumps agree: "[80] MSI: Enable+ Count=1/1
+ * Maskable- 64bit-").  Seeded at device creation; RO fields are
+ * re-asserted in cfg_write.  A PM capability belongs to PM_PLAN. */
+void ahci_pci_seed(struct pci_dev *dev) {
+    pci_dev_t *d = dev;
+    if (!d) return;
+    d->cfg[0x06] |= 0x10;              /* Status: Capabilities List */
+    d->cfg[0x34] = 0x80;               /* Capabilities Pointer */
+    d->cfg[0x80] = 0x05;               /* Capability ID: MSI */
+    d->cfg[0x81] = 0x00;               /* Next: end of list */
+    d->cfg[0x82] = 0x00;               /* MC: Enable=0, MMC=0 (1 msg) */
+    d->cfg[0x83] = 0x00;               /* MC: 32-bit, no per-vector mask */
+}
+
 uint64_t ahci_pci_cfg_read(struct pci_dev *dev, int reg, int size) {
     pci_dev_t *d = dev;
     ahci_t *a = ahci_pci_controller(d);
@@ -676,6 +707,21 @@ void ahci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
         d->cfg[0x27] = (uint8_t)(base >> 24);
         ahci_set_abar(a, base);
     }
+    /* MSI M3: fold the capability's RW fields into controller state,
+     * re-assert the RO shape, and re-route (an Enable flip retires or
+     * releases interrupts immediately). */
+    a->msi_enable = (d->cfg[0x82] & 1u) != 0;
+    a->msi_addr = (uint32_t)d->cfg[0x84] | ((uint32_t)d->cfg[0x85] << 8) |
+                  ((uint32_t)d->cfg[0x86] << 16) | ((uint32_t)d->cfg[0x87] << 24);
+    a->msi_data = (uint32_t)d->cfg[0x88] | ((uint32_t)d->cfg[0x89] << 8);
+    d->cfg[0x06] |= 0x10;
+    d->cfg[0x34] = 0x80;
+    d->cfg[0x80] = 0x05; d->cfg[0x81] = 0x00;
+    d->cfg[0x82] &= 0x71u;             /* Enable + MME writable; MMC RO 0 */
+    d->cfg[0x83] = 0;
+    d->cfg[0x84] &= 0xFCu;             /* address dword-aligned on the wire */
+    a->msi_addr &= ~3u;
+    intx_update(a);
 }
 
 void ahci_register_ctrl(machine_t *m, int ctrl) {

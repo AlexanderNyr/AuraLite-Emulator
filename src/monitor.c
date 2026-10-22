@@ -3,7 +3,31 @@
  * The frontend is polled from dbg.c. While the guest runs every socket is
  * non-blocking; no thread calls cpu_step and all run control goes through
  * the T2 debugger core. The server binds loopback unless explicitly told
- * otherwise: this endpoint has no authentication. */
+ * otherwise.
+ *
+ * UPKEEP U7 closed the "no authentication" hole this file used to state.
+ * Threat model: a malicious web page in the operator's browser
+ * (cross-origin requests / WebSocket attempts / DNS rebinding against a
+ * loopback service), another local process, and -- when bound beyond
+ * loopback -- any network peer (the transport stays plaintext HTTP; the
+ * token is the only credential, which the startup warning says out
+ * loud). Defences, applied to every request:
+ *   * Host allowlist (loopback names, plus the literal bind address):
+ *     a rebinding page's Host is neither, so it never reaches a route;
+ *   * Origin, when present on the WebSocket upgrade, must be same-origin
+ *     with Host (RFC 6455 s4.2.2/10.2: servers SHOULD verify, 403 to
+ *     refuse) -- this stops other web pages, which cannot omit Origin;
+ *   * a capability token, when configured, must be presented for the
+ *     upgrade (`?token=`, `X-X86emu-Token`, `Authorization: Bearer`) --
+ *     this stops non-browser peers, which can fake an absent Origin
+ *     (RFC 6455 s10.1). The GUI spawns the emulator with a fresh
+ *     per-run token in X86EMU_MONITOR_TOKEN (never in argv, so it stays
+ *     out of the run's argv.json and process lists); a non-loopback bind
+ *     without a token is refused at startup.
+ * The HTML page itself stays fetchable (it is static and inert); control
+ * only exists behind the upgrade. A merely tokenless loopback monitor
+ * keeps its pre-U7 shape -- that is the direct-CLI default, where the
+ * operator, the port and the risk are all local and visible. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -46,9 +70,13 @@ struct mon_out {
     struct mon_out *next;
 };
 
+#define MON_TOKEN_MAX      256u         /* capability token storage (U7) */
+
 typedef struct monitor_state {
     dbg_frontend_t fe;
     int listen_fd;
+    char token[MON_TOKEN_MAX];         /* "" = no capability configured */
+    char bind_host[INET_ADDRSTRLEN];   /* literal we bound; Host allowlist */
     int client_fd;
     int websocket;
     int close_after_flush;
@@ -940,6 +968,107 @@ static int contains_token_ci(const char *list, const char *token) {
     return 0;
 }
 
+/* ---- UPKEEP U7 request authorization (threat model: the file header) -- */
+
+/* A Host/authority value reduced to its compare-ready host part:
+ * lowercased, any :port and [...] brackets stripped. */
+static void host_part(const char *value, char *out, size_t cap) {
+    size_t o = 0;
+    const char *p = value ? value : "";
+    if (*p == '[') {
+        p++;
+        while (*p && *p != ']' && o + 1 < cap)
+            out[o++] = (char)tolower((unsigned char)*p++);
+    } else {
+        while (*p && *p != ':' && *p != '/' && o + 1 < cap)
+            out[o++] = (char)tolower((unsigned char)*p++);
+    }
+    if (cap) out[o] = 0;
+}
+
+/* DNS-rebinding gate: the name the client *thinks* it is talking to must
+ * be this machine -- a loopback name, or the literal address the
+ * operator bound. A rebinding attacker's domain is neither. */
+static int host_allowed(monitor_state_t *s, const char *host_hdr) {
+    char h[INET_ADDRSTRLEN + 64];
+    host_part(host_hdr, h, sizeof h);
+    if (!h[0]) return 0;
+    if (!strcmp(h, "127.0.0.1") || !strcmp(h, "localhost") ||
+        !strcmp(h, "::1")) return 1;
+    if (s->bind_host[0] && strcasecmp(h, s->bind_host) == 0) return 1;
+    /* A 0.0.0.0 bind means the operator chose "everywhere": a LAN peer
+     * legitimately arrives with its own literal address as Host, while a
+     * rebinding *name* is still not a literal. The token is the gate
+     * there; this check still strips the naive probes. */
+    if (!strcmp(s->bind_host, "0.0.0.0")) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, h, &a) == 1) return 1;
+    }
+    return 0;
+}
+
+/* Cross-origin gate for the upgrade: a browser's Origin (which it cannot
+ * omit or forge, RFC 6455 s10.2) must be same-origin with this request's
+ * Host -- our own pages are served from this very socket, so no other
+ * origin has business here. Absent Origin is a non-browser client,
+ * which Origin cannot vouch for anyway (s10.1); the token covers it. */
+static int origin_allowed(monitor_state_t *s, const char *origin,
+                          const char *host_hdr) {
+    const char *p = strstr(origin, "://");
+    if (!p) return 0;                       /* "null" and friends */
+    size_t scheme = (size_t)(p - origin);
+    if (!((scheme == 4 && strncasecmp(origin, "http", 4) == 0) ||
+          (scheme == 5 && strncasecmp(origin, "https", 5) == 0))) return 0;
+    char oh[INET_ADDRSTRLEN + 64], hh[INET_ADDRSTRLEN + 64];
+    host_part(p + 3, oh, sizeof oh);
+    host_part(host_hdr, hh, sizeof hh);
+    if (!oh[0] || strcmp(oh, hh) != 0) return 0;
+    return host_allowed(s, p + 3);
+}
+
+/* A capability compare should not hand out a byte-at-a-time oracle. */
+static int token_eq(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned diff = (la != lb) ? 1u : 0u;
+    size_t n = la < lb ? la : lb;
+    for (size_t i = 0; i < n; i++)
+        diff |= (unsigned)((uint8_t)a[i] ^ (uint8_t)b[i]);
+    return diff == 0;
+}
+
+/* True when the request carries the configured token (any of the three
+ * carriers), or when no token is configured. `path` still has its query. */
+static int token_presented_ok(monitor_state_t *s, const char *path,
+                              const char *req) {
+    if (!s->token[0]) return 1;
+    char hdr[MON_TOKEN_MAX + 8];
+    if (http_header(req, "X-X86emu-Token", hdr, sizeof hdr) == 1 &&
+        token_eq(hdr, s->token)) return 1;
+    if (http_header(req, "Authorization", hdr, sizeof hdr) == 1 &&
+        strncasecmp(hdr, "Bearer ", 7) == 0 && token_eq(hdr + 7, s->token))
+        return 1;
+    const char *q = strchr(path, '?');
+    if (q) {
+        for (const char *p = q + 1; *p;) {
+            if (strncmp(p, "token=", 6) == 0) {
+                const char *v = p + 6;
+                size_t n = strcspn(v, "&#");
+                char presented[MON_TOKEN_MAX];
+                if (n < sizeof presented) {
+                    memcpy(presented, v, n);
+                    presented[n] = 0;
+                    return token_eq(presented, s->token);
+                }
+                return 0;
+            }
+            const char *amp = strchr(p, '&');
+            if (!amp) break;
+            p = amp + 1;
+        }
+    }
+    return 0;
+}
+
 static int http_reply(monitor_state_t *s, int status, const char *reason,
                       const char *content_type, const void *body, size_t body_len) {
     char head[512];
@@ -1023,6 +1152,18 @@ static void process_http(monitor_state_t *s) {
     memmove(s->input, s->input + consumed, s->input_len - consumed);
     s->input_len -= consumed;
 
+    /* UPKEEP U7: authorize before any route runs. Every request names
+     * the host it believes it is talking to, and that name has to be
+     * this machine -- the rebinding defence -- before the page, let
+     * alone the upgrade, is served. */
+    char host_hdr[512] = "";
+    if (http_header(req, "Host", host_hdr, sizeof host_hdr) != 1 ||
+        !host_allowed(s, host_hdr)) {
+        static const char msg[] = "forbidden host\n";
+        (void)http_reply(s, 403, "Forbidden", "text/plain", msg, sizeof msg - 1);
+        return;
+    }
+
     char upgrade[64] = "", connection[256] = "", key[128] = "", wsver[32] = "";
     int has_upgrade = http_header(req, "Upgrade", upgrade, sizeof upgrade);
     int has_connection = http_header(req, "Connection", connection, sizeof connection);
@@ -1034,6 +1175,21 @@ static void process_http(monitor_state_t *s) {
             strncmp(path, "/ws", 3) != 0 || (path[3] && path[3] != '?' && path[3] != '/')) {
             static const char msg[] = "invalid WebSocket upgrade\n";
             (void)http_reply(s, 400, "Bad Request", "text/plain", msg, sizeof msg - 1);
+            return;
+        }
+        char origin[512] = "";
+        int has_origin = http_header(req, "Origin", origin, sizeof origin);
+        if (has_origin < 0 ||
+            (has_origin == 1 && !origin_allowed(s, origin, host_hdr))) {
+            static const char msg[] = "forbidden origin\n";
+            (void)http_reply(s, 403, "Forbidden", "text/plain", msg,
+                             sizeof msg - 1);
+            return;
+        }
+        if (!token_presented_ok(s, path, req)) {
+            static const char msg[] = "unauthorized\n";
+            (void)http_reply(s, 401, "Unauthorized", "text/plain", msg,
+                             sizeof msg - 1);
             return;
         }
         if (do_websocket_handshake(s, key) != 0) {
@@ -1171,11 +1327,35 @@ static int parse_spec(const char *spec, char host[INET_ADDRSTRLEN], int *port) {
     return 0;
 }
 
-int monitor_attach(machine_t *m, const char *spec) {
+int monitor_attach(machine_t *m, const char *spec, const char *token) {
     char host[INET_ADDRSTRLEN];
     int port;
     if (!spec || parse_spec(spec, host, &port) != 0) {
         fprintf(stderr, "--monitor: expected [IPv4:]port, got '%s'\n", spec ? spec : "");
+        return -1;
+    }
+    /* UPKEEP U7: the capability comes from --monitor-token= or, for the
+     * GUI's spawns, the environment (never argv-shaped there). A bind
+     * beyond loopback without one is refused before any socket exists:
+     * an unauthenticated network-facing run-control endpoint is not a
+     * configuration this program offers, even by accident. */
+    if (!token || !*token) {
+        const char *env = getenv("X86EMU_MONITOR_TOKEN");
+        if (env && *env) token = env;
+    }
+    struct in_addr bind_addr;
+    int loopback = inet_pton(AF_INET, host, &bind_addr) == 1 &&
+                   (ntohl(bind_addr.s_addr) >> 24) == 127;
+    if ((!token || !*token) && !loopback) {
+        fprintf(stderr,
+                "--monitor: binding %s is beyond loopback and requires a "
+                "token (--monitor-token=STR or X86EMU_MONITOR_TOKEN); "
+                "refusing to listen unauthenticated\n", host);
+        return -1;
+    }
+    if (token && strlen(token) >= MON_TOKEN_MAX) {
+        fprintf(stderr, "--monitor: token is too long (max %u bytes)\n",
+                (unsigned)MON_TOKEN_MAX - 1);
         return -1;
     }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1196,6 +1376,8 @@ int monitor_attach(machine_t *m, const char *spec) {
     if (!s) { close(fd); return -1; }
     s->listen_fd = fd;
     s->client_fd = -1;
+    if (token && *token) snprintf(s->token, sizeof s->token, "%s", token);
+    snprintf(s->bind_host, sizeof s->bind_host, "%s", host);
     s->fe.name = "monitor";
     s->fe.ctx = s;
     s->fe.on_stop = monitor_on_stop;
@@ -1210,6 +1392,13 @@ int monitor_attach(machine_t *m, const char *spec) {
         fprintf(stderr, "--monitor: debugger frontend limit reached\n");
         return -1;
     }
-    fprintf(stderr, "[monitor] listening at http://%s:%d/ (WebSocket /ws)\n", host, port);
+    fprintf(stderr, "[monitor] listening at http://%s:%d/ (WebSocket /ws%s)\n",
+            host, port, s->token[0] ? ", token required" : "");
+    if (!loopback) {
+        fprintf(stderr,
+                "[monitor] WARNING: bound beyond loopback over plaintext "
+                "HTTP -- anyone who can see the traffic can take the "
+                "token and drive this machine\n");
+    }
     return 0;
 }

@@ -1,0 +1,498 @@
+From 5e45155c48c95584a32bc9009f71ba1e6a982145 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 16:39:17 +0000
+Subject: [PATCH] Upkeep U1: settable RTC clock (UPKEEP_PLAN U1)
+
+The MC146818 clock stops being a read-only function of the
+2026 power-on anchor.  Absolute time is now base_sec (Unix
+seconds, 2026-01-01 at init) under the unchanged virtual tick
+count, so dates before the anchor are representable and the
+UIP/periodic phases do not move.
+
+Register B gains its datasheet semantics (measured against
+QEMU's mc146818rtc): the SET rising edge seeds the date bytes
+from the live clock in the current format and clears UIE;
+writes stage in those bytes and read back verbatim while SET;
+the falling edge parses them under the format that was live
+during SET, validates the civil ranges, and commits
+base_sec, keeping the sub-second phase.  Invalid fields log
+and change nothing.  The DM (BCD/binary) and 12/24-hour bits
+now govern date reads and writes in both directions.  While
+SET, UIP reads 0 and no update-ended flag is raised; the
+periodic chain keeps running.
+
+machine_t grows by the 8-byte base_sec, so pre-U1 snapshots
+are refused by the existing header layout check rather than
+reinterpreted (recorded in the plan and changelog).
+
+Vectors (tests/test_rtc.c, 4 new groups): a leap-day set to
+2024-02-29 with rollover and a warm reset preserving it;
+SET freeze (staged reads, no UIP/UF) and an invalid month
+leaving the clock untouched; binary-mode and 12-hour
+round-trips including midnight/noon; SET clearing UIE.  All
+pre-U1 vectors pass unmodified.  NC: rtc.c/rtc.h at U0 --
+behavioural abort at the first staged-readback assert.
+Gates: make test + test-sanitize green; both SeaBIOS ISO
+lanes green for real (bios.bin + NASM present).
+---
+ CHANGELOG.md              |  17 +++++
+ docs/STATUS.md            |  12 ++++
+ docs/plans/UPKEEP_PLAN.md |  23 +++++-
+ src/rtc.c                 | 146 +++++++++++++++++++++++++++++++-------
+ src/rtc.h                 |  16 +++--
+ tests/test_rtc.c          |  88 +++++++++++++++++++++++
+ 6 files changed, 269 insertions(+), 33 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 25107cc..f33fbed 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,23 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0092 (Upkeep U1: settable RTC clock)
++
++- **The MC146818 clock can be set** (`src/rtc.c`): Register B's
++  SET bit inhibits the update cycle, date writes stage in the
++  CMOS bytes (seeded from the live clock on the SET edge, UIE
++  cleared per the datasheet), and clearing SET validates and
++  commits the staged date — including dates before the 2026
++  power-on anchor. Register B's data mode (BCD/binary) and
++  12/24-hour mode now govern both reads and writes; invalid
++  staged fields are logged and ignored. Power-on values, UIP
++  phases and the periodic/update IRQ8 behaviour are unchanged.
++- Snapshot note: `machine_t` grew by the 8-byte clock base, so
++  snapshots written before this patch are refused with the
++  existing build-layout error instead of being misread.
++- 4 new groups in `tests/test_rtc.c`; NC = rtc.c/rtc.h at
++  patch 0091 (behavioural abort on staged readback).
++
+ ### Added — patch 0091 (Upkeep U0: measured baseline + plan)
+ 
+ - `docs/plans/UPKEEP_PLAN.md` opens ROADMAP candidate #4 with a
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 778797c..47806cc 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1044,6 +1044,18 @@
+   U1 RTC, U2 e1000, U3 gdb x87, U4 LAPIC, U5 CF9, U6 TCP and
+   U7 authenticated GUI/monitor. Docs only; targeted unit,
+   responder and 30-check RSP lanes green (real gdb absent).
++- Upkeep U1 (`patches/0092-UPKEEP-U1-settable-RTC-clock.patch`):
++  the RTC clock is guest-settable. Register B SET now works the
++  way QEMU's mc146818 does: the rising edge seeds the date bytes
++  from the live clock and clears UIE, writes stage, the falling
++  edge validates and commits them into a new `rtc.base_sec`
++  (Unix seconds under the unchanged tick count); DM (BCD/
++  binary) and 12/24-hour modes govern reads and writes; SET
++  freezes UIP/UF. Dates before the 2026 anchor work (vectors
++  set 2024-02-29 and 1999-06-15). `machine_t` grew 8 bytes, so
++  pre-U1 snapshots are refused by the layout check. NC: rtc at
++  U0 aborts on the first staged readback. Power-on behaviour,
++  UIP phases and periodic IRQ8 are byte-identical canaries.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index 86d5035..bfaaadf 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -4,12 +4,12 @@
+ > XHCI, MSI and PM are complete; this plan takes the remaining
+ > site-documented gaps in dependency/risk order.
+ 
+-**Status: U0 done ✅; U1 queued**
++**Status: U0+U1 done ✅; U2 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | U0 | Measured baseline for all seven row-4 items, defect ledger, decisions and phase split | ✅ done | this file (`patches/0091`) |
+-| U1 | RTC: a settable MC146818 clock/calendar without changing the pinned power-on behaviour | ⬜ queued | `tests/test_rtc.c` vectors |
++| U1 | RTC: a settable MC146818 clock/calendar without changing the pinned power-on behaviour | ✅ done | `tests/test_rtc.c` vectors (`patches/0092`) |
+ | U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ⬜ queued | `tests/test_net.c` vectors |
+ | U3 | gdbstub: publish and accept the real x87 register/control state in `g`/`G`/`p`/`P` | ⬜ queued | `tests/test_gdbstub.py` vectors |
+ | U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ⬜ queued | `tests/test_lapic.c` vectors |
+@@ -238,7 +238,7 @@ AuraLite-OS KERNEL/INITRD artifacts.
+ |---|-------------------|-------------|-------|
+ | D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | U4 |
+ | D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | U5 |
+-| D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | U1 |
++| D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | ~~U1~~ **resolved in U1** (SET-staged writes commit to `base_sec`; DM/24H govern both directions) |
+ | D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | U2 |
+ | D5 | Responder TCP appends/acks payload without sequence validation, sends no SACK and has incomplete duplicate-close states | loss/reordering corrupts the DNS stream and acknowledgement state instead of eliciting retransmission | U6 |
+ | D6 | gdbstub advertises x87 registers but reports zeros/all-empty and ignores writes | FPU debugging displays a machine that is not the one executing | U3 |
+@@ -296,6 +296,23 @@ out-of-range civil state; a warm reset preserves the set clock;
+ snapshot split-run restores it; untouched power-on vectors and
+ periodic IRQ8 remain exact.
+ 
++**U1 receipts.** Shipped with QEMU's `mc146818rtc` SET semantics
++(measured from that source): the rising SET edge seeds the
++register bytes from the live clock in the current format and
++clears UIE; writes stage in the CMOS bytes; the falling edge
++parses under the format that was live during SET and moves the
++new `base_sec` (Unix seconds under the unchanged tick count),
++keeping the sub-second phase. Range-invalid fields log and
++change nothing. While SET: reads return staged bytes, UIP
++reads 0, no UF is raised; the periodic chain keeps running.
++`machine_t` grew by the 8-byte `base_sec`, so pre-U1 snapshots
++are refused by the existing header layout check (never
++reinterpreted). Four new groups in `tests/test_rtc.c`
++(leap-day set + warm reset, freeze/invalid, binary + 12-hour
++round-trips, SET-clears-UIE); all pre-U1 vectors pass
++unmodified. NC: rtc.c/rtc.h at U0 — behavioural abort at the
++first staged-readback assert.
++
+ ### U2 — e1000 EEPROM + PHY
+ 
+ Prove the guest's exact EERD transaction for words 0–2 returns
+diff --git a/src/rtc.c b/src/rtc.c
+index 89fdc96..004e6b8 100644
+--- a/src/rtc.c
++++ b/src/rtc.c
+@@ -13,11 +13,16 @@
+ #define RTC_UIE 0x10                /* register B bit4 */
+ #define RTC_PFBIT 0x40              /* register C bit6: periodic flag   */
+ #define RTC_PIE 0x40                /* register B bit6: periodic enable */
++#define RTC_SET 0x80                /* register B bit7: inhibit update  */
++#define RTC_DM  0x04                /* register B bit2: 1=binary, 0=BCD */
++#define RTC_24H 0x02                /* register B bit1: 1=24h, 0=12h    */
++#define RTC_EPOCH_2026 1767225600LL /* 2026-01-01 00:00:00 UTC          */
+ 
+ static uint8_t bin2bcd(unsigned v) { return (uint8_t)((v / 10 << 4) | (v % 10)); }
+ 
+ void rtc_init(machine_t *m) {
+     memset(&m->rtc, 0, sizeof m->rtc);
++    m->rtc.base_sec = RTC_EPOCH_2026;   /* U1: the pinned power-on epoch */
+     m->rtc.instr_per_tick = PIT_DEFAULT_IPT; /* K7: stay pinned to the PIT pin
+                                               * (12->384): one coherent virtual
+                                               * CPU frequency across time sources */
+@@ -65,7 +70,8 @@ void rtc_tick(machine_t *m) {
+     m->rtc.ticks += m->rtc.accum / m->rtc.instr_per_tick;
+     m->rtc.accum %= m->rtc.instr_per_tick;
+     uint64_t after = m->rtc.ticks / RTC_TICKS_PER_SEC;
+-    if (after != before) {                    /* seconds boundary: update-ended */
++    if (after != before && !(m->rtc.ram[0x0B] & RTC_SET)) {
++        /* seconds boundary: update-ended (inhibited in SET mode, U1) */
+         m->rtc.flags_c |= RTC_UFBIT;
+         if (m->rtc.ram[0x0B] & RTC_UIE) {
+             m->rtc.flags_c |= RTC_IRQFBIT;
+@@ -98,9 +104,12 @@ static unsigned mdays(unsigned y, unsigned mo) {
+ }
+ 
+ /* Civil fields of "committed" virtual time: the MC146818 update phase
+- * keeps showing the PREVIOUS second while UIP is up. Also reports UIP. */
++ * keeps showing the PREVIOUS second while UIP is up. Also reports UIP.
++ * U1: absolute time is base_sec (Unix seconds) + the tick count, so a
++ * guest-set date before the 2026 power-on anchor is representable. */
+ static void rtc_civil(machine_t *m, unsigned *sec, unsigned *min, unsigned *hr,
+-                      unsigned *day, unsigned *mon, unsigned *yr, int *uip) {
++                      unsigned *dow, unsigned *day, unsigned *mon,
++                      unsigned *yr, int *uip) {
+     uint64_t t = m->rtc.ticks;
+     uint64_t s = t / RTC_TICKS_PER_SEC;
+     uint64_t in_sec = t % RTC_TICKS_PER_SEC;
+@@ -108,39 +117,117 @@ static void rtc_civil(machine_t *m, unsigned *sec, unsigned *min, unsigned *hr,
+      * UIP_TICKS ticks of each second (after the very first one), and the
+      * clock commits when the window closes */
+     *uip = t >= RTC_TICKS_PER_SEC ? in_sec < RTC_UIP_TICKS : 0;
+-    uint64_t committed = (*uip && s > 0) ? s - 1 : s;
++    uint64_t committed = (uint64_t)m->rtc.base_sec + s;
++    if (*uip && committed > 0) committed--;
+     *sec = (unsigned)(committed % 60); committed /= 60;
+     *min = (unsigned)(committed % 60); committed /= 60;
+     *hr  = (unsigned)(committed % 24); committed /= 24;
+-    unsigned y = 2026, mo = 1; uint64_t days = committed;
+-    while (days >= mdays(y, mo)) { days -= mdays(y, mo); if (++mo > 12) { mo = 1; y++; } }
++    uint64_t days = committed;
++    *dow = 1 + (unsigned)((4 + days) % 7);      /* 1970-01-01: Thursday */
++    unsigned y = 1970;
++    while (days >= 365u + (unsigned)leap(y)) { days -= 365u + (unsigned)leap(y); y++; }
++    unsigned mo = 1;
++    while (days >= mdays(y, mo)) { days -= mdays(y, mo); mo++; }
+     *day = 1 + (unsigned)days; *mon = mo; *yr = y;
+ }
+ 
++/* Register-B format conversion (DM: 1=binary else BCD; 24H bit). */
++static uint8_t rtc_to_reg(machine_t *m, unsigned v) {
++    return (m->rtc.ram[0x0B] & RTC_DM) ? (uint8_t)v : bin2bcd(v);
++}
++static unsigned rtc_from_reg(machine_t *m, uint8_t v) {
++    if (m->rtc.ram[0x0B] & RTC_DM) return v;
++    return (v >> 4) * 10u + (v & 0x0Fu);
++}
++static uint8_t rtc_hour_to_reg(machine_t *m, unsigned hr24) {
++    if (m->rtc.ram[0x0B] & RTC_24H) return rtc_to_reg(m, hr24);
++    unsigned h = hr24 % 12u ? hr24 % 12u : 12u;
++    return rtc_to_reg(m, h) | (hr24 >= 12u ? 0x80u : 0u);   /* PM bit */
++}
++static unsigned rtc_hour_from_reg(machine_t *m, uint8_t v) {
++    unsigned h = rtc_from_reg(m, v & 0x7Fu);
++    if (!(m->rtc.ram[0x0B] & RTC_24H)) {
++        h %= 12u;
++        if (v & 0x80u) h += 12u;
++    }
++    return h;
++}
++
++/* SET rising edge: snapshot the live date into the register bytes in
++ * the format Register B currently selects (so partial field writes
++ * and an untouched century stay coherent), like QEMU's update of
++ * CMOS to the stopping time.  SET falling edge: parse the staged
++ * bytes under that same (old) format and, if they name a real date,
++ * move base_sec; the sub-second phase is kept.  Invalid fields log
++ * and leave the clock alone rather than manufacturing civil state. */
++static void rtc_seed_staged(machine_t *m) {
++    unsigned sec, min, hr, dow, day, mon, yr; int uip;
++    rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
++    m->rtc.ram[0x00] = rtc_to_reg(m, sec);
++    m->rtc.ram[0x02] = rtc_to_reg(m, min);
++    m->rtc.ram[0x04] = rtc_hour_to_reg(m, hr);
++    m->rtc.ram[0x06] = rtc_to_reg(m, dow);
++    m->rtc.ram[0x07] = rtc_to_reg(m, day);
++    m->rtc.ram[0x08] = rtc_to_reg(m, mon);
++    m->rtc.ram[0x09] = rtc_to_reg(m, yr % 100);
++    m->rtc.ram[0x32] = rtc_to_reg(m, yr / 100);
++}
++
++static void rtc_commit_staged(machine_t *m) {
++    unsigned sec = rtc_from_reg(m, m->rtc.ram[0x00]);
++    unsigned min = rtc_from_reg(m, m->rtc.ram[0x02]);
++    unsigned hr  = rtc_hour_from_reg(m, m->rtc.ram[0x04]);
++    unsigned day = rtc_from_reg(m, m->rtc.ram[0x07]);
++    unsigned mon = rtc_from_reg(m, m->rtc.ram[0x08]);
++    unsigned yr  = rtc_from_reg(m, m->rtc.ram[0x09]);
++    unsigned cen = rtc_from_reg(m, m->rtc.ram[0x32]);
++    unsigned year = cen ? cen * 100u + yr : 2000u + yr;
++    if (sec > 59 || min > 59 || hr > 23 || mon < 1 || mon > 12 ||
++        year < 1970 || year > 9999 || day < 1 || day > mdays(year, mon)) {
++        mlog(&m->log, "[rtc] SET exits with invalid date fields "
++             "(%04u-%02u-%02u %02u:%02u:%02u): clock unchanged",
++             year, mon, day, hr, min, sec);
++        return;
++    }
++    uint64_t days = 0;
++    for (unsigned y = 1970; y < year; y++) days += 365u + (unsigned)leap(y);
++    for (unsigned mo = 1; mo < mon; mo++) days += mdays(year, mo);
++    days += day - 1;
++    m->rtc.base_sec = (int64_t)(days * 86400ull + hr * 3600u + min * 60u + sec);
++    m->rtc.ticks %= RTC_TICKS_PER_SEC;
++    mlog(&m->log, "[rtc] clock set to %04u-%02u-%02u %02u:%02u:%02u UTC",
++         year, mon, day, hr, min, sec);
++}
++
+ /* ---------------------------------------------------------------- ports */
+ 
+ static uint32_t rtc_data_read(machine_t *m) {
+     rtc_tick(m);
+     unsigned sel = m->rtc.idx & 0x7F;
+-    unsigned sec, min, hr, day, mon, yr; int uip;
++    int setting = (m->rtc.ram[0x0B] & RTC_SET) != 0;
++    unsigned sec, min, hr, dow, day, mon, yr; int uip;
+     switch (sel) {
+-    case 0x00: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(sec);
+-    case 0x02: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(min);
+-    case 0x04: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(hr);
+-    case 0x06: { /* day of week: 2026-01-01 was a Thursday (5, 1=Sun) */
+-        uint64_t t = m->rtc.ticks, s = t / RTC_TICKS_PER_SEC;
+-        int u = t >= RTC_TICKS_PER_SEC ? (t % RTC_TICKS_PER_SEC) < RTC_UIP_TICKS : 0;
+-        if (u && s > 0) s--;                      /* same commit rule */
+-        return 1 + (uint8_t)((4 + s / 86400) % 7); }
+-    case 0x07: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(day);
+-    case 0x08: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(mon);
+-    case 0x09: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(yr % 100);
+-    case 0x0A: { rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip);
+-                 return (m->rtc.ram[0x0A] & 0x7F) | (uip ? 0x80 : 0); }
++    /* In SET mode the staged register bytes read back verbatim;
++     * otherwise the computed clock in Register B's format. */
++    case 0x00: case 0x02: case 0x04: case 0x06:
++    case 0x07: case 0x08: case 0x09: case 0x32:
++        if (setting) return m->rtc.ram[sel];
++        rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
++        switch (sel) {
++        case 0x00: return rtc_to_reg(m, sec);
++        case 0x02: return rtc_to_reg(m, min);
++        case 0x04: return rtc_hour_to_reg(m, hr);
++        case 0x06: return rtc_to_reg(m, dow);
++        case 0x07: return rtc_to_reg(m, day);
++        case 0x08: return rtc_to_reg(m, mon);
++        case 0x09: return rtc_to_reg(m, yr % 100);
++        default:   return rtc_to_reg(m, yr / 100);
++        }
++    case 0x0A: { rtc_civil(m, &sec, &min, &hr, &dow, &day, &mon, &yr, &uip);
++                 return (m->rtc.ram[0x0A] & 0x7F) | ((uip && !setting) ? 0x80 : 0); }
+     case 0x0B: return m->rtc.ram[0x0B];
+     case 0x0C: { uint8_t v = m->rtc.flags_c; m->rtc.flags_c = 0; return v; }
+     case 0x0D: return 0x80;
+-    case 0x32: rtc_civil(m, &sec,&min,&hr,&day,&mon,&yr,&uip); return bin2bcd(yr / 100);
+     default: return m->rtc.ram[sel & 0x7F];
+     }
+ }
+@@ -149,11 +236,20 @@ static void rtc_data_write(machine_t *m, uint8_t v) {
+     rtc_tick(m);
+     unsigned sel = m->rtc.idx & 0x7F;
+     switch (sel) {
+-    case 0x00: case 0x02: case 0x04: case 0x06: case 0x07: case 0x08: case 0x09:
+-    case 0x0C: case 0x0D: case 0x32:
+-        return;                             /* computed/read-only: documented */
++    case 0x0C: case 0x0D:
++        return;                             /* read-only */
+     case 0x0A: m->rtc.ram[0x0A] = v & 0x7F; return;   /* UIP is read-only */
+-    default:   m->rtc.ram[sel & 0x7F] = v;  return;
++    case 0x0B: {                            /* U1: the SET edges */
++        uint8_t old = m->rtc.ram[0x0B];
++        if ((v & RTC_SET) && !(old & RTC_SET)) {
++            rtc_seed_staged(m);
++            v &= (uint8_t)~RTC_UIE;         /* datasheet: SET clears UIE */
++        } else if (!(v & RTC_SET) && (old & RTC_SET)) {
++            rtc_commit_staged(m);           /* parses under the old format */
++        }
++        m->rtc.ram[0x0B] = v;
++        return; }
++    default:   m->rtc.ram[sel & 0x7F] = v;  return;   /* dates stage here */
+     }
+ }
+ 
+diff --git a/src/rtc.h b/src/rtc.h
+index 933ff19..ccbe994 100644
+--- a/src/rtc.h
++++ b/src/rtc.h
+@@ -1,11 +1,14 @@
+ /* rtc.h -- MC146818A RTC/CMOS (CHIPSET H3).
+  *
+  * Ports 0x70 (index: bit7 NMI-disable stored, bits 6:0 select) / 0x71
+- * (data). Dynamic registers: 0x00-0x09 clock (BCD from the virtual
+- * epoch; writes ignored -- the clock stays epoch-anchored, documented),
+- * 0x0A (DV/RS stored, UIP bit7 computed), 0x0B (stored; UIE bit4 moves
+- * the update-ended IRQ8), 0x0C (flags, cleared on read), 0x0D (0x80),
+- * 0x32 (BCD century, computed). Everything else is battery-backed RAM.
++ * (data). Dynamic registers: 0x00-0x09 clock (computed from the
++ * virtual epoch in Register B's BCD/binary and 12/24-hour format;
++ * UPKEEP U1: writes stage under Register B SET and commit on its
++ * 1->0 edge, so the clock is guest-settable), 0x0A (DV/RS stored,
++ * UIP bit7 computed), 0x0B (stored; UIE bit4 moves the
++ * update-ended IRQ8, SET bit7 freezes updates), 0x0C (flags,
++ * cleared on read), 0x0D (0x80), 0x32 (century, computed).
++ * Everything else is battery-backed RAM.
+  *
+  * Virtual time (D6, same model as the PIT): one second == 1193182 ticks
+  * == instr_per_tick*1193182 retired instructions, counted from the
+@@ -41,6 +44,9 @@ typedef struct rtc {
+     uint8_t  flags_c;       /* pending register-C flags (UF/IRQF)       */
+     uint8_t  ram[128];      /* battery-backed bytes (dynamic regs bypass)*/
+     uint64_t ticks;         /* virtual RTC ticks since the epoch anchor */
++    int64_t  base_sec;      /* U1: Unix seconds the tick count rides on;
++                             * 1767225600 (2026-01-01 UTC) at init, moved
++                             * only by a committed SET-mode date write  */
+     uint64_t accum;         /* sub-divisor instruction residue          */
+     uint64_t last_instr;
+     uint32_t instr_per_tick;/* D6 divisor (12, same pin as the PIT)     */
+diff --git a/tests/test_rtc.c b/tests/test_rtc.c
+index e55bb78..5759e10 100644
+--- a/tests/test_rtc.c
++++ b/tests/test_rtc.c
+@@ -183,6 +183,90 @@ static void test_cmos_smp_extra_cpus(void) {
+     printf("ok: cmos_smp_extra_cpus\n");
+ }
+ 
++/* UPKEEP U1: the Linux-style SET sequence installs a new date --
++ * before the 2026 power-on anchor and across a leap day -- and a
++ * warm reset does not touch it (battery-backed silicon). */
++static void test_set_date_bcd_leap(void) {
++    fx_t f; fx_init(&f);
++    cmos_w(&f, 0x0B, 0x82);                      /* SET | 24h, BCD    */
++    assert(cmos(&f, 0x09) == 0x26);              /* seeded live date  */
++    cmos_w(&f, 0x00, 0x58); cmos_w(&f, 0x02, 0x59); cmos_w(&f, 0x04, 0x23);
++    cmos_w(&f, 0x07, 0x29); cmos_w(&f, 0x08, 0x02);
++    cmos_w(&f, 0x09, 0x24); cmos_w(&f, 0x32, 0x20);
++    assert(cmos(&f, 0x07) == 0x29);              /* staged readback   */
++    cmos_w(&f, 0x0B, 0x02);                      /* commit            */
++    assert(cmos(&f, 0x00) == 0x58 && cmos(&f, 0x02) == 0x59 &&
++           cmos(&f, 0x04) == 0x23);
++    assert(cmos(&f, 0x07) == 0x29 && cmos(&f, 0x08) == 0x02 &&
++           cmos(&f, 0x09) == 0x24 && cmos(&f, 0x32) == 0x20);
++    assert(cmos(&f, 0x06) == 0x05);              /* 2024-02-29: Thu   */
++    fx_steps(&f, 3 * SEC_INSTR + 8000 * IPT);    /* leap rollover     */
++    assert(cmos(&f, 0x00) == 0x01 && cmos(&f, 0x02) == 0x00 &&
++           cmos(&f, 0x04) == 0x00);
++    assert(cmos(&f, 0x07) == 0x01 && cmos(&f, 0x08) == 0x03);
++    assert(cmos(&f, 0x06) == 0x06);              /* 2024-03-01: Fri   */
++    machine_reset(&f.m);
++    assert(cmos(&f, 0x07) == 0x01 && cmos(&f, 0x08) == 0x03 &&
++           cmos(&f, 0x09) == 0x24);              /* reset keeps date  */
++    printf("ok: set_date_bcd_leap\n");
++}
++
++/* U1: SET freezes the update cycle (no UF, no UIP, staged reads),
++ * and an invalid staged date leaves the running clock alone. */
++static void test_set_freeze_and_invalid(void) {
++    fx_t f; fx_init(&f);
++    fx_steps(&f, 10 * SEC_INSTR + 8000 * IPT);
++    assert(cmos(&f, 0x00) == 0x10);
++    (void)cmos(&f, 0x0C);                        /* drain pending UF  */
++    cmos_w(&f, 0x0B, 0x82);
++    fx_steps(&f, 5 * SEC_INSTR + 8000 * IPT);
++    assert(cmos(&f, 0x00) == 0x10);              /* frozen at seeding */
++    assert((cmos(&f, 0x0A) & 0x80) == 0);        /* no UIP in SET     */
++    assert(cmos(&f, 0x0C) == 0x00);              /* no UF in SET      */
++    cmos_w(&f, 0x08, 0x13);                      /* month 13: invalid */
++    cmos_w(&f, 0x0B, 0x02);
++    assert(cmos(&f, 0x08) == 0x01);              /* unchanged...      */
++    assert(cmos(&f, 0x00) == 0x15);              /* ...and kept time  */
++    printf("ok: set_freeze_and_invalid\n");
++}
++
++/* U1: Register B data/hour modes govern both directions. */
++static void test_binary_and_12h_formats(void) {
++    fx_t f; fx_init(&f);
++    cmos_w(&f, 0x0B, 0x86);                      /* SET|DM(binary)|24h */
++    cmos_w(&f, 0x00, 30); cmos_w(&f, 0x02, 15); cmos_w(&f, 0x04, 13);
++    cmos_w(&f, 0x07, 15); cmos_w(&f, 0x08, 6);
++    cmos_w(&f, 0x09, 99); cmos_w(&f, 0x32, 19);  /* 1999-06-15        */
++    cmos_w(&f, 0x0B, 0x06);
++    assert(cmos(&f, 0x04) == 13 && cmos(&f, 0x09) == 99 &&
++           cmos(&f, 0x32) == 19);
++    cmos_w(&f, 0x0B, 0x02);                      /* BCD 24h, same clock */
++    assert(cmos(&f, 0x00) == 0x30 && cmos(&f, 0x04) == 0x13 &&
++           cmos(&f, 0x09) == 0x99 && cmos(&f, 0x32) == 0x19);
++    cmos_w(&f, 0x0B, 0x00);                      /* BCD 12h           */
++    assert(cmos(&f, 0x04) == 0x81);              /* 1 PM              */
++    cmos_w(&f, 0x0B, 0x82);                      /* set via 24h...    */
++    cmos_w(&f, 0x04, 0x00);
++    cmos_w(&f, 0x0B, 0x00);                      /* ...read in 12h    */
++    assert(cmos(&f, 0x04) == 0x12);              /* 12 AM             */
++    cmos_w(&f, 0x0B, 0x80);                      /* set in 12h        */
++    cmos_w(&f, 0x04, 0x92);                      /* 12 PM staged      */
++    cmos_w(&f, 0x0B, 0x00);
++    assert(cmos(&f, 0x04) == 0x92);              /* noon round-trips  */
++    printf("ok: binary_and_12h_formats\n");
++}
++
++/* U1: entering SET clears UIE (MC146818A datasheet behaviour). */
++static void test_set_clears_uie(void) {
++    fx_t f; fx_init(&f);
++    cmos_w(&f, 0x0B, 0x12);
++    assert(cmos(&f, 0x0B) == 0x12);
++    cmos_w(&f, 0x0B, 0x92);
++    assert(cmos(&f, 0x0B) == 0x82);
++    cmos_w(&f, 0x0B, 0x02);
++    printf("ok: set_clears_uie\n");
++}
++
+ int main(void) {
+     test_cmos_content_and_ports();
+     test_cmos_extended_memory_above_16m();
+@@ -191,6 +275,10 @@ int main(void) {
+     test_uip_freeze_then_commit();
+     test_regc_flags_no_uie();
+     test_irq8_update_ended();
++    test_set_date_bcd_leap();
++    test_set_freeze_and_invalid();
++    test_binary_and_12h_formats();
++    test_set_clears_uie();
+     puts("rtc tests: ok");
+     return 0;
+ }
+-- 
+2.47.3
+

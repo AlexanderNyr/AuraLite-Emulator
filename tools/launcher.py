@@ -22,11 +22,33 @@ Ground rules:
     launcher's /ws is exposed -- one port for the whole GUI;
   * run state (presets, per-run output, snapshots) lives in a state
     directory (--state-dir, default ~/.x86emu-gui), never in the repo.
+
+Access control (UPKEEP U7; threat model: UPKEEP_PLAN s1.7):
+  * a capability token gates every API route and the /ws splice. On a
+    loopback bind the token is per-process random and is embedded into
+    the served GUI page, so the default flow stays one-click; on a
+    non-loopback bind it is the persistent `access-token` file (0600) in
+    the state directory -- the desktop GUI shows and rotates it -- and
+    the page embeds nothing until the visitor presents it. Carriers:
+    `X-X86emu-Token` / `Authorization: Bearer` / `?token=` / the
+    SameSite=Strict cookie the page response sets.
+  * the Host header must name this machine (loopback names, the bound
+    literal, this host's name): a DNS-rebinding page's Host is none of
+    those, so it never reaches a route. Mutating routes and /ws also
+    require a same-origin `Origin` when a browser sends one.
+  * each machine run gets its own monitor token, handed to the emulator
+    in its environment (never argv, so it stays out of argv.json and
+    process lists); the /ws proxy presents it to the monitor, which is
+    therefore never the unauthenticated thing its header once said.
 """
 import argparse
+import hmac
+import html as _html
+import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -238,6 +260,7 @@ class Machine:
         self.proc = None
         self.run_dir = None
         self.monitor_port = None
+        self.monitor_token = None     # per-run capability for --monitor
         self.config = dict(BUILTIN_CONFIG)
         self.started_at = None
         self.exit_code = None
@@ -272,14 +295,22 @@ class Machine:
             os.makedirs(run_dir, exist_ok=True)
             monitor_port = free_port()
             argv = build_argv(self.emu_path, config, run_dir, monitor_port)
+            # UPKEEP U7: a fresh monitor capability per run, carried in the
+            # child's environment -- never in argv, so it appears neither in
+            # process lists nor in the run's argv.json. Only the owner of
+            # this process (the launcher / desktop GUI) can present it.
+            monitor_token = new_token()
+            env = dict(os.environ)
+            env["X86EMU_MONITOR_TOKEN"] = monitor_token
             out = open(os.path.join(run_dir, "stdout.log"), "wb")
             err = open(os.path.join(run_dir, "stderr.log"), "wb")
             self.proc = subprocess.Popen(
-                argv, cwd=ROOT, stdout=out, stderr=err,
+                argv, cwd=ROOT, stdout=out, stderr=err, env=env,
                 stdin=subprocess.DEVNULL, start_new_session=True)
             out.close(); err.close()
             self.run_dir = run_dir
             self.monitor_port = monitor_port
+            self.monitor_token = monitor_token
             self.config = config
             self.argv = argv
             self.started_at = time.time()
@@ -414,6 +445,169 @@ def free_port():
 
 
 # ---------------------------------------------------------------------------
+# Access control (UPKEEP U7)
+# ---------------------------------------------------------------------------
+
+ACCESS_TOKEN_FILE = "access-token"
+TOKEN_COOKIE = "x86emu_token"
+
+
+def new_token():
+    """A fresh URL-safe capability (256 bits of entropy)."""
+    return secrets.token_urlsafe(32)
+
+
+def is_loopback_bind(bind):
+    """True when `bind` keeps the launcher on this machine only."""
+    b = (bind or "").strip().lower()
+    if b in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(b).is_loopback
+    except ValueError:
+        return False            # a name we cannot prove local: treat remote
+
+
+def load_or_create_access_token(state_dir, force_new=False):
+    """The persistent remote-access credential: `<state_dir>/access-token`,
+    created 0600 on first use.  -> (token, path, created).
+
+    This is the secret the desktop GUI displays and rotates (same file),
+    so obtaining or replacing it never needs a terminal.  A running
+    launcher keeps its in-memory copy, so rotation takes effect at the
+    next launcher start.  A token someone can read from this file is a
+    token that same user could read from the runs/ state anyway -- the
+    file's owner-only mode is the honest boundary, not a cipher."""
+    path = os.path.join(state_dir, ACCESS_TOKEN_FILE)
+    if not force_new:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tok = f.read().strip()
+            if len(tok) >= 16 and re.match(r"^[A-Za-z0-9_\-]+$", tok):
+                return tok, path, False
+        except OSError:
+            pass
+    tok = new_token()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (tok + "\n").encode("ascii"))
+    finally:
+        os.close(fd)
+    try:                                # a pre-existing loose file keeps its
+        os.chmod(path, 0o600)           # mode through O_TRUNC; tighten it
+    except OSError:
+        pass
+    return tok, path, True
+
+
+def _host_part(value):
+    """A Host header/authority reduced to its hostname: lowercased,
+    brackets and any :port stripped."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        end = v.find("]")
+        return v[1:end] if end > 0 else ""
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+class Auth:
+    """One launcher's gate: the token, whether the page may embed it
+    (loopback only), and the Host allowlist.  Built by `make_auth`."""
+
+    def __init__(self, token, embed, allowed_hosts, any_literal):
+        self.token = token
+        self.embed = embed                  # loopback: page carries it
+        self.allowed_hosts = allowed_hosts  # set of lowercase host parts
+        self.any_literal = any_literal      # 0.0.0.0 bind: any IP literal
+
+    def host_ok(self, host_header):
+        h = _host_part(host_header)
+        if not h:
+            return False
+        if h in self.allowed_hosts:
+            return True
+        if self.any_literal:
+            try:
+                ipaddress.ip_address(h)
+                return True
+            except ValueError:
+                return False
+        return False
+
+    def token_ok(self, presented):
+        return bool(presented) and hmac.compare_digest(
+            str(presented), self.token)
+
+    def origin_ok(self, origin_header, host_header):
+        """Same-origin check for browser-driven mutations and the upgrade:
+        browsers always send Origin on POST and WebSocket handshakes and
+        cannot forge it; our page is same-origin by construction."""
+        if not origin_header:
+            return True                     # a non-browser client
+        u = urlparse(origin_header)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return False                    # includes Origin: null
+        return (u.hostname.lower() == _host_part(host_header)
+                and self.host_ok(u.netloc))
+
+
+def make_auth(bind, state_dir):
+    """Build the gate for one listener.
+
+    Loopback:  per-process token, embedded in the page -- the browser
+    carries it, no step for the operator.  Non-loopback: the persistent
+    access-token file, embedded in NO page; the visitor presents it once
+    (form / ?token=) and the resulting cookie carries it from there."""
+    hosts = {"127.0.0.1", "localhost", "::1"}
+    any_literal = False
+    b = (bind or "").strip().lower()
+    try:
+        ip = ipaddress.ip_address(b)
+        if ip.is_unspecified:
+            any_literal = True
+        else:
+            hosts.add(str(ip))
+    except ValueError:
+        if b and b != "localhost":
+            hosts.add(b)
+    if not is_loopback_bind(bind):
+        hn = socket.gethostname().lower()
+        if hn:
+            hosts.add(hn)
+            hosts.add(hn.split(".")[0])
+        token, _path, _created = load_or_create_access_token(state_dir)
+        return Auth(token, False, hosts, any_literal)
+    return Auth(new_token(), True, hosts, any_literal)
+
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AuraLite Emulator — доступ по токену</title>
+<style>body{background:#0b1020;color:#e7efff;font:15px/1.5 ui-monospace,Consolas,monospace;
+display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.box{background:#121a2d;border:1px solid #263451;border-radius:10px;padding:26px 30px;max-width:520px}
+h1{color:#58d6ff;font-size:19px;margin:0 0 10px}input{width:100%%;box-sizing:border-box;
+padding:9px;border:1px solid #263451;border-radius:6px;background:#0b1324;color:#e7efff;font:inherit}
+button{margin-top:12px;padding:9px 16px;border:1px solid #34758a;border-radius:7px;
+background:#15557a;color:#d9f3ff;font:inherit;cursor:pointer}
+.err{color:#ff8585}.dim{color:#8fa2c2}</style></head><body>
+<div class="box"><h1>AuraLite Emulator — удалённый доступ</h1>
+<p>Интерфейс запущен на сетевом адресе и требует токен доступа.</p>
+<p class="dim">Токен виден в настольном приложении AuraLite Emulator
+(режим «Эксперт» → вкладка «Сеть») и хранится в каталоге состояния GUI,
+файл <code>access-token</code>. Там же его можно заменить.</p>
+%(error)s
+<form method="get" action="/">
+<label>Токен доступа<br><input name="token" type="password" autocomplete="off" autofocus></label>
+<br><button type="submit">Войти</button></form>
+<p class="dim">Внимание: соединение не шифруется (HTTP). Не используйте
+этот доступ в недоверенных сетях.</p>
+</div></body></html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Presets
 # ---------------------------------------------------------------------------
 
@@ -541,6 +735,44 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "x86emu-launcher/1"
     machine = None      # injected
     presets = None
+    auth = None         # injected (UPKEEP U7): the Auth gate
+
+    # -- UPKEEP U7 access gate ------------------------------------------------
+    def _presented_token(self):
+        h = self.headers.get("X-X86emu-Token")
+        if h:
+            return h.strip()
+        a = self.headers.get("Authorization") or ""
+        if a.lower().startswith("bearer "):
+            return a[7:].strip()
+        q = parse_qs(urlparse(self.path).query)
+        if q.get("token"):
+            return q["token"][0]
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k == TOKEN_COOKIE:
+                    return v.strip().strip('"')
+        return ""
+
+    def _refuse(self, code, error):
+        self._json({"ok": False, "error": error}, code)
+        return False
+
+    def _gate(self, need_token=True, mutation=False):
+        """Authorize before any route body runs. Host first (rebinding),
+        then the capability, then Origin for state-changing routes."""
+        a = self.auth
+        if a is None:                       # miswired server: fail closed
+            return self._refuse(403, "access gate not configured")
+        if not a.host_ok(self.headers.get("Host")):
+            return self._refuse(403, "forbidden host")
+        if need_token and not a.token_ok(self._presented_token()):
+            return self._refuse(401, "unauthorized: token required")
+        if mutation and not a.origin_ok(self.headers.get("Origin"),
+                                         self.headers.get("Host")):
+            return self._refuse(403, "forbidden origin")
+        return True
 
     # -- helpers -----------------------------------------------------------
     def _json(self, obj, code=200):
@@ -582,6 +814,43 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- GET ---------------------------------------------------------------
+    def _serve_gui_page(self, authorized):
+        """The one public route. Authorized (loopback embed, or a valid
+        presented token): the real page with the capability injected for
+        its JS plus a SameSite=Strict cookie so navigations (artifact
+        downloads) and the upgrade carry it too. Otherwise: the login
+        form. A cross-origin page can never read either body (SOP), and
+        the Host gate has already refused rebinding names."""
+        if not authorized:
+            error = ""
+            if any(k == "token" for k in parse_qs(urlparse(self.path).query)):
+                error = '<p class="err">Неверный токен. Попробуйте ещё раз.</p>'
+            body = (_LOGIN_PAGE % {"error": error}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        with open(GUI_PAGE, "rb") as f:
+            page = f.read()
+        inject = ("<script>window.X86EMU_TOKEN=\"%s\";</script>"
+                  % _html.escape(self.auth.token, quote=True)).encode("utf-8")
+        if b"</head>" in page:
+            body = page.replace(b"</head>", inject + b"</head>", 1)
+        else:
+            body = inject + page
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie",
+                         "%s=%s; HttpOnly; SameSite=Strict; Path=/"
+                         % (TOKEN_COOKIE, self.auth.token))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         u = urlparse(self.path)
         path = u.path
@@ -589,13 +858,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/ws":
                 return self._upgrade_ws()
             if path in ("/", "/index.html"):
-                with open(GUI_PAGE, "rb") as f:
-                    body = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                if self.auth is not None and not self.auth.host_ok(
+                        self.headers.get("Host")):
+                    return self._refuse(403, "forbidden host")
+                ok = (self.auth is not None
+                      and (self.auth.embed
+                           or self.auth.token_ok(self._presented_token())))
+                return self._serve_gui_page(ok)
+            if not self._gate(need_token=True):
                 return
             if path == "/api/status":
                 return self._json({"ok": True, **self.machine.status()})
@@ -651,6 +921,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- POST / DELETE -------------------------------------------------------
     def do_POST(self):
         u = urlparse(self.path)
+        if not self._gate(need_token=True, mutation=True):
+            return
         try:
             body = self._body()
             if u.path == "/api/start":
@@ -676,6 +948,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": str(e)}, 500)
 
     def do_DELETE(self):
+        if not self._gate(need_token=True, mutation=True):
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/presets":
@@ -686,6 +960,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- WebSocket upgrade ----------------------------------------------------
     def _upgrade_ws(self):
+        # The splice is a state-changing channel (run control rides it),
+        # so it takes the mutation gate: Host + token + same-Origin.
+        if not self._gate(need_token=True, mutation=True):
+            return
         if (self.headers.get("Upgrade") or "").lower() != "websocket":
             return self._json({"ok": False, "error": "websocket upgrade required"}, 426)
         status = self.machine.status()
@@ -695,8 +973,9 @@ class Handler(BaseHTTPRequestHandler):
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
             return self._json({"ok": False, "error": "missing Sec-WebSocket-Key"}, 400)
-        # rebuild the request for the backend monitor
-        lines = ["GET /ws HTTP/1.1",
+        # rebuild the request for the backend monitor, presenting the
+        # per-run monitor capability this process alone knows (UPKEEP U7)
+        lines = ["GET /ws?token=%s HTTP/1.1" % (self.machine.monitor_token or ""),
                  "Host: 127.0.0.1:%d" % port,
                  "Upgrade: websocket",
                  "Connection: Upgrade",
@@ -718,9 +997,11 @@ class Handler(BaseHTTPRequestHandler):
 # main
 # ---------------------------------------------------------------------------
 
-def make_server(bind, port, machine, presets):
+def make_server(bind, port, machine, presets, auth=None):
+    if auth is None:
+        auth = make_auth(bind, machine.state_dir)
     handler = type("BoundHandler", (Handler,),
-                   {"machine": machine, "presets": presets})
+                   {"machine": machine, "presets": presets, "auth": auth})
 
     class ProxyHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -764,9 +1045,24 @@ def main(argv=None):
         return 2
     machine = Machine(os.path.abspath(a.emu), os.path.abspath(a.state_dir))
     presets = Presets(machine.state_dir)
-    srv = make_server(a.bind, a.port, machine, presets)
+    auth = make_auth(a.bind, machine.state_dir)
+    srv = make_server(a.bind, a.port, machine, presets, auth)
     print("x86emu GUI launcher: http://%s:%d/  (state: %s)" %
           (a.bind, a.port, machine.state_dir), flush=True)
+    if is_loopback_bind(a.bind):
+        print("access: token embedded in the served page (loopback only); "
+              "the API and /ws require it", flush=True)
+    else:
+        # Plaintext warning is a product requirement, not a footnote: the
+        # token below is the *only* credential and the wire is bare HTTP.
+        print("WARNING: bound beyond loopback over plaintext HTTP -- the "
+              "token below is the only credential and crosses the network "
+              "in the clear.", flush=True)
+        print("access token URL: http://%s:%d/?token=%s"
+              % (a.bind, a.port, auth.token), flush=True)
+        print("(the token lives in %s -- the desktop GUI shows and rotates "
+              "it)" % os.path.join(machine.state_dir, ACCESS_TOKEN_FILE),
+              flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

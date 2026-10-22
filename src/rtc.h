@@ -1,11 +1,14 @@
 /* rtc.h -- MC146818A RTC/CMOS (CHIPSET H3).
  *
  * Ports 0x70 (index: bit7 NMI-disable stored, bits 6:0 select) / 0x71
- * (data). Dynamic registers: 0x00-0x09 clock (BCD from the virtual
- * epoch; writes ignored -- the clock stays epoch-anchored, documented),
- * 0x0A (DV/RS stored, UIP bit7 computed), 0x0B (stored; UIE bit4 moves
- * the update-ended IRQ8), 0x0C (flags, cleared on read), 0x0D (0x80),
- * 0x32 (BCD century, computed). Everything else is battery-backed RAM.
+ * (data). Dynamic registers: 0x00-0x09 clock (computed from the
+ * virtual epoch in Register B's BCD/binary and 12/24-hour format;
+ * UPKEEP U1: writes stage under Register B SET and commit on its
+ * 1->0 edge, so the clock is guest-settable), 0x0A (DV/RS stored,
+ * UIP bit7 computed), 0x0B (stored; UIE bit4 moves the
+ * update-ended IRQ8, SET bit7 freezes updates), 0x0C (flags,
+ * cleared on read), 0x0D (0x80), 0x32 (century, computed).
+ * Everything else is battery-backed RAM.
  *
  * Virtual time (D6, same model as the PIT): one second == 1193182 ticks
  * == instr_per_tick*1193182 retired instructions, counted from the
@@ -41,6 +44,9 @@ typedef struct rtc {
     uint8_t  flags_c;       /* pending register-C flags (UF/IRQF)       */
     uint8_t  ram[128];      /* battery-backed bytes (dynamic regs bypass)*/
     uint64_t ticks;         /* virtual RTC ticks since the epoch anchor */
+    int64_t  base_sec;      /* U1: Unix seconds the tick count rides on;
+                             * 1767225600 (2026-01-01 UTC) at init, moved
+                             * only by a committed SET-mode date write  */
     uint64_t accum;         /* sub-divisor instruction residue          */
     uint64_t last_instr;
     uint32_t instr_per_tick;/* D6 divisor (12, same pin as the PIT)     */

@@ -15,6 +15,7 @@
 #include "machine.h"
 
 struct pci_dev;
+void ahci_pci_seed(struct pci_dev *d);   /* MSI M3: capability bytes */
 uint64_t ahci_pci_cfg_read(struct pci_dev *d, int reg, int size);
 void ahci_pci_cfg_write(struct pci_dev *d, int reg, int size, uint64_t val);
 

@@ -1,0 +1,357 @@
+From c566f187f8d00b33a7f9c1eb61dd660b15c45d1e Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 18:51:06 +0000
+Subject: [PATCH] MSI M1: MSI-X capability on the xHCI (QEMU shape)
+
+0:20.0 now exposes the capability list qemu-xhci wears: Status bit 4,
+Capabilities Pointer 0x90, MSI-X capability (ID 0x11, Table Size 16)
+with the vector table at BAR0+0x3000 and the PBA at BAR0+0x3800
+(MSI_PLAN 1b).  The default PCI config write path is fully writable,
+so xhci_pci_cfg_write re-asserts every read-only field after each
+write and folds Message Control's two RW bits (Enable, Function
+Mask) into xhci_t, where the M3 router will read them.
+
+The table is live MMIO storage in xhci_t (16 x addr_lo/addr_hi/data/
+ctrl), all entries masked at power-on; the PBA reads 0 and ignores
+writes (v1 keeps no pending accumulation -- a level-signalled source
+re-evaluates on unmask, MSI_PLAN section 2).  Because MSI-X state is
+PCI-function state, xhci_hw_reset now preserves the table and both
+control bits across HCRST, like the BAR decode; snapshots carry it
+inside xhci_t as before.  Nothing routes yet: INTx delivery is
+untouched (M2/M3).
+
+tests/test_xhci.c gains v_msix_cap (23 groups): the capability walk
+through real 0xCF8/0xCFC, a blast-write RO audit, table round-trips
+incl. entry 15 and the past-the-end read, PBA zero, and HCRST
+persistence.  NC: src/xhci.c + src/devices.c at M0 -> 13 failures.
+Gates: make test, make test-sanitize, both SeaBIOS ISO lanes green.
+---
+ CHANGELOG.md           | 20 ++++++++++++++++
+ ROADMAP.md             | 11 +++++----
+ docs/STATUS.md         | 10 ++++++++
+ docs/plans/MSI_PLAN.md | 26 +++++++++++++++++++--
+ src/devices.c          | 10 ++++++++
+ src/xhci.c             | 53 +++++++++++++++++++++++++++++++++++++++++-
+ tests/test_xhci.c      | 42 +++++++++++++++++++++++++++++++++
+ 7 files changed, 164 insertions(+), 8 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 43e9d2a..3d505cd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,26 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0083 (MSI M1: MSI-X capability on the xHCI)
++
++- **The xHCI wears QEMU's MSI-X shape**: Status.Capabilities set,
++  Capabilities Pointer 0x90, capability ID 0x11 with Table Size 16,
++  vector table at BAR0+0x3000 and PBA at BAR0+0x3800 (BIR 0) -- the
++  `lspci` layout of `qemu-xhci`, our 1b36:000d's reference form. The
++  default PCI config path is fully writable, so the controller's cfg
++  hook re-asserts every read-only field after each write; a vector
++  blasts 0xFFFFFFFF across the capability and only Message Control's
++  Enable and Function Mask bits move (they fold into controller
++  state, ready for the M3 router).
++- **Vector table is real MMIO storage**: 16 entries (address hi/lo,
++  data, control), all masked at power-on per spec; PBA reads back 0
++  and ignores writes (v1 keeps no pending accumulation -- the level
++  source re-evaluates on unmask, per the plan). MSI-X state is
++  PCI-function state and therefore survives HCRST, asserted by
++  vector. Delivery still runs over INTx; messages route in M2/M3.
++- **Vectors**: `v_msix_cap` in `test-xhci` (23 groups). NC: the
++  capability reverted -> 13 failures.
++
+ ### Added — patch 0082 (MSI M0: measured baseline + plan)
+ 
+ - `docs/plans/MSI_PLAN.md` opens audit candidate #2 with the measured
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 96d9770..a289e54 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -37,7 +37,7 @@ maps to exactly one plan below.
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+-| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0 done ✅; M1 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
++| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0–M1 done ✅; M2 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -111,10 +111,11 @@ either shipped or explicitly NO-GO (PERF P4).
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+    fallback preserved (historical lanes byte-identical); M4 close-out.
+-   **In progress: M0 (`0082`) shipped** -- measured: the north star is
+-   INTx/IOAPIC-only, qemu-xhci parity is MSI-X-only (cap @0x90, 16
+-   entries, table BAR0+0x3000), zero capabilities exist today, the
+-   LAPIC delivery sink (`lapic_set_irr_dest`) is already proven.
++   **In progress: M0 (`0082`) + M1 MSI-X capability on the xHCI
++   (`0083`) shipped** -- measured: the north star is INTx/IOAPIC-only,
++   qemu-xhci parity is MSI-X-only (cap @0x90, 16 entries, table
++   BAR0+0x3000), zero capabilities existed before M1, the LAPIC
++   delivery sink (`lapic_set_irr_dest`) is already proven.
+ 3. **PM_PLAN (P0–P3)** — complete the ACPI surface the G5 note leaves
+    open: PM1_STS/PM1_EN/PM1_CNT semantics, GPE0 block, SMI# as an honest
+    no-op or a measured vector, and at least S1 with a deterministic
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 03b3563..60a59c7 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -942,6 +942,16 @@
+   delivery target. Ledger D1–D3 mapped to M1/M2/M3; decisions: QEMU
+   shape on xHCI, synchronous edge delivery from the one X5 router
+   call site, INTx fallback byte-identical by construction.
++- MSI M1 (`patches/0083-MSI-M1-msix-capability-xhci.patch`): the xHCI
++  carries QEMU's MSI-X shape — Status.Capabilities + CapPtr 0x90, ID
++  0x11, Table Size 16, table at BAR0+0x3000, PBA at BAR0+0x3800. All
++  RO fields re-asserted after every cfg write (the default path is
++  fully writable); Enable/Function-Mask fold into controller state for
++  the M3 router. Vector table MMIO is live storage, reset-masked;
++  PBA reads 0 (no pending accumulation in v1 — a level source
++  re-evaluates on unmask). MSI-X state is function state, surviving
++  HCRST. NC red with 13 failures; gates green. INTx delivery is
++  untouched until M3 — nothing routes yet.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/MSI_PLAN.md b/docs/plans/MSI_PLAN.md
+index b327a6c..bc36321 100644
+--- a/docs/plans/MSI_PLAN.md
++++ b/docs/plans/MSI_PLAN.md
+@@ -4,12 +4,12 @@
+ > `ROADMAP.md` §"Next-block candidates" and to `docs/plans/XHCI_PLAN.md`
+ > (the xHCI INTx delivery this plan generalises).
+ 
+-**Status: M0 done ✅; M1 queued**
++**Status: M0–M1 done ✅; M2 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | M0 | Measured baseline: who consumes MSI, the QEMU capability shapes, our PCI/LAPIC mechanics, the defect ledger | ✅ done | this file (`patches/0082`) |
+-| M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ⬜ queued | cfg-level vectors |
++| M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ✅ done | `tests/test_xhci.c` `v_msix_cap` (23 groups) (`patches/0083`) |
+ | M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ⬜ queued | delivery vectors |
+ | M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ⬜ queued | routing vectors |
+ | M4 | Close-out: snapshots, determinism, docs, ledger | ⬜ queued | close-out + docs |
+@@ -75,6 +75,28 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+ | D2 | no MSI message decode/delivery | an enabled capability would signal into the void | M2 |
+ | D3 | devices cannot select MSI vs INTx | enabling order (OS programs cap, expects pin to go quiet) unhonoured | M3 |
+ 
++## 1e. M1 measured receipts (MSI-X capability on the xHCI)
++
++- **Shape** (cfg space of 0:20.0): Status bit 4 (Capabilities List) set,
++  cfg 0x34 = 0x90; at 0x90: ID 0x11, Next 0x00, Message Control Table
++  Size = 15 (16 entries), Table Offset/BIR = 0x3000/0, PBA
++  Offset/BIR = 0x3800/0 -- the QEMU offsets verbatim.
++- **RO discipline**: the default cfg write path is fully writable, so
++  `xhci_pci_cfg_write` re-asserts every RO field after each write; a
++  vector blasts 0xFFFFFFFF across the capability and only Message
++  Control's Enable (bit 15) and Function Mask (bit 14) move. Those two
++  bits fold into `xhci_t` (`msix_enable`/`msix_fmask`) at the same
++  place, ready for M3's router.
++- **Table/PBA MMIO**: entries at BAR0+0x3000 (16 x {addr_lo, addr_hi,
++  data, ctrl}), power-on state all masked (Vector Control = 1);
++  storage round-trips through real MMIO; past-the-table reads 0; PBA
++  at +0x3800 reads 0 and ignores writes (the §2 no-accumulation rule).
++- **Ownership line**: MSI-X state is PCI-function state, not HC state --
++  `xhci_hw_reset` preserves the table and both control bits across
++  HCRST (vector-asserted), matching silicon and the snapshot model
++  (the table rides `xhci_t`).
++- NC: `src/xhci.c` + `src/devices.c` reverted to M0 → 13 failures.
++
+ ## 2. Architecture decisions (M0)
+ 
+ - **XHCI gets MSI-X in the QEMU shape**: capability at cfg 0x90 (id 0x11,
+diff --git a/src/devices.c b/src/devices.c
+index 4e74271..ce8e1d9 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -1394,6 +1394,16 @@ void devices_init_common(machine_t *m) {
+     xhci_pci->cfg[0x2E] = 0x00; xhci_pci->cfg[0x2F] = 0x11;
+     xhci_pci->cfg[0x3C] = (uint8_t)XHCI_IRQ;          /* Interrupt Line */
+     xhci_pci->cfg[0x3D] = 0x01;                       /* Interrupt Pin: INTA# */
++    /* MSI M1: MSI-X capability in the qemu-xhci shape (MSI_PLAN 1b):
++     * cap @0x90, Table Size 16, table at BAR0+0x3000, PBA at +0x3800.
++     * RO fields are re-asserted in xhci_pci_cfg_write after every write. */
++    xhci_pci->cfg[0x06] |= 0x10;                      /* Status: Capabilities List */
++    xhci_pci->cfg[0x34] = 0x90;                       /* Capabilities Pointer */
++    xhci_pci->cfg[0x90] = 0x11;                       /* Capability ID: MSI-X */
++    xhci_pci->cfg[0x91] = 0x00;                       /* Next: end of list */
++    xhci_pci->cfg[0x92] = 15;                         /* Message Control: Table Size-1 */
++    xhci_pci->cfg[0x94] = 0x00; xhci_pci->cfg[0x95] = 0x30;   /* Table Offset 0x3000, BIR 0 */
++    xhci_pci->cfg[0x98] = 0x00; xhci_pci->cfg[0x99] = 0x38;   /* PBA Offset 0x3800, BIR 0 */
+     xhci_pci->cfg_read = xhci_pci_cfg_read;
+     xhci_pci->cfg_write = xhci_pci_cfg_write;
+     xhci_register(m);
+diff --git a/src/xhci.c b/src/xhci.c
+index 88a0c7e..84bbff4 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -103,6 +103,12 @@ typedef struct {
+     uint64_t ev_prod, ev_cons;
+     int iman_ip;            /* interrupter pending latch (EINT mirror) */
+     xhci_slot_t slots[XHCI_MAX_SLOTS];   /* X3: slot s at [s-1] */
++    /* MSI M1: MSI-X vector table (BAR0+0x3000) + Message Control state.
++     * These live in PCI space, not HC space: HCRST must not wipe them
++     * (xhci_hw_reset preserves them like the BAR decode). */
++    struct { uint32_t addr_lo, addr_hi, data, ctrl; } msix_table[16];
++    int msix_enable;        /* Message Control bit 15 */
++    int msix_fmask;         /* Message Control bit 14 */
+ } xhci_t;
+ 
+ static xhci_t g_xhci;
+@@ -129,15 +135,31 @@ static int port_attached(xhci_t *x, int p) {
+ /* ---- host-controller reset: every software-visible register to its
+  * power-on value (XHCI_PLAN X1; the guest's init step 2 waits on the
+  * HCRST bit self-clearing and on CNR clearing, both immediate here). */
++/* MSI M1: power-on state of the vector table -- every entry masked
++ * (Vector Control bit 0 = 1), Enable/Function Mask clear. */
++static void msix_power_on(xhci_t *x) {
++    memset(x->msix_table, 0, sizeof x->msix_table);
++    for (int i = 0; i < 16; i++) x->msix_table[i].ctrl = 1;
++    x->msix_enable = 0;
++    x->msix_fmask = 0;
++}
++
+ static void xhci_hw_reset(xhci_t *x) {
+     machine_t *m = x->m;
+     uint32_t base = x->base;
+     int probe = x->bar_probe;
++    /* MSI-X state is PCI-function state: an HC reset does not touch it. */
++    __typeof__(x->msix_table) tbl;
++    memcpy(tbl, x->msix_table, sizeof tbl);
++    int msix_en = x->msix_enable, msix_fm = x->msix_fmask;
+     if (x->intx_level && m) pic_set_irq(m, XHCI_IRQ, 0);
+     memset(x, 0, sizeof *x);
+     x->m = m;
+     x->base = base;
+     x->bar_probe = probe;
++    memcpy(x->msix_table, tbl, sizeof tbl);
++    x->msix_enable = msix_en;
++    x->msix_fmask = msix_fm;
+ }
+ 
+ static uint32_t op_read(xhci_t *x, uint32_t off) {
+@@ -783,7 +805,17 @@ static void bulk_process(xhci_t *x, uint32_t slot, uint32_t epid) {
+     ep_out_sync(x, out, epid, ep);
+ }
+ 
++/* MSI M1: MSI-X vector table (BAR0+0x3000, 16 x 16 B) + PBA (+0x3800). */
++#define X_MSIX_TABLE 0x3000u
++#define X_MSIX_PBA   0x3800u
++
+ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
++    if (off >= X_MSIX_TABLE && off < X_MSIX_TABLE + 16u * 16u) {
++        const uint32_t *e = &x->msix_table[(off - X_MSIX_TABLE) / 16].addr_lo;
++        return e[((off - X_MSIX_TABLE) % 16) / 4];
++    }
++    if (off >= X_MSIX_PBA && off < X_MSIX_PBA + 8u)
++        return 0;   /* v1: no pending accumulation (MSI_PLAN 2) */
+     if (off < X_CAP_LEN) {
+         switch (off) {
+         case 0x00: return (X_HCI_VERSION << 16) | X_CAP_LEN;
+@@ -800,7 +832,12 @@ static uint32_t xhci_read32(xhci_t *x, uint32_t off) {
+ }
+ 
+ static void xhci_write32(xhci_t *x, uint32_t off, uint32_t val) {
+-    (void)val;
++    if (off >= X_MSIX_TABLE && off < X_MSIX_TABLE + 16u * 16u) {
++        uint32_t *e = &x->msix_table[(off - X_MSIX_TABLE) / 16].addr_lo;
++        e[((off - X_MSIX_TABLE) % 16) / 4] = val;
++        return;
++    }
++    if (off >= X_MSIX_PBA && off < X_MSIX_PBA + 8u) return;  /* RO */
+     if (off < X_CAP_LEN) return;                /* capability space is RO */
+     if (off >= X_RTSOFF && off < X_DBOFF) { rt_write(x, off - X_RTSOFF, val); return; }
+     if (off >= X_DBOFF) {                       /* doorbells */
+@@ -919,11 +956,25 @@ void xhci_pci_cfg_write(struct pci_dev *dev, int reg, int size, uint64_t val) {
+         for (int i = 0; i < 8; i++) d->cfg[0x10 + i] = (uint8_t)(stored >> (8 * i));
+         xhci_set_base(x, base);
+     }
++    /* MSI M1: re-assert the MSI-X capability's RO fields after any write
++     * (the default cfg path is fully writable), and fold the two RW
++     * Message Control bits into controller state, where M3 routes on
++     * them. */
++    x->msix_enable = (d->cfg[0x93] & 0x80) != 0;
++    x->msix_fmask  = (d->cfg[0x93] & 0x40) != 0;
++    d->cfg[0x06] |= 0x10;
++    d->cfg[0x34] = 0x90;
++    d->cfg[0x90] = 0x11; d->cfg[0x91] = 0x00;
++    d->cfg[0x92] = 15;
++    d->cfg[0x93] = (uint8_t)((x->msix_enable ? 0x80 : 0) | (x->msix_fmask ? 0x40 : 0));
++    d->cfg[0x94] = 0x00; d->cfg[0x95] = 0x30; d->cfg[0x96] = 0; d->cfg[0x97] = 0;
++    d->cfg[0x98] = 0x00; d->cfg[0x99] = 0x38; d->cfg[0x9A] = 0; d->cfg[0x9B] = 0;
+ }
+ 
+ void xhci_register(machine_t *m) {
+     xhci_t *x = &g_xhci;
+     memset(x, 0, sizeof *x);
++    msix_power_on(x);
+     x->m = m;
+     x->base = XHCI_MMIO_BASE;
+     mem_register_mmio(m, x->base, XHCI_MMIO_SIZE, xhci_mmio_read,
+diff --git a/tests/test_xhci.c b/tests/test_xhci.c
+index 8967a67..c91b837 100644
+--- a/tests/test_xhci.c
++++ b/tests/test_xhci.c
+@@ -873,6 +873,47 @@ static void v_determinism(void) {
+     if (fails == f0) printf("ok determinism: full replay x2 byte-identical\n");
+ }
+ 
++/* ================= MSI M1: MSI-X capability ============================ */
++/* ---- v_msix_cap: QEMU shape, RO discipline, table MMIO ---------------- */
++static void v_msix_cap(void) {
++    int f0 = fails;
++    EXPECT(pci_rd8(20, 0x06) & 0x10, "Status: Capabilities List present");
++    EXPECT(pci_rd8(20, 0x34) == 0x90, "Capabilities Pointer 0x90 (got %02x)", pci_rd8(20, 0x34));
++    EXPECT(pci_rd8(20, 0x90) == 0x11, "capability ID 0x11 (MSI-X)");
++    EXPECT(pci_rd8(20, 0x91) == 0x00, "next capability: none");
++    uint32_t MC = pci_rd32(20, 0x90) >> 16;
++    EXPECT((MC & 0x7FFu) == 15, "Table Size = 16 entries (MC=%04x)", MC);
++    EXPECT(pci_rd32(20, 0x94) == 0x3000u, "table BAR0+0x3000 BIR0 (got %08x)", pci_rd32(20, 0x94));
++    EXPECT(pci_rd32(20, 0x98) == 0x3800u, "PBA BAR0+0x3800 BIR0 (got %08x)", pci_rd32(20, 0x98));
++    /* RO discipline: a blast write moves only Enable/Function Mask */
++    pci_wr32(20, 0x90, 0xFFFFFFFFu);
++    pci_wr32(20, 0x94, 0xFFFFFFFFu);
++    pci_wr32(20, 0x98, 0xFFFFFFFFu);
++    uint32_t dw = pci_rd32(20, 0x90);
++    EXPECT((dw & 0xFFFFu) == 0x0011u, "ID/next survive the blast");
++    MC = dw >> 16;
++    EXPECT((MC & 0x7FFu) == 15 && (MC & 0x3800u) == 0, "Table Size + reserved bits RO");
++    EXPECT((MC & 0xC000u) == 0xC000u, "Enable + Function Mask took the write");
++    EXPECT(pci_rd32(20, 0x94) == 0x3000u && pci_rd32(20, 0x98) == 0x3800u, "offset/BIR dwords RO");
++    pci_wr32(20, 0x90, 0x00000011u);                       /* MC := 0 */
++    EXPECT(((pci_rd32(20, 0x90) >> 16) & 0xC000u) == 0, "Enable/FMask clear again");
++    /* vector table MMIO: reset-masked, storage round-trips, PBA reads 0 */
++    uint32_t T = XHCI_BAR + 0x3000u;
++    EXPECT(rd32(T + 12) == 1, "entry 0 masked at power-on (Vector Control bit0)");
++    wr32(T + 0, 0xFEE00000u); wr32(T + 4, 0); wr32(T + 8, 0x42u); wr32(T + 12, 0);
++    EXPECT(rd32(T + 0) == 0xFEE00000u && rd32(T + 8) == 0x42u && rd32(T + 12) == 0,
++           "entry 0 round-trips");
++    wr32(T + 15 * 16 + 8, 0x77u);
++    EXPECT(rd32(T + 15 * 16 + 8) == 0x77u, "entry 15 storage exists");
++    EXPECT(rd32(T + 16 * 16) == 0, "past the table reads 0");
++    EXPECT(rd32(XHCI_BAR + 0x3800u) == 0 && rd32(XHCI_BAR + 0x3804u) == 0,
++           "PBA reads 0 (v1: no pending accumulation)");
++    /* HCRST is an HC reset, not a PCI reset: MSI-X state persists */
++    hc_reset_program(32);
++    EXPECT(rd32(T + 8) == 0x42u && rd32(T + 12) == 0, "table survives HCRST");
++    if (fails == f0) printf("ok msix cap: QEMU shape @0x90, RO held, table MMIO, HCRST-persistent\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -898,6 +939,7 @@ int main(void) {
+     v_ports_live();
+     v_irq_masking();
+     v_determinism();
++    v_msix_cap();
+     devices_done(&M);
+     if (fails) { printf("test-xhci: %d FAILED\n", fails); return 1; }
+     puts("test-xhci: all vectors passed");
+-- 
+2.47.3
+

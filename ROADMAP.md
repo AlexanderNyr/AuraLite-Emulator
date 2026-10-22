@@ -37,6 +37,7 @@ maps to exactly one plan below.
 | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
 | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
 | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -83,8 +84,8 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 |---|-----|----------------------|----------------|
 | 1 | **xHCI (USB 3.0 host controller).** The guest's USB stack speaks UHCI/EHCI/xHCI; the machine has UHCI (U4) + EHCI (U3) only | north star above; no xHCI symbol in `src/` | `docs/plans/XHCI_PLAN.md` (X0–X5, the USB_PLAN shape) |
 | 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
-| 3 | **PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed | `docs/STATUS.md` (G5 entry); `src/pm.c` is Timer-only | `docs/plans/PM_PLAN.md` (P0–P3) |
-| 4 | Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT triple-FD (`0x02`→`0x06`) not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and no TIME_WAIT model (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice) | as named | one "upkeep" patch, or folded into the plans above when touched |
+| 3 | ~~**PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed~~ | ✅ **complete** (PM_PLAN P0–P3, patches 0087–0090: PM1 registers + SCI + S5, FADT/DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM) | `docs/plans/PM_PLAN.md` (P0–P3) |
+| 4 | ~~Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice)~~ | ✅ **complete** (UPKEEP_PLAN U0–U7, patches `0091`–`0098`: all seven items closed with vectors + NCs; plan §5) | `docs/plans/UPKEEP_PLAN.md` (U0–U7, COMPLETE) |
 
 No unmeasured defects are known: the F4 lanes closed the last flake class
 (run-dependent snapshot bytes), and the defect ledgers in each plan are
@@ -110,12 +111,31 @@ either shipped or explicitly NO-GO (PERF P4).
    MSI capability + address/data programming; M2 LAPIC MSI delivery
    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
    fallback preserved (historical lanes byte-identical); M4 close-out.
-3. **PM_PLAN (P0–P3)** — complete the ACPI surface the G5 note leaves
-   open: PM1_STS/PM1_EN/PM1_CNT semantics, GPE0 block, SMI# as an honest
-   no-op or a measured vector, and at least S1 with a deterministic
-   machine state (snapshot-compatible).
-4. **Upkeep patch** — the row-4 small gaps in one measured pass (the
-   house recipe), scheduled around whichever plan touches those files.
+   **Shipped: M0 (`0082`) + M1 MSI-X capability on the xHCI (`0083`)
+   + M2 LAPIC delivery core (`0084`) + M3 device routing (`0085`)
+   + M4 close-out (`0086`) -- MSI COMPLETE** -- measured:
+   the north star is INTx/IOAPIC-only,
+   qemu-xhci parity is MSI-X-only (cap @0x90, 16 entries, table
+   BAR0+0x3000), zero capabilities existed before M1, the LAPIC
+   delivery sink (`lapic_set_irr_dest`) is already proven.
+3. **PM_PLAN (P0–P3)** — ✅ **COMPLETE** (patches 0087–0090): baseline,
+   PM1 registers + level SCI on IRQ9 + S5 via the deterministic stop,
+   a revision-4 FADT + a \_S5/\_S1 DSDT on the kernel lane, GPE0, and
+   zero-duration S1 (spec-legal immediate wake — no consumer needs
+   real parking; the fork and its measurement are in the plan §2c).
+   SMI stays honestly absent (SMI_CMD=0).
+4. **UPKEEP_PLAN (U0–U7)** — ✅ **COMPLETE** (patches
+   `0091`–`0098`): the row-4 gaps as one measured plan, split
+   by subsystem because their negative controls and canaries
+   are unrelated: RTC writes, e1000 EEPROM/PHY, gdbstub x87,
+   LAPIC MSR semantics, CF9 INIT, responder TCP
+   sequencing/SACK, and GUI/monitor capability authentication
+   (U7: Host/Origin/token-defended launcher API + WS proxy
+   and a token-gated direct monitor; GUI-managed remote
+   credential, plaintext warnings). Every item was
+   re-measured against current code and consumers, with
+   D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7; close-out in the
+   plan §5.
 
 ## Immediate queue (recent shipped patches)
 

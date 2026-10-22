@@ -1,0 +1,1796 @@
+From 32fdbc9c9762d8363e22d5494e4537523e76c30b Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Thu, 22 Oct 2026 17:07:03 +0000
+Subject: [PATCH] UPKEEP U7: GUI and monitor get capability authentication
+ (plan complete)
+
+The launcher API, its /ws proxy and the direct --monitor endpoint were
+unauthenticated: any web page (cross-origin or DNS-rebinding), any
+local process, and any network peer on an explicit remote bind had
+full run control. Measured against RFC 6455 4.2.2/10.1/10.2 (Origin is
+unforgeable only by browsers, so it can never be the whole answer):
+
+- Launcher: Host allowlist on every route (403), same-origin Origin
+  for mutations and /ws (403), and a capability token for the API and
+  the splice (401; X-X86emu-Token / Bearer / ?token= / SameSite=Strict
+  HttpOnly cookie). Loopback embeds a per-process token in the served
+  page, so the one-click flow is unchanged; a remote bind serves a
+  login form and uses the persistent 0600 access-token file the
+  desktop GUI shows and rotates (expert mode, network tab), with the
+  plaintext warning printed at startup. Each machine run gets its own
+  monitor token through the child environment, never argv (absent
+  from ps and argv.json), presented by the proxy and the desktop GUI.
+- Monitor: --monitor-token= or X86EMU_MONITOR_TOKEN; Host allowlist
+  and same-origin Origin on the upgrade; the token gates the upgrade
+  (constant-work compare); a non-loopback bind with no token is
+  refused before any socket exists, with the plaintext warning when
+  it does bind. Tokenless loopback keeps its shape apart from the
+  Host/Origin checks, so all 55 pre-U7 wire checks pass untouched.
+- tools/gui_app.py: fixes a latent missing `import subprocess`.
+
+Vectors: test_monitor lane auth (16), test_gui_launcher lane E
+(13 loopback + 9 remote; happy paths scrape the page token exactly
+like a browser), test_gui_app lane C (tokenless client refused;
+token absent from argv.json). NC against 41a850e: monitor 10/16 FAIL
+(positive carriers pass there because the old code upgrades anyone),
+launcher 22 U7 FAILs, gui_app exactly the refusal check. Gates:
+make test and make test-sanitize green with both live SeaBIOS ISO
+lanes; test-gui/test-monitor/test-monitor-codec green. Closes
+UPKEEP_PLAN (D1-D7) and ROADMAP row 4; the gdbstub's loopback
+protocol stance is recorded, not changed.
+---
+ CHANGELOG.md               |  44 +++++
+ README.md                  |  21 ++-
+ ROADMAP.md                 |  19 ++-
+ docs/STATUS.md             |  11 +-
+ docs/plans/TOOLING_PLAN.md |   6 +-
+ docs/plans/UPKEEP_PLAN.md  |  89 +++++++++-
+ src/main.c                 |  10 +-
+ src/monitor.c              | 195 +++++++++++++++++++++-
+ src/monitor.h              |   9 +-
+ tests/test_gui_app.py      |  28 +++-
+ tests/test_gui_launcher.py | 230 +++++++++++++++++++++++++-
+ tests/test_monitor.py      | 132 ++++++++++++++-
+ tools/gui_app.py           |  60 ++++++-
+ tools/launcher.py          | 322 +++++++++++++++++++++++++++++++++++--
+ web/gui.html               |   9 +-
+ web/monitor.html           |   4 +-
+ 16 files changed, 1128 insertions(+), 61 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 64eaf95..0265a8a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,50 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0098 (Upkeep U7: GUI/monitor authentication — **UPKEEP_PLAN COMPLETE**)
++
++- **The web launcher, its WebSocket proxy and the direct monitor are
++  authenticated now** (`tools/launcher.py`, `src/monitor.c`,
++  `tools/gui_app.py`, `web/gui.html`, `web/monitor.html`). Pre-U7 all
++  three accepted anyone who could reach the port: a hostile web page
++  could drive the machine through cross-origin requests, a DNS-rebinding
++  name or a tokenless WebSocket, and any local process (or, on an
++  explicit remote bind, any network peer) got full run control.
++  Threat model (malicious page / other local process / LAN peer) and
++  wire basis (RFC 6455 §4.2.2, §10.1–10.2) are recorded in
++  `UPKEEP_PLAN` §U7 and the two server headers. Every request now
++  passes a Host allowlist (DNS rebinding refused, 403), mutations and
++  WebSocket upgrades require a same-origin `Origin` when a browser
++  sends one (403), and a capability token gates the API, the upgrade
++  and the monitor itself (401; carriers `X-X86emu-Token`,
++  `Authorization: Bearer`, `?token=`, SameSite=Strict HttpOnly cookie).
++- **The default flow stays one-click.** On loopback the launcher's
++  per-process token is embedded in the served page (no-store) and its
++  cookie; each machine run privately gets its own monitor token
++  through the child's environment — never argv, so it appears in
++  neither process lists nor the run's `argv.json` — and the proxy and
++  the desktop GUI present it automatically. Beyond loopback the
++  credential is the state-dir `access-token` file (0600), shown and
++  rotated from the desktop GUI (expert «Сеть»), entered once at a
++  login form; startup prints the plaintext warning because the token
++  is the only credential on bare HTTP. A direct `--monitor=` takes
++  `--monitor-token=` or `$X86EMU_MONITOR_TOKEN`; a non-loopback
++  monitor bind without a token is refused at startup. Also fixes a
++  latent `tools/gui_app.py` NameError (missing `import subprocess`).
++- New vectors: `tests/test_monitor.py --lane auth` (16 checks; all 55
++  pre-U7 tokenless-loopback checks untouched and green),
++  `tests/test_gui_launcher.py` lane E (loopback gate + remote
++  bind/login/rotation; happy paths scrape the page token like a
++  browser), `tests/test_gui_app.py` lane C (tokenless monitor client
++  refused; token absent from `argv.json`). NC = the new suites on the
++  0097 archive tree: monitor 10/16 FAIL (positive carriers pass —
++  the old monitor upgrades everyone), launcher 22 U7 FAILs, gui_app
++  exactly the refusal check. Gates: `make test`,
++  `make test-sanitize` (both live SeaBIOS ISO lanes), `make test-gui`,
++  `test-monitor`, `test-monitor-codec` green. No guest-visible state
++  changed; the gdbstub's unauthenticated-by-protocol loopback stance
++  is recorded, not altered.
++
+ ### Fixed — patch 0097 (Upkeep U6: responder TCP sequencing)
+ 
+ - **The TAP responder's TCP receiver validates sequence numbers**
+diff --git a/README.md b/README.md
+index c73f508..a950d19 100644
+--- a/README.md
++++ b/README.md
+@@ -88,8 +88,11 @@ seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
+ a user-picked copy. At the post-mortem
+ "end" stop the page keeps the final state visible; **Остановить** sends the
+ monitor's `quit` so the emulator prints its stats and writes the artifacts
+-before exiting. There is no authentication — same rules as the live
+-monitor: keep the launcher on loopback unless remote access is intentional.
++before exiting. Access is authenticated (UPKEEP U7): on loopback the page
++carries its token automatically; on any other bind the visitor must enter
++the access token shown by the desktop GUI (expert mode, «Сеть» tab), and
++the transport is plaintext HTTP — still keep the launcher on loopback
++unless remote access is intentional.
+ 
+ ## Run
+ 
+@@ -147,10 +150,16 @@ controls provide pause/continue/step, breakpoints, debugger inspection, keyboard
+ scancodes, ASCII typing and quit. Offline PPM/log loading is still available.
+ When GDB is attached, monitor run control is read-only and GDB remains the owner.
+ 
+-There is **no authentication**. Keep the default loopback binding unless remote
+-access is intentional; an explicit bind such as `--monitor=0.0.0.0:8080` exposes
+-the emulator controls to anyone who can reach that port. Use appropriate network
+-isolation/firewall rules. The monitor currently accepts IPv4 bind addresses.
++Requests are authorized (UPKEEP U7): the `Host` must name this machine,
++a browser `Origin` must be same-origin, and with a token configured
++(`--monitor-token=STR`, or `X86EMU_MONITOR_TOKEN` in the environment —
++the form the GUI uses so the secret stays out of process lists) the
++WebSocket upgrade must present it (`?token=`, `X-X86emu-Token` or
++`Authorization: Bearer`). A non-loopback bind without a token is refused
++at startup; with one, the transport is still plaintext HTTP, so keep the
++default loopback binding unless remote access is intentional and use
++appropriate network isolation/firewall rules. The monitor currently
++accepts IPv4 bind addresses.
+ 
+ Snapshots save the whole machine when the run loop ends and resume it later in
+ a fresh process; `--max-instr` stays the total budget:
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 1c5126b..3d63a7b 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -85,7 +85,7 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ | 1 | **xHCI (USB 3.0 host controller).** The guest's USB stack speaks UHCI/EHCI/xHCI; the machine has UHCI (U4) + EHCI (U3) only | north star above; no xHCI symbol in `src/` | `docs/plans/XHCI_PLAN.md` (X0–X5, the USB_PLAN shape) |
+ | 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
+ | 3 | ~~**PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed~~ | ✅ **complete** (PM_PLAN P0–P3, patches 0087–0090: PM1 registers + SCI + S5, FADT/DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM) | `docs/plans/PM_PLAN.md` (P0–P3) |
+-| 4 | Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice) | as named | `docs/plans/UPKEEP_PLAN.md` (U0–U7; U0 baseline shipped in `0091`) |
++| 4 | ~~Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice)~~ | ✅ **complete** (UPKEEP_PLAN U0–U7, patches `0091`–`0098`: all seven items closed with vectors + NCs; plan §5) | `docs/plans/UPKEEP_PLAN.md` (U0–U7, COMPLETE) |
+ 
+ No unmeasured defects are known: the F4 lanes closed the last flake class
+ (run-dependent snapshot bytes), and the defect ledgers in each plan are
+@@ -124,13 +124,18 @@ either shipped or explicitly NO-GO (PERF P4).
+    zero-duration S1 (spec-legal immediate wake — no consumer needs
+    real parking; the fork and its measurement are in the plan §2c).
+    SMI stays honestly absent (SMI_CMD=0).
+-4. **UPKEEP_PLAN (U0–U7)** — the row-4 gaps as one measured plan,
+-   split by subsystem because their negative controls and canaries
++4. **UPKEEP_PLAN (U0–U7)** — ✅ **COMPLETE** (patches
++   `0091`–`0098`): the row-4 gaps as one measured plan, split
++   by subsystem because their negative controls and canaries
+    are unrelated: RTC writes, e1000 EEPROM/PHY, gdbstub x87,
+-   LAPIC MSR semantics, CF9 INIT, responder TCP sequencing/SACK,
+-   and GUI/monitor capability authentication. **In progress: U0
+-   (`0091`) shipped** — every item re-measured against current
+-   code and consumers, with D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7.
++   LAPIC MSR semantics, CF9 INIT, responder TCP
++   sequencing/SACK, and GUI/monitor capability authentication
++   (U7: Host/Origin/token-defended launcher API + WS proxy
++   and a token-gated direct monitor; GUI-managed remote
++   credential, plaintext warnings). Every item was
++   re-measured against current code and consumers, with
++   D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7; close-out in the
++   plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 77ff667..82e84ba 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -740,7 +740,9 @@
+   binary `FB` frames publish keyframe and changed RGB rows. Pause, continue,
+   step, break, REPL inspection, keyboard scancodes/ASCII and quit share the
+   T2 core; monitor run control is read-only with GDB attached. The default
+-  bind is 127.0.0.1 and there is no authentication. Measured: codec suite
++  bind is 127.0.0.1; UPKEEP U7 (`patches/0098`) added Host/Origin
++  authorization and an optional capability token (`--monitor-token=` /
++  `$X86EMU_MONITOR_TOKEN`, mandatory beyond loopback). Measured: codec suite
+   passes 19 vectors, live suite 54 checks; the 800×600 keyframe is sent
+   using the RFC 64-bit length, the firmware marker is observed, and stdout
+   incl. `--stats`, the PPM and log ring are byte-identical to a plain run.
+@@ -1289,8 +1291,11 @@ claim is made for x86emu's default LPC identity (ACPI is G4's opt-in
+ This remains a firmware-focused x86 emulator, not a drop-in replacement for
+ QEMU. The CPU ISA is expanded from execution traces and tests; some chipset
+ blocks are behavioral models rather than cycle-accurate implementations.
+-The live monitor is unauthenticated and defaults to loopback; non-loopback
+-binding is an explicit operator choice. Existing frozen-guest integration
++The live monitor and the GUI launcher default to loopback and, since
++UPKEEP U7, authenticate with Host/Origin checks plus a capability token
++(page-embedded on loopback, a GUI-managed credential beyond it; a
++non-loopback bind without a token is refused). The gdbstub remains
++unauthenticated by protocol on its loopback default. Existing frozen-guest integration
+ lanes still require the separate AuraLite-OS KERNEL/INITRD artifacts.
+ With `--lpc=ich9`, the ACPI tables are published (G4), the BIOS boot reaches
+ `[kernel] shell active` on 1 vCPU (G5), and `--lpc=ich9 --smp=4` boots all 4
+diff --git a/docs/plans/TOOLING_PLAN.md b/docs/plans/TOOLING_PLAN.md
+index 072b7f8..5de57d5 100644
+--- a/docs/plans/TOOLING_PLAN.md
++++ b/docs/plans/TOOLING_PLAN.md
+@@ -523,8 +523,10 @@ and disassembly. Binary framebuffer messages carry `FB`, version, keyframe
+ flag, little-endian dimensions/row count, then changed rows as y + RGB.
+ Commands: `pause/continue/step/break/exec/keys/type/quit`. When GDB is
+ attached, monitor run control is read-only. `web/monitor.html` adds the live
+-view and retains offline PPM/log loading. The endpoint has no authentication;
+-non-loopback binding is an explicit user choice.
++view and retains offline PPM/log loading. The endpoint shipped without
++authentication; UPKEEP_PLAN U7 (`patches/0098`) later added Host/Origin
++authorization and the `--monitor-token=` capability (mandatory for a
++non-loopback bind, which stays an explicit user choice).
+ 
+ **Gate.** `make test-monitor-codec`: RFC 6455 sample accept key, FIPS 180
+ SHA-1 vectors, masked and unmasked short/16-bit/64-bit payloads, and
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index da37fb7..53ef05f 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -4,7 +4,7 @@
+ > XHCI, MSI and PM are complete; this plan takes the remaining
+ > site-documented gaps in dependency/risk order.
+ 
+-**Status: U0+U1+U2+U3+U4+U5+U6 done ✅; U7 queued**
++**Status: U0–U7 done ✅ — plan COMPLETE (closed by U7)**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -15,7 +15,7 @@
+ | U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ✅ done | `tests/test_lapic.c` + `tests/test_snapshot.c` vectors (`patches/0095`) |
+ | U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ✅ done | `tests/test_chipset.c` vectors (`patches/0096`) |
+ | U6 | TAP responder TCP: sequenced receive, SACK generation and complete close-state handling | ✅ done | `tests/test_tap_responder.py` vectors (`patches/0097`) |
+-| U7 | GUI/monitor: capability authentication and browser-origin defences, then plan close-out | ⬜ queued | GUI/monitor vectors + close-out |
++| U7 | GUI/monitor: capability authentication and browser-origin defences, then plan close-out | ✅ done | GUI/monitor vectors + close-out (`patches/0098`) |
+ 
+ Each implementation phase ships one `.patch` under `patches/` with
+ measured receipts, a regression vector, one once-per-phase negative
+@@ -603,6 +603,73 @@ explicit GUI-managed credential and a plaintext warning.
+ Direct-monitor behaviour must have an equally deliberate local
+ bootstrap, not a second unauthenticated back door.
+ 
++Closed. Threat model (§1.7, now implemented): (T1) a hostile
++web page — cross-origin fetch/form/WebSocket and DNS
++rebinding against a loopback service; (T2) another local
++process, stopped by a per-run/per-process capability it cannot
++read unless it can already read the GUI state directory or
++the child's environment (the honest, documented boundary, in
++the `monitor.c` and `launcher.py` headers); (T3) any network
++peer once bound beyond loopback — the transport stays
++plaintext HTTP, the token is the only credential, and both
++servers say so on startup. Wire basis RFC 6455 §4.2.2/§10.1/
++§10.2 (Origin is unforgeable *by browsers* and arbitrary for
++everything else — hence both checks, neither alone).
++Launcher: every `/api/*` route and the `/ws` splice require
++the token (`X-X86emu-Token`, `Authorization: Bearer`,
++`?token=`, or the `x86emu_token` HttpOnly SameSite=Strict
++cookie), the Host must name this machine (403), and mutations
++plus `/ws` require a same-origin Origin when one is sent
++(403); token failures are 401. On a loopback bind the token
++is per-process random and is injected into the served page
++(+ cookie, `Cache-Control: no-store`), so the one-click flow
++is unchanged; beyond loopback the credential is the
++persistent state-dir file `access-token` (0600,
++`load_or_create_access_token`), the page embeds nothing
++until it is presented (login form), and the desktop GUI
++displays and rotates it (expert → «Сеть»), no terminal
++involved. Each machine run gets its own monitor capability
++delivered to the emulator in `X86EMU_MONITOR_TOKEN` — never
++in argv, so it stays out of process lists and `argv.json` —
++and the proxy presents it to the backend monitor. Direct
++monitor (`src/monitor.c`): `--monitor-token=` or the same
++env var; a Host allowlist (loopback names + the bound
++literal; `0.0.0.0` also admits IP-literal Hosts); Origin
++must be same-origin with the request Host on the upgrade;
++the token gates the upgrade only (the static page is inert
++and stays fetchable); a non-loopback bind with no token is
++refused before any socket exists. Tokenless loopback keeps
++its pre-U7 shape apart from the Host/Origin checks — the
++deliberate local bootstrap, with §1.7's residual risk
++explicit: a tokenless direct monitor relies on Origin/Host
++alone against local non-browser processes, which is why the
++GUI's spawns are always tokened. `web/monitor.html` passes a
++`?token=` from the page URL into its WebSocket URL.
++Vectors: `tests/test_monitor.py` lane `auth` (16 checks;
++the 55 pre-U7 tokenless checks untouched and green),
++`tests/test_gui_launcher.py` lane E (13 loopback + 9 remote
++checks; happy paths now scrape the page token exactly like
++a browser), `tests/test_gui_app.py` lane C (tokenless
++client refused at the upgrade; token absent from
++`argv.json`). NC against `41a850e`: test_monitor 10/16 FAIL
++(all refusals/warnings; the positive carriers pass there
++because the old monitor upgrades *anyone*), launcher 22
++FAILs all U7-labelled, gui_app exactly the one refusal
++check. Gates: `make test` and `make test-sanitize` green
++with both live SeaBIOS ISO lanes, `make test-gui`,
++`test-monitor`, `test-monitor-codec` green; guest-visible
++state untouched (no snapshot/RTC/device change — the token
++lives outside `machine_t`, and host time is consulted by no
++token code path; tokens do not expire, so the deterministic
++no-wall-clock rule is kept literally). Adjacent fix, in
++scope because it is the same GUI state surface:
++`tools/gui_app.py` gained the missing `import subprocess`
++(a latent NameError in `open_state_dir` on non-Windows).
++Recorded, not changed: the gdbstub remains
++unauthenticated-by-protocol; its default loopback bind and
++the docs' operator warning are its boundary (U7/D7 covered
++the GUI and monitor surfaces).
++
+ ## 4. Gates
+ 
+ Per phase: its named suite, one behavioural negative control,
+@@ -612,3 +679,21 @@ mandatory for U1/U4/U5, network end-to-end lanes for U2/U6,
+ real-client or pinned-fixture GDB lanes for U3, and GUI +
+ monitor lanes for U7. U0 is docs-only; its receipts are the
+ targeted suites in §0 plus clean patch checks.
++
++## 5. Close-out (U7)
++
++The plan is complete: D1–D7 are all closed (U1 RTC, U2
++e1000, U3 gdbstub x87, U4 LAPIC APIC_BASE, U5 CF9 INIT, U6
++responder TCP, U7 GUI/monitor authentication), each with its
++own patch (`0092`–`0098`), regression vectors and one
++behavioural negative control, and the row-4 "small honest
++gaps" entry in `ROADMAP.md` is closed with them. The only
++snapshot-layout statement in the whole plan remains U1's
++(pre-U1 snapshots are rejected; U2–U7 changed no layout).
++Open, by deliberate record only: the reset-vector fetch
++under a closed A20 gate observed at U5, the responder's
++bare-SYN tuple restart noted at U6, and the gdbstub's
++protocol-inherent lack of authentication (loopback by
++default, operator's choice) noted at U7. None of the three
++is inside D1–D7; each is named here so a future plan can
++start from the measurement, not from rediscovery.
+diff --git a/src/main.c b/src/main.c
+index 83a214e..b1ad886 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -178,6 +178,7 @@ int main(int argc, char **argv) {
+     const char *snap_save_path = NULL; /* --snapshot-save=path: TOOLING T4, at run end */
+     const char *snap_load_path = NULL; /* --snapshot-load=path: TOOLING T4, before the run */
+     const char *monitor_spec = NULL;   /* --monitor=[host:]port: TOOLING T5 */
++    const char *monitor_token = NULL;  /* --monitor-token=str: UPKEEP U7 */
+     uint64_t trace_from = 0;        /* --trace-from=VTIME: first traced instruction */
+     uint64_t trace_count = 0;       /* --trace-count=N: stop after N lines (0 = all) */
+ 
+@@ -246,6 +247,7 @@ int main(int argc, char **argv) {
+         else if (!strncmp(argv[i], "--gdb=", 6)) gdb_spec = argv[i]+6;                   /* TOOLING T3 */
+         else if (!strncmp(argv[i], "--snapshot-save=", 16)) snap_save_path = argv[i]+16;  /* TOOLING T4 */
+         else if (!strncmp(argv[i], "--snapshot-load=", 16)) snap_load_path = argv[i]+16;
++        else if (!strncmp(argv[i], "--monitor-token=", 16)) monitor_token = argv[i]+16;  /* UPKEEP U7 */
+         else if (!strncmp(argv[i], "--monitor=", 10)) monitor_spec = argv[i]+10;
+         else if (!strcmp(argv[i], "--help")) {
+             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
+@@ -278,7 +280,11 @@ int main(int argc, char **argv) {
+                   "          [--gdb=[host:]port] wait for gdb (`target remote host:port`; TOOLING T3);\n"
+                   "                      host defaults to 127.0.0.1; vCPUs are threads; `monitor help`\n"
+                   "          [--monitor=[IPv4:]port] live HTTP/WebSocket monitor (default 127.0.0.1; T5)\n"
+-                  "                      starts stopped; open http://host:port/ (no authentication)\n"
++                  "                      starts stopped; open http://host:port/ (UPKEEP U7: Host/Origin\n"
++                  "                      are authorized; --monitor-token=STR or $X86EMU_MONITOR_TOKEN\n"
++                  "                      sets the capability WebSocket clients must present --\n"
++                  "                      mandatory for any non-loopback bind; the env form keeps\n"
++                  "                      the secret out of the process list)\n"
+                   "          [--snapshot-save=path] save the machine when the run loop ends (TOOLING T4)\n"
+                   "          [--snapshot-load=path] start from a saved machine; same build and machine\n"
+                   "                      shape required; --max-instr stays a total budget\n"
+@@ -501,7 +507,7 @@ int main(int argc, char **argv) {
+         }
+         if (gdb_spec && gdb_attach(m, gdb_spec) != 0)
+             fprintf(stderr, "[gdb] not attached; the run continues without gdb\n");
+-        if (monitor_spec && monitor_attach(m, monitor_spec) != 0) {
++        if (monitor_spec && monitor_attach(m, monitor_spec, monitor_token) != 0) {
+             rc = EXIT_INPUT_ERROR;
+             if (debug_in) fclose(debug_in);
+             goto teardown;
+diff --git a/src/monitor.c b/src/monitor.c
+index aef5e43..0b2a37a 100644
+--- a/src/monitor.c
++++ b/src/monitor.c
+@@ -3,7 +3,31 @@
+  * The frontend is polled from dbg.c. While the guest runs every socket is
+  * non-blocking; no thread calls cpu_step and all run control goes through
+  * the T2 debugger core. The server binds loopback unless explicitly told
+- * otherwise: this endpoint has no authentication. */
++ * otherwise.
++ *
++ * UPKEEP U7 closed the "no authentication" hole this file used to state.
++ * Threat model: a malicious web page in the operator's browser
++ * (cross-origin requests / WebSocket attempts / DNS rebinding against a
++ * loopback service), another local process, and -- when bound beyond
++ * loopback -- any network peer (the transport stays plaintext HTTP; the
++ * token is the only credential, which the startup warning says out
++ * loud). Defences, applied to every request:
++ *   * Host allowlist (loopback names, plus the literal bind address):
++ *     a rebinding page's Host is neither, so it never reaches a route;
++ *   * Origin, when present on the WebSocket upgrade, must be same-origin
++ *     with Host (RFC 6455 s4.2.2/10.2: servers SHOULD verify, 403 to
++ *     refuse) -- this stops other web pages, which cannot omit Origin;
++ *   * a capability token, when configured, must be presented for the
++ *     upgrade (`?token=`, `X-X86emu-Token`, `Authorization: Bearer`) --
++ *     this stops non-browser peers, which can fake an absent Origin
++ *     (RFC 6455 s10.1). The GUI spawns the emulator with a fresh
++ *     per-run token in X86EMU_MONITOR_TOKEN (never in argv, so it stays
++ *     out of the run's argv.json and process lists); a non-loopback bind
++ *     without a token is refused at startup.
++ * The HTML page itself stays fetchable (it is static and inert); control
++ * only exists behind the upgrade. A merely tokenless loopback monitor
++ * keeps its pre-U7 shape -- that is the direct-CLI default, where the
++ * operator, the port and the risk are all local and visible. */
+ #define _POSIX_C_SOURCE 200809L
+ #include <arpa/inet.h>
+ #include <ctype.h>
+@@ -46,9 +70,13 @@ struct mon_out {
+     struct mon_out *next;
+ };
+ 
++#define MON_TOKEN_MAX      256u         /* capability token storage (U7) */
++
+ typedef struct monitor_state {
+     dbg_frontend_t fe;
+     int listen_fd;
++    char token[MON_TOKEN_MAX];         /* "" = no capability configured */
++    char bind_host[INET_ADDRSTRLEN];   /* literal we bound; Host allowlist */
+     int client_fd;
+     int websocket;
+     int close_after_flush;
+@@ -940,6 +968,107 @@ static int contains_token_ci(const char *list, const char *token) {
+     return 0;
+ }
+ 
++/* ---- UPKEEP U7 request authorization (threat model: the file header) -- */
++
++/* A Host/authority value reduced to its compare-ready host part:
++ * lowercased, any :port and [...] brackets stripped. */
++static void host_part(const char *value, char *out, size_t cap) {
++    size_t o = 0;
++    const char *p = value ? value : "";
++    if (*p == '[') {
++        p++;
++        while (*p && *p != ']' && o + 1 < cap)
++            out[o++] = (char)tolower((unsigned char)*p++);
++    } else {
++        while (*p && *p != ':' && *p != '/' && o + 1 < cap)
++            out[o++] = (char)tolower((unsigned char)*p++);
++    }
++    if (cap) out[o] = 0;
++}
++
++/* DNS-rebinding gate: the name the client *thinks* it is talking to must
++ * be this machine -- a loopback name, or the literal address the
++ * operator bound. A rebinding attacker's domain is neither. */
++static int host_allowed(monitor_state_t *s, const char *host_hdr) {
++    char h[INET_ADDRSTRLEN + 64];
++    host_part(host_hdr, h, sizeof h);
++    if (!h[0]) return 0;
++    if (!strcmp(h, "127.0.0.1") || !strcmp(h, "localhost") ||
++        !strcmp(h, "::1")) return 1;
++    if (s->bind_host[0] && strcasecmp(h, s->bind_host) == 0) return 1;
++    /* A 0.0.0.0 bind means the operator chose "everywhere": a LAN peer
++     * legitimately arrives with its own literal address as Host, while a
++     * rebinding *name* is still not a literal. The token is the gate
++     * there; this check still strips the naive probes. */
++    if (!strcmp(s->bind_host, "0.0.0.0")) {
++        struct in_addr a;
++        if (inet_pton(AF_INET, h, &a) == 1) return 1;
++    }
++    return 0;
++}
++
++/* Cross-origin gate for the upgrade: a browser's Origin (which it cannot
++ * omit or forge, RFC 6455 s10.2) must be same-origin with this request's
++ * Host -- our own pages are served from this very socket, so no other
++ * origin has business here. Absent Origin is a non-browser client,
++ * which Origin cannot vouch for anyway (s10.1); the token covers it. */
++static int origin_allowed(monitor_state_t *s, const char *origin,
++                          const char *host_hdr) {
++    const char *p = strstr(origin, "://");
++    if (!p) return 0;                       /* "null" and friends */
++    size_t scheme = (size_t)(p - origin);
++    if (!((scheme == 4 && strncasecmp(origin, "http", 4) == 0) ||
++          (scheme == 5 && strncasecmp(origin, "https", 5) == 0))) return 0;
++    char oh[INET_ADDRSTRLEN + 64], hh[INET_ADDRSTRLEN + 64];
++    host_part(p + 3, oh, sizeof oh);
++    host_part(host_hdr, hh, sizeof hh);
++    if (!oh[0] || strcmp(oh, hh) != 0) return 0;
++    return host_allowed(s, p + 3);
++}
++
++/* A capability compare should not hand out a byte-at-a-time oracle. */
++static int token_eq(const char *a, const char *b) {
++    size_t la = strlen(a), lb = strlen(b);
++    unsigned diff = (la != lb) ? 1u : 0u;
++    size_t n = la < lb ? la : lb;
++    for (size_t i = 0; i < n; i++)
++        diff |= (unsigned)((uint8_t)a[i] ^ (uint8_t)b[i]);
++    return diff == 0;
++}
++
++/* True when the request carries the configured token (any of the three
++ * carriers), or when no token is configured. `path` still has its query. */
++static int token_presented_ok(monitor_state_t *s, const char *path,
++                              const char *req) {
++    if (!s->token[0]) return 1;
++    char hdr[MON_TOKEN_MAX + 8];
++    if (http_header(req, "X-X86emu-Token", hdr, sizeof hdr) == 1 &&
++        token_eq(hdr, s->token)) return 1;
++    if (http_header(req, "Authorization", hdr, sizeof hdr) == 1 &&
++        strncasecmp(hdr, "Bearer ", 7) == 0 && token_eq(hdr + 7, s->token))
++        return 1;
++    const char *q = strchr(path, '?');
++    if (q) {
++        for (const char *p = q + 1; *p;) {
++            if (strncmp(p, "token=", 6) == 0) {
++                const char *v = p + 6;
++                size_t n = strcspn(v, "&#");
++                char presented[MON_TOKEN_MAX];
++                if (n < sizeof presented) {
++                    memcpy(presented, v, n);
++                    presented[n] = 0;
++                    return token_eq(presented, s->token);
++                }
++                return 0;
++            }
++            const char *amp = strchr(p, '&');
++            if (!amp) break;
++            p = amp + 1;
++        }
++    }
++    return 0;
++}
++
+ static int http_reply(monitor_state_t *s, int status, const char *reason,
+                       const char *content_type, const void *body, size_t body_len) {
+     char head[512];
+@@ -1023,6 +1152,18 @@ static void process_http(monitor_state_t *s) {
+     memmove(s->input, s->input + consumed, s->input_len - consumed);
+     s->input_len -= consumed;
+ 
++    /* UPKEEP U7: authorize before any route runs. Every request names
++     * the host it believes it is talking to, and that name has to be
++     * this machine -- the rebinding defence -- before the page, let
++     * alone the upgrade, is served. */
++    char host_hdr[512] = "";
++    if (http_header(req, "Host", host_hdr, sizeof host_hdr) != 1 ||
++        !host_allowed(s, host_hdr)) {
++        static const char msg[] = "forbidden host\n";
++        (void)http_reply(s, 403, "Forbidden", "text/plain", msg, sizeof msg - 1);
++        return;
++    }
++
+     char upgrade[64] = "", connection[256] = "", key[128] = "", wsver[32] = "";
+     int has_upgrade = http_header(req, "Upgrade", upgrade, sizeof upgrade);
+     int has_connection = http_header(req, "Connection", connection, sizeof connection);
+@@ -1036,6 +1177,21 @@ static void process_http(monitor_state_t *s) {
+             (void)http_reply(s, 400, "Bad Request", "text/plain", msg, sizeof msg - 1);
+             return;
+         }
++        char origin[512] = "";
++        int has_origin = http_header(req, "Origin", origin, sizeof origin);
++        if (has_origin < 0 ||
++            (has_origin == 1 && !origin_allowed(s, origin, host_hdr))) {
++            static const char msg[] = "forbidden origin\n";
++            (void)http_reply(s, 403, "Forbidden", "text/plain", msg,
++                             sizeof msg - 1);
++            return;
++        }
++        if (!token_presented_ok(s, path, req)) {
++            static const char msg[] = "unauthorized\n";
++            (void)http_reply(s, 401, "Unauthorized", "text/plain", msg,
++                             sizeof msg - 1);
++            return;
++        }
+         if (do_websocket_handshake(s, key) != 0) {
+             static const char msg[] = "invalid WebSocket key\n";
+             (void)http_reply(s, 400, "Bad Request", "text/plain", msg, sizeof msg - 1);
+@@ -1171,13 +1327,37 @@ static int parse_spec(const char *spec, char host[INET_ADDRSTRLEN], int *port) {
+     return 0;
+ }
+ 
+-int monitor_attach(machine_t *m, const char *spec) {
++int monitor_attach(machine_t *m, const char *spec, const char *token) {
+     char host[INET_ADDRSTRLEN];
+     int port;
+     if (!spec || parse_spec(spec, host, &port) != 0) {
+         fprintf(stderr, "--monitor: expected [IPv4:]port, got '%s'\n", spec ? spec : "");
+         return -1;
+     }
++    /* UPKEEP U7: the capability comes from --monitor-token= or, for the
++     * GUI's spawns, the environment (never argv-shaped there). A bind
++     * beyond loopback without one is refused before any socket exists:
++     * an unauthenticated network-facing run-control endpoint is not a
++     * configuration this program offers, even by accident. */
++    if (!token || !*token) {
++        const char *env = getenv("X86EMU_MONITOR_TOKEN");
++        if (env && *env) token = env;
++    }
++    struct in_addr bind_addr;
++    int loopback = inet_pton(AF_INET, host, &bind_addr) == 1 &&
++                   (ntohl(bind_addr.s_addr) >> 24) == 127;
++    if ((!token || !*token) && !loopback) {
++        fprintf(stderr,
++                "--monitor: binding %s is beyond loopback and requires a "
++                "token (--monitor-token=STR or X86EMU_MONITOR_TOKEN); "
++                "refusing to listen unauthenticated\n", host);
++        return -1;
++    }
++    if (token && strlen(token) >= MON_TOKEN_MAX) {
++        fprintf(stderr, "--monitor: token is too long (max %u bytes)\n",
++                (unsigned)MON_TOKEN_MAX - 1);
++        return -1;
++    }
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+     if (fd < 0) { perror("--monitor socket"); return -1; }
+     int one = 1;
+@@ -1196,6 +1376,8 @@ int monitor_attach(machine_t *m, const char *spec) {
+     if (!s) { close(fd); return -1; }
+     s->listen_fd = fd;
+     s->client_fd = -1;
++    if (token && *token) snprintf(s->token, sizeof s->token, "%s", token);
++    snprintf(s->bind_host, sizeof s->bind_host, "%s", host);
+     s->fe.name = "monitor";
+     s->fe.ctx = s;
+     s->fe.on_stop = monitor_on_stop;
+@@ -1210,6 +1392,13 @@ int monitor_attach(machine_t *m, const char *spec) {
+         fprintf(stderr, "--monitor: debugger frontend limit reached\n");
+         return -1;
+     }
+-    fprintf(stderr, "[monitor] listening at http://%s:%d/ (WebSocket /ws)\n", host, port);
++    fprintf(stderr, "[monitor] listening at http://%s:%d/ (WebSocket /ws%s)\n",
++            host, port, s->token[0] ? ", token required" : "");
++    if (!loopback) {
++        fprintf(stderr,
++                "[monitor] WARNING: bound beyond loopback over plaintext "
++                "HTTP -- anyone who can see the traffic can take the "
++                "token and drive this machine\n");
++    }
+     return 0;
+ }
+diff --git a/src/monitor.h b/src/monitor.h
+index ff096ee..16207c0 100644
+--- a/src/monitor.h
++++ b/src/monitor.h
+@@ -4,7 +4,12 @@
+ #include "machine.h"
+ 
+ /* Listen on `port` or `host:port` (host defaults to 127.0.0.1) and attach
+- * a non-blocking monitor frontend. Returns 0 or -1 with a stderr reason. */
+-int monitor_attach(machine_t *m, const char *spec);
++ * a non-blocking monitor frontend. Returns 0 or -1 with a stderr reason.
++ *
++ * UPKEEP U7: `token` is the capability a WebSocket client must present
++ * (query `?token=`, `X-X86emu-Token`, or `Authorization: Bearer`); NULL
++ * or empty falls back to the X86EMU_MONITOR_TOKEN environment variable.
++ * A non-loopback bind without any token is refused outright. */
++int monitor_attach(machine_t *m, const char *spec, const char *token);
+ 
+ #endif
+diff --git a/tests/test_gui_app.py b/tests/test_gui_app.py
+index c2fe1e6..7db1d63 100644
+--- a/tests/test_gui_app.py
++++ b/tests/test_gui_app.py
+@@ -212,12 +212,33 @@ def test_monitor_client():
+                "disk": "disk/disk.img", "max_instr": 3000000,
+                "stats": True, "log": True, "dump_fb": True}
+         m.start(cfg)
++        # UPKEEP U7: the run's monitor demands the per-run capability the
++        # Machine generated. A tokenless client must be refused at the
++        # upgrade itself (loop until the monitor is listening and the
++        # refusal is the *upgrade* error, not connection timing).
++        bad = gui_app.MonitorClient()
++        refused = False
++        deadline = time.time() + 10
++        while time.time() < deadline and not refused:
++            try:
++                bad.connect(m.monitor_port, timeout=1.0)   # no token, on purpose
++                bad.close()
++                break                     # handshake accepted: pre-U7 defect
++            except OSError as e:
++                refused = "refused" in str(e)
++                if not refused:
++                    time.sleep(0.1)       # monitor not bound yet; retry
++        check(refused and getattr(m, "monitor_token", None),
++              "C U7 tokenless WebSocket is refused; Machine issues a capability")
+         mon = gui_app.MonitorClient()
+         deadline = time.time() + 20
+         connected = False
+         while time.time() < deadline and not connected:
+             try:
+-                mon.connect(m.monitor_port, timeout=1.0)
++                kw = {}
++                if getattr(m, "monitor_token", None):
++                    kw["token"] = m.monitor_token   # pre-U7: connect() has no kw
++                mon.connect(m.monitor_port, timeout=1.0, **kw)
+                 connected = True
+             except OSError:
+                 time.sleep(0.1)
+@@ -266,6 +287,11 @@ def test_monitor_client():
+         arts = {a["name"] for a in m.artifacts()}
+         check("stdout.log" in arts and "argv.json" in arts,
+               "C artifacts land in the run dir")
++        if getattr(m, "monitor_token", None) and "argv.json" in arts:
++            with open(os.path.join(m.run_dir, "argv.json")) as f:
++                argv_txt = f.read()
++            check(m.monitor_token not in argv_txt,
++                  "C U7 monitor capability stays out of argv.json (env, not argv)")
+         mon.close()
+         try:
+             mon.send({"cmd": "state"})
+diff --git a/tests/test_gui_launcher.py b/tests/test_gui_launcher.py
+index 7a08590..523fe80 100644
+--- a/tests/test_gui_launcher.py
++++ b/tests/test_gui_launcher.py
+@@ -15,10 +15,20 @@ Vectors:
+      land in the run dir, output tails readable.
+   D. refusals: /ws with no machine is 502, unknown API 404, snapshot delete
+      of a missing file, bad preset name.
++  E. UPKEEP U7 access gate: the API and /ws refuse a missing or wrong
++     token, a DNS-rebinding Host and a cross-origin Origin; the page
++     carries the token (loopback) and sets the SameSite=Strict cookie;
++     the happy paths above run exactly like the browser does -- they
++     scrape the token out of the served page and present it back. A
++     second launcher on the any-address proves the remote shape: no
++     token in the page, a login form, the persistent 0600 access-token
++     file, and the plaintext warning.
+ """
+ import base64
++import http.client as http_client_mod   # the bare name http is a helper below
+ import json
+ import os
++import re
+ import socket
+ import subprocess
+ import sys
+@@ -43,11 +53,30 @@ def check(cond, label):
+         fails += 1
+ 
+ 
+-def http(port, path, method="GET", body=None):
++_TOKENS = {}
++
++
++def page_token(port):
++    """The browser's bootstrap, mirrored (UPKEEP U7): the capability is
++    embedded in the page the loopback launcher serves. Scraped once per
++    port; empty string when the page carries none -- which is exactly
++    the pre-U7 negative-control situation, where every refusal check in
++    lane E then fails while the happy paths still run."""
++    if port not in _TOKENS:
++        _code, raw = http(port, "/", _auth=False)
++        m = re.search(rb'X86EMU_TOKEN="([^"]*)"', raw)
++        _TOKENS[port] = m.group(1).decode() if m else ""
++    return _TOKENS[port]
++
++
++def http(port, path, method="GET", body=None, _auth=True):
+     url = "http://127.0.0.1:%d%s" % (port, path)
+     data = json.dumps(body).encode() if body is not None else None
++    headers = {"Content-Type": "application/json"}
++    if _auth:
++        headers["X-X86emu-Token"] = page_token(port)
+     req = urllib.request.Request(url, data=data, method=method,
+-                                 headers={"Content-Type": "application/json"})
++                                 headers=headers)
+     try:
+         with urllib.request.urlopen(req, timeout=10) as r:
+             return r.status, r.read()
+@@ -55,6 +84,20 @@ def http(port, path, method="GET", body=None):
+         return e.code, e.read()
+ 
+ 
++def http_raw(port, path, method="GET", headers=None, body=b""):
++    """Hand-set headers (Host/Origin/token) that urllib would normalize
++    away; returns (status, headers-dict, body)."""
++    conn = http_client_mod.HTTPConnection("127.0.0.1", port, timeout=10)
++    conn.request(method, path, body=body,
++                 headers=headers if headers is not None
++                 else {"Host": "127.0.0.1:%d" % port})
++    r = conn.getresponse()
++    raw = r.read()
++    hd = {k.lower(): v for k, v in r.getheaders()}
++    conn.close()
++    return r.status, hd, raw
++
++
+ def jhttp(port, path, method="GET", body=None):
+     code, raw = http(port, path, method, body)
+     try:
+@@ -167,10 +210,10 @@ class WSock:
+ def ws_handshake(port):
+     s = socket.create_connection(("127.0.0.1", port), timeout=5)
+     key = base64.b64encode(os.urandom(16)).decode()
+-    s.sendall(("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
++    s.sendall(("GET /ws?token=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+-               % (port, key)).encode())
++               % (page_token(port), port, key)).encode())
+     s.settimeout(10)
+     buf = b""
+     while b"\r\n\r\n" not in buf:
+@@ -202,13 +245,16 @@ def ws_frame(s):
+ 
+ 
+ def test_lifecycle(port):
+-    # refusals first: no machine yet
++    # refusals first: no machine yet -- but an *authorized* request now:
++    # pre-U7 this probe sent Host: x and still got its 502 (the defect);
++    # the same headers are lane E's 403 evidence.
+     try:
+         s = socket.create_connection(("127.0.0.1", port), timeout=5)
+         key = base64.b64encode(os.urandom(16)).decode()
+-        s.sendall(("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+-                   "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+-                   "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
++        s.sendall(("GET /ws?token=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
++                   "Upgrade: websocket\r\nConnection: Upgrade\r\n"
++                   "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
++                   % (page_token(port), port, key)).encode())
+         s.settimeout(5)
+         head = s.recv(200).decode(errors="replace")
+         s.close()
+@@ -295,6 +341,172 @@ def test_lifecycle(port):
+     check(code == 200, "stop on an exited machine is harmless")
+ 
+ 
++# ---------------- E. UPKEEP U7 access gate -----------------------------------
++
++
++def _ws_probe(port, path="/ws", host=None, origin=None, headers=None):
++    s = socket.create_connection(("127.0.0.1", port), timeout=5)
++    key = base64.b64encode(os.urandom(16)).decode()
++    lines = ["GET %s HTTP/1.1" % path,
++             "Host: %s" % (host or "127.0.0.1:%d" % port),
++             "Upgrade: websocket", "Connection: Upgrade",
++             "Sec-WebSocket-Key: %s" % key, "Sec-WebSocket-Version: 13"]
++    if origin is not None:
++        lines.append("Origin: %s" % origin)
++    if headers:
++        lines.extend(headers)
++    s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
++    s.settimeout(5)
++    out = b""
++    try:
++        while b"\r\n" not in out:
++            d = s.recv(4096)
++            if not d:
++                break
++            out += d
++    except OSError:
++        pass
++    s.close()
++    return out.decode(errors="replace").splitlines()[0] if out else ""
++
++
++# Symbol lookups are getattr-guarded so the pre-U7 negative control reports
++# clean FAILs instead of AttributeError on a launcher module that has no
++# access gate yet.
++COOKIE_NAME = getattr(launcher, "TOKEN_COOKIE", "x86emu_token")
++TOKEN_FILE = getattr(launcher, "ACCESS_TOKEN_FILE", "access-token")
++
++
++def test_access_gate(port):
++    tok = page_token(port)
++    good = {"Host": "127.0.0.1:%d" % port}
++
++    code, _h, _b = http_raw(port, "/api/status", headers=good)
++    check(code == 401, "U7: API without a token is 401")
++    h = dict(good, **{"X-X86emu-Token": "wrong"})
++    code, _h, _b = http_raw(port, "/api/status", headers=h)
++    check(code == 401, "U7: API with a wrong token is 401")
++    h = dict(good, **{"X-X86emu-Token": tok})
++    code, _h, _b = http_raw(port, "/api/status", headers=h)
++    check(code == 200 and len(tok) >= 32, "U7: API with the page token is 200")
++
++    # DNS rebinding: the attacker's name is not this machine
++    h = {"Host": "evil.example", "X-X86emu-Token": tok}
++    code, _h, _b = http_raw(port, "/api/status", headers=h)
++    check(code == 403, "U7: rebinding Host on the API is 403")
++    code, _h, _b = http_raw(port, "/", headers={"Host": "evil.example"})
++    check(code == 403, "U7: rebinding Host on the page is 403")
++
++    # cross-origin mutation: a browser cannot omit Origin on POST
++    h = dict(good, **{"X-X86emu-Token": tok, "Origin": "http://evil.example"})
++    code, _h, _b = http_raw(port, "/api/stop", "POST", h, b"{}")
++    check(code == 403, "U7: cross-Origin POST is 403 even with the token")
++    h = dict(good, **{"X-X86emu-Token": tok,
++                       "Origin": "http://127.0.0.1:%d" % port})
++    code, _h, _b = http_raw(port, "/api/stop", "POST", h, b"{}")
++    check(code == 200, "U7: same-Origin POST with the token passes")
++
++    # the upgrade: token first, then Origin (checked with a token so the
++    # 403 is the Origin branch, not the 401), then Host
++    line = _ws_probe(port)
++    check("401" in line, "U7: /ws without a token is 401")
++    line = _ws_probe(port, "/ws?token=wrong")
++    check("401" in line, "U7: /ws with a wrong token is 401")
++    line = _ws_probe(port, "/ws?token=%s" % tok, origin="http://evil.example")
++    check("403" in line, "U7: /ws with a cross-Origin is 403")
++    line = _ws_probe(port, "/ws?token=%s" % tok, host="evil.example")
++    check("403" in line, "U7: /ws with a rebinding Host is 403")
++
++    # the bootstrap contract the browser relies on
++    code, hd, raw = http_raw(port, "/", headers=good)
++    cookie = hd.get("set-cookie", "")
++    check(code == 200 and tok != "" and tok.encode() in raw,
++          "U7: loopback page carries the token")
++    check(COOKIE_NAME in cookie and "HttpOnly" in cookie
++          and "SameSite=Strict" in cookie,
++          "U7: page sets an HttpOnly SameSite=Strict token cookie")
++    check(hd.get("cache-control") == "no-store",
++          "U7: token-bearing page is no-store")
++    h = dict(good, Cookie="%s=%s" % (COOKIE_NAME, tok))
++    code, _h, _b = http_raw(port, "/api/status", headers=h)
++    check(code == 200, "U7: the cookie alone authorizes the API")
++
++
++def test_remote_gate(emu):
++    """A non-loopback launcher (bound to the any-address, still reached
++    here over 127.0.0.1: Host literals stay allowed): the page embeds
++    nothing, login demands the state-dir credential, and startup prints
++    the plaintext warning. The remote token file is owner-only."""
++    tmp = tempfile.mkdtemp(prefix="gui-remote-")
++    s = socket.socket()
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    proc = subprocess.Popen(
++        [sys.executable, os.path.join(ROOT, "tools", "launcher.py"),
++         "--bind", "0.0.0.0", "--port", str(port), "--state-dir", tmp,
++         "--emu", emu],
++        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++    try:
++        good = {"Host": "127.0.0.1:%d" % port}
++        for _ in range(50):
++            try:
++                code, hd, raw = http_raw(port, "/", headers=good)
++                if code == 200:
++                    break
++            except OSError:
++                pass
++            time.sleep(0.1)
++        text = raw.decode("utf-8", errors="replace")
++        check("X86EMU_TOKEN" not in text and "Токен" in text,
++              "U7 remote: bare / is the login form, no token embedded")
++
++        tok_path = os.path.join(tmp, TOKEN_FILE)
++        tok, mode = "", 0
++        if os.path.exists(tok_path):
++            mode = os.stat(tok_path).st_mode & 0o777
++            with open(tok_path) as f:
++                tok = f.read().strip()
++        check(mode == 0o600 and len(tok) >= 32,
++              "U7 remote: access-token file exists, 0600, strong")
++
++        code, _hd, raw = http_raw(port, "/?token=wrong", headers=good)
++        check(b"X86EMU_TOKEN" not in raw and "Неверный".encode() in raw,
++              "U7 remote: a wrong token stays on the login form")
++        code, hd, raw = http_raw(port, "/?token=%s" % tok, headers=good)
++        check(code == 200 and b"X86EMU_TOKEN" in raw
++              and "SameSite=Strict" in hd.get("set-cookie", ""),
++              "U7 remote: the file token unlocks the page + cookie")
++
++        code, _hd, _b = http_raw(
++            port, "/api/status",
++            headers=dict(good, **{"X-X86emu-Token": "wrong"}))
++        check(code == 401, "U7 remote: API rejects a wrong token (401)")
++        code, _hd, _b = http_raw(port, "/api/status", headers=good)
++        check(code == 401, "U7 remote: API rejects a tokenless call (401)")
++
++        line = _ws_probe(port)
++        check("401" in line, "U7 remote: /ws rejects a tokenless upgrade")
++
++        # rotation: the helper the desktop GUI button calls
++        rotate = getattr(launcher, "load_or_create_access_token", None)
++        rotated_ok = False
++        if rotate is not None:
++            new, _p, created = rotate(tmp, force_new=True)
++            rotated_ok = created and new != tok and \
++                open(tok_path).read().strip() == new
++        check(rotated_ok, "U7 remote: rotation rewrites the credential file")
++    finally:
++        proc.terminate()
++        try:
++            out, _ = proc.communicate(timeout=5)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            out, _ = proc.communicate()
++    check(b"plaintext" in out and b"token" in out.lower(),
++          "U7 remote: startup prints the plaintext warning + token URL")
++
++
+ def main():
+     emu = os.path.join(ROOT, "x86emu")
+     if not os.path.isfile(emu):
+@@ -321,7 +533,9 @@ def main():
+             time.sleep(0.1)
+         test_schema()
+         test_http_surface(port)
++        test_access_gate(port)
+         test_lifecycle(port)
++        test_remote_gate(emu)
+     finally:
+         proc.terminate()
+         try:
+diff --git a/tests/test_monitor.py b/tests/test_monitor.py
+index 019a5c8..9460057 100644
+--- a/tests/test_monitor.py
++++ b/tests/test_monitor.py
+@@ -7,6 +7,9 @@ Lanes:
+      framebuffer marker, keyboard commands, quit, and non-perturbation receipts.
+   B  endless ROM: async pause, single-step and quit while running/stopped.
+   G  GDB owns run control: monitor continue must be rejected; GDB can still quit.
++  U  UPKEEP U7 authorization: a tokened monitor refuses missing/wrong
++     capabilities (401), rebinding Host and cross-Origin upgrades (403),
++     and a non-loopback bind without a token is refused at startup.
+ """
+ import argparse
+ import http.client
+@@ -187,16 +190,52 @@ class WSClient:
+         return self.pixel0 == rgb
+ 
+ 
+-def start_monitor(args, monitor_port=None, gdb_port=None, cwd=None, host="127.0.0.1"):
++def start_monitor(args, monitor_port=None, gdb_port=None, cwd=None, host="127.0.0.1",
++                  env_extra=None):
+     mp = monitor_port or free_port()
+     full = [X86EMU] + list(args)
+     if gdb_port is not None: full.append("--gdb=127.0.0.1:%d" % gdb_port)
+     spec = "%s:%d" % (host, mp) if host else str(mp)
+     full.append("--monitor=" + spec)
+-    p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    env = None
++    if env_extra is not None:
++        env = dict(os.environ)
++        env.update(env_extra)
++    p = subprocess.Popen(full, cwd=cwd, stdout=subprocess.PIPE,
++                         stderr=subprocess.PIPE, env=env)
+     return p, mp
+ 
+ 
++def raw_status_line(port, request):
++    s = socket.create_connection(("127.0.0.1", port), timeout=5)
++    s.sendall(request.encode())
++    s.settimeout(5)
++    out = b""
++    try:
++        while b"\r\n" not in out:
++            d = s.recv(4096)
++            if not d:
++                break
++            out += d
++    except OSError:
++        pass
++    s.close()
++    return out.decode(errors="replace").splitlines()[0] if out else ""
++
++
++def ws_status_line(port, path="/ws", host=None, origin=None, extra=()):
++    lines = ["GET %s HTTP/1.1" % path,
++             "Host: %s" % (host or "127.0.0.1:%d" % port),
++             "Upgrade: websocket", "Connection: Upgrade",
++             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
++             "Sec-WebSocket-Version: 13"]
++    if origin is not None:
++        lines.append("Origin: %s" % origin)
++    lines.extend(extra)
++    time.sleep(0.05)          # one client at a time; let closes land
++    return raw_status_line(port, "\r\n".join(lines) + "\r\n\r\n")
++
++
+ def assert_http_and_handshake(port, require_accept=True):
+     status, body = wait_http(port)
+     check(status == 200 and b"Live connection and run control" in body and b"WebSocket" in body,
+@@ -475,9 +514,95 @@ def lane_framing():
+         p.communicate()
+ 
+ 
++def lane_auth():
++    """UPKEEP U7: authorization evidence on the wire. RFC 6455 s4.2.2
++    requires an HTTP error (403 named) when the server refuses by Origin;
++    s10.1 is why the token exists at all next to Origin."""
++    tok = "u7-lane-capability"
++    p, port = start_monitor(["--max-instr=1000000000"],
++                            env_extra={"X86EMU_MONITOR_TOKEN": tok})
++    try:
++        status, _body = wait_http(port)
++        check(status == 200, "U7 page stays fetchable with a local Host")
++        line = raw_status_line(port, "GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n")
++        check("403" in line, "U7 page refuses a DNS-rebinding Host (403)")
++        check("401" in ws_status_line(port),
++              "U7 tokenless WebSocket upgrade is 401")
++        check("401" in ws_status_line(port, "/ws?token=wrong"),
++              "U7 wrong-token WebSocket upgrade is 401")
++        check("101" in ws_status_line(port, "/ws?token=" + tok),
++              "U7 ?token= carrier upgrades")
++        check("101" in ws_status_line(port, "/ws",
++                                      extra=("X-X86emu-Token: " + tok,)),
++              "U7 X-X86emu-Token header carrier upgrades")
++        check("101" in ws_status_line(port, "/ws",
++                                      extra=("Authorization: Bearer " + tok,)),
++              "U7 Authorization: Bearer carrier upgrades")
++        check("403" in ws_status_line(port, "/ws?token=" + tok,
++                                      origin="http://evil.example"),
++              "U7 cross-Origin upgrade is 403 even with the token")
++        check("101" in ws_status_line(port, "/ws?token=" + tok,
++                                      origin="http://127.0.0.1:%d" % port),
++              "U7 same-Origin upgrade with the token passes")
++        check("403" in ws_status_line(port, "/ws?token=" + tok,
++                                      host="evil.example"),
++              "U7 rebinding Host upgrade is 403")
++    finally:
++        if p.poll() is None: p.kill(); p.wait()
++        p.communicate()
++
++    # --monitor-token= is the explicit CLI carrier for direct use. The
++    # try keeps the pre-U7 negative control readable: a binary without
++    # the flag exits on it, and every remaining vector must still run.
++    p, port = start_monitor(["--max-instr=1000000000", "--monitor-token=" + tok],
++                            env_extra={"X86EMU_MONITOR_TOKEN": ""})
++    try:
++        try:
++            wait_http(port)
++            cli_line = ws_status_line(port)
++            cli_up = ws_status_line(port, "/ws?token=" + tok)
++        except Exception:
++            cli_line = cli_up = ""
++        check("401" in cli_line,
++              "U7 --monitor-token= engages the capability check")
++        check("101" in cli_up, "U7 --monitor-token= value upgrades")
++    finally:
++        if p.poll() is None: p.kill(); p.wait()
++        p.communicate()
++
++    # A non-loopback bind with no token anywhere is not configurable.
++    env = dict(os.environ)
++    env.pop("X86EMU_MONITOR_TOKEN", None)
++    p = subprocess.Popen([X86EMU, "--max-instr=1000000000",
++                          "--monitor=0.0.0.0:%d" % free_port()],
++                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
++    try:
++        _out, err = p.communicate(timeout=15)
++        check(p.returncode != 0 and b"refusing to listen unauthenticated" in err,
++              "U7 non-loopback bind without a token is refused at startup")
++    except subprocess.TimeoutExpired:
++        p.kill(); p.wait()
++        check(False, "U7 non-loopback bind without a token is refused at startup")
++
++    # With a token the LAN bind serves, and the plaintext warning fires.
++    p, port = start_monitor(["--max-instr=1000000000"], host="0.0.0.0",
++                            env_extra={"X86EMU_MONITOR_TOKEN": tok})
++    try:
++        wait_http(port)
++        check("401" in ws_status_line(port),
++              "U7 tokened LAN monitor still refuses a bare upgrade")
++        check("101" in ws_status_line(port, "/ws?token=" + tok),
++              "U7 tokened LAN monitor upgrades with the capability")
++    finally:
++        if p.poll() is None: p.kill(); p.wait()
++        _out, err = p.communicate()
++    check(b"plaintext" in err,
++          "U7 non-loopback startup carries the plaintext warning")
++
++
+ def main():
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--lane", choices=("all", "handshake", "boot", "pause", "gdb", "framing"), default="all")
++    parser.add_argument("--lane", choices=("all", "handshake", "boot", "pause", "gdb", "framing", "auth"), default="all")
+     args = parser.parse_args()
+     lanes = {
+         "handshake": lane_handshake,
+@@ -485,6 +610,7 @@ def main():
+         "pause": lane_pause_step_quit,
+         "gdb": lane_gdb_readonly,
+         "framing": lane_framing,
++        "auth": lane_auth,
+     }
+     selected = list(lanes) if args.lane == "all" else [args.lane]
+     for name in selected:
+diff --git a/tools/gui_app.py b/tools/gui_app.py
+index dc1dd9b..5df6094 100644
+--- a/tools/gui_app.py
++++ b/tools/gui_app.py
+@@ -33,6 +33,7 @@ import os
+ import shutil
+ import socket
+ import struct
++import subprocess  # used by open_state_dir (was missing: latent NameError)
+ import sys
+ import time
+ import tkinter as tk
+@@ -177,15 +178,19 @@ class MonitorClient:
+         self.sock = None
+         self.buf = b""
+ 
+-    def connect(self, port, timeout=5.0):
++    def connect(self, port, timeout=5.0, token=None):
+         s = socket.create_connection(("127.0.0.1", int(port)), timeout=timeout)
+         key = base64.b64encode(os.urandom(16)).decode("ascii")
+-        req = ("GET /ws HTTP/1.1\r\n"
++        # UPKEEP U7: present the per-run monitor capability the Machine
++        # handed the emulator in its environment; the token in the path
++        # is the monitor's simplest carrier for a raw-socket client.
++        path = "/ws?token=%s" % token if token else "/ws"
++        req = ("GET %s HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Key: %s\r\n"
+-               "Sec-WebSocket-Version: 13\r\n\r\n" % (port, key))
++               "Sec-WebSocket-Version: 13\r\n\r\n" % (path, port, key))
+         s.sendall(req.encode("ascii"))
+         buf = b""
+         while b"\r\n\r\n" not in buf:
+@@ -724,6 +729,33 @@ class App:
+             "8080/8081/8082 (AURALITE_TAP_PORT) — см. docs/plans/NET_PLAN.md.")).pack(
+             anchor="w", pady=8)
+ 
++        # UPKEEP U7: the remote-access credential for the web launcher,
++        # managed here in the GUI -- no terminal is ever needed to see or
++        # rotate it. Plaintext-transport warning included on purpose.
++        tokbox = ttk.LabelFrame(self.tab_net, text="Удалённый доступ (веб-GUI)",
++                                padding=6)
++        tokbox.pack(fill="x", pady=(8, 2))
++        row = ttk.Frame(tokbox)
++        row.pack(fill="x")
++        ttk.Label(row, text="Токен доступа:").pack(side="left")
++        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir)
++        self.access_token_var = tk.StringVar(value=tok)
++        ttk.Entry(row, textvariable=self.access_token_var, width=52,
++                  state="readonly").pack(side="left", padx=4)
++        ttk.Button(row, text="Копировать",
++                   command=self.on_copy_access_token).pack(side="left")
++        ttk.Button(row, text="Заменить токен",
++                   command=self.on_rotate_access_token).pack(side="left", padx=4)
++        ttk.Label(tokbox, foreground="#666", wraplength=640, justify="left",
++                  text=("Нужен, когда веб-GUI (launcher) запущен на сетевом адресе "
++                        "вне этого компьютера: вводится один раз на странице входа. "
++                        "Замена подействует при следующем старте веб-GUI. Внимание: "
++                        "соединение веб-GUI не шифруется (HTTP) — токен пересекает "
++                        "сеть открытым текстом; не открывайте доступ в недоверенных "
++                        "сетях. Доступ только с этого компьютера токен не требует — "
++                        "он встроен в страницу автоматически.")).pack(
++                  anchor="w", pady=4)
++
+     def _build_log_tab(self):
+         bar = ttk.Frame(self.tab_log)
+         bar.pack(fill="x")
+@@ -913,7 +945,8 @@ class App:
+         if not port:
+             return
+         try:
+-            self.mon.connect(port, timeout=1.0)
++            self.mon.connect(port, timeout=1.0,
++                             token=self.machine.monitor_token)
+         except OSError:
+             return
+         self.badge_mon.configure(text="монитор: на связи", bg="#2f7d32")
+@@ -1147,6 +1180,25 @@ class App:
+         self.machine.responder_stop()
+         self.tap_status.configure(text="респондер остановлен")
+ 
++    # -- UPKEEP U7: remote-access credential (see _build_net_tab) --------
++    def on_copy_access_token(self):
++        self.root.clipboard_clear()
++        self.root.clipboard_append(self.access_token_var.get())
++        self.status.configure(text="токен доступа скопирован в буфер обмена")
++
++    def on_rotate_access_token(self):
++        if not messagebox.askokcancel(
++                APP_TITLE,
++                "Создать новый токен удалённого доступа?\n\n"
++                "Старый токен перестанет приниматься при следующем старте "
++                "веб-GUI; браузеры, где он уже введён, попросят новый."):
++            return
++        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir,
++                                                           force_new=True)
++        self.access_token_var.set(tok)
++        self.status.configure(
++            text="токен доступа заменён (подействует при следующем старте веб-GUI)")
++
+     def open_state_dir(self):
+         try:
+             if sys.platform.startswith("win"):
+diff --git a/tools/launcher.py b/tools/launcher.py
+index 01d84ac..a320d06 100644
+--- a/tools/launcher.py
++++ b/tools/launcher.py
+@@ -22,11 +22,33 @@ Ground rules:
+     launcher's /ws is exposed -- one port for the whole GUI;
+   * run state (presets, per-run output, snapshots) lives in a state
+     directory (--state-dir, default ~/.x86emu-gui), never in the repo.
++
++Access control (UPKEEP U7; threat model: UPKEEP_PLAN s1.7):
++  * a capability token gates every API route and the /ws splice. On a
++    loopback bind the token is per-process random and is embedded into
++    the served GUI page, so the default flow stays one-click; on a
++    non-loopback bind it is the persistent `access-token` file (0600) in
++    the state directory -- the desktop GUI shows and rotates it -- and
++    the page embeds nothing until the visitor presents it. Carriers:
++    `X-X86emu-Token` / `Authorization: Bearer` / `?token=` / the
++    SameSite=Strict cookie the page response sets.
++  * the Host header must name this machine (loopback names, the bound
++    literal, this host's name): a DNS-rebinding page's Host is none of
++    those, so it never reaches a route. Mutating routes and /ws also
++    require a same-origin `Origin` when a browser sends one.
++  * each machine run gets its own monitor token, handed to the emulator
++    in its environment (never argv, so it stays out of argv.json and
++    process lists); the /ws proxy presents it to the monitor, which is
++    therefore never the unauthenticated thing its header once said.
+ """
+ import argparse
++import hmac
++import html as _html
++import ipaddress
+ import json
+ import os
+ import re
++import secrets
+ import signal
+ import socket
+ import subprocess
+@@ -238,6 +260,7 @@ class Machine:
+         self.proc = None
+         self.run_dir = None
+         self.monitor_port = None
++        self.monitor_token = None     # per-run capability for --monitor
+         self.config = dict(BUILTIN_CONFIG)
+         self.started_at = None
+         self.exit_code = None
+@@ -272,14 +295,22 @@ class Machine:
+             os.makedirs(run_dir, exist_ok=True)
+             monitor_port = free_port()
+             argv = build_argv(self.emu_path, config, run_dir, monitor_port)
++            # UPKEEP U7: a fresh monitor capability per run, carried in the
++            # child's environment -- never in argv, so it appears neither in
++            # process lists nor in the run's argv.json. Only the owner of
++            # this process (the launcher / desktop GUI) can present it.
++            monitor_token = new_token()
++            env = dict(os.environ)
++            env["X86EMU_MONITOR_TOKEN"] = monitor_token
+             out = open(os.path.join(run_dir, "stdout.log"), "wb")
+             err = open(os.path.join(run_dir, "stderr.log"), "wb")
+             self.proc = subprocess.Popen(
+-                argv, cwd=ROOT, stdout=out, stderr=err,
++                argv, cwd=ROOT, stdout=out, stderr=err, env=env,
+                 stdin=subprocess.DEVNULL, start_new_session=True)
+             out.close(); err.close()
+             self.run_dir = run_dir
+             self.monitor_port = monitor_port
++            self.monitor_token = monitor_token
+             self.config = config
+             self.argv = argv
+             self.started_at = time.time()
+@@ -413,6 +444,169 @@ def free_port():
+     return port
+ 
+ 
++# ---------------------------------------------------------------------------
++# Access control (UPKEEP U7)
++# ---------------------------------------------------------------------------
++
++ACCESS_TOKEN_FILE = "access-token"
++TOKEN_COOKIE = "x86emu_token"
++
++
++def new_token():
++    """A fresh URL-safe capability (256 bits of entropy)."""
++    return secrets.token_urlsafe(32)
++
++
++def is_loopback_bind(bind):
++    """True when `bind` keeps the launcher on this machine only."""
++    b = (bind or "").strip().lower()
++    if b in ("localhost",):
++        return True
++    try:
++        return ipaddress.ip_address(b).is_loopback
++    except ValueError:
++        return False            # a name we cannot prove local: treat remote
++
++
++def load_or_create_access_token(state_dir, force_new=False):
++    """The persistent remote-access credential: `<state_dir>/access-token`,
++    created 0600 on first use.  -> (token, path, created).
++
++    This is the secret the desktop GUI displays and rotates (same file),
++    so obtaining or replacing it never needs a terminal.  A running
++    launcher keeps its in-memory copy, so rotation takes effect at the
++    next launcher start.  A token someone can read from this file is a
++    token that same user could read from the runs/ state anyway -- the
++    file's owner-only mode is the honest boundary, not a cipher."""
++    path = os.path.join(state_dir, ACCESS_TOKEN_FILE)
++    if not force_new:
++        try:
++            with open(path, "r", encoding="utf-8") as f:
++                tok = f.read().strip()
++            if len(tok) >= 16 and re.match(r"^[A-Za-z0-9_\-]+$", tok):
++                return tok, path, False
++        except OSError:
++            pass
++    tok = new_token()
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    try:
++        os.write(fd, (tok + "\n").encode("ascii"))
++    finally:
++        os.close(fd)
++    try:                                # a pre-existing loose file keeps its
++        os.chmod(path, 0o600)           # mode through O_TRUNC; tighten it
++    except OSError:
++        pass
++    return tok, path, True
++
++
++def _host_part(value):
++    """A Host header/authority reduced to its hostname: lowercased,
++    brackets and any :port stripped."""
++    v = (value or "").strip().lower()
++    if v.startswith("["):
++        end = v.find("]")
++        return v[1:end] if end > 0 else ""
++    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
++
++
++class Auth:
++    """One launcher's gate: the token, whether the page may embed it
++    (loopback only), and the Host allowlist.  Built by `make_auth`."""
++
++    def __init__(self, token, embed, allowed_hosts, any_literal):
++        self.token = token
++        self.embed = embed                  # loopback: page carries it
++        self.allowed_hosts = allowed_hosts  # set of lowercase host parts
++        self.any_literal = any_literal      # 0.0.0.0 bind: any IP literal
++
++    def host_ok(self, host_header):
++        h = _host_part(host_header)
++        if not h:
++            return False
++        if h in self.allowed_hosts:
++            return True
++        if self.any_literal:
++            try:
++                ipaddress.ip_address(h)
++                return True
++            except ValueError:
++                return False
++        return False
++
++    def token_ok(self, presented):
++        return bool(presented) and hmac.compare_digest(
++            str(presented), self.token)
++
++    def origin_ok(self, origin_header, host_header):
++        """Same-origin check for browser-driven mutations and the upgrade:
++        browsers always send Origin on POST and WebSocket handshakes and
++        cannot forge it; our page is same-origin by construction."""
++        if not origin_header:
++            return True                     # a non-browser client
++        u = urlparse(origin_header)
++        if u.scheme not in ("http", "https") or not u.hostname:
++            return False                    # includes Origin: null
++        return (u.hostname.lower() == _host_part(host_header)
++                and self.host_ok(u.netloc))
++
++
++def make_auth(bind, state_dir):
++    """Build the gate for one listener.
++
++    Loopback:  per-process token, embedded in the page -- the browser
++    carries it, no step for the operator.  Non-loopback: the persistent
++    access-token file, embedded in NO page; the visitor presents it once
++    (form / ?token=) and the resulting cookie carries it from there."""
++    hosts = {"127.0.0.1", "localhost", "::1"}
++    any_literal = False
++    b = (bind or "").strip().lower()
++    try:
++        ip = ipaddress.ip_address(b)
++        if ip.is_unspecified:
++            any_literal = True
++        else:
++            hosts.add(str(ip))
++    except ValueError:
++        if b and b != "localhost":
++            hosts.add(b)
++    if not is_loopback_bind(bind):
++        hn = socket.gethostname().lower()
++        if hn:
++            hosts.add(hn)
++            hosts.add(hn.split(".")[0])
++        token, _path, _created = load_or_create_access_token(state_dir)
++        return Auth(token, False, hosts, any_literal)
++    return Auth(new_token(), True, hosts, any_literal)
++
++
++_LOGIN_PAGE = """<!doctype html>
++<html lang="ru"><head><meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>AuraLite Emulator — доступ по токену</title>
++<style>body{background:#0b1020;color:#e7efff;font:15px/1.5 ui-monospace,Consolas,monospace;
++display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
++.box{background:#121a2d;border:1px solid #263451;border-radius:10px;padding:26px 30px;max-width:520px}
++h1{color:#58d6ff;font-size:19px;margin:0 0 10px}input{width:100%%;box-sizing:border-box;
++padding:9px;border:1px solid #263451;border-radius:6px;background:#0b1324;color:#e7efff;font:inherit}
++button{margin-top:12px;padding:9px 16px;border:1px solid #34758a;border-radius:7px;
++background:#15557a;color:#d9f3ff;font:inherit;cursor:pointer}
++.err{color:#ff8585}.dim{color:#8fa2c2}</style></head><body>
++<div class="box"><h1>AuraLite Emulator — удалённый доступ</h1>
++<p>Интерфейс запущен на сетевом адресе и требует токен доступа.</p>
++<p class="dim">Токен виден в настольном приложении AuraLite Emulator
++(режим «Эксперт» → вкладка «Сеть») и хранится в каталоге состояния GUI,
++файл <code>access-token</code>. Там же его можно заменить.</p>
++%(error)s
++<form method="get" action="/">
++<label>Токен доступа<br><input name="token" type="password" autocomplete="off" autofocus></label>
++<br><button type="submit">Войти</button></form>
++<p class="dim">Внимание: соединение не шифруется (HTTP). Не используйте
++этот доступ в недоверенных сетях.</p>
++</div></body></html>
++"""
++
++
+ # ---------------------------------------------------------------------------
+ # Presets
+ # ---------------------------------------------------------------------------
+@@ -541,6 +735,44 @@ class Handler(BaseHTTPRequestHandler):
+     server_version = "x86emu-launcher/1"
+     machine = None      # injected
+     presets = None
++    auth = None         # injected (UPKEEP U7): the Auth gate
++
++    # -- UPKEEP U7 access gate ------------------------------------------------
++    def _presented_token(self):
++        h = self.headers.get("X-X86emu-Token")
++        if h:
++            return h.strip()
++        a = self.headers.get("Authorization") or ""
++        if a.lower().startswith("bearer "):
++            return a[7:].strip()
++        q = parse_qs(urlparse(self.path).query)
++        if q.get("token"):
++            return q["token"][0]
++        for part in (self.headers.get("Cookie") or "").split(";"):
++            if "=" in part:
++                k, v = part.strip().split("=", 1)
++                if k == TOKEN_COOKIE:
++                    return v.strip().strip('"')
++        return ""
++
++    def _refuse(self, code, error):
++        self._json({"ok": False, "error": error}, code)
++        return False
++
++    def _gate(self, need_token=True, mutation=False):
++        """Authorize before any route body runs. Host first (rebinding),
++        then the capability, then Origin for state-changing routes."""
++        a = self.auth
++        if a is None:                       # miswired server: fail closed
++            return self._refuse(403, "access gate not configured")
++        if not a.host_ok(self.headers.get("Host")):
++            return self._refuse(403, "forbidden host")
++        if need_token and not a.token_ok(self._presented_token()):
++            return self._refuse(401, "unauthorized: token required")
++        if mutation and not a.origin_ok(self.headers.get("Origin"),
++                                         self.headers.get("Host")):
++            return self._refuse(403, "forbidden origin")
++        return True
+ 
+     # -- helpers -----------------------------------------------------------
+     def _json(self, obj, code=200):
+@@ -582,6 +814,43 @@ class Handler(BaseHTTPRequestHandler):
+         pass
+ 
+     # -- GET ---------------------------------------------------------------
++    def _serve_gui_page(self, authorized):
++        """The one public route. Authorized (loopback embed, or a valid
++        presented token): the real page with the capability injected for
++        its JS plus a SameSite=Strict cookie so navigations (artifact
++        downloads) and the upgrade carry it too. Otherwise: the login
++        form. A cross-origin page can never read either body (SOP), and
++        the Host gate has already refused rebinding names."""
++        if not authorized:
++            error = ""
++            if any(k == "token" for k in parse_qs(urlparse(self.path).query)):
++                error = '<p class="err">Неверный токен. Попробуйте ещё раз.</p>'
++            body = (_LOGIN_PAGE % {"error": error}).encode("utf-8")
++            self.send_response(200)
++            self.send_header("Content-Type", "text/html; charset=utf-8")
++            self.send_header("Cache-Control", "no-store")
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++            return
++        with open(GUI_PAGE, "rb") as f:
++            page = f.read()
++        inject = ("<script>window.X86EMU_TOKEN=\"%s\";</script>"
++                  % _html.escape(self.auth.token, quote=True)).encode("utf-8")
++        if b"</head>" in page:
++            body = page.replace(b"</head>", inject + b"</head>", 1)
++        else:
++            body = inject + page
++        self.send_response(200)
++        self.send_header("Content-Type", "text/html; charset=utf-8")
++        self.send_header("Cache-Control", "no-store")
++        self.send_header("Set-Cookie",
++                         "%s=%s; HttpOnly; SameSite=Strict; Path=/"
++                         % (TOKEN_COOKIE, self.auth.token))
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
+     def do_GET(self):
+         u = urlparse(self.path)
+         path = u.path
+@@ -589,13 +858,14 @@ class Handler(BaseHTTPRequestHandler):
+             if path == "/ws":
+                 return self._upgrade_ws()
+             if path in ("/", "/index.html"):
+-                with open(GUI_PAGE, "rb") as f:
+-                    body = f.read()
+-                self.send_response(200)
+-                self.send_header("Content-Type", "text/html; charset=utf-8")
+-                self.send_header("Content-Length", str(len(body)))
+-                self.end_headers()
+-                self.wfile.write(body)
++                if self.auth is not None and not self.auth.host_ok(
++                        self.headers.get("Host")):
++                    return self._refuse(403, "forbidden host")
++                ok = (self.auth is not None
++                      and (self.auth.embed
++                           or self.auth.token_ok(self._presented_token())))
++                return self._serve_gui_page(ok)
++            if not self._gate(need_token=True):
+                 return
+             if path == "/api/status":
+                 return self._json({"ok": True, **self.machine.status()})
+@@ -651,6 +921,8 @@ class Handler(BaseHTTPRequestHandler):
+     # -- POST / DELETE -------------------------------------------------------
+     def do_POST(self):
+         u = urlparse(self.path)
++        if not self._gate(need_token=True, mutation=True):
++            return
+         try:
+             body = self._body()
+             if u.path == "/api/start":
+@@ -676,6 +948,8 @@ class Handler(BaseHTTPRequestHandler):
+             return self._json({"ok": False, "error": str(e)}, 500)
+ 
+     def do_DELETE(self):
++        if not self._gate(need_token=True, mutation=True):
++            return
+         u = urlparse(self.path)
+         q = parse_qs(u.query)
+         if u.path == "/api/presets":
+@@ -686,6 +960,10 @@ class Handler(BaseHTTPRequestHandler):
+ 
+     # -- WebSocket upgrade ----------------------------------------------------
+     def _upgrade_ws(self):
++        # The splice is a state-changing channel (run control rides it),
++        # so it takes the mutation gate: Host + token + same-Origin.
++        if not self._gate(need_token=True, mutation=True):
++            return
+         if (self.headers.get("Upgrade") or "").lower() != "websocket":
+             return self._json({"ok": False, "error": "websocket upgrade required"}, 426)
+         status = self.machine.status()
+@@ -695,8 +973,9 @@ class Handler(BaseHTTPRequestHandler):
+         key = self.headers.get("Sec-WebSocket-Key")
+         if not key:
+             return self._json({"ok": False, "error": "missing Sec-WebSocket-Key"}, 400)
+-        # rebuild the request for the backend monitor
+-        lines = ["GET /ws HTTP/1.1",
++        # rebuild the request for the backend monitor, presenting the
++        # per-run monitor capability this process alone knows (UPKEEP U7)
++        lines = ["GET /ws?token=%s HTTP/1.1" % (self.machine.monitor_token or ""),
+                  "Host: 127.0.0.1:%d" % port,
+                  "Upgrade: websocket",
+                  "Connection: Upgrade",
+@@ -718,9 +997,11 @@ class Handler(BaseHTTPRequestHandler):
+ # main
+ # ---------------------------------------------------------------------------
+ 
+-def make_server(bind, port, machine, presets):
++def make_server(bind, port, machine, presets, auth=None):
++    if auth is None:
++        auth = make_auth(bind, machine.state_dir)
+     handler = type("BoundHandler", (Handler,),
+-                   {"machine": machine, "presets": presets})
++                   {"machine": machine, "presets": presets, "auth": auth})
+ 
+     class ProxyHTTPServer(ThreadingHTTPServer):
+         daemon_threads = True
+@@ -764,9 +1045,24 @@ def main(argv=None):
+         return 2
+     machine = Machine(os.path.abspath(a.emu), os.path.abspath(a.state_dir))
+     presets = Presets(machine.state_dir)
+-    srv = make_server(a.bind, a.port, machine, presets)
++    auth = make_auth(a.bind, machine.state_dir)
++    srv = make_server(a.bind, a.port, machine, presets, auth)
+     print("x86emu GUI launcher: http://%s:%d/  (state: %s)" %
+           (a.bind, a.port, machine.state_dir), flush=True)
++    if is_loopback_bind(a.bind):
++        print("access: token embedded in the served page (loopback only); "
++              "the API and /ws require it", flush=True)
++    else:
++        # Plaintext warning is a product requirement, not a footnote: the
++        # token below is the *only* credential and the wire is bare HTTP.
++        print("WARNING: bound beyond loopback over plaintext HTTP -- the "
++              "token below is the only credential and crosses the network "
++              "in the clear.", flush=True)
++        print("access token URL: http://%s:%d/?token=%s"
++              % (a.bind, a.port, auth.token), flush=True)
++        print("(the token lives in %s -- the desktop GUI shows and rotates "
++              "it)" % os.path.join(machine.state_dir, ACCESS_TOKEN_FILE),
++              flush=True)
+     try:
+         srv.serve_forever()
+     except KeyboardInterrupt:
+diff --git a/web/gui.html b/web/gui.html
+index c350078..e01608c 100644
+--- a/web/gui.html
++++ b/web/gui.html
+@@ -398,7 +398,10 @@ function toast(msg, err){const t=$('#toast');t.textContent=msg;t.className='toas
+   clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast', err?6500:3200);}
+ 
+ async function api(path, method='GET', body){
+-  const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},
++  /* UPKEEP U7: the launcher injects the capability token into this page;
++     every API call and the WS upgrade present it (cookie rides too). */
++  const r=await fetch(path,{method,headers:{'Content-Type':'application/json',
++    'X-X86emu-Token':window.X86EMU_TOKEN||''},
+     body: body!==undefined?JSON.stringify(body):undefined});
+   let j={};try{j=await r.json()}catch(_e){}
+   if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
+@@ -462,7 +465,7 @@ function cfgToForm(c){
+ /* ---------------- WebSocket (протокол монитора) ---------------- */
+ function wsURL(){
+   const proto=location.protocol==='https:'?'wss://':'ws://';
+-  return proto+location.host+'/ws';
++  return proto+location.host+'/ws?token='+encodeURIComponent(window.X86EMU_TOKEN||'');
+ }
+ function connectWS(){
+   if(ws){try{ws.close()}catch(_e){}}
+@@ -606,7 +609,7 @@ async function refreshArtifacts(){
+     const a=await api('/api/artifacts');
+     $('#artRows').innerHTML=a.entries.map(e=>
+       `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
+-      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Скачать</button></a></td></tr>`).join('')
++      <td><a href="/api/artifact/${encodeURIComponent(e.name)}?token=${encodeURIComponent(window.X86EMU_TOKEN||'')}"><button class="small">Скачать</button></a></td></tr>`).join('')
+       ||'<tr><td colspan="4">— нет файлов —</td></tr>';
+   }catch(e){}
+ }
+diff --git a/web/monitor.html b/web/monitor.html
+index 6213d83..6f32ed7 100644
+--- a/web/monitor.html
++++ b/web/monitor.html
+@@ -24,7 +24,7 @@ pre{margin:0;max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:a
+   <div class="controls"><button data-command="pause">Pause</button><button data-command="continue">Continue</button><button data-command="step">Step</button><button id="quit" class="danger">Quit emulator</button></div>
+   <div class="controls"><label>Breakpoint <input id="breakaddr" type="text" value="0x100000"></label><button id="breakbtn">Set break</button><label>REPL <input id="execLine" type="text" value="info regs"></label><button id="execbtn">Execute</button></div>
+   <div class="controls"><label>Set-1 scancodes <input id="keycodes" type="text" value="1E,9E"></label><button id="keysbtn">Send keys</button><label>Type ASCII <input id="typed" type="text" value="hello\n"></label><button id="typebtn">Type</button></div>
+-  <div class="hint">The monitor starts the machine stopped at the reset vector. Use Continue to run. Run-control commands are refused while GDB owns the session. The server has no authentication; it binds to 127.0.0.1 unless you explicitly choose another IPv4 address.</div>
++  <div class="hint">The monitor starts the machine stopped at the reset vector. Use Continue to run. Run-control commands are refused while GDB owns the session. Requests are authorized by Host/Origin, and when started with a token (--monitor-token=) the WebSocket URL must carry it (?token=, inherited from this page's URL). It binds to 127.0.0.1 unless you explicitly choose another IPv4 address.</div>
+ </div></section>
+ 
+ <section class="panel"><h2>Machine / stop state</h2><div class="body kv">
+@@ -94,7 +94,7 @@ $('#typebtn').onclick=()=>sendCommand('type',{text:$('#typed').value.replace(/\\
+ function ppm(buf){const bytes=new Uint8Array(buf);let head=new TextDecoder().decode(bytes.slice(0,1000)),m=head.match(/^P6\s+(\d+)\s+(\d+)\s+255\s/);if(!m)return;let off=m[0].length,w=+m[1],h=+m[2];if(!w||!h||off+w*h*3>bytes.length)return;canvas.width=w;canvas.height=h;const image=ctx.createImageData(w,h);for(let i=0;i<w*h;i++){image.data[i*4]=bytes[off+i*3];image.data[i*4+1]=bytes[off+i*3+1];image.data[i*4+2]=bytes[off+i*3+2];image.data[i*4+3]=255}ctx.putImageData(image,0,0)}
+ $('#ppm').onchange=e=>{const f=e.target.files[0];if(f)f.arrayBuffer().then(ppm)};
+ $('#logfile').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(t=>{$('#log').textContent=t;lastLogLines=t.split('\n').length})};
+-if(location.protocol==='http:'||location.protocol==='https:'){$('#wsurl').value=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';connect()}
++if(location.protocol==='http:'||location.protocol==='https:'){const tk=new URLSearchParams(location.search).get('token');$('#wsurl').value=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'+(tk?('?token='+encodeURIComponent(tk)):'');connect()}
+ </script>
+ </body>
+ </html>
+-- 
+2.47.3
+

@@ -5,7 +5,10 @@
  *   - PCI 8086:100E, BAR0 128 KiB register file;
  *   - CTRL.RST (bit 26) self-clears after the register reset;
  *   - RAL/RAH preloaded with the QEMU default MAC 52:54:00:12:34:56
- *     (RAH.AV set) -- the guest prefers it over EEPROM;
+ *     (RAH.AV set); since U2 the same MAC also sits in EEPROM words
+ *     0-2, the source the guest's probe actually asks first (the N0
+ *     header's "prefers it over EEPROM" measured the fallback order
+ *     backwards -- U0 found EERD first, RAL/RAH only on timeout);
  *   - RXCSUM reads 0 after reset (QEMU compat);
  *   - RX ring ingress: frame DMA into the head buffer, DD status, RDH
  *     advance, ICR.RXT0; RCTL.EN gates the receiver, RDH==RDT drops.
@@ -22,6 +25,19 @@
  *   - ICR gets TXDW (bit 0) for RS descriptors and TXQE (bit 7) for every
  *     completed walk;
  *   - a frame without CMD.EOP accumulates: no wire, no DD, no TXDW.
+ *
+ * U2 adds the EEPROM + PHY vectors (QEMU hw/net/e1000.c set_mdic /
+ * flash_eerd_read / phy_reg_init, e1000x_core_prepare_eeprom):
+ *   - the guest's exact EERD probe (START | word<<8, DONE poll, data in
+ *     bits 31:16) returns the RAL/RAH MAC from words 0-2 with DONE on
+ *     the first poll, the identity words read 0x100E/0x8086, all 64
+ *     words sum to 0xBABA, out-of-range completes with zero data, and
+ *     CTRL.RST leaves the image alone;
+ *   - MDIC reaches the PHY file at address 1: ID/status/template
+ *     values, RW round-trips, ERROR on read-only / unimplemented /
+ *     wrong-PHY accesses (with QEMU's previous-value echo), the BMCR
+ *     store mask (RESET/ANRESTART self-clear, file not reset), the
+ *     MDAC cause onto the INTx wire, and reset restoring the template.
  */
 #include <assert.h>
 #include <stdint.h>
@@ -447,6 +463,148 @@ static void test_tx_link_gate(void) {
     printf("ok e1000 tx link gate + CTRL.RST resets the TX ring\n");
 }
 
+/* ============================ U2: EEPROM ================================== */
+/* The guest's exact EEPROM transaction (AuraLite-OS@0ed0d29
+ * drivers/e1000/e1000.c): write START | word<<8 to EERD, poll DONE
+ * (bit 4) -- the guest budgets 100,000 polls per word and falls back
+ * to RAL/RAH on timeout -- then take the data from bits 31:16. */
+static uint16_t eerd_read(fx_t *f, unsigned word, int *polls) {
+    wr(f, 0x0014, 1u | (word << 8));                     /* EERD START */
+    uint32_t v = 0;
+    int n = 0;
+    do { v = rd(f, 0x0014); n++; } while (!(v & (1u << 4)) && n < 100000);
+    if (polls) *polls = n;
+    assert(v & (1u << 4));                               /* DONE arrived */
+    return (uint16_t)(v >> 16);
+}
+
+static void test_eeprom_eerd(void) {
+    fx_t f; fx_init(&f);
+    /* The north-star probe: words 0-2 must yield the same MAC the
+     * RAL/RAH fallback used to provide, DONE on the first poll. */
+    static const uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+    for (int i = 0; i < 3; i++) {
+        int polls = 0;
+        uint16_t w = eerd_read(&f, (unsigned)i, &polls);
+        assert(polls == 1);                              /* no timeout walk */
+        assert((w & 0xFF) == mac[2 * i] && (w >> 8) == mac[2 * i + 1]);
+    }
+    /* ... byte for byte the RAL/RAH preload the guest used to settle for. */
+    assert(rd(&f, 0x5400) == 0x12005452u);
+    assert(rd(&f, 0x5404) == 0x80005634u);
+    /* Identity words (QEMU template + prepare): subsystem / device ids. */
+    assert(eerd_read(&f, 0x0A, 0) == 0x6403);
+    assert(eerd_read(&f, 0x0B, 0) == 0x100E);            /* subsystem device */
+    assert(eerd_read(&f, 0x0C, 0) == 0x8086);            /* subsystem vendor */
+    assert(eerd_read(&f, 0x0D, 0) == 0x100E);            /* device id */
+    assert(eerd_read(&f, 0x0E, 0) == 0x8086);            /* vendor id */
+    /* Word 0x3F closes the image: all 64 words sum to 0xBABA. */
+    uint16_t sum = 0;
+    for (unsigned i = 0; i < 64; i++)
+        sum = (uint16_t)(sum + eerd_read(&f, i, 0));
+    assert(sum == 0xBABA);
+    /* START clear: the stored command reads back, nothing completes. */
+    wr(&f, 0x0014, (2u << 8));
+    assert(rd(&f, 0x0014) == (2u << 8));
+    /* Out of range completes with the written (zero) data field: QEMU's
+     * cap is the checksum word 0x3F, not the 8-bit address field. */
+    assert(eerd_read(&f, 0x40, 0) == 0);
+    assert(eerd_read(&f, 0xFF, 0) == 0);
+    /* CTRL.RST does not rebuild the EEPROM (QEMU prepares it at add). */
+    wr(&f, 0x0000, (1u << 26));
+    assert(eerd_read(&f, 0, 0) == 0x5452);
+    fx_done(&f);
+    printf("ok e1000 EEPROM via EERD (MAC words, identity, 0xBABA checksum, first-poll DONE)\n");
+}
+
+/* ============================= U2: PHY ==================================== */
+#define MDIC_CMD(op, phy, reg, data) \
+    (((uint32_t)(op) << 26) | ((uint32_t)(phy) << 21) | \
+     ((uint32_t)(reg) << 16) | (uint32_t)(uint16_t)(data))
+
+static uint16_t mdic_read(fx_t *f, unsigned reg) {
+    wr(f, 0x0020, MDIC_CMD(2, 1, reg, 0));               /* OP=read, PHY 1 */
+    uint32_t v = rd(f, 0x0020);
+    assert(v & (1u << 28));                              /* READY */
+    assert(!(v & (1u << 30)));                           /* no ERROR */
+    return (uint16_t)v;
+}
+static void mdic_write(fx_t *f, unsigned reg, uint16_t data) {
+    wr(f, 0x0020, MDIC_CMD(1, 1, reg, data));            /* OP=write, PHY 1 */
+    uint32_t v = rd(f, 0x0020);
+    assert(v & (1u << 28));
+    assert(!(v & (1u << 30)));
+}
+
+static void test_phy_mdic(void) {
+    fx_t f; fx_init(&f);
+    const uint32_t line_bit = 1u << 3;                   /* ISA IRQ11, slave */
+    /* Identity and the autonegotiation-done steady state (QEMU
+     * phy_reg_init + the values its link-up path settles into). */
+    assert(mdic_read(&f, 2) == 0x0141);                  /* PHYID1 */
+    assert(mdic_read(&f, 3) == 0x0C20);                  /* PHYID2, 82540EM */
+    assert(mdic_read(&f, 0) == 0x1140);                  /* BMCR 1000/FD/AUTOEN */
+    assert(mdic_read(&f, 1) == 0x796D);                  /* BMSR link+AN done */
+    assert(mdic_read(&f, 4) == 0x0DE1);                  /* ANAR */
+    assert(mdic_read(&f, 5) == 0x41E0);                  /* ANLPAR + ACK */
+    assert(mdic_read(&f, 9) == 0x0E00);                  /* CTRL1000 */
+    assert(mdic_read(&f, 10) == 0x3C00);                 /* STAT1000 */
+    assert(mdic_read(&f, 16) == 0x0360);                 /* spec ctrl */
+    assert(mdic_read(&f, 17) == 0xAC00);                 /* spec status */
+    assert(mdic_read(&f, 20) == 0x0D60);                 /* ext spec ctrl */
+    /* RW registers round-trip. */
+    mdic_write(&f, 4, 0x05E1);
+    assert(mdic_read(&f, 4) == 0x05E1);
+    mdic_write(&f, 16, 0x0260);
+    assert(mdic_read(&f, 16) == 0x0260);
+    /* OP=0 is not a transaction: READY, no ERROR, data stored verbatim,
+     * no register touched.  OP=3 reads (QEMU tests the read bit first). */
+    wr(&f, 0x0020, MDIC_CMD(0, 1, 4, 0xBEEF));
+    uint32_t v = rd(&f, 0x0020);
+    assert((v & (1u << 28)) && !(v & (1u << 30)) && (v & 0xFFFF) == 0xBEEF);
+    assert(mdic_read(&f, 4) == 0x05E1);
+    wr(&f, 0x0020, MDIC_CMD(3, 1, 4, 0));
+    assert((rd(&f, 0x0020) & 0xFFFF) == 0x05E1);         /* read won */
+    /* A write to a read-only register: ERROR+READY, value unchanged. */
+    wr(&f, 0x0020, MDIC_CMD(1, 1, 1, 0xFFFF));
+    v = rd(&f, 0x0020);
+    assert((v & (1u << 30)) && (v & (1u << 28)));
+    assert(mdic_read(&f, 1) == 0x796D);
+    /* Outside the capability table: ERROR on read and on write. */
+    wr(&f, 0x0020, MDIC_CMD(2, 1, 7, 0));
+    assert(rd(&f, 0x0020) & (1u << 30));
+    wr(&f, 0x0020, MDIC_CMD(1, 1, 31, 0x1234));
+    assert(rd(&f, 0x0020) & (1u << 30));
+    /* The wrong PHY address echoes the PREVIOUS MDIC value with ERROR
+     * (QEMU's set_mdic), not the rejected command. */
+    uint32_t prev = rd(&f, 0x0020);
+    wr(&f, 0x0020, MDIC_CMD(2, 2, 2, 0));
+    assert(rd(&f, 0x0020) == (prev | (1u << 30) | (1u << 28)));
+    /* BMCR stores through set_phy_ctrl's mask: reserved 5:0 + RESET +
+     * ANRESTART never stick, and the file is NOT reset by BMCR.RESET. */
+    mdic_write(&f, 0, 0xFFFF);
+    assert(mdic_read(&f, 0) == 0x7DC0);
+    assert(mdic_read(&f, 4) == 0x05E1);                  /* ANAR untouched */
+    assert(mdic_read(&f, 2) == 0x0141);                  /* identity untouched */
+    /* INT_EN raises the MDAC cause onto the INTx wire. */
+    assert(!(f.m.pic.slave.lines & line_bit));
+    (void)rd(&f, 0x00C0);                                /* drain ICR */
+    wr(&f, 0x00D0, (1u << 9));                           /* IMS.MDAC */
+    wr(&f, 0x0020, MDIC_CMD(2, 1, 2, 0) | (1u << 29));   /* read + INT_EN */
+    assert(rd(&f, 0x0020) & (1u << 28));
+    assert(f.m.pic.slave.lines & line_bit);              /* pin high */
+    assert(rd(&f, 0x00C0) == (1u << 9));                 /* ICR.MDAC, clears */
+    assert(!(f.m.pic.slave.lines & line_bit));           /* pin dropped */
+    /* Device reset restores the PHY template; both MAC paths consistent. */
+    wr(&f, 0x0000, (1u << 26));
+    assert(mdic_read(&f, 0) == 0x1140);
+    assert(mdic_read(&f, 4) == 0x0DE1);
+    assert(eerd_read(&f, 0, 0) == 0x5452);               /* EEPROM intact */
+    assert(rd(&f, 0x5400) == 0x12005452u);               /* RAL intact */
+    fx_done(&f);
+    printf("ok e1000 PHY via MDIC (ID/status, RW, ERROR paths, BMCR mask, MDAC wire, reset)\n");
+}
+
 int main(void) {
     test_pci_reset_contract();
     test_rx_ingress();
@@ -456,6 +614,8 @@ int main(void) {
     test_interrupt_register_semantics();
     test_intx_line();
     test_tx_link_gate();
+    test_eeprom_eerd();
+    test_phy_mdic();
     printf("test-net: all tests passed\n");
     return 0;
 }

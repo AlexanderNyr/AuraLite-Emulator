@@ -7,6 +7,391 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Fixed — patch 0098 (Upkeep U7: GUI/monitor authentication — **UPKEEP_PLAN COMPLETE**)
+
+- **The web launcher, its WebSocket proxy and the direct monitor are
+  authenticated now** (`tools/launcher.py`, `src/monitor.c`,
+  `tools/gui_app.py`, `web/gui.html`, `web/monitor.html`). Pre-U7 all
+  three accepted anyone who could reach the port: a hostile web page
+  could drive the machine through cross-origin requests, a DNS-rebinding
+  name or a tokenless WebSocket, and any local process (or, on an
+  explicit remote bind, any network peer) got full run control.
+  Threat model (malicious page / other local process / LAN peer) and
+  wire basis (RFC 6455 §4.2.2, §10.1–10.2) are recorded in
+  `UPKEEP_PLAN` §U7 and the two server headers. Every request now
+  passes a Host allowlist (DNS rebinding refused, 403), mutations and
+  WebSocket upgrades require a same-origin `Origin` when a browser
+  sends one (403), and a capability token gates the API, the upgrade
+  and the monitor itself (401; carriers `X-X86emu-Token`,
+  `Authorization: Bearer`, `?token=`, SameSite=Strict HttpOnly cookie).
+- **The default flow stays one-click.** On loopback the launcher's
+  per-process token is embedded in the served page (no-store) and its
+  cookie; each machine run privately gets its own monitor token
+  through the child's environment — never argv, so it appears in
+  neither process lists nor the run's `argv.json` — and the proxy and
+  the desktop GUI present it automatically. Beyond loopback the
+  credential is the state-dir `access-token` file (0600), shown and
+  rotated from the desktop GUI (expert «Сеть»), entered once at a
+  login form; startup prints the plaintext warning because the token
+  is the only credential on bare HTTP. A direct `--monitor=` takes
+  `--monitor-token=` or `$X86EMU_MONITOR_TOKEN`; a non-loopback
+  monitor bind without a token is refused at startup. Also fixes a
+  latent `tools/gui_app.py` NameError (missing `import subprocess`).
+- New vectors: `tests/test_monitor.py --lane auth` (16 checks; all 55
+  pre-U7 tokenless-loopback checks untouched and green),
+  `tests/test_gui_launcher.py` lane E (loopback gate + remote
+  bind/login/rotation; happy paths scrape the page token like a
+  browser), `tests/test_gui_app.py` lane C (tokenless monitor client
+  refused; token absent from `argv.json`). NC = the new suites on the
+  0097 archive tree: monitor 10/16 FAIL (positive carriers pass —
+  the old monitor upgrades everyone), launcher 22 U7 FAILs, gui_app
+  exactly the refusal check. Gates: `make test`,
+  `make test-sanitize` (both live SeaBIOS ISO lanes), `make test-gui`,
+  `test-monitor`, `test-monitor-codec` green. No guest-visible state
+  changed; the gdbstub's unauthenticated-by-protocol loopback stance
+  is recorded, not altered.
+
+### Fixed — patch 0097 (Upkeep U6: responder TCP sequencing)
+
+- **The TAP responder's TCP receiver validates sequence numbers**
+  (`tools/tap_responder.py`). The old receive path did
+  `rcv_nxt += seglen; buf += data` on whatever arrived, so a
+  duplicate acknowledged bytes never sent, an out-of-order
+  segment was glued into the DNS stream out of order, and a FIN
+  after a gap swallowed the gap's sequence space. Measured from
+  RFC 9293 §3.10.7.4 and RFC 2018 §3–4 against the frozen guest
+  (`tcp_m6d.h` decodes up to four SACK blocks to mark its
+  retransmission queue; its dup-ACK counter ignores ACKs that
+  carry data or move the window): segments are now trimmed to
+  RCV.NXT + the constant advertised window in modulo-2^32 space,
+  out-of-order data is held in a bounded queue (32 runs,
+  overflow discarded whole and never SACKed) and delivered only
+  contiguously, up to four merged SACK blocks ride duplicate
+  ACKs (first block the one holding the triggering segment)
+  once the peer's SACK-permitted — finally retained from the
+  SYN — allows them, and a FIN counts as sequence space and is
+  consumed only in order. A duplicate FIN in LAST_ACK re-sends
+  our FIN|ACK instead of freeing the tuple (the retransmission
+  timer's job, keyed to the peer's retransmit — the responder
+  stays clock-free), and a bounded FIFO tombstone table (16,
+  count-evicted) keeps answering a late duplicate FIN after
+  the passive close. CLOSING/our TIME_WAIT remain unreachable
+  (no active close exists) and were not fabricated.
+- Byte-identical in-order wire: the unmodified suite stays
+  green on the new code, an old-vs-new A/B harness matches
+  16/16 pinned handshake/DNS/close frames exactly, and the one
+  deliberate delta (junk data after the peer's FIN no longer
+  advances RCV.NXT) is recorded in the U6 receipts.
+- New vectors: 71 checks in `test_tcp_sequencing`
+  (`tests/test_tap_responder.py`) — OOO/gap-fill, overlap
+  trim, two-gap block order, 4-block cap, unnegotiated peer,
+  2^32 wrap, OOO FIN, duplicate FIN + tombstone, window trim,
+  queue bound, replay determinism. NC = the same file on the
+  0096 archive tree: exactly 35 failures, all in the new group.
+
+### Added — patch 0096 (Upkeep U5: CF9 CPU INIT)
+
+- **Port 0xCF9 knows two kinds of reset now** (`src/chipset.c`):
+  writing 0x04 (RST_CPU rising with the SYS_RST type bit clear)
+  asserts a platform INIT# — every vCPU takes the INIT processor
+  state at the next instruction boundary (BSP back at the reset
+  vector, APs parked in wait-for-SIPI, including an AP that did
+  the write) while devices, RAM, RTC and the chipset's own
+  ports ride through untouched and `resets` does not move. The
+  INIT state itself is SDM Table 9-1's INIT column (new
+  `cpu_init_reset`, now shared with the LAPIC INIT-IPI path):
+  x87/XMM register bits, MXCSR and the software-configured
+  MSRs survive; EFER/FS_BASE/GS_BASE return to 0; the LAPIC
+  file resets except its ID. The boundary request became a
+  kind (full/INIT) with source coalescing in the existing
+  field — no snapshot layout movement. The register's bit
+  names were also corrected to the PCH datasheet (SYS_RST =
+  type 0x02, RST_CPU = trigger 0x04); every pre-existing
+  hard-reset outcome (0x06, 0x0E, 0x02->0x06) is unchanged.
+- New vectors: four `tests/test_chipset.c` groups (guest-OUT
+  ritual with device sentinels and a boundary tombstone, INIT
+  CPU-state preservation, edge/repeat/coalesce, SMP with BSP
+  and AP writers) and the CF9 predicates rewritten to the
+  datasheet. NC = the new tests on the 0095 archive tree
+  (abort at the first CPU_INIT assertion).
+
+### Added — patch 0095 (Upkeep U4: LAPIC IA32_APIC_BASE)
+
+- **The local APIC window now follows MSR 0x1B** (`src/lapic.c`,
+  `src/cpu.c`): guest WRMSR relocation moves the 4 KiB window
+  (per-vCPU addresses work — the single region mirrors the
+  current context's decode, re-synced on WRMSR, reset,
+  `vcpu_load` and snapshot load), and the global enable bit
+  unmaps the window, drops IOAPIC/MSI/IPI messages at the
+  latch, freezes the timer count, stops delivery and clears
+  CPUID.1:EDX[9] (SDM §§10.4.3–10.4.5; register state persists
+  across the disable except the SVR software-enable, per the
+  measured QEMU model). Reserved-bit, x2APIC (bit 10) and
+  beyond-MAXPHYADDR writes are rejected with all state
+  untouched — logged, no #GP, as the rest of the permissive
+  MSR lane behaves. The BSP bit is a strap again: `cpu_reset`
+  seeds it by slot identity (APs no longer power up claiming
+  to be the bootstrap processor), writes preserve it, and
+  INIT does not reset the MSR. Snapshot save/load carries a
+  relocated or disabled LAPIC equivalently (window rebound
+  from the restored MSR before the MMIO-map check; no format
+  change).
+- New vectors: four `tests/test_lapic.c` groups driving real
+  guest WRMSR code (relocation/return, 7 rejected shapes,
+  disable/freeze/re-enable with delivery of a pre-disable
+  latch, SMP identity + context-following window) and the two
+  snapshot cases in `tests/test_snapshot.c`. NC = the new
+  tests on the 0094 archive tree (abort at the first U4
+  assert; exactly the 9 U4 snapshot FAILs).
+
+### Added — patch 0094 (Upkeep U3: gdbstub x87)
+
+- **gdb sees and writes the real x87 state** (`src/gdbstub.c`,
+  bridge helpers in `src/cpu.c`): registers 24–39 used to
+  read as zeros with a hard-wired all-empty tag word and
+  silently swallow writes. Now `$st0..$st7` carry the
+  TOP-rotated 80-bit register file, `$fctrl/$fstat/$ftag`
+  are the live FCW/FSW/full-FTW, and `$fiseg/$fioff/$foseg/
+  $fooff/$fop` publish the recorded last-instruction fields
+  — the convention as GDB's own `i387-tdep.c` interprets it,
+  cross-checked against QEMU's i386 stub. Writes via `P`/`G`
+  land in the logical register with its tag re-classified
+  (an FSW write moves TOP), so `set $st0 = -2.5` followed by
+  an `FSTP` stores exactly those bytes. The `g` packet keeps
+  its 592-byte size and every non-x87 byte is unchanged;
+  hosts without an 80-bit `long double` report the ST
+  registers as unavailable (`x`) instead of fabricating.
+- New vectors: 27 pure-RSP checks (lane D of
+  `tests/test_gdbstub.py`, 57 total) plus real-client lane F
+  in `test-gdb` driving GNU gdb's `info float` / `set $stN` /
+  memory readback (SKIP without gdb). NC = the new tests on
+  the pre-U3 tree: 16 lane-D checks fail, lanes A–C green.
+
+### Added — patch 0093 (Upkeep U2: e1000 EEPROM + PHY)
+
+- **The 82540EM has its EEPROM** (`src/e1000.c`): EERD reads a
+  64-word image (QEMU template; MAC in words 0–2; `0x100E`/
+  `0x8086` identity words; word `0x3F` closes the sum to
+  `0xBABA`) and completes synchronously on the read, like
+  QEMU's `flash_eerd_read`. The guest's EEPROM probe — three
+  100,000-poll timeouts before this patch — now returns the
+  same `52:54:00:12:34:56` on the first poll, so its boot
+  receipt will name the EEPROM as the MAC source instead of
+  RAL/RAH (same address, preferred source).
+- **The PHY answers on MDIC**: a 32-register M88E1000 file at
+  PHY address 1 with QEMU's capability table and
+  `phy_reg_init` values at the autonegotiation-done steady
+  state (PHY ID `0141:0C20`, link up, AN complete), READY/
+  ERROR semantics including the wrong-PHY previous-value
+  echo, `set_phy_ctrl`'s BMCR mask, and the MDAC interrupt
+  cause on the existing INTx wire. MDIC also moved to
+  Intel's real offset `0x20` (was an unobservable `0x200`
+  typo in the N0 define). The EECD bit-bang interface
+  remains a plain register — no measured consumer uses it.
+- 2 new groups in `tests/test_net.c`; NC = e1000.c at
+  patch 0092 (behavioural abort on the EERD DONE assert).
+  Snapshot layout unchanged (new state is device-local;
+  `--tap` runs already refuse snapshots).
+
+### Added — patch 0092 (Upkeep U1: settable RTC clock)
+
+- **The MC146818 clock can be set** (`src/rtc.c`): Register B's
+  SET bit inhibits the update cycle, date writes stage in the
+  CMOS bytes (seeded from the live clock on the SET edge, UIE
+  cleared per the datasheet), and clearing SET validates and
+  commits the staged date — including dates before the 2026
+  power-on anchor. Register B's data mode (BCD/binary) and
+  12/24-hour mode now govern both reads and writes; invalid
+  staged fields are logged and ignored. Power-on values, UIP
+  phases and the periodic/update IRQ8 behaviour are unchanged.
+- Snapshot note: `machine_t` grew by the 8-byte clock base, so
+  snapshots written before this patch are refused with the
+  existing build-layout error instead of being misread.
+- 4 new groups in `tests/test_rtc.c`; NC = rtc.c/rtc.h at
+  patch 0091 (behavioural abort on staged readback).
+
+### Added — patch 0091 (Upkeep U0: measured baseline + plan)
+
+- `docs/plans/UPKEEP_PLAN.md` opens ROADMAP candidate #4 with a
+  current-code and consumer audit of all seven documented gaps.
+  Measured scope corrections matter: an x2APIC decoder is not
+  implied by LAPIC MSR writes (CPUID does not advertise it);
+  the missing CF9 operation is `0x02` itself, while
+  `0x02 -> 0x06` already full-resets; and the TCP responder's
+  normal passive close correctly leaves TIME_WAIT to the guest,
+  so its real defects are unsequenced receive/SACK and duplicate
+  close segments. The plan splits the work into U1 RTC writes,
+  U2 e1000 EEPROM/PHY, U3 gdbstub x87, U4 LAPIC MSR, U5 CF9 INIT,
+  U6 responder TCP and U7 GUI/monitor capability authentication.
+  Docs only; no behaviour change.
+
+### Added — patch 0090 (PM P3: zero-duration S1 + close-out) — PM plan complete
+
+- **S1** (`src/pm.c`, `src/acpi.c`): SLP_TYP=1 is a zero-duration
+  suspend — WAK_STS latches on the sleep write and the run
+  continues (spec-legal immediate wake; measured decision:
+  no consumer needs real device parking). The DSDT publishes
+  `\_S1 = Package(1,0)` beside `\_S5`, both pinned to the
+  decoder by the vector.
+- **PM plan COMPLETE (P0–P3, patches 0087–0090)**: measured
+  baseline → PM1 registers + level SCI + S5 power-off → FADT/
+  DSDT discovery on the kernel lane + GPE0 → S1. Stated limits:
+  GPE0 has no sources yet; S3/S4 do not exist; S1 never parks the
+  machine; SMI/SMM absent by design (SMI_CMD=0).
+
+### Added — patch 0089 (PM P2: FADT, DSDT, GPE0)
+
+- **FADT + DSDT on the kernel lane** (`src/acpi.c`): a revision-4
+  FACP (field offsets from the ACPICA definition) advertising the
+  PM block exactly as implemented — SCI on IRQ9, PM1a
+  EVT/CNT/TMR and GPE0 at 0xB000 with agreeing 64-bit GAS mirrors,
+  `SMI_CMD=0` (there is no SMM here), 24-bit timer, RESET_REG at
+  0xCF9 with value 0x0E — plus a DSDT containing exactly
+  `\_S5 = Package(7,0)`, the sleep type patch 0088 decodes. The
+  two are pinned to each other by `tests/test_acpi.c`. RSDT/XSDT
+  now list FACP before APIC.
+- **GPE0 registers** (`src/pm.c`): STS (W1C) + EN at
+  PMBASE+0x20/0x24, feeding the same level SCI as PM1; no GPE
+  sources exist yet (the wire is proved, sources arrive with
+  their consumers).
+- NCs: pm.c + acpi.c reverted to patch 0088 — both suites abort
+  behaviourally. Gates: `make test` + sanitize green; both
+  SeaBIOS ISO lanes green with the stock BIOS present.
+
+### Added — patch 0088 (PM P1: PM1 registers, SCI, S5)
+
+- **PM1 block implemented** (`src/pm.c`): PM1_STS is a W1C latch over
+  the RW1C mask, PM1_EN stores, PM1_CNT stores SCI_EN/BM_RLD and
+  decodes SLP_TYP/SLP_EN; the real 24-bit Timer wrap latches
+  TMR_STS, now also advanced from `devices_tick`. Reads/writes reuse
+  the byte-stream assembler, so byte and word accesses compose like
+  the Timer's.
+- **SCI**: level on IRQ9 (gated by SCI_EN and the enabled-event
+  expression), through the `pic_set_irq` fleet convention.
+- **S5**: SLP_TYP=7 + SLP_EN logs `[pm] S5 power-off` and stops the
+  run deterministically (`stop_requested`) instead of the old silent
+  hang; non-S5 types log until P3. The decode type pins the
+  encoding P2's DSDT must publish.
+- 3 new groups in `tests/test_pm.c` (register storage, overflow
+  latch + SCI gating, S5 stop); NC = pm.c/pm.h reverted to P0 —
+  behavioural abort at the first EN-store assert. Timer behaviour
+  byte-identical: the pre-P1 "only TMR has state" canary passes
+  unmodified.
+
+### Added — patch 0087 (PM P0: measured baseline + plan)
+
+- `docs/plans/PM_PLAN.md` opens audit candidate #3 with the measured
+  baseline: the kernel lane fabricates no FADT/DSDT at all, and the
+  G5 PM block models only the PM Timer — PM1_STS/PM1_EN are dead,
+  PM1_CNT sleep writes are swallowed, so an ACPI power-off from any
+  guest on the SeaBIOS FADT hangs the machine instead of stopping
+  it; nobody drives SCI. The plan records the ledger (D1 sleep
+  decode/S5, D2 PM1 event semantics, D3 GPE0, D4 kernel-lane tables,
+  D5 an S-state machine) and the decisions: S5 rides the existing
+  deterministic stop path, SCI becomes a level on IRQ 9 like the
+  rest of the fleet, TMR_STS latches on the real 24-bit overflow,
+  SMI stays honestly absent (SMI_CMD=0), and the S1 parking-vs-
+  zero-duration fork is measured at P2 before P3 takes it. Docs
+  only; no behaviour change.
+
+### Added — patch 0086 (MSI M4: close-out) — MSI plan complete
+
+- **Snapshot-proved, not assumed**: MSI/MSI-X state rides the tags
+  that already exist (whole controller structs + per-function PCI
+  config records), and the M4 vector proves the composition end to
+  end -- programme a vector and enable the capability, save,
+  vandalise the live state (disable, scribble the entry, HCRST),
+  load, and watch the very next completion arrive as the restored
+  message with the pin still silent. The message-script determinism
+  vector replays an identical delivery stream twice.
+- **MSI plan COMPLETE (M0–M4, patches 0082–0086)**: QEMU-parity
+  MSI-X on the xHCI, an x86 message-delivery core on the proven
+  LAPIC sink, ICH-parity MSI on both AHCIs, edge routing with a
+  byte-identical INTx fallback, and snapshot/determinism receipts.
+  Stated limits: one vector in use (one interrupter), no pending-bit
+  accumulation, Lowest Priority degenerates to Fixed,
+  SMI/NMI/INIT/ExtINT messages refused, e1000 INTx-only by design.
+
+### Added — patch 0085 (MSI M3: per-device routing, AHCI MSI)
+
+- **Interrupts now choose their transport**: each controller already
+  had exactly one function computing its interrupt level; both became
+  routers. With MSI-X enabled, the xHCI silences its INTx pin (PCI
+  forbids asserting it then) and sends one message from vector-table
+  entry 0 on the level's rising edge -- re-armed when the guest's ack
+  drops the level, never duplicated while it holds. The AHCI gained
+  an MSI capability in the shape measured from ICH silicon
+  (cfg 0x80, one message, 32-bit address, no per-vector masking,
+  seeded on both controllers) and routes by the same rule. Turning
+  the capability off restores the pin byte-for-byte; every existing
+  lane, none of which enables MSI, is untouched.
+- **Masking releases, it doesn't lose**: with a per-vector mask or
+  the xHCI Function Mask up, the level pends silently; the unmask
+  write itself delivers the message. No pending-bit accumulation
+  anywhere, per the plan's level-source rule.
+- **Vectors**: `v_msix_route` (test-xhci) walks enable -> message ->
+  held-level exactly-once -> ack/re-arm -> mask/unmask -> disable/
+  pin-return through the real LAPIC; `test_msi_line` (test_ahci)
+  drives real command completions both ways. NCs: 5 failures with
+  the xHCI engine at M2, pin assertion with the AHCI route stubbed.
+
+### Added — patch 0084 (MSI M2: LAPIC message delivery)
+
+- **`msi_deliver(machine, addr, data)`** (`src/lapic.c`): one PCI
+  MSI/MSI-X message decoded per the x86 format -- destination and
+  destination mode from the address, vector and delivery mode from
+  the data -- and landed on the same IRR sink the IOAPIC already
+  proves, so arbitration (PPR, intack, EOI) behaves identically for
+  both interrupt transports. Physical Fixed delivers as addressed
+  (with the IOAPIC's BSP fallback for unroutable ids); Lowest
+  Priority degenerates to Fixed because no arbitration fabric exists
+  to consult; flat logical destinations match against LDR[31:24];
+  vectors below 16 take the ESR receive-illegal-vector bit; a
+  non-APIC address is not a message at all.
+- **Refused modes fabricate nothing**: SMI, NMI, INIT, ExtINT and
+  the reserved delivery encodings log one line and drop -- no
+  half-true injections of kinds this core cannot honour. Level and
+  trigger bits are advisory: an MSI is an edge by construction and
+  the source keeps its own pending state.
+- **New lane `test-msi`** (4 groups) wired into `make test` and
+  `make test-sanitize`, observing landings through the real
+  deliverable -> intack -> EOI path. NC: delivery stubbed ->
+  9 failures.
+
+### Added — patch 0083 (MSI M1: MSI-X capability on the xHCI)
+
+- **The xHCI wears QEMU's MSI-X shape**: Status.Capabilities set,
+  Capabilities Pointer 0x90, capability ID 0x11 with Table Size 16,
+  vector table at BAR0+0x3000 and PBA at BAR0+0x3800 (BIR 0) -- the
+  `lspci` layout of `qemu-xhci`, our 1b36:000d's reference form. The
+  default PCI config path is fully writable, so the controller's cfg
+  hook re-asserts every read-only field after each write; a vector
+  blasts 0xFFFFFFFF across the capability and only Message Control's
+  Enable and Function Mask bits move (they fold into controller
+  state, ready for the M3 router).
+- **Vector table is real MMIO storage**: 16 entries (address hi/lo,
+  data, control), all masked at power-on per spec; PBA reads back 0
+  and ignores writes (v1 keeps no pending accumulation -- the level
+  source re-evaluates on unmask, per the plan). MSI-X state is
+  PCI-function state and therefore survives HCRST, asserted by
+  vector. Delivery still runs over INTx; messages route in M2/M3.
+- **Vectors**: `v_msix_cap` in `test-xhci` (23 groups). NC: the
+  capability reverted -> 13 failures.
+
+### Added — patch 0082 (MSI M0: measured baseline + plan)
+
+- `docs/plans/MSI_PLAN.md` opens audit candidate #2 with the measured
+  baseline: the north-star guest consumes no MSI (its PCI layer stops
+  at the INTx line; routing is IOAPIC-from-MADT), the QEMU parity
+  shape for our xHCI is MSI-X only (capability at cfg 0x90, 16
+  entries, table at BAR0+0x3000, PBA at +0x3800), and this machine
+  currently exposes zero PCI capabilities with no message decode --
+  while the LAPIC delivery sink the IOAPIC already proves
+  (`lapic_set_irr_dest`) waits ready. Decisions pinned: QEMU shape,
+  one synchronous router call site, INTx fallback byte-identical
+  until a guest enables the capability. Docs only; no behaviour
+  change.
+
 ### Added — patch 0081 (XHCI X5: INTx + ports) — XHCI plan complete
 
 - **The interrupt pin is live**: IRQ 10 (INTA#) is asserted while

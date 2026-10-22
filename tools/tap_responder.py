@@ -51,6 +51,21 @@ tape can pin it.  No guest assertion depends on the value.
 Determinism: every byte of every reply is a pure function of the request -- no
 clock, no lease bookkeeping, no counters leaking into packets -- so two runs of
 the same guest produce identical wires.
+
+UPKEEP U6 closed the receive-path hole this file grew with the TCP carriage:
+segments used to be glued onto the stream in *arrival* order (`rcv_nxt +=
+seglen` on whatever showed up), so a duplicate or out-of-order segment -- the
+wire's normal produce on any loss -- silently reinterpreted the DNS stream
+and made every later ACK number arithmetic on fiction.  The receiver now
+validates against RCV.NXT and the advertised window, trims overlaps, queues
+out-of-order data (bounded), answers with duplicate ACKs carrying RFC 2018
+SACK blocks when SACK was negotiated, sequences FINs in order only, re-sends
+its FIN|ACK to a duplicate FIN in LAST_ACK instead of forgetting the tuple,
+and keeps bounded tombstones for a late duplicate FIN after the close.  The
+guest's M6d machinery is the consumer: it decodes up to four SACK blocks
+(`tcp_m6d.h`, `TCPM6D_MAX_BLOCKS`) to mark its retransmission queue and pick
+the hole for fast retransmit, so what is emitted here is exactly the shape
+that decoder reads.
 """
 
 import argparse
@@ -103,6 +118,17 @@ TCP_MSS = 1460              # NETL3_V4_MSS (netl3.h:35)
 TCP_OPT_END = 0
 TCP_OPT_MSS = 2
 TCP_OPT_SACK_PERM = 4
+TCP_OPT_SACK = 5
+# UPKEEP U6 queue bounds.  Both are deterministic *counts*, never ages: this
+# file's replies stay a pure function of the frames seen (no clock anywhere
+# in the TCP model above).
+#   * OOO runs held per connection.  Bytes are bounded by TCP_WINDOW itself
+#     (nothing at or beyond RCV.NXT+RCV.WND is accepted), and 32 runs is
+#     more than alternating MSS-sized holes can carve out of 64 KiB.
+#   * Tombstones kept after a passive close completes, so a late duplicate
+#     FIN can still be re-acknowledged.  FIFO eviction by count only.
+TCP_OOO_MAX_SEGS = 32
+TCP_TOMBSTONE_MAX = 16
 # The guest opens TCP_MAX_CONNS (16) concurrent connections to 10.0.2.3:53 in
 # tcp_x5_self_test and expects every one of them to reach ESTABLISHED, so the
 # table has to be comfortably wider than that.  It is bounded because an
@@ -327,6 +353,69 @@ def tcp_parse_options(opts: bytes):
     return mss, sack
 
 
+def seq_diff(a: int, b: int) -> int:
+    """Signed (a - b) in modulo-2^32 sequence space, in [-2^31, 2^31).
+
+    TCP sequence numbers wrap, so plain subtraction misjudges order at the
+    seam: 24 follows 0xFFFFFFF9, it does not precede it by four billion.
+    This is the serial-number arithmetic RFC 9293's comparisons assume, and
+    the same trick the guest's SACK decoder already trusts
+    (`(int32_t)(e - s) <= 0` rejects a nonsense block, tcp_m6d.h)."""
+    d = (a - b) & 0xFFFFFFFF
+    return d - 0x100000000 if d >= 0x80000000 else d
+
+
+def tcp_sack_options(rcv_nxt: int, ooo, trigger_seq=None) -> bytes:
+    """RFC 2018 SACK option bytes describing the out-of-order queue `ooo`
+    (entries [seq, data, fin], all inside (RCV.NXT, RCV.NXT+RCV.WND)), or
+    b"" when nothing uncontiguous is held.
+
+    Only data bytes are described -- a queued FIN occupies sequence space
+    but SACK blocks are about bytes the sender need not retransmit, and
+    advertising the FIN would tell the sender a byte exists there.  Runs
+    are merged when adjacent (a filled hole between two queued runs makes
+    one block), then ordered per RFC 2018 s4: the first block MUST be the
+    one containing the segment that triggered this ACK (the most recent
+    change to the receive queue), the rest follow in sequence order.  At
+    most four blocks: 8n+2 bytes plus two pad bytes is what the 40-byte
+    option space holds with no timestamp option in play, and four is
+    exactly the guest decoder's TCPM6D_MAX_BLOCKS.  Everything is computed
+    in offsets from RCV.NXT, so a block straddling the 2^32 seam comes out
+    with a right edge numerically below its left edge -- precisely the
+    shape the guest's `(int32_t)(e - s) > 0` sanity check accepts."""
+    spans = []
+    for seq, data, _fin in ooo:
+        if not data:
+            continue                      # a queued FIN alone SACKs nothing
+        lo = seq_diff(seq, rcv_nxt)
+        if lo > 0:
+            spans.append((lo, lo + len(data)))
+    if not spans:
+        return b""
+    spans.sort()
+    blocks = []
+    for lo, hi in spans:
+        if blocks and lo <= blocks[-1][1]:        # adjacent or overlapping
+            if hi > blocks[-1][1]:
+                blocks[-1] = (blocks[-1][0], hi)
+        else:
+            blocks.append((lo, hi))
+    if trigger_seq is not None:
+        t = seq_diff(trigger_seq, rcv_nxt)
+        for i, (lo, hi) in enumerate(blocks):
+            if lo <= t < hi:
+                blocks.insert(0, blocks.pop(i))
+                break
+    blocks = blocks[:4]
+    opts = bytearray((TCP_OPT_SACK, 2 + 8 * len(blocks)))
+    for lo, hi in blocks:
+        opts += struct.pack("!II", (rcv_nxt + lo) & 0xFFFFFFFF,
+                            (rcv_nxt + hi) & 0xFFFFFFFF)
+    while len(opts) % 4:
+        opts.append(TCP_OPT_END)
+    return bytes(opts)
+
+
 def parse_tcp(body: bytes):
     """-> dict or None.  The header length comes from `data_offset`, never from
     a constant: the guest's SYN is 28 bytes (options) while its data segments
@@ -534,10 +623,18 @@ class Responder:
                       "ignored": 0}
         # TCP is the one protocol here that cannot be answered statelessly --
         # a 4-tuple needs its own sequence numbers.  Keyed by the tuple, holds
-        # {snd_nxt, rcv_nxt, state, buf}; bounded at TCP_MAX_CONNS, freed when
-        # the connection finishes, and derived only from the segments seen, so
-        # two runs of the same guest still produce the same wire.
+        # {snd_nxt, rcv_nxt, state, buf, isn, mac, sack_perm, ooo, fin_seq};
+        # bounded at TCP_MAX_CONNS, freed when the connection finishes, and
+        # derived only from the segments seen, so two runs of the same guest
+        # still produce the same wire.
         self.tcp = {}
+        # Bounded retained state after a passive close completes (UPKEEP U6):
+        # the final ACK we owe a late duplicate FIN, keyed by the same tuple.
+        # The guest is the active closer and therefore the side in TIME_WAIT;
+        # this is not a passive-side TIME_WAIT (2MSL is a wall clock and this
+        # file has none) -- it keeps exactly {rcv_nxt, snd_nxt, mac} so the
+        # final ACK stays answerable, evicted FIFO past TCP_TOMBSTONE_MAX.
+        self.tcp_closed = {}
 
     def log(self, msg: str) -> None:
         if not self.quiet:
@@ -700,10 +797,15 @@ class Responder:
 
     # ---- TCP ------------------------------------------------------------
 
-    def tcp_segment(self, c, tuple_key, flags, data=b"", ident=0):
+    def tcp_segment(self, c, tuple_key, flags, data=b"", ident=0, opts=b"",
+                    seq=None):
         """One segment for an existing 4-tuple, 20-byte header (options ride
         SYNs only -- the guest's own `tcp_send_segment_at` says so: "Options
-        ride the SYN only; data segments stay 20 bytes").
+        ride the SYN only; data segments stay 20 bytes").  The one exception
+        is ours, since UPKEEP U6: ACKs may carry RFC 2018 SACK blocks in
+        `opts`, which is what the guest negotiates SACK-permitted *for*.
+        `seq` overrides SND.NXT for the one retransmission this timerless
+        responder ever makes -- its FIN in LAST_ACK.
 
         The TCP checksum is ALWAYS computed.  Unlike UDP over IPv4, where a
         zero checksum legally means "not computed" (and is what the guest
@@ -711,10 +813,218 @@ class Responder:
         with checksum 0 is not a valid segment, so `--udp-checksum` has no
         business reaching this path."""
         cip, cport, sip, sport = tuple_key
-        seg = build_tcp(sport, cport, c["snd_nxt"], c["rcv_nxt"], flags,
-                        sip, cip, data=data, compute_csum=True)
+        seg = build_tcp(sport, cport, c["snd_nxt"] if seq is None else seq,
+                        c["rcv_nxt"], flags, sip, cip, opts=opts, data=data,
+                        compute_csum=True)
         ip = build_ipv4(IP_PROTO_TCP, sip, cip, seg, ident=ident)
         return build_eth(c["mac"], self.gw_mac, ETHERTYPE_IPV4, ip)
+
+    def tcp_sack_opts(self, c, trigger_seq=None):
+        """The SACK option bytes for an ACK on connection `c`, or b"" --
+        either because nothing uncontiguous is held, or because the peer
+        never sent SACK-permitted in its SYN, in which case RFC 2018 s4 says
+        the receiver MUST NOT send SACK options at all.  (Our own SYN-ACK
+        always offers SACK-permitted, but that licenses the *guest* to SACK
+        our data, not us to SACK theirs.)"""
+        if not c.get("sack_perm"):
+            return b""
+        return tcp_sack_options(c["rcv_nxt"], c["ooo"], trigger_seq)
+
+    def tcp_ack_frame(self, c, key, ident, trigger_seq=None):
+        """A bare acknowledgment <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>, with
+        SACK blocks for whatever out-of-order data is held.  Data-less and
+        at the constant advertised window, so the guest counts it as a true
+        duplicate ACK under RFC 5681 s2: its `tcpm6_on_ack` is handed
+        `data_len > 0` and `window != snd_wnd` as exclusions, and either
+        would silently un-count a dup ACK that fast retransmit waits for."""
+        return self.tcp_segment(c, key, TCP_ACK,
+                                opts=self.tcp_sack_opts(c, trigger_seq),
+                                ident=ident)
+
+    def tcp_forget(self, key, tombstone=False):
+        """Drop a 4-tuple.  With `tombstone`, keep the final sequence
+        positions (UPKEEP U6) bounded FIFO at TCP_TOMBSTONE_MAX entries, so
+        a late duplicate of the peer's FIN can be re-acknowledged instead
+        of meeting the silence an unknown tuple gets."""
+        c = self.tcp.pop(key, None)
+        if tombstone and c is not None:
+            self.tcp_closed[key] = {"rcv_nxt": c["rcv_nxt"],
+                                    "snd_nxt": c["snd_nxt"], "mac": c["mac"]}
+            while len(self.tcp_closed) > TCP_TOMBSTONE_MAX:
+                self.tcp_closed.pop(next(iter(self.tcp_closed)))
+
+    def tcp_receive(self, c, t):
+        """Sequence one segment against RCV.NXT (UPKEEP U6).
+
+        -> (delivered, fin_now, want_ack, trigger_seq):
+            delivered    contiguous bytes were appended to c["buf"]
+            fin_now      the peer's FIN became the next sequence position
+                         and was consumed; the caller owes our FIN|ACK
+            want_ack     an immediate acknowledgment is owed -- the
+                         pre-U6 cadence ACKed everything data-bearing, and
+                         that cadence is kept so the in-order wire is
+                         unchanged byte for byte
+            trigger_seq  where the triggering segment began (after
+                         trimming), for the RFC 2018 first-block rule;
+                         None when this segment advanced the ACK number
+
+        The pre-U6 code was `rcv_nxt += seglen; buf += data`
+        unconditionally: a duplicate advanced the cumulative ACK over
+        bytes never sent, an out-of-order segment was glued straight onto
+        the stream, and a FIN after a gap consumed the gap's sequence
+        space along with its own.  The rule here is RFC 9293 s3.10.7.4's
+        own: "One could tailor actual segments to fit this assumption by
+        trimming off any portions that lie outside the window (including
+        SYN and FIN) and only processing further if the segment then
+        begins at RCV.NXT.  Segments with higher beginning sequence
+        numbers SHOULD be held for later processing."  What is discarded
+        (old, or beyond the window's right edge) is acknowledged with the
+        current RCV.NXT and never SACKed -- SACK advertises what is held,
+        and inventing holdings would retire the guest's retransmission
+        queue over bytes we threw away.
+        """
+        data = t["data"]
+        seq = t["seq"]
+        fin = bool(t["flags"] & TCP_FIN)
+        dlen = len(data)
+        if not dlen and not fin:
+            return False, False, False, None    # a pure ACK: see the rule
+                                                # in handle_tcp's docstring
+        rcv = c["rcv_nxt"]
+        off = seq_diff(seq, rcv)                # first byte's position
+        fin_off = off + dlen                    # the FIN byte's position
+        if fin_off < 0 or (fin_off == 0 and not fin):
+            return False, False, True, None     # an old duplicate, whole
+        if off >= TCP_WINDOW:
+            return False, False, True, None     # entirely beyond RCV.WND
+        # The FIN survives trimming only if its own position lies inside
+        # the window -- the acceptability tests examine SEQ+SEG.LEN-1 with
+        # the FIN counted in SEG.LEN.  A FIN trimmed off here is not lost:
+        # the sender's retransmission brings it back once RCV.NXT moves.
+        fin = fin and fin_off < TCP_WINDOW
+        if off < 0:                             # straddles RCV.NXT: only
+            data = data[-off:]                  # the new part is processed
+            seq = rcv
+            dlen = len(data)
+            off = 0
+        if off + dlen > TCP_WINDOW:             # straddles the right edge
+            data = data[:TCP_WINDOW - off]
+            dlen = len(data)
+
+        if off > 0:                             # beyond a gap: hold it
+            self.tcp_ooo_insert(c, seq, data, fin)
+            return False, False, True, seq
+
+        delivered = False
+        if dlen:
+            c["buf"] += data
+            c["rcv_nxt"] = (rcv + dlen) & 0xFFFFFFFF
+            delivered = True
+        if fin:
+            c["rcv_nxt"] = (c["rcv_nxt"] + 1) & 0xFFFFFFFF
+            c["ooo"] = []         # nothing may follow a FIN: purge the queue
+            return delivered, True, True, None
+        fin_now, more = self.tcp_drain_ooo(c)
+        return delivered or more, fin_now, True, None
+
+    def tcp_ooo_insert(self, c, seq, data, fin):
+        """Queue one in-window segment that starts past RCV.NXT.
+
+        Portions already queued are carved out of the newcomer, never the
+        other way around, so a retransmission with different boundaries
+        cannot double-count bytes (and the bytes kept are the first copy
+        seen, which every later segment is measured against).  The FIN, if
+        it survived window trimming, rides the piece that ends at its
+        position; if the data was wholly queued already but the FIN is new
+        -- a retransmitted tail whose FIN stood outside the window the
+        first time -- a zero-length marker holds its place.
+
+        The queue is bounded at TCP_OOO_MAX_SEGS runs; a segment that
+        would break the bound is discarded whole rather than partially
+        (a partial accept would need SACK to describe shards, and the
+        sender's retransmission finds room once the left gap fills).
+        All interval work is in offsets from RCV.NXT, where every run lies
+        in (0, TCP_WINDOW), so plain integer comparisons stay correct
+        across the 2^32 seam."""
+        rcv = c["rcv_nxt"]
+        pieces = [(seq_diff(seq, rcv), data)]
+        for eseq, edata, _efin in c["ooo"]:
+            if not edata:
+                continue
+            elo = seq_diff(eseq, rcv)
+            ehi = elo + len(edata)
+            carved = []
+            for plo, pdata in pieces:
+                phi = plo + len(pdata)
+                if ehi <= plo or elo >= phi:
+                    carved.append((plo, pdata))
+                    continue
+                if elo > plo:
+                    carved.append((plo, pdata[:elo - plo]))
+                if ehi < phi:
+                    carved.append((ehi, pdata[ehi - plo:]))
+            pieces = carved
+            if not pieces:
+                break
+
+        fin_pos = seq_diff(seq, rcv) + len(data) if fin else None
+        if fin_pos is not None:
+            for eseq, edata, efin in c["ooo"]:
+                eoff = seq_diff(eseq, rcv)
+                if efin and eoff + len(edata) == fin_pos:
+                    fin_pos = None     # this FIN is already queued
+                    break
+                if edata and eoff <= fin_pos < eoff + len(edata):
+                    fin_pos = None     # the position is claimed as data:
+                    break              # a contradictory peer; first wins
+        entries = []
+        for plo, pdata in pieces:
+            take_fin = fin_pos is not None and plo + len(pdata) == fin_pos
+            entries.append([(rcv + plo) & 0xFFFFFFFF, pdata, take_fin])
+            if take_fin:
+                fin_pos = None
+        if fin_pos is not None:
+            entries.append([(rcv + fin_pos) & 0xFFFFFFFF, b"", True])
+        if not entries:
+            return
+        if len(c["ooo"]) + len(entries) > TCP_OOO_MAX_SEGS:
+            return               # discarded whole: honestly unSACKed
+        c["ooo"].extend(entries)
+
+    def tcp_drain_ooo(self, c):
+        """Deliver queued runs RCV.NXT has caught up with, in SEQ order.
+
+        A run may straddle RCV.NXT -- the segment that just landed
+        re-covered its head -- so only its new tail is delivered.  A run
+        wholly behind RCV.NXT is a duplicate's duplicate and is dropped,
+        except that a FIN positioned exactly at RCV.NXT is consumed
+        (sequence space is sequence space; the caller owes the close
+        handshake for it).  -> (fin_now, delivered_anything)."""
+        delivered = False
+        while True:
+            progressed = False
+            for e in list(c["ooo"]):
+                eoff = seq_diff(e[0], c["rcv_nxt"])
+                span = len(e[1]) + (1 if e[2] else 0)
+                if eoff + span <= 0:
+                    c["ooo"].remove(e)          # wholly old: dead
+                    progressed = True
+                    continue
+                if eoff > 0:
+                    continue                     # still across a gap
+                data = e[1][-eoff:] if eoff < 0 else e[1]
+                c["ooo"].remove(e)
+                progressed = True
+                if data:
+                    c["buf"] += data
+                    c["rcv_nxt"] = (c["rcv_nxt"] + len(data)) & 0xFFFFFFFF
+                    delivered = True
+                if e[2]:
+                    c["rcv_nxt"] = (c["rcv_nxt"] + 1) & 0xFFFFFFFF
+                    c["ooo"] = []       # nothing may follow a FIN
+                    return True, delivered
+            if not progressed:
+                return False, delivered
 
     def handle_tcp(self, src_mac, ipsrc, ipdst, body, ident):
         """-> list of reply frames (usually 0 or 1).
@@ -740,6 +1050,22 @@ class Responder:
           segment matching the tuple, so an ACK we sent in reply to its final
           ACK would be eaten by the next `tcp_close` and misread as a FIN ACK.
           Silence is both correct TCP and the deterministic choice.
+        * Sequence numbers are validated (UPKEEP U6, RFC 9293 s3.10.7.4 --
+          `tcp_receive`): only contiguous bytes reach the DNS stream, gaps
+          are held in a bounded queue and reported with RFC 2018 SACK blocks
+          on duplicate ACKs, and a FIN counts only in sequence order.  The
+          guest's receiver never checks our seq/ack either, but *its* M6d
+          fast-retransmit machinery reads SACK blocks and counts duplicate
+          ACKs, so the stimuli it was built against have to be real.
+        * The close is as small as the guest makes it: we are always the
+          passive closer (our FIN answers the peer's), so CLOSING and
+          TIME_WAIT are *guest-side* states here and unreachable on ours --
+          no code fabricates them.  What a passive closer does owe: a
+          duplicate FIN in LAST_ACK gets our FIN|ACK again (the
+          retransmission timer's job, keyed to the peer's retransmission,
+          since determinism forbids us a clock), and after the tuple is
+          freed a bounded tombstone still answers a late duplicate FIN
+          with the final ACK.
         """
         if self.no_tcp:
             self.stats["ignored"] += 1
@@ -770,7 +1096,11 @@ class Responder:
         c = self.tcp.get(key)
 
         if flags & TCP_RST:
+            # An aborted connection keeps no tombstone either: a reset means
+            # both sides have wiped the slate, and answering some late
+            # duplicate FIN from before the RST would resurrect it.
             self.tcp.pop(key, None)
+            self.tcp_closed.pop(key, None)
             return []
 
         if (flags & TCP_SYN) and not (flags & TCP_ACK):
@@ -787,8 +1117,18 @@ class Responder:
                 mss, sack = tcp_parse_options(t["opts"])
                 c = {"snd_nxt": TCP_ISN + 1, "rcv_nxt": (t["seq"] + 1) & 0xFFFFFFFF,
                      "state": "SYN_RCVD", "buf": b"", "mac": src_mac,
-                     "isn": TCP_ISN}
+                     "isn": TCP_ISN,
+                     # SACK may only ever be *sent* to a peer that offered
+                     # SACK-permitted in its SYN (RFC 2018 s4).  The flag is
+                     # retained here because everything after the handshake
+                     # depends on it; pre-U6 it was parsed, logged, and lost.
+                     "sack_perm": sack, "ooo": [], "fin_seq": None}
                 self.tcp[key] = c
+                # A fresh SYN supersedes any tombstone for this tuple: the
+                # guest's ephemeral wheel (40000..64999) wraps, and the new
+                # connection's sequence space must not be answered with the
+                # old one's final ACK.
+                self.tcp_closed.pop(key, None)
                 self.stats["tcp"] += 1
                 self.log("  TCP SYN from %s:%d -> %d (peer mss=%d sack=%s) "
                          "-> SYN-ACK isn=0x%08x"
@@ -802,6 +1142,13 @@ class Responder:
                 c["snd_nxt"] = c["isn"] + 1
                 c["rcv_nxt"] = (t["seq"] + 1) & 0xFFFFFFFF
                 c["state"] = "SYN_RCVD"
+                # The sequencing state restarts with the handshake: queued
+                # runs were measured against the old RCV.NXT and a stale
+                # FIN position would retransmit a FIN that no longer
+                # belongs to this incarnation of the tuple.
+                c["ooo"] = []
+                c["fin_seq"] = None
+                c["sack_perm"] = tcp_parse_options(t["opts"])[1]
                 self.log("  TCP SYN (retransmit) from port %d -> SYN-ACK again"
                          % t["sport"])
             seg = build_tcp(t["dport"], t["sport"], c["isn"], c["rcv_nxt"],
@@ -811,61 +1158,109 @@ class Responder:
             return [build_eth(src_mac, self.gw_mac, ETHERTYPE_IPV4, ip)]
 
         if c is None:
+            tomb = self.tcp_closed.get(key)
+            if tomb is not None and (flags & TCP_FIN) and \
+                    seq_diff((t["seq"] + len(t["data"])) & 0xFFFFFFFF,
+                             tomb["rcv_nxt"]) == -1:
+                # A late duplicate of the FIN that closed this tuple, after
+                # the tuple was freed: answer the final ACK once more and
+                # keep the tombstone.  This is the treatment RFC 9293
+                # prescribes in TIME_WAIT ("the only thing that can arrive
+                # is a retransmission of the remote FIN.  Acknowledge it"),
+                # minus the 2MSL clock -- the retention bound is a count,
+                # because this file's replies stay a pure function of the
+                # frames seen.  A plain ACK, not our FIN again: the final
+                # ACK we already received proves the guest saw the FIN, so
+                # what it is missing must be the ACK.
+                self.log("  TCP FIN (late duplicate) from port %d -> final "
+                         "ACK again" % t["sport"])
+                seg = build_tcp(t["dport"], t["sport"], tomb["snd_nxt"],
+                                tomb["rcv_nxt"], TCP_ACK, ipdst, ipsrc)
+                ip = build_ipv4(IP_PROTO_TCP, ipdst, ipsrc, seg, ident=ident)
+                return [build_eth(tomb["mac"], self.gw_mac, ETHERTYPE_IPV4,
+                                  ip)]
             # No connection: whatever this is, it gets no answer (see the bare
             # ACK rule above -- inventing an RST here would hand the guest's
             # closer a segment it would misread).
             return []
 
-        seglen = len(t["data"])
-        if flags & TCP_SYN:
-            seglen += 1
-        if flags & TCP_FIN:
-            seglen += 1
-        if seglen:
-            c["rcv_nxt"] = (c["rcv_nxt"] + seglen) & 0xFFFFFFFF
+        if c["state"] == "LAST_ACK":
+            # RFC 9293: "The only thing that can arrive in this state is an
+            # acknowledgment of our FIN.  If our FIN is now acknowledged,
+            # delete the TCB."  Everything else is a retransmission from a
+            # peer that has not seen (or has not yet had answered) some part
+            # of our close -- and forgetting the tuple is the one response
+            # that can help none of those peers.
+            if (flags & TCP_ACK) and not (flags & TCP_FIN) \
+                    and t["ack"] == c["snd_nxt"]:
+                # The guest ACKed our FIN: it is in TIME_WAIT now and will
+                # send nothing more except possibly a retransmission of its
+                # FIN.  Forget the tuple -- keeping it would make a later
+                # stray segment look like it belonged to a live connection --
+                # but keep a tombstone, so that FIN retransmission is met
+                # with the final ACK rather than with unknown-tuple silence.
+                self.log("  TCP close complete: port %d (tuple freed)"
+                         % t["sport"])
+                self.tcp_forget(key, tombstone=True)
+                return []
+            if (flags & TCP_FIN) and \
+                    seq_diff((t["seq"] + len(t["data"])) & 0xFFFFFFFF,
+                             c["rcv_nxt"]) == -1:
+                # A retransmission of the FIN we already consumed: the peer
+                # never saw our FIN|ACK (its ack predates our FIN -- had it
+                # seen the FIN, this segment would be the final ACK above).
+                # Pre-U6 this freed the tuple, stranding the guest in
+                # FIN_WAIT_2 until its close timed out.  A stack with a
+                # retransmission timer would simply resend its FIN; we have
+                # no timers by design, so the peer's retransmission is our
+                # clock: send the same FIN|ACK again and stay in LAST_ACK.
+                self.log("  TCP FIN (duplicate) from port %d -> FIN-ACK again"
+                         % t["sport"])
+                return [self.tcp_segment(c, key, TCP_FIN | TCP_ACK,
+                                         seq=c["fin_seq"], ident=ident)]
+            if t["data"] or (flags & TCP_FIN):
+                # Text after the peer's FIN, or a FIN somewhere unexpected:
+                # the text is ignored (the stream has ended), but an
+                # out-of-place segment still earns the challenge ACK
+                # <SEQ=SND.NXT><ACK=RCV.NXT> of the first acceptability step.
+                return [self.tcp_ack_frame(c, key, ident)]
+            return []          # a stale ACK that does not ack our FIN: the
+                               # bare-ACK rule (silence) applies as anywhere
 
         if (flags & TCP_ACK) and c["state"] == "SYN_RCVD":
             c["state"] = "ESTAB"
             self.log("  TCP handshake complete: %s:%d <-> :%d ESTABLISHED "
                      "(%d connection(s) open)"
                      % (ipstr(ipsrc), t["sport"], t["dport"], len(self.tcp)))
-            if not seglen:
-                return []                     # the guest's final ACK: silence
+
+        delivered, fin_now, want_ack, trigger = self.tcp_receive(c, t)
 
         out = []
-        if t["data"]:
-            c["buf"] += t["data"]
-            # A bare ACK goes out only when there is nothing to piggyback it
-            # on: an answer to the data acknowledges the data itself (its
-            # rcv_nxt already advanced above), and sending both would spend two
-            # segments -- and two of the guest's RX descriptors -- on one
-            # round trip.
-            if t["dport"] == DNS_PORT:
-                replied, frames = self.dns_over_tcp(c, key, ident)
-                out += frames
-                if not replied:
-                    out.append(self.tcp_segment(c, key, TCP_ACK, ident=ident))
-            else:
-                out.append(self.tcp_segment(c, key, TCP_ACK, ident=ident))
+        answered = False
+        if delivered and t["dport"] == DNS_PORT:
+            answered, frames = self.dns_over_tcp(
+                c, key, ident, opts=self.tcp_sack_opts(c, trigger))
+            out += frames
+        # A bare ACK goes out only when there is nothing to piggyback it
+        # on: an answer to the data acknowledges the data itself (its
+        # rcv_nxt already advanced in tcp_receive), and sending both would
+        # spend two segments -- and two of the guest's RX descriptors -- on
+        # one round trip.  The same holds when our FIN|ACK below *is* the
+        # acknowledgment and no data came with the peer's FIN: the guest's
+        # closer is built for a single FIN-ACK (see the docstring).
+        if want_ack and not answered and not (fin_now and not delivered):
+            out.append(self.tcp_ack_frame(c, key, ident, trigger))
 
-        if flags & TCP_FIN:
-            if c["state"] == "LAST_ACK":
-                # Our FIN was already out; this is a duplicate.  Free it.
-                self.tcp.pop(key, None)
-                return out
+        if fin_now:
             c["state"] = "LAST_ACK"
             fin = self.tcp_segment(c, key, TCP_FIN | TCP_ACK, ident=ident)
+            c["fin_seq"] = c["snd_nxt"]
             c["snd_nxt"] = (c["snd_nxt"] + 1) & 0xFFFFFFFF
             self.log("  TCP FIN from port %d -> FIN-ACK (closing)" % t["sport"])
             out.append(fin)
-        elif (flags & TCP_ACK) and c["state"] == "LAST_ACK":
-            # The guest ACKed our FIN: it is in TIME_WAIT now and will send
-            # nothing more.  Forget the tuple -- keeping it would make a later
-            # stray segment look like it belonged to a live connection.
-            self.tcp.pop(key, None)
         return out
 
-    def dns_over_tcp(self, c, key, ident):
+    def dns_over_tcp(self, c, key, ident, opts=b""):
         """RFC 1035 s4.2.2 carriage: a 2-byte length prefix, then the same
         message.  The guest's `dns_wire_query_tcp` sends the prefix and the
         query as two separate `tcp_send_h` calls and accumulates the reply
@@ -908,7 +1303,7 @@ class Responder:
                      % (q["qname"], q["id"], ipstr(self.dns_answer_ip),
                         len(reply)))
             seg = self.tcp_segment(c, key, TCP_ACK | TCP_PSH, data=body,
-                                   ident=ident)
+                                   ident=ident, opts=opts)
             c["snd_nxt"] = (c["snd_nxt"] + len(body)) & 0xFFFFFFFF
             out.append(seg)
             answered = True

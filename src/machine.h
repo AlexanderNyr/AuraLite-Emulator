@@ -277,6 +277,9 @@ static inline void vcpu_load(machine_t *m, int i) {
         m->cpu = m->vcpu[i].c;
         m->lapic = m->vcpu[i].l;
         m->cur_vcpu = i;
+        /* U4: the one LAPIC window mirrors the loaded context's
+         * IA32_APIC_BASE (SDM 10.4.5 per-processor window). */
+        lapic_sync_mmio(m);
     }
 }
 static inline void vcpu_store(machine_t *m, int i) {

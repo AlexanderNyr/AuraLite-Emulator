@@ -50,8 +50,9 @@ typedef struct cpu {
                           * IA32_GS_BASE (0xC0000101). K3: per-CPU data in
                           * long mode flows through these MSRs (measured:
                           * AuraLite's cpu_local/scheduler init). */
-    uint16_t fcw;    /* K3: x87 control word tracked for FLDCW/FNSTCW;
-                          * no x87 data model behind it (deliberate). */
+    uint16_t fcw;    /* K3: x87 control word (FLDCW/FNSTCW).  The data
+                          * model behind it arrived in F1 -- see the x87
+                          * block below. */
     uint32_t mxcsr;    /* K3: SSE control/status; FXSAVE/FXRSTOR/LDMXCSR/
                         * STMXCSR route here. */
     uint64_t xmm[16][2]; /* K4: the media data file exists now -- the
@@ -129,6 +130,10 @@ typedef struct cpu {
 } cpu_t;
 
 void cpu_reset(cpu_t *c);
+/* UPKEEP U5: INIT# state -- cpu_reset for the core, with the x87/XMM
+ * files, MXCSR, KERNEL_GS_BASE and the software MSRs (minus
+ * EFER/FS_BASE/GS_BASE) carried over; see cpu.c for the SDM table. */
+void cpu_init_reset(cpu_t *c);
 /* Executes exactly one instruction; returns 0 normally, -1 on fault or on a
  * hlt+cli halt without progress.
  *
@@ -144,6 +149,23 @@ int  cpu_step(cpu_t *c);
 
 uint64_t cpu_get_msr(cpu_t *c, uint32_t idx, int *found);
 void     cpu_set_msr(cpu_t *c, uint32_t idx, uint64_t val);
+
+/* UPKEEP U3: the gdbstub's x87 bridge.  ST(i) is LOGICAL at this boundary
+ * (rotated by TOP, the convention measured from GDB i387-tdep.c
+ * i387_print_float_info and QEMU target/i386/gdbstub.c's read side);
+ * values cross as the 10 raw bytes of the 80-bit extended form.  A write
+ * re-classifies the physical register's FTW tag (FRSTOR precedent: the
+ * state stays one the CPU itself could hold) and leaves TOP alone --
+ * it is a register write, not a push.  cpu_x87_set_fsw routes an FSW
+ * write through the x87_load_env invariant (ftop follows TOP).
+ * cpu_x87_host_supported() is 0 when the host long double is not the
+ * ISA 80-bit format: x87 execution already #UDs there, and the stub
+ * then reports ST registers as RSP-unavailable ('x') instead of
+ * fabricating bytes from a representation that cannot hold them. */
+int  cpu_x87_host_supported(void);
+void cpu_x87_st_to80(const cpu_t *c, int sti, uint8_t b[10]);
+void cpu_x87_st_from80(cpu_t *c, int sti, const uint8_t b[10]);
+void cpu_x87_set_fsw(cpu_t *c, uint16_t v);
 
 const char *cpu_mode_name(cpu_t *c);
 int cpu_addr_size(cpu_t *c);

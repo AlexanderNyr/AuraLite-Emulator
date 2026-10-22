@@ -43,18 +43,57 @@ int main(void) {
     assert(le32(rsdp + 20) == 36);
     assert(le64(rsdp + 24) == base + 0x080);
 
-    /* RSDT / XSDT: one MADT pointer each, valid checksums */
+    /* RSDT / XSDT: FACP then MADT (PM P2), valid checksums */
     const uint8_t *rsdt = w + 0x040;
     assert(memcmp(rsdt, "RSDT", 4) == 0);
-    assert(le32(rsdt + 4) == 40);
-    assert(sum8(rsdt, 40) == 0);
-    assert(le32(rsdt + 36) == base + 0x0C0);
+    assert(le32(rsdt + 4) == 44);
+    assert(sum8(rsdt, 44) == 0);
+    assert(le32(rsdt + 36) == base + 0x900);
+    assert(le32(rsdt + 40) == base + 0x0C0);
 
     const uint8_t *xsdt = w + 0x080;
     assert(memcmp(xsdt, "XSDT", 4) == 0);
-    assert(le32(xsdt + 4) == 44);
-    assert(sum8(xsdt, 44) == 0);
-    assert(le64(xsdt + 36) == base + 0x0C0);
+    assert(le32(xsdt + 4) == 52);
+    assert(sum8(xsdt, 52) == 0);
+    assert(le64(xsdt + 36) == base + 0x900);
+    assert(le64(xsdt + 44) == base + 0x0C0);
+
+    /* PM P2: the FADT advertises exactly what pm.c implements */
+    const uint8_t *fadt = w + 0x900;
+    assert(memcmp(fadt, "FACP", 4) == 0);
+    assert(le32(fadt + 4) == 244 && fadt[8] == 4);
+    assert(sum8(fadt, 244) == 0);
+    assert(le32(fadt + 40) == base + 0xA00);       /* DSDT pointer    */
+    assert(le64(fadt + 140) == base + 0xA00);      /* X_DSDT          */
+    assert((fadt[46] | (fadt[47] << 8)) == 9);     /* SCI_INT = IRQ9  */
+    assert(le32(fadt + 48) == 0);                  /* SMI_CMD: no SMM */
+    assert(le32(fadt + 56) == 0xB000);             /* PM1a_EVT_BLK    */
+    assert(le32(fadt + 64) == 0xB004);             /* PM1a_CNT_BLK    */
+    assert(le32(fadt + 76) == 0xB008);             /* PM_TMR_BLK      */
+    assert(le32(fadt + 80) == 0xB020);             /* GPE0_BLK        */
+    assert(fadt[88] == 4 && fadt[89] == 2 && fadt[91] == 4 && fadt[92] == 8);
+    assert((le32(fadt + 112) & 0x100) == 0);       /* 24-bit timer    */
+    assert((le32(fadt + 112) & 0x400) != 0);       /* RESET_REG_SUP   */
+    assert(fadt[116] == 1 && fadt[117] == 8 && le64(fadt + 120) == 0xCF9);
+    assert(fadt[128] == 0x0E);                     /* RESET_VALUE     */
+    /* the X_ GAS mirrors agree with the 32-bit fields */
+    assert(fadt[148] == 1 && le64(fadt + 152) == 0xB000);
+    assert(fadt[172] == 1 && le64(fadt + 176) == 0xB004);
+    assert(fadt[208] == 1 && le64(fadt + 212) == 0xB008);
+    assert(fadt[220] == 1 && le64(fadt + 224) == 0xB020);
+
+    /* and the DSDT is exactly \_S5 = Package(7, 0) + \_S1 =
+     * Package(1, 0): the two sleep types pm.c decodes, pinned
+     * byte-for-byte to the decoder (PM P1/P3). */
+    const uint8_t *dsdt = w + 0xA00;
+    assert(memcmp(dsdt, "DSDT", 4) == 0);
+    assert(le32(dsdt + 4) == 60);
+    assert(sum8(dsdt, 60) == 0);
+    static const uint8_t ss_aml[24] = {
+        0x08, '_', 'S', '5', '_', 0x12, 0x06, 0x02, 0x0A, 0x07, 0x0A, 0x00,
+        0x08, '_', 'S', '1', '_', 0x12, 0x06, 0x02, 0x0A, 0x01, 0x0A, 0x00
+    };
+    assert(memcmp(dsdt + 36, ss_aml, 24) == 0);
 
     /* MADT walk: LAPIC(0), IOAPIC(1 @ 0xFEC00000, GSI 0), ISO(IRQ0 -> GSI2) */
     const uint8_t *madt = w + 0x0C0;
@@ -88,8 +127,9 @@ int main(void) {
     assert(saw_lapic && saw_ioapic && saw_iso);
 
     /* negative control: one flipped byte must break the table checksum */
-    for (int t = 0; t < 3; t++) {
-        uint8_t *tab = (uint8_t *)(t == 0 ? madt : t == 1 ? rsdt : xsdt);
+    for (int t = 0; t < 5; t++) {
+        uint8_t *tab = (uint8_t *)(t == 0 ? madt : t == 1 ? rsdt : t == 2 ? xsdt
+                                                           : t == 3 ? fadt : dsdt);
         uint32_t  n  = le32(tab + 4);
         uint8_t save = tab[n - 1];
         tab[n - 1] ^= 0xA5;

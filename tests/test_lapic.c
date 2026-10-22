@@ -1,4 +1,4 @@
-/* tests/test_lapic.c -- CHIPSET H6 vectors: local APIC (xAPIC).
+/* tests/test_lapic.c -- CHIPSET H6 + UPKEEP U4 vectors: local APIC (xAPIC).
  *
  * Fixture style: real-mode guests cannot reach the 0xFEE00000 MMIO window
  * (real-mode linear addresses stop just above 1MB), so real-mode vectors
@@ -468,6 +468,219 @@ static void test_smp_broadcast_init_sipi_and_counter_preservation(void) {
     printf("ok: smp_broadcast_init_sipi_and_counter_preservation\n");
 }
 
+/* --------------------------------------------------- UPKEEP U4 ----- */
+
+/* Emit a 16-bit guest snippet "mov ecx,0x1B; mov eax,lo; mov edx,hi;
+ * wrmsr; jmp $" at physical address `at`. Returns the byte length. */
+static int emit_wrmsr(fx_t *f, uint32_t at, uint64_t val) {
+    uint8_t code[24];
+    int n = 0;
+    code[n++] = 0x66; code[n++] = 0xB9;
+    code[n++] = 0x1B; code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0x66; code[n++] = 0xB8;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(val >> (8 * i));
+    code[n++] = 0x66; code[n++] = 0xBA;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(val >> (8 * i + 32));
+    code[n++] = 0x0F; code[n++] = 0x30;
+    code[n++] = 0xEB; code[n++] = 0xFE;
+    memcpy(f->m.ram + at, code, (size_t)n);
+    return n;
+}
+/* Write IA32_APIC_BASE by executing a real guest WRMSR on the current
+ * context (code at 0x4000; CS base must be 0, as in the UP fixtures). */
+static void guest_wrmsr(fx_t *f, uint64_t val) {
+    emit_wrmsr(f, 0x4000, val);
+    f->m.cpu.rip = 0x4000;
+    for (int i = 0; i < 8; i++) (void)cpu_step(&f->m.cpu);
+}
+static uint64_t get_apicbase(cpu_t *c) {
+    int found;
+    uint64_t v = cpu_get_msr(c, LAPIC_MSR_APICBASE, &found);
+    assert(found);
+    return v;
+}
+#define NEWB 0xFEE80000ULL   /* a free aligned slot above the IOAPIC */
+
+static void test_apicbase_relocation(void) {
+    fx_t f; fx_init(&f);
+    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);   /* BSP power-on */
+    lw(&f, LAPIC_ID, 0xAA000000u);
+    lw(&f, LAPIC_TPR, 0x40);
+    guest_wrmsr(&f, NEWB | LAPIC_MSR_EN);                  /* BSP bit clear in val */
+    assert(get_apicbase(&f.m.cpu) == (NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP));
+    /* window moved: old page is open bus, new page answers with state */
+    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0x00050014u);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_ID, 4) == 0xAA000000u);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_TPR, 4) == 0x40);
+    mem_write(&f.m, NEWB + LAPIC_TPR, 4, 0x50);
+    /* relocate back; the BSP strap is preserved across every write */
+    guest_wrmsr(&f, LAPIC_BASE | LAPIC_MSR_EN);
+    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    assert(lr(&f, LAPIC_VER) == 0x00050014u);
+    assert(lr(&f, LAPIC_TPR) == 0x50);                     /* written at NEWB */
+    printf("ok: apicbase_relocation\n");
+}
+
+static void test_apicbase_rejects(void) {
+    fx_t f; fx_init(&f);
+    static const uint64_t BAD[] = {
+        LAPIC_BASE | LAPIC_MSR_EN | 0x1,            /* bit 0 reserved */
+        LAPIC_BASE | LAPIC_MSR_EN | (1u << 7),      /* bits 0-7 reserved */
+        LAPIC_BASE | LAPIC_MSR_EN | (1u << 9),      /* bit 9 reserved */
+        LAPIC_BASE | LAPIC_MSR_EN | LAPIC_MSR_EXTD, /* x2APIC: unsupported */
+        LAPIC_BASE | LAPIC_MSR_EN | (1ULL << 40),   /* beyond MAXPHYADDR=40 */
+        LAPIC_BASE | LAPIC_MSR_EN | (1ULL << 63),
+        0xFEE00123ULL | LAPIC_MSR_EN,               /* stray in-page bits */
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        guest_wrmsr(&f, BAD[i]);
+        assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);   /* nothing stored */
+        assert(lr(&f, LAPIC_VER) == 0x00050014u);              /* window intact */
+    }
+    printf("ok: apicbase_rejects\n");
+}
+
+/* Guest: mov eax,1; cpuid; mov [0x2440],edx; jmp $  -> CPUID.1:EDX */
+static uint32_t guest_cpuid1_edx(fx_t *f) {
+    static const uint8_t T_CPUID[] = {
+        0x66, 0xB8, 0x01,0x00,0x00,0x00,
+        0x0F, 0xA2,
+        0x66, 0x89, 0x16, 0x40,0x24,
+        0xEB, 0xFE };
+    memcpy(f->m.ram + 0x4100, T_CPUID, sizeof T_CPUID);
+    f->m.cpu.rip = 0x4100;
+    for (int i = 0; i < 8; i++) (void)cpu_step(&f->m.cpu);
+    return (uint32_t)mem_read(&f->m, 0x2440, 4);
+}
+
+static void test_apicbase_global_disable(void) {
+    fx_t f; fx_init(&f);
+    ivt(&f.m, 0x40, PH_MARK); load(&f, PH_MARK, H_MARK, sizeof H_MARK);
+    ivt(&f.m, 0x44, PH_MARK3); load(&f, PH_MARK3, H_MARK3, sizeof H_MARK3);
+    load(&f, 0, T_STI_SPIN, sizeof T_STI_SPIN);
+    lw(&f, LAPIC_ID, 0xAB000000u);
+    lw(&f, LAPIC_TPR, 0x33);
+    lw(&f, LAPIC_SVR, 0x1FF);
+    /* a timer armed far away + a latched, deliverable self-IPI */
+    arm_timer(&f, 0x44, 100000, 0x8);
+    assert((guest_cpuid1_edx(&f) & (1u << 9)) != 0);       /* APIC advertised */
+    lw(&f, LAPIC_ICR_LO, (1u << 18) | 0x40);
+    assert(lapic_deliverable(&f.m) == 0x40);
+
+    /* ---- globally disable (EN=0) ---- */
+    guest_wrmsr(&f, LAPIC_BASE);
+    assert(get_apicbase(&f.m.cpu) == (LAPIC_BASE | LAPIC_MSR_BSP));
+    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    assert(lapic_deliverable(&f.m) == -1);                 /* latch held, undeliverable */
+    assert((guest_cpuid1_edx(&f) & (1u << 9)) == 0);       /* "no on-chip APIC" */
+    /* every fixed-interrupt sink drops at the latch while disabled */
+    lapic_set_irr_dest(&f.m, 0xAB, 0x41);                  /* the IOAPIC endpoint */
+    msi_deliver(&f.m, 0xFEE00000ULL | (0xABULL << 12), 0x42);
+    lapic_set_irr(&f.m, 0x43);
+    uint32_t frozen = f.m.lapic.tmccur;
+    assert(frozen > 0 && frozen <= 100000);
+    for (int i = 0; i < 500; i++) (void)cpu_step(&f.m.cpu);
+    assert(f.m.lapic.tmccur == frozen);                    /* timer frozen in place */
+    assert((f.m.lapic.irr[0x44 >> 3] & (1u << (0x44 & 7))) == 0);
+
+    /* ---- re-enable: state kept (documented choice), SVR enable dropped ---- */
+    guest_wrmsr(&f, LAPIC_BASE | LAPIC_MSR_EN);
+    assert(lr(&f, LAPIC_VER) == 0x00050014u);
+    assert((lr(&f, LAPIC_SVR) & 0x100) == 0);              /* cleared by the disable */
+    assert(lr(&f, LAPIC_ID) == 0xAB000000u);               /* state persisted */
+    assert(lr(&f, LAPIC_TPR) == 0x33);
+    /* one IRR word covers 0x40..0x5F: bit0 = the kept pre-disable
+     * latch, bits 1..3 = the three messages dropped while disabled */
+    assert(lr(&f, irr_reg(0x40)) == (1u << 0));
+    assert((lr(&f, irr_reg(0x42)) & (1u << (0x42 & 31))) == 0);  /* dropped (MSI) */
+    assert((lr(&f, irr_reg(0x43)) & (1u << (0x43 & 31))) == 0);  /* dropped (set_irr) */
+    /* timer resumes from the frozen count and eventually fires */
+    for (int i = 0; i < 200; i++) (void)cpu_step(&f.m.cpu);
+    assert(f.m.lapic.tmccur < frozen);
+    for (int i = 0; i < 60000 && f.m.lapic.tmccur; i++) (void)cpu_step(&f.m.cpu);
+    assert(f.m.lapic.tmccur == 0);
+    assert((lr(&f, irr_reg(0x44)) & (1u << (0x44 & 31))) != 0);
+    /* (The spent one-shot re-latches on later ticks in this model --
+     * pre-U4 H6 behaviour, out of scope here -- so mask its LVT before
+     * re-arming delivery; the already-latched bit still delivers.) */
+    lw(&f, LAPIC_LVT_TMR, LVT_MASKED | 0x44);
+    /* both survivors really land on the guest after SVR re-arm, in
+     * priority order (0x44 before the older 0x40), host EOIs between */
+    lw(&f, LAPIC_SVR, 0x1FF);
+    run_until(&f, 0x2104, 50);
+    assert(mem_read(&f.m, 0x2104, 1) == 1);
+    lw(&f, LAPIC_EOI, 0);
+    run_until(&f, 0x2100, 50);
+    assert(mem_read(&f.m, 0x2100, 1) == 1);
+    lw(&f, LAPIC_EOI, 0);
+    printf("ok: apicbase_global_disable\n");
+}
+
+static void test_apicbase_smp_identity(void) {
+    /* U4: BSP identity by slot, a per-vCPU window that follows the
+     * context switch, INIT preserving IA32_APIC_BASE, and the EN gate
+     * applied per target with INIT remaining reachable. */
+    fx_t f; fx_init(&f);
+    f.m.n_vcpus = 2;
+    f.m.vcpu[0].c = f.m.cpu; f.m.vcpu[0].l = f.m.lapic;
+    f.m.vcpu[0].state = VCPU_RUN;
+    f.m.vcpu[1].c.mach = &f.m;
+    cpu_reset(&f.m.vcpu[1].c);
+    f.m.vcpu[1].l = f.m.lapic;
+    f.m.vcpu[1].l.id = 1u << 24;
+    f.m.vcpu[1].state = VCPU_WAIT_SIPI;
+    f.m.cur_vcpu = 0;
+    /* role-correct power-on MSRs */
+    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);            /* BSP */
+    assert(get_apicbase(&f.m.vcpu[1].c) == (LAPIC_BASE | LAPIC_MSR_EN)); /* AP */
+
+    /* bring the AP up at 0x8000 running "WRMSR -> NEWB|EN; jmp $" */
+    lw(&f, LAPIC_SVR, 0x1FF);
+    emit_wrmsr(&f, 0x8000, NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP);    /* tries to steal BSP */
+    lw(&f, LAPIC_ICR_LO, 0x000C4608u);                              /* broadcast SIPI 0x08 */
+    assert(f.m.vcpu[1].state == VCPU_RUN);
+    vcpu_load(&f.m, 1);
+    for (int i = 0; i < 10; i++) (void)cpu_step(&f.m.cpu);
+    assert(get_apicbase(&f.m.cpu) == (NEWB | LAPIC_MSR_EN));        /* BSP NOT stolen */
+    /* the window is the AP's own while its context is loaded */
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0x00050014u);
+    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    vcpu_store(&f.m, 1);
+    vcpu_load(&f.m, 0);
+    /* ...and the BSP's window is back at the default base */
+    assert(lr(&f, LAPIC_VER) == 0x00050014u);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    assert(get_apicbase(&f.m.vcpu[1].c) == (NEWB | LAPIC_MSR_EN));
+
+    /* targeted INIT: the relocated base + EN survive (QEMU apic_init_reset) */
+    lw(&f, LAPIC_ICR_HI, 1u << 24);
+    lw(&f, LAPIC_ICR_LO, 0x00004500u);
+    assert(f.m.vcpu[1].state == VCPU_WAIT_SIPI);
+    assert(get_apicbase(&f.m.vcpu[1].c) == (NEWB | LAPIC_MSR_EN));
+    assert(f.m.vcpu[1].l.id == (1u << 24));
+
+    /* now let the AP disable itself at NEWB; fixed IPI then drops,
+     * but INIT still gets through */
+    emit_wrmsr(&f, 0x8000, NEWB);                                   /* EN=0 */
+    lw(&f, LAPIC_ICR_LO, 0x000C4608u);                              /* SIPI again */
+    vcpu_load(&f.m, 1);
+    for (int i = 0; i < 10; i++) (void)cpu_step(&f.m.cpu);
+    assert(get_apicbase(&f.m.cpu) == NEWB);
+    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
+    vcpu_store(&f.m, 1);
+    vcpu_load(&f.m, 0);
+    lw(&f, LAPIC_ICR_HI, 1u << 24);
+    lw(&f, LAPIC_ICR_LO, 0x45);                                     /* fixed IPI to AP */
+    assert((f.m.vcpu[1].l.irr[0x45 >> 3] & (1u << (0x45 & 7))) == 0);
+    lw(&f, LAPIC_ICR_HI, 1u << 24);
+    lw(&f, LAPIC_ICR_LO, 0x00004500u);                              /* INIT still lands */
+    assert(f.m.vcpu[1].state == VCPU_WAIT_SIPI);
+    assert(get_apicbase(&f.m.vcpu[1].c) == NEWB);                   /* EN=0 also survives */
+    printf("ok: apicbase_smp_identity\n");
+}
+
 int main(void) {
     test_mmio_registers();
     test_svr_gates_delivery_not_latching();
@@ -479,6 +692,10 @@ int main(void) {
     test_msr_apic_base();
     test_hlt_wake_via_ipi_and_latched_irr();
     test_smp_broadcast_init_sipi_and_counter_preservation();
+    test_apicbase_relocation();
+    test_apicbase_rejects();
+    test_apicbase_global_disable();
+    test_apicbase_smp_identity();
     printf("test_lapic: all vectors passed\n");
     return 0;
 }

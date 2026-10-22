@@ -212,12 +212,33 @@ def test_monitor_client():
                "disk": "disk/disk.img", "max_instr": 3000000,
                "stats": True, "log": True, "dump_fb": True}
         m.start(cfg)
+        # UPKEEP U7: the run's monitor demands the per-run capability the
+        # Machine generated. A tokenless client must be refused at the
+        # upgrade itself (loop until the monitor is listening and the
+        # refusal is the *upgrade* error, not connection timing).
+        bad = gui_app.MonitorClient()
+        refused = False
+        deadline = time.time() + 10
+        while time.time() < deadline and not refused:
+            try:
+                bad.connect(m.monitor_port, timeout=1.0)   # no token, on purpose
+                bad.close()
+                break                     # handshake accepted: pre-U7 defect
+            except OSError as e:
+                refused = "refused" in str(e)
+                if not refused:
+                    time.sleep(0.1)       # monitor not bound yet; retry
+        check(refused and getattr(m, "monitor_token", None),
+              "C U7 tokenless WebSocket is refused; Machine issues a capability")
         mon = gui_app.MonitorClient()
         deadline = time.time() + 20
         connected = False
         while time.time() < deadline and not connected:
             try:
-                mon.connect(m.monitor_port, timeout=1.0)
+                kw = {}
+                if getattr(m, "monitor_token", None):
+                    kw["token"] = m.monitor_token   # pre-U7: connect() has no kw
+                mon.connect(m.monitor_port, timeout=1.0, **kw)
                 connected = True
             except OSError:
                 time.sleep(0.1)
@@ -266,6 +287,11 @@ def test_monitor_client():
         arts = {a["name"] for a in m.artifacts()}
         check("stdout.log" in arts and "argv.json" in arts,
               "C artifacts land in the run dir")
+        if getattr(m, "monitor_token", None) and "argv.json" in arts:
+            with open(os.path.join(m.run_dir, "argv.json")) as f:
+                argv_txt = f.read()
+            check(m.monitor_token not in argv_txt,
+                  "C U7 monitor capability stays out of argv.json (env, not argv)")
         mon.close()
         try:
             mon.send({"cmd": "state"})

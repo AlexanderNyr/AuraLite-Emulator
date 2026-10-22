@@ -183,6 +183,90 @@ static void test_cmos_smp_extra_cpus(void) {
     printf("ok: cmos_smp_extra_cpus\n");
 }
 
+/* UPKEEP U1: the Linux-style SET sequence installs a new date --
+ * before the 2026 power-on anchor and across a leap day -- and a
+ * warm reset does not touch it (battery-backed silicon). */
+static void test_set_date_bcd_leap(void) {
+    fx_t f; fx_init(&f);
+    cmos_w(&f, 0x0B, 0x82);                      /* SET | 24h, BCD    */
+    assert(cmos(&f, 0x09) == 0x26);              /* seeded live date  */
+    cmos_w(&f, 0x00, 0x58); cmos_w(&f, 0x02, 0x59); cmos_w(&f, 0x04, 0x23);
+    cmos_w(&f, 0x07, 0x29); cmos_w(&f, 0x08, 0x02);
+    cmos_w(&f, 0x09, 0x24); cmos_w(&f, 0x32, 0x20);
+    assert(cmos(&f, 0x07) == 0x29);              /* staged readback   */
+    cmos_w(&f, 0x0B, 0x02);                      /* commit            */
+    assert(cmos(&f, 0x00) == 0x58 && cmos(&f, 0x02) == 0x59 &&
+           cmos(&f, 0x04) == 0x23);
+    assert(cmos(&f, 0x07) == 0x29 && cmos(&f, 0x08) == 0x02 &&
+           cmos(&f, 0x09) == 0x24 && cmos(&f, 0x32) == 0x20);
+    assert(cmos(&f, 0x06) == 0x05);              /* 2024-02-29: Thu   */
+    fx_steps(&f, 3 * SEC_INSTR + 8000 * IPT);    /* leap rollover     */
+    assert(cmos(&f, 0x00) == 0x01 && cmos(&f, 0x02) == 0x00 &&
+           cmos(&f, 0x04) == 0x00);
+    assert(cmos(&f, 0x07) == 0x01 && cmos(&f, 0x08) == 0x03);
+    assert(cmos(&f, 0x06) == 0x06);              /* 2024-03-01: Fri   */
+    machine_reset(&f.m);
+    assert(cmos(&f, 0x07) == 0x01 && cmos(&f, 0x08) == 0x03 &&
+           cmos(&f, 0x09) == 0x24);              /* reset keeps date  */
+    printf("ok: set_date_bcd_leap\n");
+}
+
+/* U1: SET freezes the update cycle (no UF, no UIP, staged reads),
+ * and an invalid staged date leaves the running clock alone. */
+static void test_set_freeze_and_invalid(void) {
+    fx_t f; fx_init(&f);
+    fx_steps(&f, 10 * SEC_INSTR + 8000 * IPT);
+    assert(cmos(&f, 0x00) == 0x10);
+    (void)cmos(&f, 0x0C);                        /* drain pending UF  */
+    cmos_w(&f, 0x0B, 0x82);
+    fx_steps(&f, 5 * SEC_INSTR + 8000 * IPT);
+    assert(cmos(&f, 0x00) == 0x10);              /* frozen at seeding */
+    assert((cmos(&f, 0x0A) & 0x80) == 0);        /* no UIP in SET     */
+    assert(cmos(&f, 0x0C) == 0x00);              /* no UF in SET      */
+    cmos_w(&f, 0x08, 0x13);                      /* month 13: invalid */
+    cmos_w(&f, 0x0B, 0x02);
+    assert(cmos(&f, 0x08) == 0x01);              /* unchanged...      */
+    assert(cmos(&f, 0x00) == 0x15);              /* ...and kept time  */
+    printf("ok: set_freeze_and_invalid\n");
+}
+
+/* U1: Register B data/hour modes govern both directions. */
+static void test_binary_and_12h_formats(void) {
+    fx_t f; fx_init(&f);
+    cmos_w(&f, 0x0B, 0x86);                      /* SET|DM(binary)|24h */
+    cmos_w(&f, 0x00, 30); cmos_w(&f, 0x02, 15); cmos_w(&f, 0x04, 13);
+    cmos_w(&f, 0x07, 15); cmos_w(&f, 0x08, 6);
+    cmos_w(&f, 0x09, 99); cmos_w(&f, 0x32, 19);  /* 1999-06-15        */
+    cmos_w(&f, 0x0B, 0x06);
+    assert(cmos(&f, 0x04) == 13 && cmos(&f, 0x09) == 99 &&
+           cmos(&f, 0x32) == 19);
+    cmos_w(&f, 0x0B, 0x02);                      /* BCD 24h, same clock */
+    assert(cmos(&f, 0x00) == 0x30 && cmos(&f, 0x04) == 0x13 &&
+           cmos(&f, 0x09) == 0x99 && cmos(&f, 0x32) == 0x19);
+    cmos_w(&f, 0x0B, 0x00);                      /* BCD 12h           */
+    assert(cmos(&f, 0x04) == 0x81);              /* 1 PM              */
+    cmos_w(&f, 0x0B, 0x82);                      /* set via 24h...    */
+    cmos_w(&f, 0x04, 0x00);
+    cmos_w(&f, 0x0B, 0x00);                      /* ...read in 12h    */
+    assert(cmos(&f, 0x04) == 0x12);              /* 12 AM             */
+    cmos_w(&f, 0x0B, 0x80);                      /* set in 12h        */
+    cmos_w(&f, 0x04, 0x92);                      /* 12 PM staged      */
+    cmos_w(&f, 0x0B, 0x00);
+    assert(cmos(&f, 0x04) == 0x92);              /* noon round-trips  */
+    printf("ok: binary_and_12h_formats\n");
+}
+
+/* U1: entering SET clears UIE (MC146818A datasheet behaviour). */
+static void test_set_clears_uie(void) {
+    fx_t f; fx_init(&f);
+    cmos_w(&f, 0x0B, 0x12);
+    assert(cmos(&f, 0x0B) == 0x12);
+    cmos_w(&f, 0x0B, 0x92);
+    assert(cmos(&f, 0x0B) == 0x82);
+    cmos_w(&f, 0x0B, 0x02);
+    printf("ok: set_clears_uie\n");
+}
+
 int main(void) {
     test_cmos_content_and_ports();
     test_cmos_extended_memory_above_16m();
@@ -191,6 +275,10 @@ int main(void) {
     test_uip_freeze_then_commit();
     test_regc_flags_no_uie();
     test_irq8_update_ended();
+    test_set_date_bcd_leap();
+    test_set_freeze_and_invalid();
+    test_binary_and_12h_formats();
+    test_set_clears_uie();
     puts("rtc tests: ok");
     return 0;
 }

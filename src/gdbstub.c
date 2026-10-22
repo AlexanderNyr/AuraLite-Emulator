@@ -83,6 +83,23 @@ static uint64_t get_le(const char *in, int bytes) {
     return v;
 }
 
+/* U3: the 80-bit ST registers cross the wire as 10 raw bytes in memory
+ * order, wider than put_le/get_le's uint64_t. */
+static void put_raw10(char *out, const uint8_t b[10]) {
+    for (int i = 0; i < 10; i++) {
+        out[2 * i] = hexd[b[i] >> 4]; out[2 * i + 1] = hexd[b[i] & 15];
+    }
+    out[20] = 0;
+}
+static void get_raw10(const char *in, uint8_t b[10]) {
+    memset(b, 0, 10);
+    for (int i = 0; i < 10; i++) {
+        int hi = hexval(in[2 * i]), lo = hexval(in[2 * i + 1]);
+        if (hi < 0 || lo < 0) break;            /* get_le's stop-at-junk */
+        b[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
 /* ---------------------------------------------------- target registers --- */
 /* GDB amd64 numbering (target.xml below): 0-15 GPRs in gdb order, 16 rip,
  * 17 eflags, 18-23 cs ss ds es fs gs, 24-31 st0-7, 32-39 x87 control,
@@ -103,16 +120,40 @@ static int reg_size(int r) {
     return 8;
 }
 
+/* U3 (UPKEEP_PLAN): the x87 block 24-39 is live state, not the old zero
+ * fill.  The convention is measured from GDB i387-tdep.c
+ * (i387_print_float_info: tag = ftag >> (2*physical), display regnum =
+ * (physical + 8 - TOP) % 8) and QEMU target/i386/gdbstub.c's read side:
+ * st_i is the LOGICAL register (physical (TOP+i)&7) as 10 extended bytes;
+ * fctrl/fstat/ftag are the 16-bit FCW/FSW/FTW (FTW full, 2 bits keyed by
+ * PHYSICAL register) zero-extended to the XML's 32-bit slots; fstat's TOP
+ * bits are re-derived from ftop exactly as QEMU does, so GDB's rotation
+ * interpretation can never desync from the CPU's own.  fiseg/fioff/
+ * foseg/fooff/fop are the recorded last-instruction fields (32-bit slots:
+ * 64-bit FIP/FDP truncate, as they do for every 32-bit consumer of this
+ * register set -- QEMU returns 0 for the whole group, this CPU tracks
+ * them and tells the truth).  On a host whose long double is not 80-bit
+ * the ST registers are 'x' (RSP unavailable), never fabricated bytes. */
 static void reg_hex(cpu_t *c, int r, char *out) {
-    int sz = reg_size(r);
     if (r < 16)       put_le(out, c->gpr[gdb2gpr[r]], 8);
     else if (r == 16) put_le(out, c->rip, 8);
     else if (r == 17) put_le(out, c->rflags, 4);
     else if (r < 24)  put_le(out, c->seg[gdbseg[r - 18]].sel, 4);
-    else if (r < 32)  { memset(out, '0', (size_t)sz * 2); out[sz * 2] = 0; }   /* no x87 data model */
+    else if (r < 32)  {
+        if (cpu_x87_host_supported()) {
+            uint8_t b[10];
+            cpu_x87_st_to80(c, r - 24, b);
+            put_raw10(out, b);
+        } else { memset(out, 'x', 20); out[20] = 0; }
+    }
     else if (r == 32) put_le(out, c->fcw, 4);
-    else if (r == 34) put_le(out, 0xFFFF, 4);                                 /* all tags empty */
-    else if (r < 40)  put_le(out, 0, 4);
+    else if (r == 33) put_le(out, (c->fsw & ~0x3800u) | (((unsigned)c->ftop & 7u) << 11), 4);
+    else if (r == 34) put_le(out, c->ftw, 4);
+    else if (r == 35) put_le(out, c->fcs, 4);
+    else if (r == 36) put_le(out, (uint32_t)c->fip, 4);
+    else if (r == 37) put_le(out, c->fds, 4);
+    else if (r == 38) put_le(out, (uint32_t)c->fdp, 4);
+    else if (r < 40)  put_le(out, c->fop, 4);
     else if (r < 56)  { put_le(out, c->xmm[r - 40][0], 8); put_le(out + 16, c->xmm[r - 40][1], 8); }
     else if (r == 56) put_le(out, c->mxcsr, 4);
     else if (r == 57) put_le(out, c->seg[SEG_FS].base, 8);
@@ -124,14 +165,39 @@ static void reg_hex(cpu_t *c, int r, char *out) {
     else              put_le(out, c->efer, 8);
 }
 
-/* Writable: GPRs, rip, eflags, xmm, mxcsr, fs/gs base. Segment selectors,
- * x87 and control registers are read-only here (a selector write without a
- * descriptor load, or a CR write without the CPU's side effects, would
- * create a machine state the CPU itself could never reach). */
+/* Writable: GPRs, rip, eflags, x87 (U3), xmm, mxcsr, fs/gs base. Segment
+ * selectors and control registers stay read-only here (a selector write
+ * without a descriptor load, or a CR write without the CPU's side
+ * effects, would create a machine state the CPU itself could never
+ * reach).  x87 writes are admissible because FRSTOR/FLDENV themselves
+ * load exactly this state: an ST write goes to the LOGICAL register's
+ * physical slot (QEMU's write side skips the rotation its read side
+ * applies -- measured, deliberately not copied: `set $st0` must name the
+ * register `p $st0` just read) with the FTW tag re-classified from the
+ * value; an FSW write moves ftop with TOP.  ST writes in a whole-set G
+ * packet are interpreted against the TOP in effect while the packet is
+ * applied in regnum order -- changing FSW and STs in one packet moves
+ * the ring under the later fields, as it would against the physical
+ * stack; GDB's own single-register flow uses P. */
 static void reg_set(machine_t *m, cpu_t *c, int r, const char *hex) {
     if (r < 16) c->gpr[gdb2gpr[r]] = get_le(hex, 8);
     else if (r == 16) c->rip = get_le(hex, 8);
     else if (r == 17) c->rflags = (get_le(hex, 4) & 0x00257FD5ull) | 2;
+    else if (r >= 24 && r < 32) {
+        if (cpu_x87_host_supported()) {
+            uint8_t b[10];
+            get_raw10(hex, b);
+            cpu_x87_st_from80(c, r - 24, b);
+        }                                       /* else stays 'x': no-op */
+    }
+    else if (r == 32) c->fcw = (uint16_t)get_le(hex, 4);
+    else if (r == 33) cpu_x87_set_fsw(c, (uint16_t)get_le(hex, 4));
+    else if (r == 34) c->ftw = (uint16_t)get_le(hex, 4);
+    else if (r == 35) c->fcs = (uint16_t)get_le(hex, 4);
+    else if (r == 36) c->fip = get_le(hex, 4);
+    else if (r == 37) c->fds = (uint16_t)get_le(hex, 4);
+    else if (r == 38) c->fdp = get_le(hex, 4);
+    else if (r == 39) c->fop = (uint16_t)get_le(hex, 4);
     else if (r >= 40 && r < 56) { c->xmm[r - 40][0] = get_le(hex, 8); c->xmm[r - 40][1] = get_le(hex + 16, 8); }
     else if (r == 56) c->mxcsr = (uint32_t)get_le(hex, 4);
     else if (r == 57) c->seg[SEG_FS].base = get_le(hex, 8);

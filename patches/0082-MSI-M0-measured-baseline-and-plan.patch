@@ -1,0 +1,228 @@
+From cd99dc2935420b0e7bd3d7cfb54529c5d15c2d1a Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Tue, 20 Oct 2026 18:33:31 +0000
+Subject: [PATCH] MSI M0: measured baseline + plan (docs/plans/MSI_PLAN.md)
+
+Opens audit candidate #2 after XHCI closed.  The baseline, measured
+2026-10-20: the north-star guest has no MSI anywhere (drivers/pci
+offers class scan, BAR and the INTx line in 119 lines; interrupt
+routing is IOAPIC-from-MADT), so the audience is other guests and
+QEMU parity.  Parity for 1b36:000d is MSI-X only: capability at cfg
+0x90, Count=16, vector table at BAR0+0x3000, PBA at BAR0+0x3800
+(Red Hat bugs 1451189/1373184) -- both offsets free in our 64 KiB
+BAR0.  Our machine has zero PCI capabilities (cfg[0x34]=0 on every
+function) and no message decode, but the M2 delivery sink already
+exists and is proven by the IOAPIC (lapic_set_irr_dest), and every
+device drives level INTx on change -- the single call sites M3
+turns into routers.
+
+Decisions recorded: xHCI takes the QEMU MSI-X shape with entry 0 in
+use (MaxIntrs=1); delivery is synchronous/edge-shaped from the X5
+xhci_intx_update site with masked-state re-evaluation on unmask (no
+PBA accumulation in v1, equivalent for a level source); msi_deliver
+lives beside its LAPIC sink; INTx fallback stays byte-identical
+until a guest enables the capability; AHCI MSI joins in M3, e1000
+stays INTx-only by parity.  Docs only, no behaviour change.
+---
+ CHANGELOG.md           |  14 +++++
+ ROADMAP.md             |   5 ++
+ docs/STATUS.md         |  11 ++++
+ docs/plans/MSI_PLAN.md | 116 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 146 insertions(+)
+ create mode 100644 docs/plans/MSI_PLAN.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 27f31de..43e9d2a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,20 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0082 (MSI M0: measured baseline + plan)
++
++- `docs/plans/MSI_PLAN.md` opens audit candidate #2 with the measured
++  baseline: the north-star guest consumes no MSI (its PCI layer stops
++  at the INTx line; routing is IOAPIC-from-MADT), the QEMU parity
++  shape for our xHCI is MSI-X only (capability at cfg 0x90, 16
++  entries, table at BAR0+0x3000, PBA at +0x3800), and this machine
++  currently exposes zero PCI capabilities with no message decode --
++  while the LAPIC delivery sink the IOAPIC already proves
++  (`lapic_set_irr_dest`) waits ready. Decisions pinned: QEMU shape,
++  one synchronous router call site, INTx fallback byte-identical
++  until a guest enables the capability. Docs only; no behaviour
++  change.
++
+ ### Added — patch 0081 (XHCI X5: INTx + ports) — XHCI plan complete
+ 
+ - **The interrupt pin is live**: IRQ 10 (INTA#) is asserted while
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 0fdce0a..96d9770 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -37,6 +37,7 @@ maps to exactly one plan below.
+ | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
++| [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | 🚧 **IN PROGRESS** (M0 done ✅; M1 queued) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -110,6 +111,10 @@ either shipped or explicitly NO-GO (PERF P4).
+    MSI capability + address/data programming; M2 LAPIC MSI delivery
+    (edge semantics, EOI, no INTx pin); M3 per-device routing with INTx
+    fallback preserved (historical lanes byte-identical); M4 close-out.
++   **In progress: M0 (`0082`) shipped** -- measured: the north star is
++   INTx/IOAPIC-only, qemu-xhci parity is MSI-X-only (cap @0x90, 16
++   entries, table BAR0+0x3000), zero capabilities exist today, the
++   LAPIC delivery sink (`lapic_set_irr_dest`) is already proven.
+ 3. **PM_PLAN (P0–P3)** — complete the ACPI surface the G5 note leaves
+    open: PM1_STS/PM1_EN/PM1_CNT semantics, GPE0 block, SMI# as an honest
+    no-op or a measured vector, and at least S1 with a deterministic
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3611c41..03b3563 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -931,6 +931,17 @@
+   (determinism x2). NC red with 21 failures; gates green.
+   **Totals for the XHCI arc**: patches `0076`–`0081`, 22 vector
+   groups in `tests/test_xhci.c`, NC counts 58/24/39/32/21.
++- MSI M0 (`patches/0082-MSI-M0-measured-baseline-and-plan.patch`):
++  baseline for audit candidate #2 (`docs/plans/MSI_PLAN.md`). Measured:
++  the north-star guest has no MSI anywhere (119-line PCI API, INTx line
++  only, IOAPIC-from-MADT routing) -- the audience is other guests;
++  QEMU parity for our xHCI identity is MSI-X-only (cap @0x90, 16
++  entries, table BAR0+0x3000, PBA +0x3800); our machine has zero PCI
++  capabilities on any function and no MSI decode, but the LAPIC vector
++  sink the IOAPIC already uses (`lapic_set_irr_dest`) is the proven
++  delivery target. Ledger D1–D3 mapped to M1/M2/M3; decisions: QEMU
++  shape on xHCI, synchronous edge delivery from the one X5 router
++  call site, INTx fallback byte-identical by construction.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/MSI_PLAN.md b/docs/plans/MSI_PLAN.md
+new file mode 100644
+index 0000000..b327a6c
+--- /dev/null
++++ b/docs/plans/MSI_PLAN.md
+@@ -0,0 +1,116 @@
++# MSI Plan — message-signalled interrupts (MSI / MSI-X)
++
++> Audit 2026-10-19 candidate #2 (after XHCI, now complete). Companion to
++> `ROADMAP.md` §"Next-block candidates" and to `docs/plans/XHCI_PLAN.md`
++> (the xHCI INTx delivery this plan generalises).
++
++**Status: M0 done ✅; M1 queued**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| M0 | Measured baseline: who consumes MSI, the QEMU capability shapes, our PCI/LAPIC mechanics, the defect ledger | ✅ done | this file (`patches/0082`) |
++| M1 | PCI MSI-X capability on the xHCI (QEMU-parity shape) + capability-list plumbing (Status.Cap, cfg 0x34) + table/PBA MMIO in BAR0 | ⬜ queued | cfg-level vectors |
++| M2 | LAPIC MSI message delivery: address/data decode -> `lapic_set_irr_dest`, edge semantics, delivery-mode honesty | ⬜ queued | delivery vectors |
++| M3 | Per-device routing: xHCI picks MSI-X vs INTx by Enable/mask state; AHCI gains an MSI capability + routing; INTx fallback byte-identical | ⬜ queued | routing vectors |
++| M4 | Close-out: snapshots, determinism, docs, ledger | ⬜ queued | close-out + docs |
++
++Each phase ships one `.patch` under `patches/` with measured receipts, a
++regression vector, one once-per-phase negative control, green gates and
++the docs update in the same commit (the `ROADMAP.md` standing rules).
++
++## 1. Measured baseline (M0)
++
++### 1a. The consumer side
++
++- **AuraLite-OS (the north star) does not use MSI at all** (measured
++  2026-10-20): its PCI API is 119 lines (`drivers/pci/pci.c`) offering
++  class scan, BAR read and the INTx line only; `msi` appears nowhere in
++  `drivers/pci/pci.{c,h}`, `kernel/arch/x86_64/irq.c` or
++  `kernel/arch/x86_64/ioapic.c`. Its interrupt world is legacy INTx
++  routed through the IOAPIC redirection table built from MADT source
++  overrides (bus source -> GSI). So the north star needs nothing here
++  today; the audience is every *other* guest (Linux/Windows on the
++  SeaBIOS lanes), for whom xHCI/AHCI without message interrupts means
++  shared-INTx degradation -- and QEMU parity, which XHCI_PLAN adopted
++  as a north-star-adjacent rule.
++- `tests/` fixtures and lanes drive devices through PIC/IOAPIC paths
++  today, so all historical lanes must stay byte-identical behind the
++  INTx fallback (M3's core invariant).
++
++### 1b. The QEMU parity shapes
++
++- **qemu-xhci `1b36:000d`** (the identity our XHCI wears) exposes
++  **MSI-X only, no MSI** (Red Hat bug 1451189: "nec-usb-xhci supports
++  both MSI and MSI-X, qemu-xhci only the (newer) MSI-X interrupts").
++  `lspci` shape (bug 1373184): `Capabilities: [90] MSI-X: Enable+
++  Count=16 Masked-`, `Vector table: BAR=0 offset=00003000`,
++  `PBA: BAR=0 offset=00003800`. Our BAR0 is 64 KiB and both offsets are
++  free (doorbells end at 0x1080), so the parity shape drops in as-is.
++- **ich9-ahci** (our AHCI's QEMU counterpart): MSI-capable in QEMU
++  (`msi` property); the exact cap shape is an M3 measurement.
++- **e1000 82540EM**: no MSI on the hardware or in QEMU -- parity says
++  leave it alone (recorded so nobody "fixes" it later).
++
++### 1c. Our machine today (measured)
++
++- **Zero PCI capabilities anywhere**: `cfg[0x34]` is 0 and Status bit 4
++  (Capabilities List) is clear on every function (`grep` over
++  `src/pci.c`, `src/devices.c`). The config machinery itself is ready:
++  `cfg[256]` per device with per-device `cfg_read`/`cfg_write` hooks
++  (AHCI, XHCI already use them for BAR probe semantics).
++- **No MSI mechanism**: `grep MSI|0xFEE` finds only the LAPIC window
++  itself (`LAPIC_BASE 0xFEE00000`, MADT). A would-be MSI write decodes
++  as an ordinary LAPIC register access today.
++- **Vector delivery already exists**: the IOAPIC lands interrupts via
++  `lapic_set_irr_dest(m, dest, vec)` (`src/ioapic.c`), so M2 is a decode
++  layer in front of a proven sink, not new plumbing. Devices drive
++  level INTx through `pic_set_irq` on change (AHCI S5 / XHCI X5
++  convention) -- the per-device place where M3 chooses the path.
++
++### 1d. Defect ledger
++
++| # | Defect (measured absence) | Consequence | Phase |
++|---|---------------------------|-------------|-------|
++| D1 | no MSI/MSI-X capability on any function | modern-guest xHCI/AHCI drivers fall back to shared INTx or polling | M1 (+M3 for AHCI) |
++| D2 | no MSI message decode/delivery | an enabled capability would signal into the void | M2 |
++| D3 | devices cannot select MSI vs INTx | enabling order (OS programs cap, expects pin to go quiet) unhonoured | M3 |
++
++## 2. Architecture decisions (M0)
++
++- **XHCI gets MSI-X in the QEMU shape**: capability at cfg 0x90 (id 0x11,
++  next=0), Table Size 16 (Message Control[10:0] = 15), table at
++  BAR0+0x3000, PBA at BAR0+0x3800. We use entry 0 (interrupter 0 is the
++  only source, `HCSPARAMS1.MaxIntrs=1`). The other 15 entries exist for
++  shape parity; a guest that arms them sees correct table storage and
++  no sources, which is what a 1-interrupter controller is.
++- **Delivery is synchronous and edge-shaped**, consistent with the whole
++  device fleet: when the interrupter condition (IP level) rises with
++  MSI-X enabled and unmasked, one message is delivered (the X5
++  `xhci_intx_update` single call site becomes the router). While masked
++  (Function Mask or per-vector Mask), the pending bit does **not**
++  accumulate in v1: IP itself stays latched and unmasking re-evaluates
++  the level, which is equivalent for a level source -- stated here so
++  M1 vectors assert the actual contract, not the spec's PBA subtlety.
++- **`msi_deliver(m, addr, data)` lives in `lapic.c`** next to its sink:
++  x86 message decode (addr: dest id at [19:12], RH/DM; data: vector
++  [7:0], delivery mode [10:8]). Fixed delivery lands as-is; other modes
++  are logged and delivered as Fixed in v1 (single-vCPU machine: lowest
++  priority degenerates to the one CPU; SMI/NMI/INIT messages are
++  dropped with a log line, never fabricated).
++- **INTx fallback is the default and byte-identical**: nothing changes
++  until a guest sets MSI-X Enable (or MSI Enable on AHCI in M3), so
++  every historical receipt and the guest's INTx path are preserved by
++  construction; the X5 vectors keep guarding the pin.
++- **Cap plumbing is per-device**: the capability list pointer/Status
++  bit get set in `devices.c` device construction, and the capability
++  registers ride each controller's existing cfg hooks (RO fields
++  written by nobody, Enable/mask/table storage in controller state,
++  covered by the existing snapshot tags -- `xhci_t` for the table).
++
++## 3. Gates (standing rules)
++
++Per phase: profile vectors (`test-xhci`, `test-ahci`, a new `test-msi`
++lane for M2's delivery core) + one NC + `make test` +
++`make test-sanitize` + both SeaBIOS ISO lanes, docs in the same commit,
++one patch per phase, cumulative patch refreshed from the current
++github `main`.
+-- 
+2.47.3
+

@@ -178,6 +178,7 @@ int main(int argc, char **argv) {
     const char *snap_save_path = NULL; /* --snapshot-save=path: TOOLING T4, at run end */
     const char *snap_load_path = NULL; /* --snapshot-load=path: TOOLING T4, before the run */
     const char *monitor_spec = NULL;   /* --monitor=[host:]port: TOOLING T5 */
+    const char *monitor_token = NULL;  /* --monitor-token=str: UPKEEP U7 */
     uint64_t trace_from = 0;        /* --trace-from=VTIME: first traced instruction */
     uint64_t trace_count = 0;       /* --trace-count=N: stop after N lines (0 = all) */
 
@@ -246,6 +247,7 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--gdb=", 6)) gdb_spec = argv[i]+6;                   /* TOOLING T3 */
         else if (!strncmp(argv[i], "--snapshot-save=", 16)) snap_save_path = argv[i]+16;  /* TOOLING T4 */
         else if (!strncmp(argv[i], "--snapshot-load=", 16)) snap_load_path = argv[i]+16;
+        else if (!strncmp(argv[i], "--monitor-token=", 16)) monitor_token = argv[i]+16;  /* UPKEEP U7 */
         else if (!strncmp(argv[i], "--monitor=", 10)) monitor_spec = argv[i]+10;
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--rom=path] [--disk=path] [--platform=sandybridge|ivybridge|haswell|broadwell|baytrail]\n"
@@ -278,7 +280,11 @@ int main(int argc, char **argv) {
                   "          [--gdb=[host:]port] wait for gdb (`target remote host:port`; TOOLING T3);\n"
                   "                      host defaults to 127.0.0.1; vCPUs are threads; `monitor help`\n"
                   "          [--monitor=[IPv4:]port] live HTTP/WebSocket monitor (default 127.0.0.1; T5)\n"
-                  "                      starts stopped; open http://host:port/ (no authentication)\n"
+                  "                      starts stopped; open http://host:port/ (UPKEEP U7: Host/Origin\n"
+                  "                      are authorized; --monitor-token=STR or $X86EMU_MONITOR_TOKEN\n"
+                  "                      sets the capability WebSocket clients must present --\n"
+                  "                      mandatory for any non-loopback bind; the env form keeps\n"
+                  "                      the secret out of the process list)\n"
                   "          [--snapshot-save=path] save the machine when the run loop ends (TOOLING T4)\n"
                   "          [--snapshot-load=path] start from a saved machine; same build and machine\n"
                   "                      shape required; --max-instr stays a total budget\n"
@@ -501,7 +507,7 @@ int main(int argc, char **argv) {
         }
         if (gdb_spec && gdb_attach(m, gdb_spec) != 0)
             fprintf(stderr, "[gdb] not attached; the run continues without gdb\n");
-        if (monitor_spec && monitor_attach(m, monitor_spec) != 0) {
+        if (monitor_spec && monitor_attach(m, monitor_spec, monitor_token) != 0) {
             rc = EXIT_INPUT_ERROR;
             if (debug_in) fclose(debug_in);
             goto teardown;

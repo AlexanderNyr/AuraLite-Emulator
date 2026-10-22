@@ -88,8 +88,11 @@ seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
 a user-picked copy. At the post-mortem
 "end" stop the page keeps the final state visible; **Остановить** sends the
 monitor's `quit` so the emulator prints its stats and writes the artifacts
-before exiting. There is no authentication — same rules as the live
-monitor: keep the launcher on loopback unless remote access is intentional.
+before exiting. Access is authenticated (UPKEEP U7): on loopback the page
+carries its token automatically; on any other bind the visitor must enter
+the access token shown by the desktop GUI (expert mode, «Сеть» tab), and
+the transport is plaintext HTTP — still keep the launcher on loopback
+unless remote access is intentional.
 
 ## Run
 
@@ -147,10 +150,16 @@ controls provide pause/continue/step, breakpoints, debugger inspection, keyboard
 scancodes, ASCII typing and quit. Offline PPM/log loading is still available.
 When GDB is attached, monitor run control is read-only and GDB remains the owner.
 
-There is **no authentication**. Keep the default loopback binding unless remote
-access is intentional; an explicit bind such as `--monitor=0.0.0.0:8080` exposes
-the emulator controls to anyone who can reach that port. Use appropriate network
-isolation/firewall rules. The monitor currently accepts IPv4 bind addresses.
+Requests are authorized (UPKEEP U7): the `Host` must name this machine,
+a browser `Origin` must be same-origin, and with a token configured
+(`--monitor-token=STR`, or `X86EMU_MONITOR_TOKEN` in the environment —
+the form the GUI uses so the secret stays out of process lists) the
+WebSocket upgrade must present it (`?token=`, `X-X86emu-Token` or
+`Authorization: Bearer`). A non-loopback bind without a token is refused
+at startup; with one, the transport is still plaintext HTTP, so keep the
+default loopback binding unless remote access is intentional and use
+appropriate network isolation/firewall rules. The monitor currently
+accepts IPv4 bind addresses.
 
 Snapshots save the whole machine when the run loop ends and resume it later in
 a fresh process; `--max-instr` stays the total budget:

@@ -24,7 +24,7 @@ pre{margin:0;max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:a
   <div class="controls"><button data-command="pause">Pause</button><button data-command="continue">Continue</button><button data-command="step">Step</button><button id="quit" class="danger">Quit emulator</button></div>
   <div class="controls"><label>Breakpoint <input id="breakaddr" type="text" value="0x100000"></label><button id="breakbtn">Set break</button><label>REPL <input id="execLine" type="text" value="info regs"></label><button id="execbtn">Execute</button></div>
   <div class="controls"><label>Set-1 scancodes <input id="keycodes" type="text" value="1E,9E"></label><button id="keysbtn">Send keys</button><label>Type ASCII <input id="typed" type="text" value="hello\n"></label><button id="typebtn">Type</button></div>
-  <div class="hint">The monitor starts the machine stopped at the reset vector. Use Continue to run. Run-control commands are refused while GDB owns the session. The server has no authentication; it binds to 127.0.0.1 unless you explicitly choose another IPv4 address.</div>
+  <div class="hint">The monitor starts the machine stopped at the reset vector. Use Continue to run. Run-control commands are refused while GDB owns the session. Requests are authorized by Host/Origin, and when started with a token (--monitor-token=) the WebSocket URL must carry it (?token=, inherited from this page's URL). It binds to 127.0.0.1 unless you explicitly choose another IPv4 address.</div>
 </div></section>
 
 <section class="panel"><h2>Machine / stop state</h2><div class="body kv">
@@ -94,7 +94,7 @@ $('#typebtn').onclick=()=>sendCommand('type',{text:$('#typed').value.replace(/\\
 function ppm(buf){const bytes=new Uint8Array(buf);let head=new TextDecoder().decode(bytes.slice(0,1000)),m=head.match(/^P6\s+(\d+)\s+(\d+)\s+255\s/);if(!m)return;let off=m[0].length,w=+m[1],h=+m[2];if(!w||!h||off+w*h*3>bytes.length)return;canvas.width=w;canvas.height=h;const image=ctx.createImageData(w,h);for(let i=0;i<w*h;i++){image.data[i*4]=bytes[off+i*3];image.data[i*4+1]=bytes[off+i*3+1];image.data[i*4+2]=bytes[off+i*3+2];image.data[i*4+3]=255}ctx.putImageData(image,0,0)}
 $('#ppm').onchange=e=>{const f=e.target.files[0];if(f)f.arrayBuffer().then(ppm)};
 $('#logfile').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(t=>{$('#log').textContent=t;lastLogLines=t.split('\n').length})};
-if(location.protocol==='http:'||location.protocol==='https:'){$('#wsurl').value=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';connect()}
+if(location.protocol==='http:'||location.protocol==='https:'){const tk=new URLSearchParams(location.search).get('token');$('#wsurl').value=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'+(tk?('?token='+encodeURIComponent(tk)):'');connect()}
 </script>
 </body>
 </html>

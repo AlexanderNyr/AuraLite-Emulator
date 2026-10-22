@@ -31,7 +31,17 @@ typedef struct pm {
     uint64_t last_instr;/* vtime_instr at the last advance                  */
     uint64_t accum;     /* fractional PIT-tick accumulator (TMR runs 3x)   */
     uint64_t reads;     /* TMR reads (diagnostic)                          */
+    uint16_t sts;       /* PM1_STS latch (W1C bits; PM P1)                 */
+    uint16_t en;        /* PM1_EN                                          */
+    uint16_t cnt;       /* PM1_CNT stored bits (SCI_EN, BM_RLD)            */
+    int sci_level;      /* last level driven on the SCI line (IRQ9)        */
+    uint32_t gpe_sts;   /* GPE0_STS latch at +0x20 (W1C; PM P2)           */
+    uint32_t gpe_en;    /* GPE0_EN at +0x24                               */
 } pm_t;
+
+#define PM_SCI_IRQ 9
+#define PM_DEFAULT_BASE 0xB000   /* Q35/SeaBIOS PMBASE; the FADT
+                                    advertises this address (PM P2) */
 
 /* Reset the block and decode it at the Q35/SeaBIOS default base 0xb000. */
 void pm_init(struct machine *m);
@@ -41,5 +51,8 @@ void pm_set_base(struct machine *m, uint16_t base);
 
 /* Current 24-bit Timer value, advanced from vtime_instr. */
 uint32_t pm_timer_now(struct machine *m);
+
+/* Advance the Timer and re-drive SCI (device-tick cadence, PM P1). */
+void pm_tick(struct machine *m);
 
 #endif

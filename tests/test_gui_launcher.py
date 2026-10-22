@@ -15,10 +15,20 @@ Vectors:
      land in the run dir, output tails readable.
   D. refusals: /ws with no machine is 502, unknown API 404, snapshot delete
      of a missing file, bad preset name.
+  E. UPKEEP U7 access gate: the API and /ws refuse a missing or wrong
+     token, a DNS-rebinding Host and a cross-origin Origin; the page
+     carries the token (loopback) and sets the SameSite=Strict cookie;
+     the happy paths above run exactly like the browser does -- they
+     scrape the token out of the served page and present it back. A
+     second launcher on the any-address proves the remote shape: no
+     token in the page, a login form, the persistent 0600 access-token
+     file, and the plaintext warning.
 """
 import base64
+import http.client as http_client_mod   # the bare name http is a helper below
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -43,16 +53,49 @@ def check(cond, label):
         fails += 1
 
 
-def http(port, path, method="GET", body=None):
+_TOKENS = {}
+
+
+def page_token(port):
+    """The browser's bootstrap, mirrored (UPKEEP U7): the capability is
+    embedded in the page the loopback launcher serves. Scraped once per
+    port; empty string when the page carries none -- which is exactly
+    the pre-U7 negative-control situation, where every refusal check in
+    lane E then fails while the happy paths still run."""
+    if port not in _TOKENS:
+        _code, raw = http(port, "/", _auth=False)
+        m = re.search(rb'X86EMU_TOKEN="([^"]*)"', raw)
+        _TOKENS[port] = m.group(1).decode() if m else ""
+    return _TOKENS[port]
+
+
+def http(port, path, method="GET", body=None, _auth=True):
     url = "http://127.0.0.1:%d%s" % (port, path)
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if _auth:
+        headers["X-X86emu-Token"] = page_token(port)
     req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
+
+
+def http_raw(port, path, method="GET", headers=None, body=b""):
+    """Hand-set headers (Host/Origin/token) that urllib would normalize
+    away; returns (status, headers-dict, body)."""
+    conn = http_client_mod.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request(method, path, body=body,
+                 headers=headers if headers is not None
+                 else {"Host": "127.0.0.1:%d" % port})
+    r = conn.getresponse()
+    raw = r.read()
+    hd = {k.lower(): v for k, v in r.getheaders()}
+    conn.close()
+    return r.status, hd, raw
 
 
 def jhttp(port, path, method="GET", body=None):
@@ -167,10 +210,10 @@ class WSock:
 def ws_handshake(port):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     key = base64.b64encode(os.urandom(16)).decode()
-    s.sendall(("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+    s.sendall(("GET /ws?token=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
-               % (port, key)).encode())
+               % (page_token(port), port, key)).encode())
     s.settimeout(10)
     buf = b""
     while b"\r\n\r\n" not in buf:
@@ -202,13 +245,16 @@ def ws_frame(s):
 
 
 def test_lifecycle(port):
-    # refusals first: no machine yet
+    # refusals first: no machine yet -- but an *authorized* request now:
+    # pre-U7 this probe sent Host: x and still got its 502 (the defect);
+    # the same headers are lane E's 403 evidence.
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=5)
         key = base64.b64encode(os.urandom(16)).decode()
-        s.sendall(("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
-                   "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
-                   "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+        s.sendall(("GET /ws?token=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                   "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                   % (page_token(port), port, key)).encode())
         s.settimeout(5)
         head = s.recv(200).decode(errors="replace")
         s.close()
@@ -295,6 +341,172 @@ def test_lifecycle(port):
     check(code == 200, "stop on an exited machine is harmless")
 
 
+# ---------------- E. UPKEEP U7 access gate -----------------------------------
+
+
+def _ws_probe(port, path="/ws", host=None, origin=None, headers=None):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    key = base64.b64encode(os.urandom(16)).decode()
+    lines = ["GET %s HTTP/1.1" % path,
+             "Host: %s" % (host or "127.0.0.1:%d" % port),
+             "Upgrade: websocket", "Connection: Upgrade",
+             "Sec-WebSocket-Key: %s" % key, "Sec-WebSocket-Version: 13"]
+    if origin is not None:
+        lines.append("Origin: %s" % origin)
+    if headers:
+        lines.extend(headers)
+    s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    s.settimeout(5)
+    out = b""
+    try:
+        while b"\r\n" not in out:
+            d = s.recv(4096)
+            if not d:
+                break
+            out += d
+    except OSError:
+        pass
+    s.close()
+    return out.decode(errors="replace").splitlines()[0] if out else ""
+
+
+# Symbol lookups are getattr-guarded so the pre-U7 negative control reports
+# clean FAILs instead of AttributeError on a launcher module that has no
+# access gate yet.
+COOKIE_NAME = getattr(launcher, "TOKEN_COOKIE", "x86emu_token")
+TOKEN_FILE = getattr(launcher, "ACCESS_TOKEN_FILE", "access-token")
+
+
+def test_access_gate(port):
+    tok = page_token(port)
+    good = {"Host": "127.0.0.1:%d" % port}
+
+    code, _h, _b = http_raw(port, "/api/status", headers=good)
+    check(code == 401, "U7: API without a token is 401")
+    h = dict(good, **{"X-X86emu-Token": "wrong"})
+    code, _h, _b = http_raw(port, "/api/status", headers=h)
+    check(code == 401, "U7: API with a wrong token is 401")
+    h = dict(good, **{"X-X86emu-Token": tok})
+    code, _h, _b = http_raw(port, "/api/status", headers=h)
+    check(code == 200 and len(tok) >= 32, "U7: API with the page token is 200")
+
+    # DNS rebinding: the attacker's name is not this machine
+    h = {"Host": "evil.example", "X-X86emu-Token": tok}
+    code, _h, _b = http_raw(port, "/api/status", headers=h)
+    check(code == 403, "U7: rebinding Host on the API is 403")
+    code, _h, _b = http_raw(port, "/", headers={"Host": "evil.example"})
+    check(code == 403, "U7: rebinding Host on the page is 403")
+
+    # cross-origin mutation: a browser cannot omit Origin on POST
+    h = dict(good, **{"X-X86emu-Token": tok, "Origin": "http://evil.example"})
+    code, _h, _b = http_raw(port, "/api/stop", "POST", h, b"{}")
+    check(code == 403, "U7: cross-Origin POST is 403 even with the token")
+    h = dict(good, **{"X-X86emu-Token": tok,
+                       "Origin": "http://127.0.0.1:%d" % port})
+    code, _h, _b = http_raw(port, "/api/stop", "POST", h, b"{}")
+    check(code == 200, "U7: same-Origin POST with the token passes")
+
+    # the upgrade: token first, then Origin (checked with a token so the
+    # 403 is the Origin branch, not the 401), then Host
+    line = _ws_probe(port)
+    check("401" in line, "U7: /ws without a token is 401")
+    line = _ws_probe(port, "/ws?token=wrong")
+    check("401" in line, "U7: /ws with a wrong token is 401")
+    line = _ws_probe(port, "/ws?token=%s" % tok, origin="http://evil.example")
+    check("403" in line, "U7: /ws with a cross-Origin is 403")
+    line = _ws_probe(port, "/ws?token=%s" % tok, host="evil.example")
+    check("403" in line, "U7: /ws with a rebinding Host is 403")
+
+    # the bootstrap contract the browser relies on
+    code, hd, raw = http_raw(port, "/", headers=good)
+    cookie = hd.get("set-cookie", "")
+    check(code == 200 and tok != "" and tok.encode() in raw,
+          "U7: loopback page carries the token")
+    check(COOKIE_NAME in cookie and "HttpOnly" in cookie
+          and "SameSite=Strict" in cookie,
+          "U7: page sets an HttpOnly SameSite=Strict token cookie")
+    check(hd.get("cache-control") == "no-store",
+          "U7: token-bearing page is no-store")
+    h = dict(good, Cookie="%s=%s" % (COOKIE_NAME, tok))
+    code, _h, _b = http_raw(port, "/api/status", headers=h)
+    check(code == 200, "U7: the cookie alone authorizes the API")
+
+
+def test_remote_gate(emu):
+    """A non-loopback launcher (bound to the any-address, still reached
+    here over 127.0.0.1: Host literals stay allowed): the page embeds
+    nothing, login demands the state-dir credential, and startup prints
+    the plaintext warning. The remote token file is owner-only."""
+    tmp = tempfile.mkdtemp(prefix="gui-remote-")
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "tools", "launcher.py"),
+         "--bind", "0.0.0.0", "--port", str(port), "--state-dir", tmp,
+         "--emu", emu],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        good = {"Host": "127.0.0.1:%d" % port}
+        for _ in range(50):
+            try:
+                code, hd, raw = http_raw(port, "/", headers=good)
+                if code == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        text = raw.decode("utf-8", errors="replace")
+        check("X86EMU_TOKEN" not in text and "Токен" in text,
+              "U7 remote: bare / is the login form, no token embedded")
+
+        tok_path = os.path.join(tmp, TOKEN_FILE)
+        tok, mode = "", 0
+        if os.path.exists(tok_path):
+            mode = os.stat(tok_path).st_mode & 0o777
+            with open(tok_path) as f:
+                tok = f.read().strip()
+        check(mode == 0o600 and len(tok) >= 32,
+              "U7 remote: access-token file exists, 0600, strong")
+
+        code, _hd, raw = http_raw(port, "/?token=wrong", headers=good)
+        check(b"X86EMU_TOKEN" not in raw and "Неверный".encode() in raw,
+              "U7 remote: a wrong token stays on the login form")
+        code, hd, raw = http_raw(port, "/?token=%s" % tok, headers=good)
+        check(code == 200 and b"X86EMU_TOKEN" in raw
+              and "SameSite=Strict" in hd.get("set-cookie", ""),
+              "U7 remote: the file token unlocks the page + cookie")
+
+        code, _hd, _b = http_raw(
+            port, "/api/status",
+            headers=dict(good, **{"X-X86emu-Token": "wrong"}))
+        check(code == 401, "U7 remote: API rejects a wrong token (401)")
+        code, _hd, _b = http_raw(port, "/api/status", headers=good)
+        check(code == 401, "U7 remote: API rejects a tokenless call (401)")
+
+        line = _ws_probe(port)
+        check("401" in line, "U7 remote: /ws rejects a tokenless upgrade")
+
+        # rotation: the helper the desktop GUI button calls
+        rotate = getattr(launcher, "load_or_create_access_token", None)
+        rotated_ok = False
+        if rotate is not None:
+            new, _p, created = rotate(tmp, force_new=True)
+            rotated_ok = created and new != tok and \
+                open(tok_path).read().strip() == new
+        check(rotated_ok, "U7 remote: rotation rewrites the credential file")
+    finally:
+        proc.terminate()
+        try:
+            out, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+    check(b"plaintext" in out and b"token" in out.lower(),
+          "U7 remote: startup prints the plaintext warning + token URL")
+
+
 def main():
     emu = os.path.join(ROOT, "x86emu")
     if not os.path.isfile(emu):
@@ -321,7 +533,9 @@ def main():
             time.sleep(0.1)
         test_schema()
         test_http_surface(port)
+        test_access_gate(port)
         test_lifecycle(port)
+        test_remote_gate(emu)
     finally:
         proc.terminate()
         try:

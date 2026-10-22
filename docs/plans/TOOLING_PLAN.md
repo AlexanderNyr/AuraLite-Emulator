@@ -523,8 +523,10 @@ and disassembly. Binary framebuffer messages carry `FB`, version, keyframe
 flag, little-endian dimensions/row count, then changed rows as y + RGB.
 Commands: `pause/continue/step/break/exec/keys/type/quit`. When GDB is
 attached, monitor run control is read-only. `web/monitor.html` adds the live
-view and retains offline PPM/log loading. The endpoint has no authentication;
-non-loopback binding is an explicit user choice.
+view and retains offline PPM/log loading. The endpoint shipped without
+authentication; UPKEEP_PLAN U7 (`patches/0098`) later added Host/Origin
+authorization and the `--monitor-token=` capability (mandatory for a
+non-loopback bind, which stays an explicit user choice).
 
 **Gate.** `make test-monitor-codec`: RFC 6455 sample accept key, FIPS 180
 SHA-1 vectors, masked and unmasked short/16-bit/64-bit payloads, and

@@ -10,13 +10,16 @@
  *      smaller than RAM;
  *   4. refusals with the exact reason: bad magic, other format version,
  *      other build layout, truncation at every record boundary class,
- *      trailing garbage, other platform, other vCPU count.
+ *      trailing garbage, other platform, other vCPU count;
+ *   5. UPKEEP U4: a relocated and a relocated+disabled LAPIC window
+ *      save/load equivalently (functions continue at the guest's base).
  */
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include "harness.h"
 #include "cpu.h"
+#include "lapic.h"
 #include "snapshot.h"
 
 static int fails;
@@ -103,6 +106,74 @@ static size_t read_all(const char *path, uint8_t **out) {
     return k;
 }
 
+/* UPKEEP U4: a snapshot taken with the LAPIC relocated (and one with it
+ * relocated AND globally disabled) restores with the window exactly
+ * where the guest left it, via lapic_sync_mmio on the load path. */
+static machine_t SC, SD;                       /* snapshot U4 fixtures */
+static void drop_mmio(machine_t *m) {
+    while (m->mmio_list) {
+        mmio_region_t *n = m->mmio_list->next;
+        free(m->mmio_list);
+        m->mmio_list = n;
+    }
+}
+static void boot_lapic(machine_t *m) {
+    drop_mmio(m);
+    setup_machine(m);
+    cpu_devtick_set(0);
+    lapic_init(m);
+    lapic_mmio_register(m);
+}
+/* "mov ecx,0x1B; mov eax,lo; mov edx,hi; wrmsr; jmp $" at 0x5000 */
+static void guest_set_apicbase(machine_t *m, uint64_t v) {
+    uint8_t code[24]; int n = 0;
+    code[n++] = 0x66; code[n++] = 0xB9; code[n++] = 0x1B;
+    code[n++] = 0; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0x66; code[n++] = 0xB8;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i));
+    code[n++] = 0x66; code[n++] = 0xBA;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i + 32));
+    code[n++] = 0x0F; code[n++] = 0x30; code[n++] = 0xEB; code[n++] = 0xFE;
+    memcpy(m->ram + 0x5000, code, (size_t)n);
+    m->cpu.rip = 0x5000;
+    for (int i = 0; i < 8; i++) (void)cpu_step(&m->cpu);
+}
+static int u4_snapshot_cases(const char *ps, const char *ps2) {
+    int f0 = fails;
+    const uint64_t NEWB = 0xFEE80000ULL;
+    int found;
+    /* relocated + enabled */
+    boot_lapic(&SC);
+    mem_write(&SC, LAPIC_BASE + LAPIC_ID, 4, 0xAB000000u);
+    guest_set_apicbase(&SC, NEWB | LAPIC_MSR_EN);
+    EXPECT((uint32_t)mem_read(&SC, NEWB + LAPIC_VER, 4) == 0x00050014u, "src relocated window dead");
+    assert(snap_save(&SC, ps, &CFG) == 0);
+    boot_lapic(&SD);
+    assert(snap_load(&SD, ps, &CFG) == 0);
+    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0x00050014u, "loaded relocated window dead");
+    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_ID, 4) == 0xAB000000u, "loaded LAPIC ID lost");
+    EXPECT((uint32_t)mem_read(&SD, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu, "old window resurrected");
+    EXPECT(cpu_get_msr(&SD.cpu, LAPIC_MSR_APICBASE, &found) == (NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP) && found,
+           "loaded MSR not the relocated value");
+    assert(snap_save(&SD, ps2, &CFG) == 0);
+    EXPECT(same_file(ps, ps2), "relocated save -> load -> save not a fixed point");
+    /* relocated + globally disabled */
+    guest_set_apicbase(&SC, NEWB);                      /* EN=0 at the new base */
+    assert(snap_save(&SC, ps, &CFG) == 0);
+    boot_lapic(&SD);
+    assert(snap_load(&SD, ps, &CFG) == 0);
+    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu, "disabled window decoded");
+    EXPECT((uint32_t)mem_read(&SD, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu, "default window decoded");
+    EXPECT(cpu_get_msr(&SD.cpu, LAPIC_MSR_APICBASE, &found) == (NEWB | LAPIC_MSR_BSP) && found,
+           "loaded MSR not the disabled relocated value");
+    guest_set_apicbase(&SD, NEWB | LAPIC_MSR_EN);       /* guest revives it */
+    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0x00050014u, "revived window dead");
+    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_ID, 4) == 0xAB000000u, "ID lost across disabled snapshot");
+    drop_mmio(&SC); drop_mmio(&SD);
+    if (fails == f0) printf("ok U4 snapshot: relocated and disabled LAPIC save/load equivalently\n");
+    return fails - f0;
+}
+
 int main(void) {
     const char *p1 = "/tmp/test-snap-1.snap", *p2 = "/tmp/test-snap-2.snap", *p3 = "/tmp/test-snap-3.snap";
     const char *bad = "/tmp/test-snap-bad.snap";
@@ -147,6 +218,7 @@ int main(void) {
     printf("ok determinism: identical files for identical states; save -> load -> save fixed point\n");
 
     /* 3. sparse RAM */
+    u4_snapshot_cases("/tmp/test-snap-u4a.snap", "/tmp/test-snap-u4b.snap");
     long sz = fsize(p1);
     EXPECT(sz > 0 && sz < 2 * 1024 * 1024, "snapshot of a tiny program is %ld bytes", sz);
     printf("ok sparse: %ld-byte file for a %u MiB machine\n", sz, RAM_SIZE >> 20);
@@ -191,6 +263,7 @@ int main(void) {
     printf("ok refusals: bad magic, version, build layout, truncation x6, trailing bytes, platform, vCPUs, --tap\n");
     free(img); free(mod); free(ref_ram);
     remove(p1); remove(p2); remove(p3); remove(bad);
+    remove("/tmp/test-snap-u4a.snap"); remove("/tmp/test-snap-u4b.snap");
     if (fails) { printf("test-snap: %d FAILED\n", fails); return 1; }
     puts("test-snap: all vectors passed");
     return 0;

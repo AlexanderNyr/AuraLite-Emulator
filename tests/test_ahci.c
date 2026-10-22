@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "machine.h"
+#include "pci.h"          /* MSI M3: pci_dev_t for the capability test */
 #include "ahci.h"
 #include "harness.h"
 
@@ -842,6 +843,58 @@ static void test_intx_line(void) {
     printf("ok intx line\n");
 }
 
+/* MSI M3: the MSI capability (ICH shape at cfg 0x80) reroutes the S5
+ * interrupt condition to one LAPIC message on its rising edge; the pin
+ * stays silent while enabled and returns byte-identical when disabled. */
+static void run_one_cmd(fx_t *f) {
+    mem_write(&f->m, P(0, 0x00), 4, T_CLB);
+    t_hdr(&f->m, 1, 0);
+    t_fis(&f->m, 0x25, 0, 1);
+    t_prdt(&f->m, 0, T_BUF1, 512);
+    mem_write(&f->m, P(0, 0x38), 4, 1);
+    assert(mem_read(&f->m, P(0, 0x10), 4) & 1u);   /* DHRS latched */
+}
+
+static void test_msi_line(void) {
+    fx_t f; fx_init(&f);
+    lapic_init(&f.m);
+    lapic_mmio_register(&f.m);
+    f.m.lapic.svr |= 0x100u;
+    fx_attach_disk(&f, 0, 1024 * 1024);
+    pci_dev_t d;
+    memset(&d, 0, sizeof d);
+    d.bus = 0; d.dev = 31; d.func = 2;
+    ahci_pci_seed(&d);
+    assert((d.cfg[0x06] & 0x10) && d.cfg[0x34] == 0x80 && d.cfg[0x80] == 0x05);
+    assert(d.cfg[0x81] == 0 && d.cfg[0x82] == 0 && d.cfg[0x83] == 0);
+    ahci_pci_cfg_write(&d, 0x84, 4, 0xFEE00000u);
+    ahci_pci_cfg_write(&d, 0x88, 4, 0x45u);
+    ahci_pci_cfg_write(&d, 0x80, 4, 0x00010005u);        /* MC.Enable */
+    assert(d.cfg[0x82] & 1u);
+    /* completion on the PxIE path: message, no pin */
+    mem_write(&f.m, P(0, 0x14), 4, 1u);                  /* PxIE.DHRS */
+    run_one_cmd(&f);
+    assert(!(f.m.pic.slave.lines & (1u << 6)));          /* IRQ14 silent */
+    assert(lapic_intack(&f.m) == 0x45);                  /* one message */
+    mem_write(&f.m, 0xFEE000B0u, 4, 0);                  /* EOI */
+    /* condition still latched: second completion does not re-send */
+    run_one_cmd(&f);
+    assert(lapic_intack(&f.m) < 0);
+    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);         /* ack */
+    run_one_cmd(&f);
+    assert(lapic_intack(&f.m) == 0x45);                  /* re-armed */
+    mem_write(&f.m, 0xFEE000B0u, 4, 0);
+    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+    /* MSI off: the pin path is back */
+    ahci_pci_cfg_write(&d, 0x80, 4, 0x00000005u);
+    run_one_cmd(&f);
+    assert(f.m.pic.slave.lines & (1u << 6));
+    mem_write(&f.m, P(0, 0x10), 4, 0xFFFFFFFFu);
+    assert(!(f.m.pic.slave.lines & (1u << 6)));
+    fx_done(&f);
+    printf("ok msi line\n");
+}
+
 int main(void) {
     test_global_regs();
     test_dark_ports();
@@ -867,6 +920,7 @@ int main(void) {
     test_engine_write_128k();
     test_writethrough();
     test_intx_line();
+    test_msi_line();
     printf("test_ahci: ALL PASS\n");
     return 0;
 }

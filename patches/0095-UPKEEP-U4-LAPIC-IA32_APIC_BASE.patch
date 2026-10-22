@@ -1,0 +1,982 @@
+From ec485c39093f1274e712ca759a08c69afa5b4100 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.local>
+Date: Wed, 21 Oct 2026 20:37:55 +0000
+Subject: [PATCH] UPKEEP U4: make IA32_APIC_BASE a real register (LAPIC
+ relocation + EN)
+
+WRMSR 0x1B was sparse storage: the MMIO window never moved, the
+global enable gated nothing, and every vCPU powered up claiming
+BSP (D1 in docs/plans/UPKEEP_PLAN.md). Measured from Intel SDM
+Vol.3A ss.10.4.3-10.4.5/10.4.7 and QEMU master hw/intc/apic.c +
+apic_common.c:
+
+- One "LAPIC" MMIO region mirrors the current context's MSR
+  decode; re-synced on accepted WRMSR, live-pair reset,
+  vcpu_load and snapshot load. Per-vCPU window addresses with
+  a single registration (SDM 10.4.5); handlers decode against
+  the live base.
+- WRMSR 0x1B validates before storing: reserved bits (0-7, 9),
+  the x2APIC EN bit (unsupported, CPUID.1:ECX[21]=0) and bits
+  beyond MAXPHYADDR=40 reject the write with state untouched
+  (logged; no #GP, matching the permissive house MSR lane).
+  The BSP bit is a strap: writes preserve it (QEMU), and
+  cpu_reset seeds it by slot identity (context 0 is the BSP).
+- EN=0 is SDM's "no on-chip APIC": the window unmaps,
+  CPUID.1:EDX[9] reads 0, IOAPIC/MSI/IPI fixed messages drop
+  at the latch, the timer freezes mid-count, delivery stops,
+  INIT/SIPI stay reachable. Register state persists across
+  the disable except the SVR software-enable (QEMU's choice
+  inside SDM's "may be lost"); QEMU's looser EN=0 MMIO-write
+  and IRR-latching was measured and not copied. INIT now
+  preserves the MSR (QEMU apic_init_reset does not touch it).
+- Snapshot load rebinds the window from the restored MSR
+  before the MMIO-map check, so a relocated or disabled
+  LAPIC restores and continues equivalently; no format change,
+  no machine_t movement.
+
+Vectors: four new groups in tests/test_lapic.c driving real
+guest WRMSR code (relocation + return with old-window closure,
+7 rejected-write shapes, disable/freeze/re-enable incl. timer
+resume and end-to-end delivery of a pre-disable latch, SMP
+role identity with a window that follows the context switch)
+and both snapshot cases in tests/test_snapshot.c. NC: the new
+tests on the 0094 archive tree abort at the first U4 assertion
+(test_lapic) and show exactly the 9 U4 snapshot FAILs.
+make test (stock SeaBIOS ISO lanes present) and
+make test-sanitize are green; all K/SMP receipts unchanged.
+---
+ CHANGELOG.md              |  29 +++++
+ docs/STATUS.md            |  20 ++++
+ docs/plans/UPKEEP_PLAN.md |  42 +++++++-
+ src/cpu.c                 |  38 ++++++-
+ src/devices.c             |   3 +-
+ src/lapic.c               | 110 +++++++++++++++++--
+ src/lapic.h               |  54 +++++++++-
+ src/machine.h             |   3 +
+ src/snapshot.c            |   7 +-
+ tests/test_lapic.c        | 219 +++++++++++++++++++++++++++++++++++++-
+ tests/test_snapshot.c     |  75 ++++++++++++-
+ 11 files changed, 576 insertions(+), 24 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c61c9a8..7630329 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,35 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0095 (Upkeep U4: LAPIC IA32_APIC_BASE)
++
++- **The local APIC window now follows MSR 0x1B** (`src/lapic.c`,
++  `src/cpu.c`): guest WRMSR relocation moves the 4 KiB window
++  (per-vCPU addresses work — the single region mirrors the
++  current context's decode, re-synced on WRMSR, reset,
++  `vcpu_load` and snapshot load), and the global enable bit
++  unmaps the window, drops IOAPIC/MSI/IPI messages at the
++  latch, freezes the timer count, stops delivery and clears
++  CPUID.1:EDX[9] (SDM §§10.4.3–10.4.5; register state persists
++  across the disable except the SVR software-enable, per the
++  measured QEMU model). Reserved-bit, x2APIC (bit 10) and
++  beyond-MAXPHYADDR writes are rejected with all state
++  untouched — logged, no #GP, as the rest of the permissive
++  MSR lane behaves. The BSP bit is a strap again: `cpu_reset`
++  seeds it by slot identity (APs no longer power up claiming
++  to be the bootstrap processor), writes preserve it, and
++  INIT does not reset the MSR. Snapshot save/load carries a
++  relocated or disabled LAPIC equivalently (window rebound
++  from the restored MSR before the MMIO-map check; no format
++  change).
++- New vectors: four `tests/test_lapic.c` groups driving real
++  guest WRMSR code (relocation/return, 7 rejected shapes,
++  disable/freeze/re-enable with delivery of a pre-disable
++  latch, SMP identity + context-following window) and the two
++  snapshot cases in `tests/test_snapshot.c`. NC = the new
++  tests on the 0094 archive tree (abort at the first U4
++  assert; exactly the 9 U4 snapshot FAILs).
++
+ ### Added — patch 0094 (Upkeep U3: gdbstub x87)
+ 
+ - **gdb sees and writes the real x87 state** (`src/gdbstub.c`,
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index a2a836c..8c45cf7 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1093,6 +1093,26 @@
+   documented not fixed: stub breakpoints are linear while
+   gdb reconciles hits against raw `$pc`, so real-mode ROM
+   breakpoints auto-continue (flat modes unaffected).
++- Upkeep U4 (`patches/0095-UPKEEP-U4-LAPIC-IA32_APIC_BASE.patch`):
++  `IA32_APIC_BASE` became a real register instead of sparse
++  storage. Measured from SDM §§10.4.3–10.4.5/10.4.7 and
++  QEMU's `apic.c`/`apic_common.c`: WRMSR relocates the LAPIC
++  window per-vCPU (one region mirrors the current context's
++  decode across WRMSR/reset/switch/snapshot-load), the
++  global-enable bit unmaps the window and makes CPUID stop
++  advertising an APIC while IOAPIC/MSI/IPI messages drop at
++  the latch, the timer freezes mid-count and resumes, and
++  the BSP bit is seeded by slot role rather than being 1 on
++  every vCPU. Invalid writes (reserved bits, x2APIC, base
++  beyond MAXPHYADDR 40) change nothing. Register state
++  persists across a disable except the SVR software-enable
++  (QEMU's exact choice, within the SDM's "may be lost");
++  QEMU's looser EN=0 write/latch behaviour was measured and
++  not copied. Snapshots restore relocated/disabled windows
++  equivalently with no format change. NC: test_lapic aborts
++  at the first U4 assert on the 0094 tree and the snapshot
++  suite shows exactly the 9 U4 FAILs. A pre-existing spent
++  one-shot timer re-latch is recorded in the U4 receipts.
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index 8aff591..cb435ac 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -4,7 +4,7 @@
+ > XHCI, MSI and PM are complete; this plan takes the remaining
+ > site-documented gaps in dependency/risk order.
+ 
+-**Status: U0+U1+U2+U3 done ✅; U4 queued**
++**Status: U0+U1+U2+U3+U4 done ✅; U5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -12,7 +12,7 @@
+ | U1 | RTC: a settable MC146818 clock/calendar without changing the pinned power-on behaviour | ✅ done | `tests/test_rtc.c` vectors (`patches/0092`) |
+ | U2 | e1000: EEPROM reads through EERD and a PHY register file through MDIC | ✅ done | `tests/test_net.c` vectors (`patches/0093`) |
+ | U3 | gdbstub: publish and accept the real x87 register/control state in `g`/`G`/`p`/`P` | ✅ done | `tests/test_gdbstub.py` vectors (`patches/0094`) |
+-| U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ⬜ queued | `tests/test_lapic.c` vectors |
++| U4 | LAPIC: architectural `IA32_APIC_BASE` relocation and global enable/disable | ✅ done | `tests/test_lapic.c` + `tests/test_snapshot.c` vectors (`patches/0095`) |
+ | U5 | Chipset: CPU INIT from CF9 `RST_CPU`, distinct from the existing full reset | ⬜ queued | `tests/test_chipset.c` vectors |
+ | U6 | TAP responder TCP: sequenced receive, SACK generation and complete close-state handling | ⬜ queued | `tests/test_tap_responder.py` vectors |
+ | U7 | GUI/monitor: capability authentication and browser-origin defences, then plan close-out | ⬜ queued | GUI/monitor vectors + close-out |
+@@ -236,7 +236,7 @@ AuraLite-OS KERNEL/INITRD artifacts.
+ 
+ | # | Defect (measured) | Consequence | Phase |
+ |---|-------------------|-------------|-------|
+-| D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | U4 |
++| D1 | `IA32_APIC_BASE` writes are sparse-MSR storage; decode/delivery ignore base/EN; AP reset also seeds BSP=1 | relocated/disabled LAPIC software follows an address or state the machine does not implement | ~~U4~~ **resolved in U4** (live validated WRMSR: per-context window mirror, BSP strap seeded by role + preserved on writes, EN gates MMIO/timer/IPI/IOAPIC/MSI, snapshot rebinds the window) |
+ | D2 | CF9 `RST_CPU` alone has no boundary effect; only full reset exists | CPU-only INIT reboot paths continue executing as if the write were inert | U5 |
+ | D3 | RTC calendar/century writes are dropped and Register-B SET/DM/hour mode do not govern the clock | OS time-setting silently fails; readback always derives from the 2026 anchor | ~~U1~~ **resolved in U1** (SET-staged writes commit to `base_sec`; DM/24H govern both directions) |
+ | D4 | EERD/MDIC are generic storage with no EEPROM/PHY state or completion bits | the north star takes three EEPROM timeouts; PHY-probing drivers see a fictional command echo | ~~U2~~ **resolved in U2** (64-word EEPROM + synchronous DONE; 32-register PHY with cap table, READY/ERROR, MDAC; MDIC offset corrected 0x200 → 0x20) |
+@@ -429,7 +429,7 @@ by `stepi`. NC: the U3 test on a `b6d048b` tree — 16 lane-D
+ checks fail on the old zeros/`0xFFFF`/ignored writes while
+ lanes A–C and the packet-shape checks stay green.
+ 
+-### U4 — LAPIC MSR
++### U4 — LAPIC MSR ✅
+ 
+ Prove guest WRMSR relocation and return, old-window closure,
+ global-disable/re-enable effects across MMIO, timer, IPI,
+@@ -440,6 +440,40 @@ continue equivalently or refuse with the measured reason the
+ phase intentionally chooses; silently comparing against the
+ fixed base is not acceptance.
+ 
++**Receipts (U4):** primary sources measured first — Intel SDM
++Vol.3A §§10.4.3–10.4.5, 10.4.7 (EN=0 ⇒ "functionally without an
++on-chip APIC" + CPUID flag 0; base bits 12..MAXPHYADDR−1 with
++0–7/9/10 reserved; per-processor window addresses are legal)
++and QEMU master `hw/intc/apic.c` + `apic_common.c`
++(`apic_set_base` preserves BSP and drops the SVR enable on a
++disabling write; state persists across disable; `apic_init_reset`
++never touches `apicbase`; QEMU's looser EN=0 latching/MMIO-write
++behaviour is deliberately not copied). Model: one `"LAPIC"`
++MMIO region mirroring the *current context's* MSR decode,
++re-synced on accepted WRMSR, live-pair reset, `vcpu_load` and
++snapshot load — per-vCPU windows with a single registration;
++WRMSR 0x1B validates before storing (reserved/x2APIC/beyond-40
++rejects leave all state untouched, logged, no #GP — the house
++permissive MSR lane); EN=0 unmaps the window, drops fixed
++IOAPIC/MSI/IPI at the latch, freezes the timer without losing
++its count, and clears CPUID.1:EDX[9], while INIT/SIPI stay
++reachable; `cpu_reset` seeds BSP by slot identity and INIT
++preserves the MSR. Snapshot takes the stronger branch: the
++load path rebinds the window from the restored MSR before the
++MMIO-map check, so relocated and disabled LAPICs restore
++equivalently (no format change). Vectors: 4 new groups in
++`tests/test_lapic.c` (real guest WRMSR relocation + return,
++7 rejected-write shapes, full disable lifecycle incl. timer
++freeze/resume and end-to-end delivery of a pre-disable latch,
++SMP identity/window-follows-context/INIT-preservation) and
++both snapshot cases in `tests/test_snapshot.c`. NC: the new
++tests on `25faae1` — `test_lapic` aborts at the first U4
++assertion; `test-snap` reports exactly the 9 U4 FAILs.
++Adjacent finding (recorded, not fixed — outside D1): a spent
++one-shot LAPIC timer re-latches its vector on every tick once
++at zero (pre-existing H6 behaviour; masked-LVT guests are
++unaffected).
++
+ ### U5 — CF9 CPU INIT
+ 
+ Prove `0x02` is consumed only at an instruction boundary;
+diff --git a/src/cpu.c b/src/cpu.c
+index e766283..ac1d648 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -852,8 +852,14 @@ static void do_cpuid(machine_t *m) {
+      * APIC ID (m->lapic.id[31:24]); 0 on the BSP and in UP, so single-vCPU
+      * and BSP receipts stay bit-identical while APs identify themselves to
+      * SeaBIOS smp_write_msr(). */
+-    if (leaf == 1)
++    if (leaf == 1) {
+         b = (b & 0x00FFFFFFu) | (m->lapic.id & 0xFF000000u);
++        /* UPKEEP U4 (SDM 10.4.3): with the local APIC globally disabled
++         * (IA32_APIC_BASE[11]=0) the CPUID APIC feature flag reads 0 --
++         * the processor looks like it has no on-chip APIC. */
++        int f; uint64_t ab = cpu_get_msr(c, LAPIC_MSR_APICBASE, &f);
++        if (f && !(ab & LAPIC_MSR_EN)) dd &= ~(1u << 9);
++    }
+     c->gpr[RAX] = a; c->gpr[RBX] = b; c->gpr[RCX] = cc; c->gpr[RDX] = dd;
+ }
+ 
+@@ -899,9 +905,24 @@ void cpu_reset(cpu_t *c) {
+     c->ftw = 0xFFFF;       /* F1: all eight x87 registers empty at power-on */
+     c->cr0 = 0x60000010ULL;
+     c->halted = 0; c->fault = 0; c->intr_delay = 0;
+-    /* CHIPSET H6: IA32_APIC_BASE resets to base|EN|BSP (the xAPIC comes
+-     * out of reset hardware-enabled and software-disabled at SVR). */
+-    cpu_set_msr(c, LAPIC_MSR_APICBASE, LAPIC_MSR_DEFAULT);
++    /* CHIPSET H6 + UPKEEP U4: IA32_APIC_BASE resets to base|EN, with the
++     * BSP bit set only on the bootstrap processor (SDM 10.4.4: "set to
++     * 1 for the processor selected as the BSP and set to 0 for the
++     * remaining processors"; the xAPIC comes out of reset hardware-
++     * enabled and software-disabled at SVR). The role comes from the
++     * cpu's identity in its machine: context 0 is the BSP. */
++    {
++        int is_bsp = 1;
++        if (mach && mach->n_vcpus > 1) {
++            if (c == &mach->cpu) is_bsp = (mach->cur_vcpu == 0);
++            else for (int i = 0; i < EM_MAX_VCPU; i++)
++                     if (c == &mach->vcpu[i].c) { is_bsp = (i == 0); break; }
++        }
++        cpu_set_msr(c, LAPIC_MSR_APICBASE,
++                    LAPIC_BASE | LAPIC_MSR_EN | (is_bsp ? LAPIC_MSR_BSP : 0));
++        /* a reset of the live pair re-bases the MMIO window too */
++        if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
++    }
+ }
+ 
+ /* ---------------------------------------------------------------- x87 (F1) --
+@@ -3595,7 +3616,14 @@ really_slow:
+                 }
+                 break; } }
+         case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
+-                     cpu_set_msr(c, idx, val);
++                     /* UPKEEP U4: IA32_APIC_BASE belongs to the LAPIC model
++                      * (validation -> BSP preservation -> window sync);
++                      * a rejected write stores nothing and raises no #GP
++                      * -- the house MSR lane is permissive (RDMSR on an
++                      * unknown index reads 0; CR writes keep no reserved-
++                      * bit #GP), so the rejection is logged instead. */
++                     if (idx==LAPIC_MSR_APICBASE) lapic_apicbase_write(m, c, val);
++                     else cpu_set_msr(c, idx, val);
+                      if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
+                      /* K3: GS-base MSRs are the architected long-mode
+                       * segment base for GS addressing -- keep the decoder's
+diff --git a/src/devices.c b/src/devices.c
+index 7a14603..a0c9949 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -1280,7 +1280,8 @@ void devices_init_common(machine_t *m) {
+      * 0xCF9 (chipset.[ch], consumed by cpu_step at the boundary). */
+     chipset_init(m);
+     chipset_io_register(m);
+-    /* CHIPSET H6: local APIC MMIO window at 0xFEE00000 -- CPUID.1:EDX
++    /* CHIPSET H6 (+UPKEEP U4 relocation): local APIC MMIO window, born at
++     * 0xFEE00000 -- CPUID.1:EDX
+      * advertised APIC long before the window existed (measured). */
+     lapic_init(m);
+     lapic_mmio_register(m);
+diff --git a/src/lapic.c b/src/lapic.c
+index 4c1d97b..565683e 100644
+--- a/src/lapic.c
++++ b/src/lapic.c
+@@ -22,6 +22,82 @@ static int map_highest(const uint8_t *map) {
+ static void map_set(uint8_t *map, int v)   { map[v >> 3] |= (uint8_t)(1u << (v & 7)); }
+ static void map_clear(uint8_t *map, int v) { map[v >> 3] &= (uint8_t)~(1u << (v & 7)); }
+ 
++/* ------------------------------------ IA32_APIC_BASE (UPKEEP U4) --- */
++
++/* The MSR lives in each cpu_t's sparse store, seeded per-role by
++ * cpu_reset. An absent entry (a bare fixture that never reset its cpu)
++ * reads as the power-on default. */
++static uint64_t apicbase_of(cpu_t *c) {
++    int found;
++    uint64_t v = cpu_get_msr(c, LAPIC_MSR_APICBASE, &found);
++    return found ? v : LAPIC_MSR_DEFAULT;
++}
++/* cpu of context i (machine.h has the lapic twin, vcpu_lapic). */
++static cpu_t *ctx_cpu(machine_t *m, int i) {
++    if (m->n_vcpus <= 1 || i == m->cur_vcpu) return &m->cpu;
++    return &m->vcpu[i].c;
++}
++static int apic_en(machine_t *m, int i) {
++    return (apicbase_of(ctx_cpu(m, i)) & LAPIC_MSR_EN) != 0;
++}
++static uint64_t window_base(machine_t *m) {
++    return apicbase_of(&m->cpu) & LAPIC_MSR_BASE_MASK;
++}
++
++void lapic_sync_mmio(machine_t *m) {
++    for (mmio_region_t *r = m->mmio_list; r; r = r->next)
++        if (r->name && strcmp(r->name, "LAPIC") == 0) {
++            r->base = window_base(m);
++            r->enabled = apic_en(m, m->cur_vcpu);
++            return;
++        }
++}
++
++/* LAPIC twin of cpu `c` anywhere in the machine (live pair or a parked
++ * slot); NULL for a cpu foreign to this machine. */
++static lapic_t *lapic_of_cpu(machine_t *m, cpu_t *c) {
++    if (c == &m->cpu) return &m->lapic;
++    for (int i = 0; i < EM_MAX_VCPU; i++)
++        if (c == &m->vcpu[i].c) return &m->vcpu[i].l;
++    return NULL;
++}
++
++int lapic_apicbase_write(machine_t *m, cpu_t *c, uint64_t val) {
++    uint64_t oldv = apicbase_of(c);
++    if (val & LAPIC_MSR_EXTD) {
++        mlog(&m->log, "[lapic] IA32_APIC_BASE write 0x%llx rejected: "
++             "x2APIC (bit 10) is not implemented (CPUID.1:ECX[21]=0)",
++             (unsigned long long)val);
++        return 0;
++    }
++    if (val & ~(LAPIC_MSR_BASE_MASK | LAPIC_MSR_BSP | LAPIC_MSR_EN)) {
++        mlog(&m->log, "[lapic] IA32_APIC_BASE write 0x%llx rejected: "
++             "reserved bits set (SDM Fig.10-5: bits 0-7,9 and "
++             "MAXPHYADDR=40..63 are reserved; MSR unchanged)",
++             (unsigned long long)val);
++        return 0;
++    }
++    /* BSP is a machine strap, not software-writable (QEMU apic_set_base
++     * preserves it; SDM 10.4.4 assigns it at reset). */
++    uint64_t nv = (val & LAPIC_MSR_BASE_MASK) | (val & LAPIC_MSR_EN)
++                | (oldv & LAPIC_MSR_BSP);
++    cpu_set_msr(c, LAPIC_MSR_APICBASE, nv);
++    if (!(nv & LAPIC_MSR_EN)) {
++        lapic_t *l = lapic_of_cpu(m, c);
++        if (l) l->svr &= ~0x100u;   /* the disabling write also drops the
++                                     * SVR software enable (QEMU); the rest
++                                     * of the register file is kept */
++    }
++    if (c == &m->cpu) lapic_sync_mmio(m);
++    if (nv != oldv)
++        mlog(&m->log, "[lapic] IA32_APIC_BASE <- 0x%llx (base 0x%llx, %s%s)",
++             (unsigned long long)nv,
++             (unsigned long long)(nv & LAPIC_MSR_BASE_MASK),
++             (nv & LAPIC_MSR_EN) ? "EN" : "globally disabled",
++             (nv & LAPIC_MSR_BSP) ? ", BSP" : "");
++    return 1;
++}
++
+ /* --------------------------------------------------- arbitration */
+ 
+ static uint32_t lapic_ppr(const lapic_t *l) {
+@@ -33,6 +109,7 @@ static uint32_t lapic_ppr(const lapic_t *l) {
+ 
+ int lapic_deliverable(machine_t *m) {
+     lapic_t *l = &m->lapic;
++    if (!apic_en(m, m->cur_vcpu)) return -1;         /* U4: globally off */
+     if (!(l->svr & 0x100)) return -1;                /* software-disabled */
+     int v = map_highest(l->irr);
+     if (v < 0) return -1;
+@@ -66,6 +143,7 @@ static void lapic_eoi(machine_t *m) {
+ }
+ 
+ void lapic_set_irr(machine_t *m, int vector) {
++    if (!apic_en(m, m->cur_vcpu)) return;   /* U4: no APIC to latch into */
+     if (vector < 16) { m->lapic.esr |= (1u << 6); return; }
+     map_set(m->lapic.irr, vector);
+ }
+@@ -87,6 +165,10 @@ void lapic_tick(machine_t *m) {
+     uint64_t now = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
+     uint64_t delta = now - l->last_tsu;
+     l->last_tsu = now;
++    /* U4: a globally disabled APIC has no timer. The clock snapshot
++     * above keeps advancing so the disabled interval does not dump into
++     * the counter when the APIC is re-enabled; the count just freezes. */
++    if (!apic_en(m, m->cur_vcpu)) return;
+     if (!l->tmict || !delta) return;
+ 
+     uint32_t div = dcr_div(l->dcr);
+@@ -129,6 +211,7 @@ void lapic_set_irr_dest(machine_t *m, uint32_t dest, int vector) {
+     if (vector < 16) { m->lapic.esr |= (1u << 6); return; }
+     int idx = lapic_index_by_id(m, dest);
+     if (idx < 0) idx = 0;
++    if (!apic_en(m, idx)) return;   /* U4: a disabled target drops the message */
+     map_set(vcpu_lapic(m, idx)->irr, vector);
+ }
+ 
+@@ -164,7 +247,7 @@ void msi_deliver(machine_t *m, uint64_t addr, uint32_t data) {
+         lapic_t *li = vcpu_lapic(m, i);
+         if (dest & (li->ldr >> 24)) {
+             if (vector < 16) { m->lapic.esr |= (1u << 6); return; }
+-            map_set(li->irr, (int)vector);
++            if (apic_en(m, i)) map_set(li->irr, (int)vector);  /* U4 gate */
+             return;
+         }
+     }
+@@ -184,7 +267,13 @@ static void vcpu_take_init(machine_t *m, int idx) {
+     uint64_t keep_steps = s->c.executed_steps;
+     uint64_t keep_instr = s->c.instr_count;
+     int keep_trace = s->c.trace;
++    /* U4: IA32_APIC_BASE survives INIT (QEMU apic_init_reset leaves
++     * apicbase untouched; SDM 10.4.7.3's "same as reset" covers the
++     * APIC register state, not this MSR). */
++    int ab_found;
++    uint64_t ab_keep = cpu_get_msr(&s->c, LAPIC_MSR_APICBASE, &ab_found);
+     cpu_reset(&s->c);
++    if (ab_found) cpu_set_msr(&s->c, LAPIC_MSR_APICBASE, ab_keep);
+     s->c.executed_steps = keep_steps;
+     s->c.instr_count = keep_instr;
+     s->c.trace = keep_trace;
+@@ -280,9 +369,12 @@ static void lapic_icr_write(machine_t *m, uint32_t v) {
+     if (vec < 16) { l->esr |= (1u << 6); return; }  /* receive-illegal */
+     /* K6: fixed IPIs honor the broadcast shorthands per-context.
+      * shorthand: 0 targeted, 1 self, 2 all, 3 all-excluding-self. */
++    /* U4: fixed IPIs to a globally disabled target are dropped at the
++     * latch (INIT/SIPI above are NOT gated: SDM 10.4.7.2 still answers
++     * them in the software-disabled state, and INIT is the recovery path). */
+     if (shorthand == 2 || shorthand == 3) {
+         for (int i = 0; i < m->n_vcpus && i < EM_MAX_VCPU; i++)
+-            if (shorthand == 2 || i != m->cur_vcpu)
++            if ((shorthand == 2 || i != m->cur_vcpu) && apic_en(m, i))
+                 map_set(vcpu_lapic(m, i)->irr, vec);
+         return;
+     }
+@@ -290,10 +382,12 @@ static void lapic_icr_write(machine_t *m, uint32_t v) {
+         int idx = lapic_index_by_id(m, (l->icr_hi >> 24) & 0xFF);
+         if (idx < 0 && ((l->icr_hi >> 24) & 0xFF) == 0xFF)
+             idx = m->cur_vcpu;                   /* broadcast-dest reg: us */
+-        if (idx < 0) return;                     /* nobody home */
++        if (idx < 0 || !apic_en(m, idx)) return;  /* nobody home / U4 gate */
+         map_set(vcpu_lapic(m, idx)->irr, vec);
+         return;
+     }
++    /* shorthand 1 (self): the ICR write reached us, so our own window
++     * is mapped and EN is 1 by construction -- no gate needed. */
+     map_set(l->irr, vec);                        /* shorthand 1: self */
+ }
+ 
+@@ -302,8 +396,9 @@ static void lapic_icr_write(machine_t *m, uint32_t v) {
+ static uint64_t lapic_read(void *ctx, uint64_t addr, int size) {
+     machine_t *m = ctx;
+     lapic_t *l = &m->lapic;
++    uint64_t base = window_base(m);   /* U4: the window moves with the MSR */
+     uint32_t v = 0;
+-    switch ((uint32_t)(addr - LAPIC_BASE) & ~0xFu) {   /* 16B register slots */
++    switch ((uint32_t)(addr - base) & ~0xFu) {   /* 16B register slots */
+     case LAPIC_ID:   v = l->id; break;
+     case LAPIC_VER:  v = 0x00050014u; break;  /* version 0x14, MaxLVT=5 */
+     case LAPIC_TPR:  v = l->tpr; break;
+@@ -315,13 +410,13 @@ static uint64_t lapic_read(void *ctx, uint64_t addr, int size) {
+     case LAPIC_IRR_BASE: case LAPIC_IRR_BASE+0x10: case LAPIC_IRR_BASE+0x20:
+     case LAPIC_IRR_BASE+0x30: case LAPIC_IRR_BASE+0x40: case LAPIC_IRR_BASE+0x50:
+     case LAPIC_IRR_BASE+0x60: case LAPIC_IRR_BASE+0x70: {
+-        uint32_t off = (uint32_t)(addr - LAPIC_BASE) & ~0xFu;
++        uint32_t off = (uint32_t)(addr - base) & ~0xFu;
+         int base = (int)(off - LAPIC_IRR_BASE) / 4;    /* 4 map bytes per reg */
+         for (int i = 0; i < 4; i++) v |= (uint32_t)l->irr[base + i] << (8 * i);
+         break; }
+     case 0x180: case 0x190: case 0x1A0: case 0x1B0:
+     case 0x1C0: case 0x1D0: case 0x1E0: case 0x1F0: {
+-        uint32_t off = (uint32_t)(addr - LAPIC_BASE) & ~0xFu;
++        uint32_t off = (uint32_t)(addr - base) & ~0xFu;
+         int base = (int)(off - 0x180) / 4;
+         for (int i = 0; i < 4; i++) v |= (uint32_t)l->isr[base + i] << (8 * i);
+         break; }
+@@ -349,7 +444,7 @@ static void lapic_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+     machine_t *m = ctx;
+     lapic_t *l = &m->lapic;
+     uint32_t v = (uint32_t)val & (size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu);
+-    switch ((uint32_t)(addr - LAPIC_BASE) & ~0xFu) {
++    switch ((uint32_t)(addr - window_base(m)) & ~0xFu) {
+     case LAPIC_ID:   l->id = v & 0xFF000000u; break;
+     case LAPIC_TPR:  l->tpr = v & 0xFFu; break;
+     case LAPIC_EOI:  lapic_eoi(m); break;
+@@ -390,4 +485,5 @@ void lapic_init(machine_t *m) {
+ 
+ void lapic_mmio_register(machine_t *m) {
+     mem_register_mmio(m, LAPIC_BASE, 0x1000, lapic_read, lapic_write, m, "LAPIC");
++    lapic_sync_mmio(m);   /* U4: adopt the current context's MSR decode */
+ }
+diff --git a/src/lapic.h b/src/lapic.h
+index c450cc0..507d078 100644
+--- a/src/lapic.h
++++ b/src/lapic.h
+@@ -3,9 +3,38 @@
+  * MMIO window at 0xFEE00000, 4KB, 32-bit registers on 16-byte spacing.
+  * CPUID.1:EDX already advertised APIC before this phase (measured: the
+  * window absorbed writes and floated reads then) -- H6 makes the claim
+- * true. IA32_APIC_BASE (MSR 0x1B) resets to 0xFEE00900 (EN|BSP, seeded
+- * by cpu_reset); MSR-based relocation/disable is not modeled (stored
+- * only, documented).
++ * true. IA32_APIC_BASE (MSR 0x1B) resets to base|EN|BSP on the BSP and
++ * base|EN on APs (UPKEEP U4, seeded per-role by cpu_reset).
++ *
++ * UPKEEP U4 -- IA32_APIC_BASE is live (Intel SDM Vol.3 ss.10.4.3-10.4.5,
++ * measured against QEMU master hw/intc/apic.c + apic_common.c):
++ *  - the single "LAPIC" MMIO region mirrors the CURRENT context's
++ *    base/EN (SDM 10.4.5 permits per-processor window addresses, and
++ *    every MMIO access here executes in the accessor's context, so one
++ *    region re-synced on WRMSR / reset / context switch / snapshot
++ *    load reproduces per-vCPU windows exactly);
++ *  - WRMSR 0x1B is validated BEFORE the store: any bit outside
++ *    BASE[39:12]|EN(bit11)|BSP(bit8) -- reserved lo bits, bit9, the
++ *    x2APIC EN bit (this model has no x2APIC in CPUID), or bits beyond
++ *    MAXPHYADDR=40 -- rejects the whole write with state untouched
++ *    (logged; no #GP, the house MSR lane is permissive elsewhere too);
++ *  - the BSP bit is a machine-assigned strap: writes preserve it
++ *    (QEMU apic_set_base does the same), cpu_reset seeds it by role
++ *    (SDM 10.4.4: "set to 1 for the processor selected as the BSP and
++ *    set to 0 for the remaining processors");
++ *  - EN=0 means "functionally equivalent to a processor without an
++ *    on-chip APIC" (SDM 10.4.3): the window unmaps (region disabled,
++ *    so accesses fall to open bus), CPUID.1:EDX[9] reads 0, fixed
++ *    interrupts from IOAPIC/MSI/IPI are dropped at the latch, the
++ *    timer freezes in place, and delivery stops. Register state is
++ *    KEPT across the disable (SDM only says it "may be lost"; QEMU
++ *    also keeps it) except the SVR software-enable bit, which the
++ *    disabling write clears (QEMU apic_set_base). INIT analogously
++ *    preserves IA32_APIC_BASE (QEMU apic_init_reset does not touch
++ *    apicbase; SDM 10.4.7.3's "same as reset" covers the APIC
++ *    register state). Deliberately NOT copied from QEMU: its loose
++ *    EN=0 behaviour (MMIO writes still apply, reads float, IRR still
++ *    latches) contradicts the SDM sentence above.
+  *
+  * Modeled:
+  *  - ID (RW), VERSION (RO, 6 LVT entries), TPR (RW), PPR (RO, computed
+@@ -42,7 +71,13 @@ struct machine;
+ 
+ #define LAPIC_BASE            0xFEE00000ULL
+ #define LAPIC_MSR_APICBASE    0x1B
+-#define LAPIC_MSR_DEFAULT     0xFEE00900ULL   /* base | EN(bit11) | BSP(bit8) */
++#define LAPIC_MSR_BSP         (1ULL << 8)
++#define LAPIC_MSR_EXTD        (1ULL << 10)  /* x2APIC enable: unsupported, rejected */
++#define LAPIC_MSR_EN          (1ULL << 11)
++#define LAPIC_MSR_BASE_MASK   0xFFFFFF000ULL /* bits 39:12 (CPUID.80000008 phys=40) */
++#define LAPIC_MSR_DEFAULT     0xFEE00900ULL   /* power-on value on the BSP:
++                                               * base | EN(bit11) | BSP(bit8);
++                                               * APs reset to the same minus BSP */
+ 
+ /* register offsets within the 4KB window */
+ #define LAPIC_ID       0x020
+@@ -85,6 +120,17 @@ typedef struct lapic {
+ void lapic_init(struct machine *m);
+ void lapic_mmio_register(struct machine *m);
+ 
++/* UPKEEP U4: point the single "LAPIC" MMIO region at the CURRENT
++ * context's IA32_APIC_BASE decode (base + EN-driven enable). Called on
++ * an accepted WRMSR, on reset of the live cpu pair, on every vCPU
++ * context switch and on snapshot load; a no-op when no window is
++ * registered (bare unit harnesses). */
++void lapic_sync_mmio(struct machine *m);
++/* UPKEEP U4: WRMSR to IA32_APIC_BASE (see lapic.c). Validates first;
++ * on rejection nothing changes. Returns 1 when the write landed. */
++struct cpu;
++int  lapic_apicbase_write(struct machine *m, struct cpu *c, uint64_t val);
++
+ /* Highest deliverable vector per the SVR+PPR arbitration, or -1. */
+ int  lapic_deliverable(struct machine *m);
+ /* Moves the deliverable vector IRR->ISR and returns it. */
+diff --git a/src/machine.h b/src/machine.h
+index 7f183c2..5675c7e 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -277,6 +277,9 @@ static inline void vcpu_load(machine_t *m, int i) {
+         m->cpu = m->vcpu[i].c;
+         m->lapic = m->vcpu[i].l;
+         m->cur_vcpu = i;
++        /* U4: the one LAPIC window mirrors the loaded context's
++         * IA32_APIC_BASE (SDM 10.4.5 per-processor window). */
++        lapic_sync_mmio(m);
+     }
+ }
+ static inline void vcpu_store(machine_t *m, int i) {
+diff --git a/src/snapshot.c b/src/snapshot.c
+index 0583b9e..440c8a4 100644
+--- a/src/snapshot.c
++++ b/src/snapshot.c
+@@ -13,6 +13,7 @@
+ #include <stddef.h>
+ #include "snapshot.h"
+ #include "cpu.h"
++#include "lapic.h"
+ #include "pci.h"
+ #include "platform.h"
+ 
+@@ -252,9 +253,13 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
+     if (s->loading && !s->failed) { cpu_devtick_set(cs[0]); if (cs[1]) cpu_dbg_knob_resolve(); }
+     sio_sparse(&s->pub, "ram", m->ram, RAM_SIZE);
+     /* Restore device decode state before comparing the MMIO map: the guest
+-     * can relocate AHCI BAR5, and ahci_snap rebinds that live window. */
++     * can relocate AHCI BAR5, and ahci_snap rebinds that live window. The
++     * LAPIC window likewise mirrors IA32_APIC_BASE (U4), already restored
++     * by machine_rec above -- rebind it here so a snapshot taken with the
++     * LAPIC relocated or globally disabled loads equivalently. */
+     pci_snap(m, &s->pub);
+     ahci_snap(m, &s->pub);
++    if (s->loading && !s->failed) lapic_sync_mmio(m);
+     mmio_rec(m, s);
+     devices_snap(m, &s->pub);
+     if (m->disk) sio_sparse(&s->pub, "disk.usb", m->disk, m->disk_len);
+diff --git a/tests/test_lapic.c b/tests/test_lapic.c
+index 3b9cec1..216bff9 100644
+--- a/tests/test_lapic.c
++++ b/tests/test_lapic.c
+@@ -1,4 +1,4 @@
+-/* tests/test_lapic.c -- CHIPSET H6 vectors: local APIC (xAPIC).
++/* tests/test_lapic.c -- CHIPSET H6 + UPKEEP U4 vectors: local APIC (xAPIC).
+  *
+  * Fixture style: real-mode guests cannot reach the 0xFEE00000 MMIO window
+  * (real-mode linear addresses stop just above 1MB), so real-mode vectors
+@@ -468,6 +468,219 @@ static void test_smp_broadcast_init_sipi_and_counter_preservation(void) {
+     printf("ok: smp_broadcast_init_sipi_and_counter_preservation\n");
+ }
+ 
++/* --------------------------------------------------- UPKEEP U4 ----- */
++
++/* Emit a 16-bit guest snippet "mov ecx,0x1B; mov eax,lo; mov edx,hi;
++ * wrmsr; jmp $" at physical address `at`. Returns the byte length. */
++static int emit_wrmsr(fx_t *f, uint32_t at, uint64_t val) {
++    uint8_t code[24];
++    int n = 0;
++    code[n++] = 0x66; code[n++] = 0xB9;
++    code[n++] = 0x1B; code[n++] = 0; code[n++] = 0; code[n++] = 0;
++    code[n++] = 0x66; code[n++] = 0xB8;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(val >> (8 * i));
++    code[n++] = 0x66; code[n++] = 0xBA;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(val >> (8 * i + 32));
++    code[n++] = 0x0F; code[n++] = 0x30;
++    code[n++] = 0xEB; code[n++] = 0xFE;
++    memcpy(f->m.ram + at, code, (size_t)n);
++    return n;
++}
++/* Write IA32_APIC_BASE by executing a real guest WRMSR on the current
++ * context (code at 0x4000; CS base must be 0, as in the UP fixtures). */
++static void guest_wrmsr(fx_t *f, uint64_t val) {
++    emit_wrmsr(f, 0x4000, val);
++    f->m.cpu.rip = 0x4000;
++    for (int i = 0; i < 8; i++) (void)cpu_step(&f->m.cpu);
++}
++static uint64_t get_apicbase(cpu_t *c) {
++    int found;
++    uint64_t v = cpu_get_msr(c, LAPIC_MSR_APICBASE, &found);
++    assert(found);
++    return v;
++}
++#define NEWB 0xFEE80000ULL   /* a free aligned slot above the IOAPIC */
++
++static void test_apicbase_relocation(void) {
++    fx_t f; fx_init(&f);
++    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);   /* BSP power-on */
++    lw(&f, LAPIC_ID, 0xAA000000u);
++    lw(&f, LAPIC_TPR, 0x40);
++    guest_wrmsr(&f, NEWB | LAPIC_MSR_EN);                  /* BSP bit clear in val */
++    assert(get_apicbase(&f.m.cpu) == (NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP));
++    /* window moved: old page is open bus, new page answers with state */
++    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0x00050014u);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_ID, 4) == 0xAA000000u);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_TPR, 4) == 0x40);
++    mem_write(&f.m, NEWB + LAPIC_TPR, 4, 0x50);
++    /* relocate back; the BSP strap is preserved across every write */
++    guest_wrmsr(&f, LAPIC_BASE | LAPIC_MSR_EN);
++    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    assert(lr(&f, LAPIC_VER) == 0x00050014u);
++    assert(lr(&f, LAPIC_TPR) == 0x50);                     /* written at NEWB */
++    printf("ok: apicbase_relocation\n");
++}
++
++static void test_apicbase_rejects(void) {
++    fx_t f; fx_init(&f);
++    static const uint64_t BAD[] = {
++        LAPIC_BASE | LAPIC_MSR_EN | 0x1,            /* bit 0 reserved */
++        LAPIC_BASE | LAPIC_MSR_EN | (1u << 7),      /* bits 0-7 reserved */
++        LAPIC_BASE | LAPIC_MSR_EN | (1u << 9),      /* bit 9 reserved */
++        LAPIC_BASE | LAPIC_MSR_EN | LAPIC_MSR_EXTD, /* x2APIC: unsupported */
++        LAPIC_BASE | LAPIC_MSR_EN | (1ULL << 40),   /* beyond MAXPHYADDR=40 */
++        LAPIC_BASE | LAPIC_MSR_EN | (1ULL << 63),
++        0xFEE00123ULL | LAPIC_MSR_EN,               /* stray in-page bits */
++    };
++    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
++        guest_wrmsr(&f, BAD[i]);
++        assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);   /* nothing stored */
++        assert(lr(&f, LAPIC_VER) == 0x00050014u);              /* window intact */
++    }
++    printf("ok: apicbase_rejects\n");
++}
++
++/* Guest: mov eax,1; cpuid; mov [0x2440],edx; jmp $  -> CPUID.1:EDX */
++static uint32_t guest_cpuid1_edx(fx_t *f) {
++    static const uint8_t T_CPUID[] = {
++        0x66, 0xB8, 0x01,0x00,0x00,0x00,
++        0x0F, 0xA2,
++        0x66, 0x89, 0x16, 0x40,0x24,
++        0xEB, 0xFE };
++    memcpy(f->m.ram + 0x4100, T_CPUID, sizeof T_CPUID);
++    f->m.cpu.rip = 0x4100;
++    for (int i = 0; i < 8; i++) (void)cpu_step(&f->m.cpu);
++    return (uint32_t)mem_read(&f->m, 0x2440, 4);
++}
++
++static void test_apicbase_global_disable(void) {
++    fx_t f; fx_init(&f);
++    ivt(&f.m, 0x40, PH_MARK); load(&f, PH_MARK, H_MARK, sizeof H_MARK);
++    ivt(&f.m, 0x44, PH_MARK3); load(&f, PH_MARK3, H_MARK3, sizeof H_MARK3);
++    load(&f, 0, T_STI_SPIN, sizeof T_STI_SPIN);
++    lw(&f, LAPIC_ID, 0xAB000000u);
++    lw(&f, LAPIC_TPR, 0x33);
++    lw(&f, LAPIC_SVR, 0x1FF);
++    /* a timer armed far away + a latched, deliverable self-IPI */
++    arm_timer(&f, 0x44, 100000, 0x8);
++    assert((guest_cpuid1_edx(&f) & (1u << 9)) != 0);       /* APIC advertised */
++    lw(&f, LAPIC_ICR_LO, (1u << 18) | 0x40);
++    assert(lapic_deliverable(&f.m) == 0x40);
++
++    /* ---- globally disable (EN=0) ---- */
++    guest_wrmsr(&f, LAPIC_BASE);
++    assert(get_apicbase(&f.m.cpu) == (LAPIC_BASE | LAPIC_MSR_BSP));
++    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    assert(lapic_deliverable(&f.m) == -1);                 /* latch held, undeliverable */
++    assert((guest_cpuid1_edx(&f) & (1u << 9)) == 0);       /* "no on-chip APIC" */
++    /* every fixed-interrupt sink drops at the latch while disabled */
++    lapic_set_irr_dest(&f.m, 0xAB, 0x41);                  /* the IOAPIC endpoint */
++    msi_deliver(&f.m, 0xFEE00000ULL | (0xABULL << 12), 0x42);
++    lapic_set_irr(&f.m, 0x43);
++    uint32_t frozen = f.m.lapic.tmccur;
++    assert(frozen > 0 && frozen <= 100000);
++    for (int i = 0; i < 500; i++) (void)cpu_step(&f.m.cpu);
++    assert(f.m.lapic.tmccur == frozen);                    /* timer frozen in place */
++    assert((f.m.lapic.irr[0x44 >> 3] & (1u << (0x44 & 7))) == 0);
++
++    /* ---- re-enable: state kept (documented choice), SVR enable dropped ---- */
++    guest_wrmsr(&f, LAPIC_BASE | LAPIC_MSR_EN);
++    assert(lr(&f, LAPIC_VER) == 0x00050014u);
++    assert((lr(&f, LAPIC_SVR) & 0x100) == 0);              /* cleared by the disable */
++    assert(lr(&f, LAPIC_ID) == 0xAB000000u);               /* state persisted */
++    assert(lr(&f, LAPIC_TPR) == 0x33);
++    /* one IRR word covers 0x40..0x5F: bit0 = the kept pre-disable
++     * latch, bits 1..3 = the three messages dropped while disabled */
++    assert(lr(&f, irr_reg(0x40)) == (1u << 0));
++    assert((lr(&f, irr_reg(0x42)) & (1u << (0x42 & 31))) == 0);  /* dropped (MSI) */
++    assert((lr(&f, irr_reg(0x43)) & (1u << (0x43 & 31))) == 0);  /* dropped (set_irr) */
++    /* timer resumes from the frozen count and eventually fires */
++    for (int i = 0; i < 200; i++) (void)cpu_step(&f.m.cpu);
++    assert(f.m.lapic.tmccur < frozen);
++    for (int i = 0; i < 60000 && f.m.lapic.tmccur; i++) (void)cpu_step(&f.m.cpu);
++    assert(f.m.lapic.tmccur == 0);
++    assert((lr(&f, irr_reg(0x44)) & (1u << (0x44 & 31))) != 0);
++    /* (The spent one-shot re-latches on later ticks in this model --
++     * pre-U4 H6 behaviour, out of scope here -- so mask its LVT before
++     * re-arming delivery; the already-latched bit still delivers.) */
++    lw(&f, LAPIC_LVT_TMR, LVT_MASKED | 0x44);
++    /* both survivors really land on the guest after SVR re-arm, in
++     * priority order (0x44 before the older 0x40), host EOIs between */
++    lw(&f, LAPIC_SVR, 0x1FF);
++    run_until(&f, 0x2104, 50);
++    assert(mem_read(&f.m, 0x2104, 1) == 1);
++    lw(&f, LAPIC_EOI, 0);
++    run_until(&f, 0x2100, 50);
++    assert(mem_read(&f.m, 0x2100, 1) == 1);
++    lw(&f, LAPIC_EOI, 0);
++    printf("ok: apicbase_global_disable\n");
++}
++
++static void test_apicbase_smp_identity(void) {
++    /* U4: BSP identity by slot, a per-vCPU window that follows the
++     * context switch, INIT preserving IA32_APIC_BASE, and the EN gate
++     * applied per target with INIT remaining reachable. */
++    fx_t f; fx_init(&f);
++    f.m.n_vcpus = 2;
++    f.m.vcpu[0].c = f.m.cpu; f.m.vcpu[0].l = f.m.lapic;
++    f.m.vcpu[0].state = VCPU_RUN;
++    f.m.vcpu[1].c.mach = &f.m;
++    cpu_reset(&f.m.vcpu[1].c);
++    f.m.vcpu[1].l = f.m.lapic;
++    f.m.vcpu[1].l.id = 1u << 24;
++    f.m.vcpu[1].state = VCPU_WAIT_SIPI;
++    f.m.cur_vcpu = 0;
++    /* role-correct power-on MSRs */
++    assert(get_apicbase(&f.m.cpu) == LAPIC_MSR_DEFAULT);            /* BSP */
++    assert(get_apicbase(&f.m.vcpu[1].c) == (LAPIC_BASE | LAPIC_MSR_EN)); /* AP */
++
++    /* bring the AP up at 0x8000 running "WRMSR -> NEWB|EN; jmp $" */
++    lw(&f, LAPIC_SVR, 0x1FF);
++    emit_wrmsr(&f, 0x8000, NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP);    /* tries to steal BSP */
++    lw(&f, LAPIC_ICR_LO, 0x000C4608u);                              /* broadcast SIPI 0x08 */
++    assert(f.m.vcpu[1].state == VCPU_RUN);
++    vcpu_load(&f.m, 1);
++    for (int i = 0; i < 10; i++) (void)cpu_step(&f.m.cpu);
++    assert(get_apicbase(&f.m.cpu) == (NEWB | LAPIC_MSR_EN));        /* BSP NOT stolen */
++    /* the window is the AP's own while its context is loaded */
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0x00050014u);
++    assert((uint32_t)mem_read(&f.m, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    vcpu_store(&f.m, 1);
++    vcpu_load(&f.m, 0);
++    /* ...and the BSP's window is back at the default base */
++    assert(lr(&f, LAPIC_VER) == 0x00050014u);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    assert(get_apicbase(&f.m.vcpu[1].c) == (NEWB | LAPIC_MSR_EN));
++
++    /* targeted INIT: the relocated base + EN survive (QEMU apic_init_reset) */
++    lw(&f, LAPIC_ICR_HI, 1u << 24);
++    lw(&f, LAPIC_ICR_LO, 0x00004500u);
++    assert(f.m.vcpu[1].state == VCPU_WAIT_SIPI);
++    assert(get_apicbase(&f.m.vcpu[1].c) == (NEWB | LAPIC_MSR_EN));
++    assert(f.m.vcpu[1].l.id == (1u << 24));
++
++    /* now let the AP disable itself at NEWB; fixed IPI then drops,
++     * but INIT still gets through */
++    emit_wrmsr(&f, 0x8000, NEWB);                                   /* EN=0 */
++    lw(&f, LAPIC_ICR_LO, 0x000C4608u);                              /* SIPI again */
++    vcpu_load(&f.m, 1);
++    for (int i = 0; i < 10; i++) (void)cpu_step(&f.m.cpu);
++    assert(get_apicbase(&f.m.cpu) == NEWB);
++    assert((uint32_t)mem_read(&f.m, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu);
++    vcpu_store(&f.m, 1);
++    vcpu_load(&f.m, 0);
++    lw(&f, LAPIC_ICR_HI, 1u << 24);
++    lw(&f, LAPIC_ICR_LO, 0x45);                                     /* fixed IPI to AP */
++    assert((f.m.vcpu[1].l.irr[0x45 >> 3] & (1u << (0x45 & 7))) == 0);
++    lw(&f, LAPIC_ICR_HI, 1u << 24);
++    lw(&f, LAPIC_ICR_LO, 0x00004500u);                              /* INIT still lands */
++    assert(f.m.vcpu[1].state == VCPU_WAIT_SIPI);
++    assert(get_apicbase(&f.m.vcpu[1].c) == NEWB);                   /* EN=0 also survives */
++    printf("ok: apicbase_smp_identity\n");
++}
++
+ int main(void) {
+     test_mmio_registers();
+     test_svr_gates_delivery_not_latching();
+@@ -479,6 +692,10 @@ int main(void) {
+     test_msr_apic_base();
+     test_hlt_wake_via_ipi_and_latched_irr();
+     test_smp_broadcast_init_sipi_and_counter_preservation();
++    test_apicbase_relocation();
++    test_apicbase_rejects();
++    test_apicbase_global_disable();
++    test_apicbase_smp_identity();
+     printf("test_lapic: all vectors passed\n");
+     return 0;
+ }
+diff --git a/tests/test_snapshot.c b/tests/test_snapshot.c
+index 873ebf3..fe92f27 100644
+--- a/tests/test_snapshot.c
++++ b/tests/test_snapshot.c
+@@ -10,13 +10,16 @@
+  *      smaller than RAM;
+  *   4. refusals with the exact reason: bad magic, other format version,
+  *      other build layout, truncation at every record boundary class,
+- *      trailing garbage, other platform, other vCPU count.
++ *      trailing garbage, other platform, other vCPU count;
++ *   5. UPKEEP U4: a relocated and a relocated+disabled LAPIC window
++ *      save/load equivalently (functions continue at the guest's base).
+  */
+ #include <stdio.h>
+ #include <string.h>
+ #include <assert.h>
+ #include "harness.h"
+ #include "cpu.h"
++#include "lapic.h"
+ #include "snapshot.h"
+ 
+ static int fails;
+@@ -103,6 +106,74 @@ static size_t read_all(const char *path, uint8_t **out) {
+     return k;
+ }
+ 
++/* UPKEEP U4: a snapshot taken with the LAPIC relocated (and one with it
++ * relocated AND globally disabled) restores with the window exactly
++ * where the guest left it, via lapic_sync_mmio on the load path. */
++static machine_t SC, SD;                       /* snapshot U4 fixtures */
++static void drop_mmio(machine_t *m) {
++    while (m->mmio_list) {
++        mmio_region_t *n = m->mmio_list->next;
++        free(m->mmio_list);
++        m->mmio_list = n;
++    }
++}
++static void boot_lapic(machine_t *m) {
++    drop_mmio(m);
++    setup_machine(m);
++    cpu_devtick_set(0);
++    lapic_init(m);
++    lapic_mmio_register(m);
++}
++/* "mov ecx,0x1B; mov eax,lo; mov edx,hi; wrmsr; jmp $" at 0x5000 */
++static void guest_set_apicbase(machine_t *m, uint64_t v) {
++    uint8_t code[24]; int n = 0;
++    code[n++] = 0x66; code[n++] = 0xB9; code[n++] = 0x1B;
++    code[n++] = 0; code[n++] = 0; code[n++] = 0;
++    code[n++] = 0x66; code[n++] = 0xB8;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i));
++    code[n++] = 0x66; code[n++] = 0xBA;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i + 32));
++    code[n++] = 0x0F; code[n++] = 0x30; code[n++] = 0xEB; code[n++] = 0xFE;
++    memcpy(m->ram + 0x5000, code, (size_t)n);
++    m->cpu.rip = 0x5000;
++    for (int i = 0; i < 8; i++) (void)cpu_step(&m->cpu);
++}
++static int u4_snapshot_cases(const char *ps, const char *ps2) {
++    int f0 = fails;
++    const uint64_t NEWB = 0xFEE80000ULL;
++    int found;
++    /* relocated + enabled */
++    boot_lapic(&SC);
++    mem_write(&SC, LAPIC_BASE + LAPIC_ID, 4, 0xAB000000u);
++    guest_set_apicbase(&SC, NEWB | LAPIC_MSR_EN);
++    EXPECT((uint32_t)mem_read(&SC, NEWB + LAPIC_VER, 4) == 0x00050014u, "src relocated window dead");
++    assert(snap_save(&SC, ps, &CFG) == 0);
++    boot_lapic(&SD);
++    assert(snap_load(&SD, ps, &CFG) == 0);
++    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0x00050014u, "loaded relocated window dead");
++    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_ID, 4) == 0xAB000000u, "loaded LAPIC ID lost");
++    EXPECT((uint32_t)mem_read(&SD, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu, "old window resurrected");
++    EXPECT(cpu_get_msr(&SD.cpu, LAPIC_MSR_APICBASE, &found) == (NEWB | LAPIC_MSR_EN | LAPIC_MSR_BSP) && found,
++           "loaded MSR not the relocated value");
++    assert(snap_save(&SD, ps2, &CFG) == 0);
++    EXPECT(same_file(ps, ps2), "relocated save -> load -> save not a fixed point");
++    /* relocated + globally disabled */
++    guest_set_apicbase(&SC, NEWB);                      /* EN=0 at the new base */
++    assert(snap_save(&SC, ps, &CFG) == 0);
++    boot_lapic(&SD);
++    assert(snap_load(&SD, ps, &CFG) == 0);
++    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0xFFFFFFFFu, "disabled window decoded");
++    EXPECT((uint32_t)mem_read(&SD, LAPIC_BASE + LAPIC_VER, 4) == 0xFFFFFFFFu, "default window decoded");
++    EXPECT(cpu_get_msr(&SD.cpu, LAPIC_MSR_APICBASE, &found) == (NEWB | LAPIC_MSR_BSP) && found,
++           "loaded MSR not the disabled relocated value");
++    guest_set_apicbase(&SD, NEWB | LAPIC_MSR_EN);       /* guest revives it */
++    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_VER, 4) == 0x00050014u, "revived window dead");
++    EXPECT((uint32_t)mem_read(&SD, NEWB + LAPIC_ID, 4) == 0xAB000000u, "ID lost across disabled snapshot");
++    drop_mmio(&SC); drop_mmio(&SD);
++    if (fails == f0) printf("ok U4 snapshot: relocated and disabled LAPIC save/load equivalently\n");
++    return fails - f0;
++}
++
+ int main(void) {
+     const char *p1 = "/tmp/test-snap-1.snap", *p2 = "/tmp/test-snap-2.snap", *p3 = "/tmp/test-snap-3.snap";
+     const char *bad = "/tmp/test-snap-bad.snap";
+@@ -147,6 +218,7 @@ int main(void) {
+     printf("ok determinism: identical files for identical states; save -> load -> save fixed point\n");
+ 
+     /* 3. sparse RAM */
++    u4_snapshot_cases("/tmp/test-snap-u4a.snap", "/tmp/test-snap-u4b.snap");
+     long sz = fsize(p1);
+     EXPECT(sz > 0 && sz < 2 * 1024 * 1024, "snapshot of a tiny program is %ld bytes", sz);
+     printf("ok sparse: %ld-byte file for a %u MiB machine\n", sz, RAM_SIZE >> 20);
+@@ -191,6 +263,7 @@ int main(void) {
+     printf("ok refusals: bad magic, version, build layout, truncation x6, trailing bytes, platform, vCPUs, --tap\n");
+     free(img); free(mod); free(ref_ram);
+     remove(p1); remove(p2); remove(p3); remove(bad);
++    remove("/tmp/test-snap-u4a.snap"); remove("/tmp/test-snap-u4b.snap");
+     if (fails) { printf("test-snap: %d FAILED\n", fails); return 1; }
+     puts("test-snap: all vectors passed");
+     return 0;
+-- 
+2.47.3
+

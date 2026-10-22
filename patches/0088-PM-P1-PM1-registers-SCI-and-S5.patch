@@ -1,0 +1,403 @@
+From 159646dd1ab1a21951a048313a22644f5722f448 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Wed, 21 Oct 2026 13:27:51 +0000
+Subject: [PATCH] PM P1: PM1 registers, SCI, S5 (PM_PLAN P1)
+
+The G5 PM block stops reading zero at everything except the
+Timer: PM1_STS becomes a W1C latch over the RW1C mask
+(0x8501), PM1_EN stores, PM1_CNT stores SCI_EN/BM_RLD and
+decodes SLP_TYP/SLP_EN, all through the existing byte-stream
+assembler so byte and word accesses compose like the Timer's.
+pm_advance now latches TMR_STS on the real 24-bit wrap and is
+also driven from devices_tick (pm_tick), so the event latches
+even if nobody reads the Timer. SCI is a level on IRQ9, gated
+by SCI_EN and (sts & en), through pic_set_irq like the rest
+of the fleet. S5 (SLP_TYP=7, the Q35/PIIX4 encoding P2's
+DSDT must publish) logs and stops the run via stop_requested
+-- an ACPI power-off finally works; other sleep types log
+until P3 instead of being faked.
+
+Timer behaviour is byte-identical: the pre-P1 "only TMR has
+state" vector passes unmodified (its CNT write of 0 is a
+no-op store). Vectors (tests/test_pm.c, 3 new groups):
+register storage word+byte; the overflow latch, W1C
+selectivity, and the SCI level following SCI_EN; the S5
+decode stopping the run while type 0 does not. NC: pm.c/pm.h
+reverted to the P0 version -- the P1 groups abort at the
+first EN-store assert (the vectors use only pre-P1 symbols,
+so the revert compiles and fails behaviourally). Gates:
+make test + test-sanitize green, ISO lane green. Docs:
+PM_PLAN.md (P1 receipts, D1/D2 resolved), STATUS.md,
+CHANGELOG.md.
+---
+ CHANGELOG.md          | 20 +++++++++++
+ docs/STATUS.md        | 12 +++++++
+ docs/plans/PM_PLAN.md | 29 +++++++++++++---
+ src/devices.c         |  1 +
+ src/pm.c              | 81 ++++++++++++++++++++++++++++++++++++++-----
+ src/pm.h              |  9 +++++
+ tests/test_pm.c       | 61 ++++++++++++++++++++++++++++++++
+ 7 files changed, 200 insertions(+), 13 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5631d0f..49dd9db 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,26 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0088 (PM P1: PM1 registers, SCI, S5)
++
++- **PM1 block implemented** (`src/pm.c`): PM1_STS is a W1C latch over
++  the RW1C mask, PM1_EN stores, PM1_CNT stores SCI_EN/BM_RLD and
++  decodes SLP_TYP/SLP_EN; the real 24-bit Timer wrap latches
++  TMR_STS, now also advanced from `devices_tick`. Reads/writes reuse
++  the byte-stream assembler, so byte and word accesses compose like
++  the Timer's.
++- **SCI**: level on IRQ9 (gated by SCI_EN and the enabled-event
++  expression), through the `pic_set_irq` fleet convention.
++- **S5**: SLP_TYP=7 + SLP_EN logs `[pm] S5 power-off` and stops the
++  run deterministically (`stop_requested`) instead of the old silent
++  hang; non-S5 types log until P3. The decode type pins the
++  encoding P2's DSDT must publish.
++- 3 new groups in `tests/test_pm.c` (register storage, overflow
++  latch + SCI gating, S5 stop); NC = pm.c/pm.h reverted to P0 —
++  behavioural abort at the first EN-store assert. Timer behaviour
++  byte-identical: the pre-P1 "only TMR has state" canary passes
++  unmodified.
++
+ ### Added — patch 0087 (PM P0: measured baseline + plan)
+ 
+ - `docs/plans/PM_PLAN.md` opens audit candidate #3 with the measured
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 42b45d3..c38be91 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -994,6 +994,18 @@
+   P1 (registers+SCI+S5), P2 (FADT/DSDT+GPE0), P3 (S1, with the
+   parking-vs-zero-duration fork recorded for a P2 measurement). The
+   north-star guest consumes no PM today (its ACPI is MADT-only).
++- PM P1 (`patches/0088-PM-P1-PM1-registers-SCI-and-S5.patch`): the PM
++  block grows PM1_STS (W1C over the RW1C mask), PM1_EN (stored),
++  PM1_CNT (SCI_EN stored, SLP_TYP/SLP_EN decoded) through the
++  existing byte-stream assembler. The real 24-bit Timer wrap in
++  `pm_advance` latches TMR_STS; `pm_tick` joins `devices_tick` so the
++  event latches without a Timer read. SCI is a level on IRQ9 gated by
++  SCI_EN, through `pic_set_irq`. S5 (SLP_TYP=7, the Q35/PIIX4
++  encoding P2's DSDT will publish) logs and stops the run via
++  `stop_requested`; other types log until P3. 3 new groups in
++  `tests/test_pm.c`; NC = pm.c/pm.h at P0 (vectors use only pre-P1
++  symbols): abort at the first EN-store assert. Timer behaviour
++  byte-identical (canary vector passes unmodified).
+ 
+ ## BIOS compatibility diagnostics (G2–G4; plan: `docs/plans/COMPAT_PLAN.md`)
+ 
+diff --git a/docs/plans/PM_PLAN.md b/docs/plans/PM_PLAN.md
+index 1ddb615..577edc4 100644
+--- a/docs/plans/PM_PLAN.md
++++ b/docs/plans/PM_PLAN.md
+@@ -5,12 +5,12 @@
+ > (`src/pm.{h,c}` — the Timer block this plan completes) and
+ > KERNEL-BOOT K3 (`src/acpi.c` — RSDP/MADT only today).
+ 
+-**Status: P0 done ✅; P1 queued**
++**Status: P0+P1 done ✅; P2 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | P0 | Measured baseline: the current PM/ACPI surface, who consumes PM, the defect ledger, decisions | ✅ done | this file (`patches/0087`) |
+-| P1 | PM1 register block: PM1_STS/EN (W1C, TMR_STS overflow), PM1_CNT (SCI_EN store, sleep decode), SCI line, S5 power-off | ⬜ queued | `tests/test_pm.c` vectors |
++| P1 | PM1 register block: PM1_STS/EN (W1C, TMR_STS overflow), PM1_CNT (SCI_EN store, sleep decode), SCI line, S5 power-off | ✅ done | `tests/test_pm.c` vectors (`patches/0088`) |
+ | P2 | Tables + GPE: FADT + minimal DSDT (\_S5) on the kernel lane, GPE0 STS/EN registers, SCI aggregate; SMI_CMD stays an honest no-SMI | ⬜ queued | table vectors + GPE vectors |
+ | P3 | S1 + close-out: a deterministic, snapshot-compatible suspend state; wake sources; docs | ⬜ queued | close-out + docs |
+ 
+@@ -64,8 +64,8 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+ 
+ | # | Defect (measured) | Consequence | Phase |
+ |---|-------------------|-------------|-------|
+-| D1 | PM1_CNT writes swallowed; no sleep decode | ACPI power-off never stops the machine | P1 |
+-| D2 | PM1_STS/PM1_EN dead: TMR_STS never sets on 24-bit overflow, no W1C; no SCI source | timer-overflow events and event enables are fiction-free zeros — guests polling STS spin | P1 |
++| D1 | PM1_CNT writes swallowed; no sleep decode | ACPI power-off never stops the machine | ~~P1~~ **resolved in P1** (SLP_TYP=7+SLP_EN → `stop_requested`) |
++| D2 | PM1_STS/PM1_EN dead: TMR_STS never sets on 24-bit overflow, no W1C; no SCI source | timer-overflow events and event enables are fiction-free zeros — guests polling STS spin | ~~P1~~ **resolved in P1** (W1C STS, stored EN, TMR_STS on wrap, level SCI on IRQ9) |
+ | D3 | GPE0 block reads zero; no SCI aggregate | general-purpose events cannot exist | P2 |
+ | D4 | no FADT/DSDT on the kernel lane | PM is undiscoverable except via SeaBIOS' tables | P2 |
+ | D5 | no S-state machine at all (S1 included) | suspend is unrepresentable | P3 |
+@@ -104,6 +104,27 @@ the docs update in the same commit (the `ROADMAP.md` standing rules).
+   `machine_t`; new fields ride the existing machine snapshot
+   composition (checked at each phase like MSI M4 did).
+ 
++## 2b. P1 receipts
++
++Implemented in `src/pm.c` (state `sts/en/cnt/sci_level` in `pm_t`):
++reads assemble the W1C status, stored enables and the stored CNT bits
++(SLP_EN reads 0) through the existing byte stream; writes are
++byte-composed — STS clears through the RW1C mask `0x8501`, EN stores,
++CNT low stores SCI_EN/BM_RLD, CNT high decodes SLP_TYP/SLP_EN. The
++24-bit wrap inside `pm_advance` latches TMR_STS; `pm_tick` (joined to
++`devices_tick`) advances at the device cadence, so the event latches
++even when nobody reads the Timer. SCI is a level on IRQ9 through
++`pic_set_irq`, recomputed on every state write and advance. S5
++(SLP_TYP=7) logs and sets `stop_requested`; other types log and do
++nothing until P3. Timer behaviour is byte-identical (the pre-P1
++"only TMR has state" vector still passes unmodified — its CNT write
++is 0, which is a no-op store). NC: `pm.c/pm.h` reverted to the P0
++version — the three P1 groups abort at the first EN-store assert
++while the Timer groups stay green (the vectors deliberately use
++only pre-P1 symbols, so the revert compiles and fails
++behaviourally, not at link time). Gates: `make test` + sanitize
++green, ISO lane green.
++
+ ## 3. Gates (standing rules)
+ 
+ Per phase: `tests/test_pm.c` (extends the existing Timer vectors),
+diff --git a/src/devices.c b/src/devices.c
+index 2ce9ae2..7a14603 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -577,6 +577,7 @@ void devices_tick(machine_t *m) {
+         ehci_walk(m, g_ehci.base);
+     uhci_tick(m);
+     e1000_tick();            /* NET N0: TAP datagrams -> RX ring */
++    pm_tick(m);              /* PM P1: TMR overflow -> TMR_STS -> SCI */
+ }
+ 
+ /* ================================ UHCI (USB 1.1) =========================== */
+diff --git a/src/pm.c b/src/pm.c
+index 32555c5..e80a673 100644
+--- a/src/pm.c
++++ b/src/pm.c
+@@ -9,6 +9,27 @@
+ #define PM_TMR_MASK    0x00FFFFFFu
+ #define PM_TMR_RATIO   3u        /* 3.579545 MHz / 1.193182 MHz, exactly 3 */
+ 
++/* PM P1: PM1 register bits (ICH9 PMBASE layout: STS +0x00, EN +0x02,
++ * CNT +0x04, TMR +0x08; GPE0 arrives in P2). */
++#define PM1_TMR_STS    0x0001u
++#define PM1_STS_W1C    0x8501u   /* TMR(0) PWRBTN(8) RTC(10) WAK(15) */
++#define PM1_CNT_SCI_EN 0x0001u
++#define PM1_CNT_BM_RLD 0x0002u
++#define PM1_SLP_EN     0x2000u
++#define PM1_SLP_TYP(v) (((v) >> 10) & 7u)
++#define PM_SLP_TYP_S5  7u        /* Q35/PIIX4 encoding; P2's DSDT matches */
++
++/* SCI is a level like the rest of the fleet: asserted while SCI_EN and
++ * any enabled event latches (PM1 now, GPE0 joins in P2). */
++static void pm_sci_update(machine_t *m) {
++    pm_t *p = &m->pm;
++    int lvl = ((p->cnt & PM1_CNT_SCI_EN) && (p->sts & p->en)) ? 1 : 0;
++    if (lvl != p->sci_level) {
++        p->sci_level = lvl;
++        pic_set_irq(m, PM_SCI_IRQ, lvl);
++    }
++}
++
+ /* Advance the 24-bit counter to "now".  Called on every read, so the value
+  * a guest sees never depends on how often the block was polled; the whole
+  * cadence is derived from vtime_instr, like pit_tick(). */
+@@ -23,7 +44,18 @@ static void pm_advance(machine_t *m) {
+     p->accum += delta * PM_TMR_RATIO;
+     uint64_t ticks = p->accum / ipt;
+     p->accum %= ipt;
+-    if (ticks) p->count = (uint32_t)((p->count + ticks) & PM_TMR_MASK);
++    if (ticks) {
++        /* PM P1: the 24-bit wrap is the TMR_STS event, as on silicon
++         * (one overflow per ~4.7 s of virtual time). */
++        if ((uint64_t)p->count + ticks > PM_TMR_MASK) p->sts |= PM1_TMR_STS;
++        p->count = (uint32_t)((p->count + ticks) & PM_TMR_MASK);
++        pm_sci_update(m);
++    }
++}
++
++void pm_tick(machine_t *m) {
++    pm_advance(m);
++    pm_sci_update(m);
+ }
+ 
+ uint32_t pm_timer_now(machine_t *m) {
+@@ -37,14 +69,18 @@ static int pm_hits_tmr(uint16_t off, int size) {
+ }
+ 
+ static uint32_t pm_read_byte_stream(machine_t *m, uint16_t off, int size) {
+-    /* Assemble the Timer register from its three live bytes.  Bits 31:24
+-     * are reserved and read as zero (ICH9: TMR is a 24-bit counter). */
++    /* Assemble each modelled register byte-wise: PM1_STS/EN/CNT (P1) and
++     * the Timer's three live bytes (bits 31:24 reserved-zero).  SLP_EN is
++     * write-only and reads back 0 because pm.cnt never stores it. */
+     uint32_t tmr = pm_hits_tmr(off, size) ? pm_timer_now(m) : 0;
++    uint16_t regs[3] = { m->pm.sts, m->pm.en, m->pm.cnt };
+     uint32_t v = 0;
+     for (int i = 0; i < size; i++) {
+         unsigned a = off + (unsigned)i;
+         uint8_t b = 0;
+-        if (a >= PM_TMR_OFF && a < PM_TMR_OFF + 3)
++        if (a < 6)
++            b = (uint8_t)(regs[a / 2] >> (8 * (a & 1u)));
++        else if (a >= PM_TMR_OFF && a < PM_TMR_OFF + 3)
+             b = (uint8_t)(tmr >> (8 * (a - PM_TMR_OFF)));
+         v |= (uint32_t)b << (8 * i);
+     }
+@@ -54,7 +90,7 @@ static uint32_t pm_read_byte_stream(machine_t *m, uint16_t off, int size) {
+ static uint32_t pm_io_read(void *ctx, uint16_t port, int size) {
+     machine_t *m = ctx;
+     uint16_t off = (uint16_t)(port - m->pm.base);
+-    /* Only the Timer register has state; the rest of the block reads 0.
++    /* PM1 + Timer have state; the rest of the block still reads 0.
+      * A read that straddles the Timer keeps its live bytes (see above). */
+     if (port >= m->pm.base && off < PM_BLOCK_LEN) {
+         if (pm_hits_tmr(off, size)) m->pm.reads++;
+@@ -63,14 +99,41 @@ static uint32_t pm_io_read(void *ctx, uint16_t port, int size) {
+     return size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+ }
+ 
++/* PM P1: a sleep request.  S5 is the machine's deterministic stop (the
++ * same endpoint the debugger uses); other types are P3's to implement
++ * and are logged, not faked. */
++static void pm_sleep(machine_t *m, unsigned typ) {
++    if (typ == PM_SLP_TYP_S5) {
++        mlog(&m->log, "[pm] S5 power-off via PM1_CNT -- stopping the run");
++        m->stop_requested = 1;
++    } else {
++        mlog(&m->log, "[pm] sleep type %u requested -- ignored until PM P3", typ);
++    }
++}
++
+ static void pm_io_write(void *ctx, uint16_t port, int size, uint32_t val) {
+     machine_t *m = ctx;
+-    (void)size; (void)val;
+     uint16_t off = (uint16_t)(port - m->pm.base);
+     if (port < m->pm.base || off >= PM_BLOCK_LEN) return;
+-    /* The Timer is read-only; PM1_STS would be W1C and PM1_CNT a sleep
+-     * transition, neither of which this behavioural model implements.
+-     * Swallowing the write is the honest option: nothing is fabricated. */
++    /* Byte-wise, so the word/byte writes real drivers use compose the
++     * same way the read stream assembles them.  The Timer is read-only. */
++    for (int i = 0; i < size; i++) {
++        unsigned a = off + (unsigned)i;
++        uint32_t b = (val >> (8 * i)) & 0xFFu;
++        if (a < 2) {                    /* PM1_STS: W1C on the RW1C bits */
++            m->pm.sts &= (uint16_t)~((b << (8 * a)) & PM1_STS_W1C);
++        } else if (a < 4) {             /* PM1_EN: plain storage */
++            unsigned sh = 8 * (a - 2);
++            m->pm.en = (uint16_t)((m->pm.en & ~(0xFFu << sh)) | (b << sh));
++        } else if (a == 4) {            /* PM1_CNT low: SCI_EN, BM_RLD */
++            m->pm.cnt = (uint16_t)((m->pm.cnt & 0xFF00u) |
++                                   (b & (PM1_CNT_SCI_EN | PM1_CNT_BM_RLD)));
++        } else if (a == 5) {            /* PM1_CNT high: SLP_TYP/SLP_EN */
++            uint32_t hi = b << 8;
++            if (hi & PM1_SLP_EN) pm_sleep(m, PM1_SLP_TYP(hi));
++        }
++    }
++    pm_sci_update(m);
+ }
+ 
+ static void pm_register_block(machine_t *m, uint16_t base) {
+diff --git a/src/pm.h b/src/pm.h
+index 1324354..32d580e 100644
+--- a/src/pm.h
++++ b/src/pm.h
+@@ -31,8 +31,14 @@ typedef struct pm {
+     uint64_t last_instr;/* vtime_instr at the last advance                  */
+     uint64_t accum;     /* fractional PIT-tick accumulator (TMR runs 3x)   */
+     uint64_t reads;     /* TMR reads (diagnostic)                          */
++    uint16_t sts;       /* PM1_STS latch (W1C bits; PM P1)                 */
++    uint16_t en;        /* PM1_EN                                          */
++    uint16_t cnt;       /* PM1_CNT stored bits (SCI_EN, BM_RLD)            */
++    int sci_level;      /* last level driven on the SCI line (IRQ9)        */
+ } pm_t;
+ 
++#define PM_SCI_IRQ 9
++
+ /* Reset the block and decode it at the Q35/SeaBIOS default base 0xb000. */
+ void pm_init(struct machine *m);
+ 
+@@ -42,4 +48,7 @@ void pm_set_base(struct machine *m, uint16_t base);
+ /* Current 24-bit Timer value, advanced from vtime_instr. */
+ uint32_t pm_timer_now(struct machine *m);
+ 
++/* Advance the Timer and re-drive SCI (device-tick cadence, PM P1). */
++void pm_tick(struct machine *m);
++
+ #endif
+diff --git a/tests/test_pm.c b/tests/test_pm.c
+index 6d98f9c..4e81c6d 100644
+--- a/tests/test_pm.c
++++ b/tests/test_pm.c
+@@ -148,6 +148,64 @@ static void test_lpc_config_hook_moves_base(void) {
+     puts("ok   pm: LPC PMBASE (0x40 = 0xb000|1) lands on 0xb000");
+ }
+ 
++/* PM P1: PM1_STS/EN/CNT at +0x00/+0x02/+0x04 -- W1C status, stored
++ * enables, SCI_EN gating, level SCI on IRQ9 (slave 8259 line 1). */
++static void test_pm1_registers(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m); pic_init(&m);
++    const uint16_t B = PM_DEFAULT_BASE;
++    assert(io_read(&m, B + 0, 2) == 0 && io_read(&m, B + 2, 2) == 0 &&
++           io_read(&m, B + 4, 2) == 0);
++    io_write(&m, B + 2, 2, 0x8101);                /* PM1_EN stores   */
++    assert(io_read(&m, B + 2, 2) == 0x8101);
++    io_write(&m, B + 4, 1, 0x01);                  /* byte write CNT  */
++    assert(io_read(&m, B + 4, 2) == 0x0001);       /* SCI_EN stored   */
++    assert(io_read(&m, B + 4, 1) == 0x01);         /* byte reads work */
++    puts("ok   pm: PM1_EN/CNT store their bits (word and byte access)");
++}
++
++static void test_tmr_sts_and_sci(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m); pic_init(&m);
++    const uint16_t B = PM_DEFAULT_BASE;
++    m.pm.count = 0x00FFFFFEu; m.pm.last_instr = m.vtime_instr;
++    m.vtime_instr += 3 * STEPS_PER_TMR;            /* 3 TMR ticks: wrap */
++    (void)io_read(&m, B + 8, 4);                   /* advance on read   */
++    assert((io_read(&m, B + 0, 2) & 0x0001) == 1); /* TMR_STS latched   */
++    assert((m.pic.slave.lines & 0x02) == 0);       /* EN=0: no SCI      */
++
++    io_write(&m, B + 0, 2, 0x0001);                /* W1C               */
++    assert((io_read(&m, B + 0, 2) & 0x0001) == 0);
++
++    m.pm.count = 0x00FFFFFEu; m.pm.last_instr = m.vtime_instr;
++    m.vtime_instr += 3 * STEPS_PER_TMR;
++    (void)io_read(&m, B + 8, 4);
++    assert((io_read(&m, B + 0, 2) & 0x0001) == 1);
++    io_write(&m, B + 0, 2, 0x8000);                /* clear WAK only    */
++    assert((io_read(&m, B + 0, 2) & 0x0001) == 1); /* TMR_STS survives  */
++
++    io_write(&m, B + 2, 2, 0x0001);                /* TMR_EN, SCI_EN=0  */
++    assert((m.pic.slave.lines & 0x02) == 0);
++    io_write(&m, B + 4, 1, 0x01);                  /* SCI_EN=1          */
++    assert((m.pic.slave.lines & 0x02) != 0);       /* IRQ9 asserted     */
++    io_write(&m, B + 0, 2, 0x0001);                /* W1C the event     */
++    assert((m.pic.slave.lines & 0x02) == 0);       /* level released    */
++    puts("ok   pm: TMR overflow latches TMR_STS, W1C clears, SCI gates");
++}
++
++static void test_s5_request(void) {
++    machine_t m; setup_machine(&m);
++    pit_init(&m); pm_init(&m);
++    const uint16_t B = PM_DEFAULT_BASE;
++    assert(m.stop_requested == 0);
++    io_write(&m, B + 4, 2, 0x2000);                /* SLP_EN + typ 0    */
++    assert(m.stop_requested == 0);                 /* not S5: no stop   */
++    io_write(&m, B + 4, 2, 0x3C00);                /* SLP_EN + typ 7    */
++    assert(m.stop_requested == 1);                 /* S5 stops the run  */
++    assert((io_read(&m, B + 4, 2) & 0x2000) == 0); /* SLP_EN reads 0    */
++    puts("ok   pm: PM1_CNT SLP_TYP=7 + SLP_EN stops the run (S5)");
++}
++
+ int main(void) {
+     test_default_window_and_rate();
+     test_24bit_wrap();
+@@ -155,6 +213,9 @@ int main(void) {
+     test_other_registers_and_write_ignore();
+     test_rebase();
+     test_lpc_config_hook_moves_base();
++    test_pm1_registers();
++    test_tmr_sts_and_sci();
++    test_s5_request();
+     puts("pm tests: ok");
+     return 0;
+ }
+-- 
+2.47.3
+

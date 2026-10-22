@@ -1078,10 +1078,11 @@ and its harnesses.
   `bootp.c` (every mirror 404'd). `--gw-mac` pins it if that ever
   matters; no guest assert depends on the value beyond consistency.
 - TCP beyond what the guest exercises: no retransmission timers of our
-  own, no window scaling, no SACK *sending* (we only acknowledge the
-  guest's SACK-permitted option), no out-of-order handling, no
-  `TIME_WAIT` timer (the tuple is freed on the closing ACK), no IPv6,
-  no `tcp6_self_test` peer (the guest skips it without one).
+  own, no window scaling, no `TIME_WAIT` timer (the tuple is freed on
+  the closing ACK), no IPv6, no `tcp6_self_test` peer (the guest skips
+  it without one). (SACK *sending*, sequenced receive and out-of-order
+  handling arrived later, in UPKEEP U6 / `patches/0097` — see
+  `docs/plans/UPKEEP_PLAN.md`; this list otherwise stands.)
 - DHCP lease state, renewal and `DECLINE` — the responder stays
   stateless by design, which is what makes two instances and a replayed
   frame answer identically.

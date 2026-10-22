@@ -577,6 +577,7 @@ void devices_tick(machine_t *m) {
         ehci_walk(m, g_ehci.base);
     uhci_tick(m);
     e1000_tick();            /* NET N0: TAP datagrams -> RX ring */
+    pm_tick(m);              /* PM P1: TMR overflow -> TMR_STS -> SCI */
 }
 
 /* ================================ UHCI (USB 1.1) =========================== */
@@ -1279,7 +1280,8 @@ void devices_init_common(machine_t *m) {
      * 0xCF9 (chipset.[ch], consumed by cpu_step at the boundary). */
     chipset_init(m);
     chipset_io_register(m);
-    /* CHIPSET H6: local APIC MMIO window at 0xFEE00000 -- CPUID.1:EDX
+    /* CHIPSET H6 (+UPKEEP U4 relocation): local APIC MMIO window, born at
+     * 0xFEE00000 -- CPUID.1:EDX
      * advertised APIC long before the window existed (measured). */
     lapic_init(m);
     lapic_mmio_register(m);
@@ -1333,6 +1335,7 @@ void devices_init_common(machine_t *m) {
     sata_pci->cfg[0x27] = (uint8_t)(AHCI_ABAR >> 24);
     sata_pci->cfg_read = ahci_pci_cfg_read;
     sata_pci->cfg_write = ahci_pci_cfg_write;
+    ahci_pci_seed(sata_pci);                          /* MSI M3 */
     ahci_register(m);
 
     /* GPU: dev2/func0 (real Intel iGPU convention) */
@@ -1394,6 +1397,16 @@ void devices_init_common(machine_t *m) {
     xhci_pci->cfg[0x2E] = 0x00; xhci_pci->cfg[0x2F] = 0x11;
     xhci_pci->cfg[0x3C] = (uint8_t)XHCI_IRQ;          /* Interrupt Line */
     xhci_pci->cfg[0x3D] = 0x01;                       /* Interrupt Pin: INTA# */
+    /* MSI M1: MSI-X capability in the qemu-xhci shape (MSI_PLAN 1b):
+     * cap @0x90, Table Size 16, table at BAR0+0x3000, PBA at +0x3800.
+     * RO fields are re-asserted in xhci_pci_cfg_write after every write. */
+    xhci_pci->cfg[0x06] |= 0x10;                      /* Status: Capabilities List */
+    xhci_pci->cfg[0x34] = 0x90;                       /* Capabilities Pointer */
+    xhci_pci->cfg[0x90] = 0x11;                       /* Capability ID: MSI-X */
+    xhci_pci->cfg[0x91] = 0x00;                       /* Next: end of list */
+    xhci_pci->cfg[0x92] = 15;                         /* Message Control: Table Size-1 */
+    xhci_pci->cfg[0x94] = 0x00; xhci_pci->cfg[0x95] = 0x30;   /* Table Offset 0x3000, BIR 0 */
+    xhci_pci->cfg[0x98] = 0x00; xhci_pci->cfg[0x99] = 0x38;   /* PBA Offset 0x3800, BIR 0 */
     xhci_pci->cfg_read = xhci_pci_cfg_read;
     xhci_pci->cfg_write = xhci_pci_cfg_write;
     xhci_register(m);
@@ -1451,6 +1464,7 @@ void devices_add_ahci2(machine_t *m) {
     p->cfg[0x27] = (uint8_t)(AHCI_ABAR2 >> 24);
     p->cfg_read = ahci_pci_cfg_read;
     p->cfg_write = ahci_pci_cfg_write;
+    ahci_pci_seed(p);                                 /* MSI M3 */
     ahci_register_ctrl(m, 1);
 }
 

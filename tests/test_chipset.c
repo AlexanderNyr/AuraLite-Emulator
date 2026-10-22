@@ -1,4 +1,4 @@
-/* tests/test_chipset.c -- CHIPSET H5 vectors: A20 gate + system reset.
+/* tests/test_chipset.c -- CHIPSET H5 (+ UPKEEP U5) vectors: A20 gate + system reset + CF9 CPU INIT.
  *
  * A20 vectors drive the real ports (0x92, KBC 0xD0/0xD1) and observe the
  * physical-address consequences through mem_read/mem_write (the very bus
@@ -171,21 +171,41 @@ static void test_reset_via_p92(void) {
 
 static void test_reset_via_cf9_predicates(void) {
     fx_t f; fx_init(&f);
-    /* neither 0x02 (CPU INIT only) nor 0x04 (SYS_RST without RST_CPU)
-     * alone resets; both are stored and read back */
+    /* PCH RST_CNT (U5 bit roles): bit1 SYS_RST = type, bit2 RST_CPU =
+     * the 0->1 trigger edge. The type bit alone is inert storage. */
     io_write(&f.m, 0xCF9, 1, 0x02);
     assert(f.m.chipset.resets == 0 && f.m.chipset.reset_pending == 0);
     assert(io_read(&f.m, 0xCF9, 1) == 0x02);
+    /* 0x04 alone: RST_CPU rising with SYS_RST clear = INIT#, a CPU INIT
+     * request -- NOT a full reset */
     io_write(&f.m, 0xCF9, 1, 0x04);
-    assert(f.m.chipset.resets == 0 && f.m.chipset.reset_pending == 0);
+    assert(f.m.chipset.resets == 0);
+    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
     assert(io_read(&f.m, 0xCF9, 1) == 0x04);
-    /* the classic dance: 0x02 then 0x06 (SYS_RST rises with RST_CPU set) */
-    io_write(&f.m, 0xCF9, 1, 0x02);
+    f.m.cpu.rip = 0x1234;                         /* somewhere non-reset */
+    assert(cpu_step(&f.m.cpu) == 0);              /* boundary consumption */
+    assert(f.m.chipset.resets == 0);
+    assert(f.m.chipset.reset_pending == 0);
+    assert(f.m.cpu.rip == 0xFFF0);                /* ...and the CPU took INIT */
+    assert(io_read(&f.m, 0xCF9, 1) == 0x04);      /* cf9 itself rides through */
+    /* single-shot hard reset: SYS_RST already set in the firing value */
+    io_write(&f.m, 0xCF9, 1, 0x00);
     io_write(&f.m, 0xCF9, 1, 0x06);
-    assert(f.m.chipset.reset_pending == 1);
-    assert(f.m.chipset.resets == 0);              /* not until the boundary */
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
     assert(cpu_step(&f.m.cpu) == 0);
     assert(f.m.chipset.resets == 1);
+    /* the value our own FADT advertises (P2): 0x0E full-flavor hard */
+    io_write(&f.m, 0xCF9, 1, 0x0E);
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+    assert(cpu_step(&f.m.cpu) == 0);
+    assert(f.m.chipset.resets == 2);
+    /* the classic dance: 0x02 then 0x06 */
+    io_write(&f.m, 0xCF9, 1, 0x02);
+    io_write(&f.m, 0xCF9, 1, 0x06);
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+    assert(f.m.chipset.resets == 2);              /* not until the boundary */
+    assert(cpu_step(&f.m.cpu) == 0);
+    assert(f.m.chipset.resets == 3);
     assert(f.m.chipset.reset_pending == 0);
     printf("ok: reset_via_cf9_predicates\n");
 }
@@ -228,6 +248,200 @@ static void test_reset_via_kbc_outport(void) {
     printf("ok: reset_via_kbc_outport\n");
 }
 
+/* --------------------------------------------------- UPKEEP U5 ----- */
+
+static const uint8_t TRIG_INIT[] = {    /* mov al,4; mov dx,0xCF9; out dx,al; tombstone; jmp $ */
+    0xB0,0x04, 0xBA,0xF9,0x0C, 0xEE, 0xC6,0x06,0x06,0x20,0xEE, 0xEB,0xFE };
+
+static void test_cpu_init_via_cf9_ritual(void) {
+    fx_t f; fx_init(&f);
+    install_reset_path(&f); dirty_machine(&f);
+    /* extra sentinels a full reset would clear and an INIT# must not */
+    f.m.pit.ch[0].cr = 0xBEEF;                    /* PIT reload value */
+    f.m.rtc.ram[0x40] = 0xA5;                     /* a battery-backed byte */
+    int64_t rtc_base = f.m.rtc.base_sec;
+    /* p92 storage with its A20 source OFF (a full reset re-seeds 0x02);
+     * keep the line itself open through the 8042 contribution so the
+     * reset-vector fetch takes the board's normal path */
+    io_write(&f.m, 0x64, 1, 0xD1);
+    io_write(&f.m, 0x60, 1, 0x03);                /* KBC A20 on, SRST# high */
+    io_write(&f.m, 0x92, 1, 0x00);                /* p92 source off */
+    assert(f.m.chipset.a20 == 1 && f.m.chipset.a20_kbc == 1 &&
+           f.m.chipset.a20_p92 == 0);
+
+    run_trigger(&f, TRIG_INIT, sizeof TRIG_INIT);
+    /* the CPU restarted at the reset vector, BETWEEN instructions */
+    assert(mem_read(&f.m, 0x2007, 1) == 1);
+    assert(mem_read(&f.m, 0x2006, 1) == 0);       /* tombstone never ran */
+    /* ...but no system reset happened and no device was re-initialised */
+    assert(f.m.chipset.resets == 0);
+    assert(f.m.chipset.reset_pending == 0);
+    assert(io_read(&f.m, 0x21, 1) == 0xFD);       /* PIC mask intact */
+    io_write(&f.m, 0x64, 1, 0x20);
+    assert(io_read(&f.m, 0x60, 1) == 0x45);       /* KBC command byte intact */
+    assert(f.m.pit.ch[0].cr == 0xBEEF);           /* PIT intact */
+    assert(f.m.rtc.ram[0x40] == 0xA5);            /* RTC CMOS intact */
+    assert(f.m.rtc.base_sec == rtc_base);
+    assert(mem_read(&f.m, 0x600, 1) == 0x42);     /* RAM intact */
+    assert(io_read(&f.m, 0x92, 1) == 0x00);       /* p92 NOT re-seeded to 0x02 */
+    assert(f.m.chipset.a20_kbc == 1 && f.m.chipset.a20_p92 == 0 &&
+           f.m.chipset.a20 == 1);                 /* gate line state intact */
+    assert(io_read(&f.m, 0xCF9, 1) == 0x04);      /* INIT is not a chipset reset */
+    printf("ok: cpu_init_via_cf9_ritual\n");
+}
+
+static void test_cpu_init_preserves_cpu_state(void) {
+    fx_t f; fx_init(&f);
+    cpu_t *c = &f.m.cpu;
+    int found;
+    /* SDM Table 9-1 INIT column: configure some "unchanged" state */
+    cpu_set_msr(c, 0xC0000081u, 0x1122334455667788ULL);   /* STAR */
+    cpu_set_msr(c, LAPIC_MSR_APICBASE, 0xFEE80900ULL);    /* relocated LAPIC */
+    cpu_set_msr(c, 0xC0000100u, 0xABCD0000ULL);           /* FS_BASE -> 0 by INIT */
+    c->efer = 0x500; cpu_set_msr(c, 0xC0000080u, 0x500);  /* EFER -> 0 */
+    c->kgs_base = 0x77770000ULL;
+    c->mxcsr = 0x3F80u;
+    c->xmm[3][0] = 0x1122334455667788ULL; c->xmm[3][1] = 0x99AABBCCDDEEFF00ULL;
+    c->fst[2] = -2.5L;                                    /* ST pattern, stale post-INIT */
+    c->fcw = 0x027F; c->ftop = 3;
+    c->gpr[0] = 0xDEAD;                                   /* EAX must reset */
+    f.m.cpu.rip = 0x1234;
+    uint64_t steps = c->executed_steps;
+
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
+    assert(cpu_step(c) == 0);
+
+    assert(c->rip == 0xFFF0 && c->seg[SEG_CS].sel == 0xF000 &&
+           c->seg[SEG_CS].base == 0xFFFF0000ULL);
+    assert(c->cr0 == 0x60000010ULL);
+    assert(c->gpr[0] == 0);
+    assert(cpu_get_msr(c, 0xC0000081u, &found) == 0x1122334455667788ULL && found);
+    assert(cpu_get_msr(c, LAPIC_MSR_APICBASE, &found) == 0xFEE80900ULL && found);
+    assert(cpu_get_msr(c, 0xC0000100u, &found) == 0);      /* FS_BASE reset */
+    assert(cpu_get_msr(c, 0xC0000080u, &found) == 0);      /* EFER reset */
+    assert(c->efer == 0);
+    assert(c->kgs_base == 0x77770000ULL);
+    assert(c->mxcsr == 0x3F80u);
+    assert(c->xmm[3][0] == 0x1122334455667788ULL && c->xmm[3][1] == 0x99AABBCCDDEEFF00ULL);
+    assert(c->fst[2] == -2.5L);                           /* stale bits ride through */
+    assert(c->fcw == 0x037F && c->ftw == 0xFFFF && c->fsw == 0 && c->ftop == 0);
+    assert(c->executed_steps == steps);                   /* monotonic bookkeeping */
+    printf("ok: cpu_init_preserves_cpu_state\n");
+}
+
+/* step until the reentry byte reaches n (the reset-vector stub has run n times) */
+static void run_until_entry(fx_t *f, uint32_t n) {
+    for (int i = 0; i < 256 && mem_read(&f->m, 0x2007, 1) < n; i++)
+        (void)cpu_step(&f->m.cpu);
+    assert(mem_read(&f->m, 0x2007, 1) == n);
+}
+
+static void test_cpu_init_edge_repeat_coalesce(void) {
+    fx_t f; fx_init(&f);
+    install_reset_path(&f);
+    cpu_reset(&f.m.cpu);                          /* power-on state, not a counted reset */
+    run_until_entry(&f, 1);                       /* power-on entry */
+    /* first INIT# */
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
+    run_until_entry(&f, 2);
+    assert(f.m.chipset.resets == 0);
+    /* the stored bit is still set: writing 0x04 again is no new edge */
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == 0);
+    for (int i = 0; i < 24; i++) (void)cpu_step(&f.m.cpu);
+    assert(mem_read(&f.m, 0x2007, 1) == 2);       /* nothing happened */
+    /* clear the trigger, set it again: a fresh edge, a fresh INIT# */
+    io_write(&f.m, 0xCF9, 1, 0x00);
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
+    run_until_entry(&f, 3);
+    /* coalescing: an INIT pending, then an 8042 reset pulse before the
+     * boundary upgrades it into exactly one FULL reset */
+    io_write(&f.m, 0x21, 1, 0xFD);                /* PIC sentinel */
+    io_write(&f.m, 0xCF9, 1, 0x00);
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == RESET_KIND_CPU_INIT);
+    io_write(&f.m, 0x64, 1, 0xFE);
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+    run_until_entry(&f, 4);
+    assert(f.m.chipset.resets == 1);
+    assert(io_read(&f.m, 0x21, 1) == 0xFF);       /* devices WERE reset */
+    /* ...and the reverse absorbs: an INIT behind a pending full reset */
+    io_write(&f.m, 0x64, 1, 0xFE);
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+    io_write(&f.m, 0xCF9, 1, 0x04);
+    assert(f.m.chipset.reset_pending == RESET_KIND_FULL);
+    run_until_entry(&f, 5);
+    assert(f.m.chipset.resets == 2);
+    printf("ok: cpu_init_edge_repeat_coalesce\n");
+}
+
+static void smp_fx(fx_t *f) {
+    fx_init(f);
+    install_reset_path(f);
+    f->m.n_vcpus = 3;
+    f->m.vcpu[0].c = f->m.cpu; f->m.vcpu[0].l = f->m.lapic;
+    f->m.vcpu[0].state = VCPU_RUN;
+    for (int i = 1; i < 3; i++) {
+        f->m.vcpu[i].c.mach = &f->m;
+        cpu_reset(&f->m.vcpu[i].c);
+        f->m.vcpu[i].l = f->m.lapic;
+        f->m.vcpu[i].l.id = (uint32_t)i << 24;
+        f->m.vcpu[i].state = VCPU_RUN;
+    }
+    f->m.cur_vcpu = 0;
+}
+
+static void test_cpu_init_smp_all_contexts(void) {
+    /* (a) the writer is the BSP: every context takes INIT, APs park */
+    fx_t f; smp_fx(&f);
+    dirty_machine(&f);
+    f.m.vcpu[1].c.rip = 0x1234; f.m.vcpu[1].c.gpr[0] = 0xA1;
+    f.m.vcpu[2].l.tpr = 0x77;
+    cpu_set_msr(&f.m.vcpu[2].c, LAPIC_MSR_APICBASE, 0xFEE80800ULL); /* relocated */
+    run_trigger(&f, TRIG_INIT, sizeof TRIG_INIT);     /* executes on the BSP */
+    assert(mem_read(&f.m, 0x2007, 1) == 1);           /* BSP at reset vector */
+    assert(mem_read(&f.m, 0x2006, 1) == 0);           /* boundary respected */
+    assert(f.m.chipset.resets == 0);
+    for (int i = 1; i < 3; i++) {
+        assert(f.m.vcpu[i].state == VCPU_WAIT_SIPI);
+        assert(f.m.vcpu[i].c.rip == 0xFFF0);
+        assert(f.m.vcpu[i].c.halted == 0);
+        assert(f.m.vcpu[i].l.id == ((uint32_t)i << 24));   /* ID kept */
+        assert(f.m.vcpu[i].l.svr == 0x00FFu);              /* regs reset */
+    }
+    int found;
+    assert(cpu_get_msr(&f.m.vcpu[2].c, LAPIC_MSR_APICBASE, &found) ==
+           0xFEE80800ULL && found);                     /* base kept */
+    assert(f.m.vcpu[2].l.tpr == 0);                     /* LVT/TPR wiped */
+    assert(io_read(&f.m, 0x21, 1) == 0xFD);             /* devices untouched */
+
+    /* (b) the writer is an AP: the INIT is still platform-wide -- the
+     * BSP restarts, the writing AP parks itself. */
+    fx_t g; smp_fx(&g);
+    vcpu_load(&g.m, 1);
+    g.m.cpu.seg[SEG_CS].sel = 0; g.m.cpu.seg[SEG_CS].base = 0; g.m.cpu.rip = 0;
+    memcpy(g.m.ram, TRIG_INIT, sizeof TRIG_INIT);
+    int parked = 0;
+    for (int i = 0; i < 32 && !parked; i++) {
+        (void)cpu_step(&g.m.cpu);
+        parked = (g.m.cpu.halted == 1 && g.m.chipset.reset_pending == 0);
+    }
+    assert(parked);
+    assert(g.m.vcpu[1].state == VCPU_WAIT_SIPI);        /* writer parked */
+    assert(g.m.cpu.halted == 1);                        /* and holds still */
+    assert(g.m.cpu.rip == 0xFFF0);
+    vcpu_store(&g.m, 1);
+    assert(g.m.vcpu[0].state == VCPU_RUN);              /* BSP did NOT park */
+    assert(g.m.vcpu[0].c.rip == 0xFFF0);                /* ...but was INIT'd */
+    assert(g.m.vcpu[2].state == VCPU_WAIT_SIPI);
+    assert(g.m.vcpu[2].c.rip == 0xFFF0);
+    vcpu_load(&g.m, 0);
+    printf("ok: cpu_init_smp_all_contexts\n");
+}
+
 int main(void) {
     test_a20_default_open();
     test_a20_wrap_via_p92();
@@ -237,6 +451,10 @@ int main(void) {
     test_reset_via_cf9();
     test_reset_via_kbc_fe();
     test_reset_via_kbc_outport();
+    test_cpu_init_via_cf9_ritual();
+    test_cpu_init_preserves_cpu_state();
+    test_cpu_init_edge_repeat_coalesce();
+    test_cpu_init_smp_all_contexts();
     printf("test_chipset: all vectors passed\n");
     return 0;
 }

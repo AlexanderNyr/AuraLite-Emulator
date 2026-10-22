@@ -852,8 +852,14 @@ static void do_cpuid(machine_t *m) {
      * APIC ID (m->lapic.id[31:24]); 0 on the BSP and in UP, so single-vCPU
      * and BSP receipts stay bit-identical while APs identify themselves to
      * SeaBIOS smp_write_msr(). */
-    if (leaf == 1)
+    if (leaf == 1) {
         b = (b & 0x00FFFFFFu) | (m->lapic.id & 0xFF000000u);
+        /* UPKEEP U4 (SDM 10.4.3): with the local APIC globally disabled
+         * (IA32_APIC_BASE[11]=0) the CPUID APIC feature flag reads 0 --
+         * the processor looks like it has no on-chip APIC. */
+        int f; uint64_t ab = cpu_get_msr(c, LAPIC_MSR_APICBASE, &f);
+        if (f && !(ab & LAPIC_MSR_EN)) dd &= ~(1u << 9);
+    }
     c->gpr[RAX] = a; c->gpr[RBX] = b; c->gpr[RCX] = cc; c->gpr[RDX] = dd;
 }
 
@@ -899,9 +905,73 @@ void cpu_reset(cpu_t *c) {
     c->ftw = 0xFFFF;       /* F1: all eight x87 registers empty at power-on */
     c->cr0 = 0x60000010ULL;
     c->halted = 0; c->fault = 0; c->intr_delay = 0;
-    /* CHIPSET H6: IA32_APIC_BASE resets to base|EN|BSP (the xAPIC comes
-     * out of reset hardware-enabled and software-disabled at SVR). */
-    cpu_set_msr(c, LAPIC_MSR_APICBASE, LAPIC_MSR_DEFAULT);
+    /* CHIPSET H6 + UPKEEP U4: IA32_APIC_BASE resets to base|EN, with the
+     * BSP bit set only on the bootstrap processor (SDM 10.4.4: "set to
+     * 1 for the processor selected as the BSP and set to 0 for the
+     * remaining processors"; the xAPIC comes out of reset hardware-
+     * enabled and software-disabled at SVR). The role comes from the
+     * cpu's identity in its machine: context 0 is the BSP. */
+    {
+        int is_bsp = 1;
+        if (mach && mach->n_vcpus > 1) {
+            if (c == &mach->cpu) is_bsp = (mach->cur_vcpu == 0);
+            else for (int i = 0; i < EM_MAX_VCPU; i++)
+                     if (c == &mach->vcpu[i].c) { is_bsp = (i == 0); break; }
+        }
+        cpu_set_msr(c, LAPIC_MSR_APICBASE,
+                    LAPIC_BASE | LAPIC_MSR_EN | (is_bsp ? LAPIC_MSR_BSP : 0));
+        /* a reset of the live pair re-bases the MMIO window too */
+        if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
+    }
+}
+
+/* UPKEEP U5: the INIT# processor state (Intel SDM Vol.3A Table 9-1,
+ * the INIT column; implementation-measured against QEMU do_cpu_init's
+ * start_init_save..end_init_save region). Everything cpu_reset()
+ * does, EXCEPT the state silicon keeps over an INIT:
+ *   - x87 register BIT PATTERNS (the control file becomes the FINIT
+ *     state -- tags empty, FCW=037F, FIP/FDP/FOP=0 -- while the ST
+ *     bits underneath stay stale, exactly like FINIT itself),
+ *   - the XMM file and MXCSR,
+ *   - IA32_KERNEL_GS_BASE,
+ *   - the software-configured MSRs, except the three the INIT column
+ *     puts back at their reset 0: EFER, FS_BASE, GS_BASE.
+ * Emulator bookkeeping that machine_reset preserves too (the
+ * monotonic step counters and the debug trace flag) survives alike.
+ * Used by both INIT sources: the LAPIC INIT IPI and the chipset
+ * CF9 INIT#. */
+void cpu_init_reset(cpu_t *c) {
+    machine_t *mach = c->mach;
+    msr_entry_t keep_msr[MAX_MSR];
+    int keep_n = c->msr_count;
+    memcpy(keep_msr, c->msr, sizeof keep_msr);
+    long double keep_fst[8];
+    memcpy(keep_fst, c->fst, sizeof keep_fst);
+    uint64_t keep_xmm[16][2];
+    memcpy(keep_xmm, c->xmm, sizeof keep_xmm);
+    uint32_t keep_mxcsr = c->mxcsr;
+    uint64_t keep_kgs = c->kgs_base;
+    uint64_t keep_steps = c->executed_steps;
+    uint64_t keep_instr = c->instr_count;
+    int keep_trace = c->trace;
+
+    cpu_reset(c);
+
+    memcpy(c->msr, keep_msr, sizeof keep_msr);
+    c->msr_count = keep_n;
+    cpu_set_msr(c, 0xC0000080u, 0);        /* EFER: reset 0 */
+    cpu_set_msr(c, 0xC0000100u, 0);        /* IA32_FS_BASE */
+    cpu_set_msr(c, 0xC0000101u, 0);        /* IA32_GS_BASE */
+    memcpy(c->fst, keep_fst, sizeof keep_fst);
+    memcpy(c->xmm, keep_xmm, sizeof keep_xmm);
+    c->mxcsr = keep_mxcsr;
+    c->kgs_base = keep_kgs;
+    c->executed_steps = keep_steps;
+    c->instr_count = keep_instr;
+    c->trace = keep_trace;
+    /* cpu_reset synced the window to the reseeded default; the
+     * preserved IA32_APIC_BASE may say otherwise -- resync. */
+    if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
 }
 
 /* ---------------------------------------------------------------- x87 (F1) --
@@ -1018,6 +1088,32 @@ static void x87_set_c(cpu_t *c, unsigned c0, unsigned c1, unsigned c2, unsigned 
 static void x87_w(cpu_t *c, int p, long double v) {
     c->fst[p] = v;
     memset((char *)&c->fst[p] + 10, 0, 6);
+}
+
+/* UPKEEP U3: the gdbstub bridge declared in cpu.h.  All ST(i) traffic is
+ * logical (x87_phys rotation).  Both converters are no-ops on a host whose
+ * long double is not the 80-bit format -- the memcpy in x87_ld_from80
+ * would overflow a narrower slot, and the stub has already reported the
+ * registers unavailable there.  The write normalizes padding (x87_w, so
+ * snapshots stay byte-stable) and re-classifies the destination tag from
+ * the value: an empty register written through RSP becomes valid/zero/
+ * special, never a valid-bytes-but-tagged-empty state no instruction
+ * sequence could consume. */
+int cpu_x87_host_supported(void) { return x87_host_ok(); }
+void cpu_x87_st_to80(const cpu_t *c, int sti, uint8_t b[10]) {
+    if (!x87_host_ok()) { memset(b, 0, 10); return; }
+    x87_ld_to80(c->fst[x87_phys(c, sti)], b);
+}
+void cpu_x87_st_from80(cpu_t *c, int sti, const uint8_t b[10]) {
+    if (!x87_host_ok()) return;
+    int p = x87_phys(c, sti);
+    long double v = x87_ld_from80(b);
+    x87_w(c, p, v);
+    x87_set_tag(c, p, x87_class(v));
+}
+void cpu_x87_set_fsw(cpu_t *c, uint16_t v) {
+    c->fsw = v;
+    c->ftop = (v >> 11) & 7;          /* x87_load_env's invariant */
 }
 
 /* push: stack overflow overwrites the last register and raises IE|SF|C1 */
@@ -2179,10 +2275,15 @@ int cpu_step(cpu_t *c) {
      * on their own qTD array, measured) complete without MMIO kicks. */
     if ((++s_devtick & 0xFFu) == 0 && cpu_devices_tick) cpu_devices_tick(m);
 
-    /* ---- CHIPSET H5: a requested system reset (KBC 0xFE / output-port
-     * bit0 / port 0x92 bit0 / port 0xCF9) takes effect at the next
-     * instruction boundary, modeling reset-line propagation and keeping
-     * a reset out of the middle of an executing instruction. */
+    /* ---- CHIPSET H5/U5: a requested system reset (KBC 0xFE /
+     * output-port bit0 / port 0x92 bit0 / port 0xCF9 hard) or CPU
+     * INIT# (port 0xCF9 soft) takes effect at the next instruction
+     * boundary, modeling reset-line propagation and keeping the
+     * event out of the middle of an executing instruction. */
+    if (m->chipset.reset_pending == RESET_KIND_CPU_INIT) {
+        machine_cpu_init(m);       /* clears the request itself */
+        return 0;
+    }
     if (m->chipset.reset_pending) {
         machine_reset(m);          /* clears the request via chipset_init */
         return 0;
@@ -3569,7 +3670,14 @@ really_slow:
                 }
                 break; } }
         case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
-                     cpu_set_msr(c, idx, val);
+                     /* UPKEEP U4: IA32_APIC_BASE belongs to the LAPIC model
+                      * (validation -> BSP preservation -> window sync);
+                      * a rejected write stores nothing and raises no #GP
+                      * -- the house MSR lane is permissive (RDMSR on an
+                      * unknown index reads 0; CR writes keep no reserved-
+                      * bit #GP), so the rejection is logged instead. */
+                     if (idx==LAPIC_MSR_APICBASE) lapic_apicbase_write(m, c, val);
+                     else cpu_set_msr(c, idx, val);
                      if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
                      /* K3: GS-base MSRs are the architected long-mode
                       * segment base for GS addressing -- keep the decoder's
