@@ -8,10 +8,10 @@ source of truth: user input can never become an arbitrary flag.
 
 Two user modes, switchable at any time and persisted:
 
-  * Обычный  -- VirtualBox-style: a machine list, a big screen, and a
+  * Normal   -- VirtualBox-style: a machine list, a big screen, and a
                 three-step "new machine" wizard ending in one-click boot,
                 including plain ISO boot ("select ISO -> Start");
-  * Эксперт  -- the full option surface (every SCHEMA field), the monitor
+  * Expert   -- the full option surface (every SCHEMA field), the monitor
                 console (exec), artifacts, snapshots, TAP responder.
 
 Ground rules (same as the launcher):
@@ -135,28 +135,28 @@ def normal_config(kind, path=None, bios=None, initrd=None):
     cfg = {"platform": "haswell"}
     if kind == "iso":
         if not path or not os.path.isfile(path):
-            raise ConfigError("ISO-образ не найден: %s" % path)
+            raise ConfigError("ISO image not found: %s" % path)
         if not bios or not os.path.isfile(bios):
-            raise ConfigError("нужен bios.bin (стоковый SeaBIOS) — укажите файл в мастере")
+            raise ConfigError("bios.bin is required (stock SeaBIOS) — pick the file in the wizard")
         cfg.update({"rom": bios, "lpc": "ich9", "cdrom": path,
                     "max_instr": ISO_MAX_INSTR})
     elif kind == "disk":
         if not path or not os.path.isfile(path):
-            raise ConfigError("дисковый образ не найден: %s" % path)
+            raise ConfigError("disk image not found: %s" % path)
         cfg.update({"rom": os.path.join(ROOT, "firmware", "firmware.bin"),
                     "disk": path, "max_instr": 200 * 1000 * 1000})
     elif kind == "kernel":
         if not path or not os.path.isfile(path):
-            raise ConfigError("образ ядра не найден: %s" % path)
+            raise ConfigError("kernel image not found: %s" % path)
         cfg.update({"kernel": path, "max_instr": 500 * 1000 * 1000})
         if initrd:
             if not os.path.isfile(initrd):
-                raise ConfigError("initrd не найден: %s" % initrd)
+                raise ConfigError("initrd not found: %s" % initrd)
             cfg["initrd"] = initrd
     elif kind == "empty":
         cfg.update({"max_instr": 2 * 1000 * 1000})
     else:
-        raise ConfigError("неизвестный тип машины: %s" % kind)
+        raise ConfigError("unknown machine type: %s" % kind)
     cfg.update(_stat_flags())
     return cfg
 
@@ -413,42 +413,42 @@ class App:
     def _build_menu(self):
         menubar = tk.Menu(self.root)
         m_file = tk.Menu(menubar, tearoff=0)
-        m_file.add_command(label="Новая машина…", command=self.on_new_machine)
+        m_file.add_command(label="New machine…", command=self.on_new_machine)
         m_file.add_separator()
-        m_file.add_command(label="Открыть папку состояния", command=self.open_state_dir)
+        m_file.add_command(label="Open state folder", command=self.open_state_dir)
         m_file.add_separator()
-        m_file.add_command(label="Выход", command=self.on_close)
+        m_file.add_command(label="Exit", command=self.on_close)
         m_view = tk.Menu(menubar, tearoff=0)
         self.mode_var = tk.StringVar(value=self.ui["mode"])
-        m_view.add_radiobutton(label="Обычный режим", variable=self.mode_var,
+        m_view.add_radiobutton(label="Normal mode", variable=self.mode_var,
                                value="normal", command=lambda: self.set_mode("normal"))
-        m_view.add_radiobutton(label="Экспертный режим", variable=self.mode_var,
+        m_view.add_radiobutton(label="Expert mode", variable=self.mode_var,
                                value="expert", command=lambda: self.set_mode("expert"))
         m_help = tk.Menu(menubar, tearoff=0)
-        m_help.add_command(label="О программе", command=self.on_about)
-        menubar.add_cascade(label="Файл", menu=m_file)
-        menubar.add_cascade(label="Вид", menu=m_view)
-        menubar.add_cascade(label="Справка", menu=m_help)
+        m_help.add_command(label="About", command=self.on_about)
+        menubar.add_cascade(label="File", menu=m_file)
+        menubar.add_cascade(label="View", menu=m_view)
+        menubar.add_cascade(label="Help", menu=m_help)
         self.root.config(menu=menubar)
 
     def _build_layout(self):
         top = ttk.Frame(self.root, padding=(8, 6))
         top.pack(fill="x")
-        ttk.Label(top, text="Режим:").pack(side="left")
-        ttk.Radiobutton(top, text="Обычный", value="normal", variable=self.mode_var,
+        ttk.Label(top, text="Mode:").pack(side="left")
+        ttk.Radiobutton(top, text="Normal", value="normal", variable=self.mode_var,
                         style="Mode.TRadiobutton",
                         command=lambda: self.set_mode("normal")).pack(side="left")
-        ttk.Radiobutton(top, text="Экспертный", value="expert", variable=self.mode_var,
+        ttk.Radiobutton(top, text="Expert", value="expert", variable=self.mode_var,
                         style="Mode.TRadiobutton",
                         command=lambda: self.set_mode("expert")).pack(side="left")
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10)
         self.autostart_var = tk.BooleanVar(value=bool(self.ui["autostart"]))
-        ttk.Checkbutton(top, text="Автозапуск после старта", variable=self.autostart_var,
+        ttk.Checkbutton(top, text="Start the run automatically", variable=self.autostart_var,
                         command=self._save_ui).pack(side="left")
-        self.badge_state = tk.Label(top, text="машина выключена", bg="#5b6470", fg="white",
+        self.badge_state = tk.Label(top, text="machine off", bg="#5b6470", fg="white",
                                     padx=8, pady=2)
         self.badge_state.pack(side="right", padx=4)
-        self.badge_mon = tk.Label(top, text="монитор: —", bg="#5b6470", fg="white",
+        self.badge_mon = tk.Label(top, text="monitor: —", bg="#5b6470", fg="white",
                                   padx=8, pady=2)
         self.badge_mon.pack(side="right", padx=4)
 
@@ -458,34 +458,34 @@ class App:
         # -- sidebar: machine (preset) list + controls --------------------
         side = ttk.Frame(main, padding=4)
         main.add(side, weight=0)
-        ttk.Label(side, text="Машины").pack(anchor="w")
+        ttk.Label(side, text="Machines").pack(anchor="w")
         self.preset_list = tk.Listbox(side, height=18, exportselection=False, width=28)
         self.preset_list.pack(fill="both", expand=True, pady=4)
         self.preset_list.bind("<<ListboxSelect>>", lambda e: self.on_preset_select())
         btns = ttk.Frame(side)
         btns.pack(fill="x")
-        self.btn_start = ttk.Button(btns, text="▶ Пуск", style="Big.TButton",
+        self.btn_start = ttk.Button(btns, text="▶ Start", style="Big.TButton",
                                     command=self.on_start)
         self.btn_start.pack(fill="x", pady=2)
         row = ttk.Frame(side)
         row.pack(fill="x")
-        self.btn_pause = ttk.Button(row, text="⏸ Пауза", command=self.on_pause)
+        self.btn_pause = ttk.Button(row, text="⏸ Pause", command=self.on_pause)
         self.btn_pause.pack(side="left", fill="x", expand=True, padx=1)
-        self.btn_cont = ttk.Button(row, text="▶ Пуск ▶", command=self.on_continue)
+        self.btn_cont = ttk.Button(row, text="▶ Resume ▶", command=self.on_continue)
         self.btn_cont.pack(side="left", fill="x", expand=True, padx=1)
         row2 = ttk.Frame(side)
         row2.pack(fill="x")
-        self.btn_step = ttk.Button(row2, text="Шаг", command=self.on_step)
+        self.btn_step = ttk.Button(row2, text="Step", command=self.on_step)
         self.btn_step.pack(side="left", fill="x", expand=True, padx=1)
-        self.btn_stop = ttk.Button(row2, text="⏹ Стоп", command=self.on_stop)
+        self.btn_stop = ttk.Button(row2, text="⏹ Stop", command=self.on_stop)
         self.btn_stop.pack(side="left", fill="x", expand=True, padx=1)
-        ttk.Button(side, text="↻ Перезапуск", command=self.on_restart).pack(fill="x", pady=2)
-        ttk.Button(side, text="＋ Новая машина…", command=self.on_new_machine).pack(fill="x", pady=2)
+        ttk.Button(side, text="↻ Restart", command=self.on_restart).pack(fill="x", pady=2)
+        ttk.Button(side, text="＋ New machine…", command=self.on_new_machine).pack(fill="x", pady=2)
         row3 = ttk.Frame(side)
         row3.pack(fill="x", pady=(6, 0))
-        ttk.Button(row3, text="Изменить", command=self.on_preset_edit).pack(
+        ttk.Button(row3, text="Edit", command=self.on_preset_edit).pack(
             side="left", fill="x", expand=True, padx=1)
-        ttk.Button(row3, text="Удалить", command=self.on_preset_delete).pack(
+        ttk.Button(row3, text="Delete", command=self.on_preset_delete).pack(
             side="left", fill="x", expand=True, padx=1)
 
         # -- notebook -----------------------------------------------------
@@ -498,13 +498,13 @@ class App:
         self.tab_snap = ttk.Frame(self.nb, padding=4)
         self.tab_net = ttk.Frame(self.nb, padding=4)
         self.tab_log = ttk.Frame(self.nb, padding=4)
-        self.nb.add(self.tab_screen, text=" Экран ")
-        self.nb.add(self.tab_config, text=" Конфигурация ")
-        self.nb.add(self.tab_mon, text=" Монитор ")
-        self.nb.add(self.tab_art, text=" Артефакты ")
-        self.nb.add(self.tab_snap, text=" Снапшоты ")
-        self.nb.add(self.tab_net, text=" Сеть ")
-        self.nb.add(self.tab_log, text=" Журнал ")
+        self.nb.add(self.tab_screen, text=" Screen ")
+        self.nb.add(self.tab_config, text=" Configuration ")
+        self.nb.add(self.tab_mon, text=" Monitor ")
+        self.nb.add(self.tab_art, text=" Artifacts ")
+        self.nb.add(self.tab_snap, text=" Snapshots ")
+        self.nb.add(self.tab_net, text=" Network ")
+        self.nb.add(self.tab_log, text=" Log ")
 
         self._build_screen_tab()
         self._build_config_tab()
@@ -514,19 +514,19 @@ class App:
         self._build_net_tab()
         self._build_log_tab()
 
-        self.status = ttk.Label(self.root, text="готов", style="Status.TLabel", anchor="w")
+        self.status = ttk.Label(self.root, text="ready", style="Status.TLabel", anchor="w")
         self.status.pack(fill="x", side="bottom")
 
     def _build_screen_tab(self):
         bar = ttk.Frame(self.tab_screen)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Масштаб:").pack(side="left")
+        ttk.Label(bar, text="Scale:").pack(side="left")
         self.scale_var = tk.StringVar(value="fit")
         cb = ttk.Combobox(bar, textvariable=self.scale_var, state="readonly", width=8,
                           values=("fit", "1", "1.5", "2"))
         cb.pack(side="left", padx=4)
         cb.bind("<<ComboboxSelected>>", lambda e: self._apply_scale())
-        self.fb_info = ttk.Label(bar, text="фреймбуфер: —")
+        self.fb_info = ttk.Label(bar, text="framebuffer: —")
         self.fb_info.pack(side="right")
         wrap = ttk.Frame(self.tab_screen)
         wrap.pack(fill="both", expand=True)
@@ -609,62 +609,64 @@ class App:
             ttk.Checkbutton(r, text=label, variable=var).pack(side="left")
             self.cfg_vars[key] = var
 
-        section("Загрузка")
-        row_path("rom", "Прошивка (ROM)")
-        row_path("disk", "Диск (USB-образ)")
-        row_path("kernel", "Ядро (ELF64)")
+        section("Boot")
+        row_path("rom", "Firmware (ROM)")
+        row_path("disk", "Disk (USB image)")
+        row_path("kernel", "Kernel (ELF64)")
         row_path("initrd", "Initrd")
-        row_path("snapshot_load", "Снапшот для загрузки")
-        section("ЦП / платформа")
-        row_choice("platform", "Платформа", launcher.PLATFORMS)
+        row_path("snapshot_load", "Snapshot to load")
+        section("CPU / platform")
+        row_choice("platform", "Platform", launcher.PLATFORMS)
         row_int("smp", "vCPU (smp)")
-        row_int("cpus", "Ядер (cpus)")
+        row_int("cpus", "Cores (cpus)")
         row_bool("smp_probe", "smp-probe")
-        section("Чипсет")
+        section("Chipset")
         row_choice("lpc", "LPC", launcher.LPCS)
-        row_bool("no_usb_uhci", "Без USB UHCI")
-        section("Накопители (SATA)")
-        row_path("sata", "Порт 0 (диск/ISO)")
-        row_path("sata1", "Порт 1")
-        row_path("sata2p", "Порт 2")
-        row_path("sata3", "Порт 3")
-        row_bool("ahci2", "Второй контроллер (ahci2)")
-        row_path("sata2", "ahci2: порт 0")
-        row_path("sata2_port1", "ahci2: порт 1")
+        row_bool("no_usb_uhci", "No USB UHCI")
+        section("Storage (SATA)")
+        row_path("sata", "Port 0 (disk/ISO)")
+        row_path("sata1", "Port 1")
+        row_path("sata2p", "Port 2")
+        row_path("sata3", "Port 3")
+        row_bool("ahci2", "Second controller (ahci2)")
+        row_path("sata2", "ahci2: port 0")
+        row_path("sata2_port1", "ahci2: port 1")
         row_bool("sata_writethrough", "Write-through")
-        section("Видео")
-        row_str("vbe", "Режим VBE (например 1024x768x32 / off)")
-        row_bool("no_fb", "Без фреймбуфера")
-        section("Сеть")
+        row_path("virtio_blk", "VirtIO disk (image, 0:05.0)")
+        section("Video")
+        row_str("vbe", "VBE mode (e.g. 1024x768x32 / off)")
+        row_bool("no_fb", "No framebuffer")
+        section("Network")
         row_str("tap", "TAP (host:port)")
-        section("Прогон")
-        row_int("max_instr", "Лимит инструкций")
-        row_bool("stats", "Статистика")
-        row_bool("log", "Журнал (log)")
-        row_bool("dump_fb", "Скриншот fb")
-        row_bool("dump_text", "Текстовый экран")
-        row_bool("trace_file", "Трасса")
-        row_int("trace_from", "Трасса: с инструкции")
-        row_int("trace_count", "Трасса: сколько")
-        section("Отладка")
-        row_str("gdb", "GDB (порт или host:port)")
-        row_str("watch_phys", "Следить за физ. адресом")
-        row_path("symbols", "Файл символов")
-        row_path("debug_script", "Скрипт отладчика")
-        row_str("keys", "Скан-коды (hex, через запятую)")
-        row_str("keys_at", "Когда вводить (prompt/адрес)")
-        row_path("snapshot_save", "Сохранить снапшот в")
+        row_str("virtio_net", "VirtIO net TAP (host:port, no e1000)")
+        section("Run")
+        row_int("max_instr", "Instruction limit")
+        row_bool("stats", "Statistics")
+        row_bool("log", "Log (log)")
+        row_bool("dump_fb", "Framebuffer screenshot")
+        row_bool("dump_text", "Text screen dump")
+        row_bool("trace_file", "Trace")
+        row_int("trace_from", "Trace: from instruction")
+        row_int("trace_count", "Trace: how many")
+        section("Debugging")
+        row_str("gdb", "GDB (port or host:port)")
+        row_str("watch_phys", "Watch physical address")
+        row_path("symbols", "Symbol file")
+        row_path("debug_script", "Debugger script")
+        row_str("keys", "Scancodes (hex, comma-separated)")
+        row_str("keys_at", "When to type (prompt/address)")
+        row_path("snapshot_save", "Save snapshot to")
 
         self._config_from_dict(BUILTIN_CONFIG)
 
     def _build_monitor_tab(self):
         bar = ttk.Frame(self.tab_mon)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Команда монитора:").pack(side="left")
+        ttk.Label(bar, text="Monitor command:").pack(side="left")
         self.mon_entry = ttk.Entry(bar)
         self.mon_entry.pack(side="left", fill="x", expand=True, padx=4)
         self.mon_entry.bind("<Return>", lambda e: self.on_exec())
-        ttk.Button(bar, text="Выполнить", command=self.on_exec).pack(side="left")
+        ttk.Button(bar, text="Execute", command=self.on_exec).pack(side="left")
         for label, line in (("regs", "regs"), ("breaks", "info break"),
                             ("ahci", "ahci"), ("pic", "pic"), ("log", "log")):
             ttk.Button(bar, text=label,
@@ -678,40 +680,40 @@ class App:
     def _build_artifacts_tab(self):
         bar = ttk.Frame(self.tab_art)
         bar.pack(fill="x")
-        ttk.Button(bar, text="Обновить", command=self.refresh_artifacts).pack(side="left")
-        ttk.Button(bar, text="Сохранить как…", command=self.on_artifact_save).pack(
+        ttk.Button(bar, text="Refresh", command=self.refresh_artifacts).pack(side="left")
+        ttk.Button(bar, text="Save as…", command=self.on_artifact_save).pack(
             side="left", padx=4)
-        ttk.Button(bar, text="Открыть папку", command=self.on_artifact_dir).pack(side="left")
+        ttk.Button(bar, text="Open folder", command=self.on_artifact_dir).pack(side="left")
         self.art_tree = ttk.Treeview(self.tab_art, columns=("size", "mtime"),
                                      show="headings", height=14)
-        self.art_tree.heading("size", text="Размер")
-        self.art_tree.heading("mtime", text="Изменён")
+        self.art_tree.heading("size", text="Size")
+        self.art_tree.heading("mtime", text="Modified")
         self.art_tree.pack(fill="both", expand=True, pady=4)
 
     def _build_snapshots_tab(self):
         bar = ttk.Frame(self.tab_snap)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Имя:").pack(side="left")
+        ttk.Label(bar, text="Name:").pack(side="left")
         self.snap_name = tk.StringVar(value="gui.snap")
         ttk.Entry(bar, textvariable=self.snap_name, width=24).pack(side="left", padx=4)
-        ttk.Button(bar, text="Сохранить (savevm)", command=self.on_snap_save).pack(side="left")
-        ttk.Button(bar, text="Загрузить (loadvm)", command=self.on_snap_load).pack(
+        ttk.Button(bar, text="Save (savevm)", command=self.on_snap_save).pack(side="left")
+        ttk.Button(bar, text="Load (loadvm)", command=self.on_snap_load).pack(
             side="left", padx=4)
-        ttk.Button(bar, text="Удалить", command=self.on_snap_delete).pack(side="left", padx=4)
-        ttk.Button(bar, text="Обновить", command=self.refresh_snapshots).pack(side="left", padx=4)
+        ttk.Button(bar, text="Delete", command=self.on_snap_delete).pack(side="left", padx=4)
+        ttk.Button(bar, text="Refresh", command=self.refresh_snapshots).pack(side="left", padx=4)
         ttk.Label(self.tab_snap, foreground="#666",
-                  text="Снапшоты работают только на остановленной машине (пауза/шаг/точка)."
+                  text="Snapshots only work on a stopped machine (pause/step/breakpoint)."
                   ).pack(anchor="w", pady=2)
         self.snap_tree = ttk.Treeview(self.tab_snap, columns=("size", "mtime"),
                                       show="headings", height=14)
-        self.snap_tree.heading("size", text="Размер")
-        self.snap_tree.heading("mtime", text="Изменён")
+        self.snap_tree.heading("size", text="Size")
+        self.snap_tree.heading("mtime", text="Modified")
         self.snap_tree.pack(fill="both", expand=True, pady=4)
 
     def _build_net_tab(self):
         bar = ttk.Frame(self.tab_net, padding=4)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Порт респондера:").pack(side="left")
+        ttk.Label(bar, text="Responder port:").pack(side="left")
         self.tap_port = tk.StringVar(value="8080")
         ttk.Entry(bar, textvariable=self.tap_port, width=8).pack(side="left", padx=4)
         ttk.Label(bar, text="drop:").pack(side="left")
@@ -719,53 +721,53 @@ class App:
         ttk.Entry(bar, textvariable=self.tap_drop, width=16).pack(side="left", padx=4)
         self.tap_no_tcp = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="no-tcp", variable=self.tap_no_tcp).pack(side="left", padx=4)
-        ttk.Button(bar, text="Старт", command=self.on_tap_start).pack(side="left", padx=4)
-        ttk.Button(bar, text="Стоп", command=self.on_tap_stop).pack(side="left")
-        self.tap_status = ttk.Label(self.tab_net, text="респондер остановлен")
+        ttk.Button(bar, text="Start", command=self.on_tap_start).pack(side="left", padx=4)
+        ttk.Button(bar, text="Stop", command=self.on_tap_stop).pack(side="left")
+        self.tap_status = ttk.Label(self.tab_net, text="responder stopped")
         self.tap_status.pack(anchor="w", pady=4)
         ttk.Label(self.tab_net, foreground="#666", wraplength=640, justify="left", text=(
-            "TAP-респондер отвечает на ARP/ICMP/DHCP/DNS/TCP для адреса host:port из "
-            "поля «TAP» в Конфигурации. Порт респондера выбирается из семейства "
-            "8080/8081/8082 (AURALITE_TAP_PORT) — см. docs/plans/NET_PLAN.md.")).pack(
+            "The TAP responder answers ARP/ICMP/DHCP/DNS/TCP for the host:port address from "
+            "the \"TAP\" field in Configuration. The responder port is chosen from the "
+            "8080/8081/8082 family (AURALITE_TAP_PORT) — see docs/plans/NET_PLAN.md.")).pack(
             anchor="w", pady=8)
 
         # UPKEEP U7: the remote-access credential for the web launcher,
         # managed here in the GUI -- no terminal is ever needed to see or
         # rotate it. Plaintext-transport warning included on purpose.
-        tokbox = ttk.LabelFrame(self.tab_net, text="Удалённый доступ (веб-GUI)",
+        tokbox = ttk.LabelFrame(self.tab_net, text="Remote access (web GUI)",
                                 padding=6)
         tokbox.pack(fill="x", pady=(8, 2))
         row = ttk.Frame(tokbox)
         row.pack(fill="x")
-        ttk.Label(row, text="Токен доступа:").pack(side="left")
+        ttk.Label(row, text="Access token:").pack(side="left")
         tok, _p, _c = launcher.load_or_create_access_token(self.state_dir)
         self.access_token_var = tk.StringVar(value=tok)
         ttk.Entry(row, textvariable=self.access_token_var, width=52,
                   state="readonly").pack(side="left", padx=4)
-        ttk.Button(row, text="Копировать",
+        ttk.Button(row, text="Copy",
                    command=self.on_copy_access_token).pack(side="left")
-        ttk.Button(row, text="Заменить токен",
+        ttk.Button(row, text="Replace token",
                    command=self.on_rotate_access_token).pack(side="left", padx=4)
         ttk.Label(tokbox, foreground="#666", wraplength=640, justify="left",
-                  text=("Нужен, когда веб-GUI (launcher) запущен на сетевом адресе "
-                        "вне этого компьютера: вводится один раз на странице входа. "
-                        "Замена подействует при следующем старте веб-GUI. Внимание: "
-                        "соединение веб-GUI не шифруется (HTTP) — токен пересекает "
-                        "сеть открытым текстом; не открывайте доступ в недоверенных "
-                        "сетях. Доступ только с этого компьютера токен не требует — "
-                        "он встроен в страницу автоматически.")).pack(
+                  text=("Needed when the web GUI (launcher) runs on a network address "
+                        "outside this computer: entered once on the sign-in page. "
+                        "A replacement takes effect at the next web GUI start. Warning: "
+                        "the web GUI connection is not encrypted (HTTP) — the token crosses "
+                        "the network in clear text; do not open access on untrusted "
+                        "networks. Access from this computer only needs no token — "
+                        "it is built into the page automatically.")).pack(
                   anchor="w", pady=4)
 
     def _build_log_tab(self):
         bar = ttk.Frame(self.tab_log)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Фильтр:").pack(side="left")
+        ttk.Label(bar, text="Filter:").pack(side="left")
         self.log_filter = tk.StringVar(value="")
         ttk.Entry(bar, textvariable=self.log_filter, width=24).pack(side="left", padx=4)
         self.log_filter.trace_add("write", lambda *_: self._paint_log())
         self.log_scroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="автопрокрутка", variable=self.log_scroll).pack(side="left")
-        ttk.Button(bar, text="Обновить", command=self.refresh_output).pack(side="left", padx=4)
+        ttk.Checkbutton(bar, text="autoscroll", variable=self.log_scroll).pack(side="left")
+        ttk.Button(bar, text="Refresh", command=self.refresh_output).pack(side="left", padx=4)
         self.log_box = tk.Text(self.tab_log, height=20, wrap="none",
                                bg="#101418", fg="#d7e0ea")
         self.log_box.pack(fill="both", expand=True, pady=4)
@@ -794,7 +796,7 @@ class App:
                 try:
                     cfg[key] = int(val, 0)
                 except ValueError:
-                    raise ConfigError("%s: ожидается целое число" % key)
+                    raise ConfigError("%s: an integer is expected" % key)
             elif spec["type"] == "bool":
                 cfg[key] = True
             else:
@@ -857,7 +859,7 @@ class App:
     def on_preset_edit(self):
         name = self.current_preset()
         if not name:
-            messagebox.showinfo(APP_TITLE, "Сначала выберите машину в списке.")
+            messagebox.showinfo(APP_TITLE, "Select a machine in the list first.")
             return
         self.set_mode("expert")
         self.nb.select(self.tab_config)
@@ -866,7 +868,7 @@ class App:
         name = self.current_preset()
         if not name:
             return
-        if not messagebox.askyesno(APP_TITLE, "Удалить машину «%s»?" % name):
+        if not messagebox.askyesno(APP_TITLE, "Delete machine \"%s\"?" % name):
             return
         self.presets.delete(name)
         self.refresh_presets()
@@ -890,18 +892,18 @@ class App:
             cfg = self.collect_config()
             validate_config(cfg)
         except ConfigError as e:
-            messagebox.showerror(APP_TITLE, "Конфигурация не запущена:\n%s" % e)
+            messagebox.showerror(APP_TITLE, "Configuration not started:\n%s" % e)
             return
         try:
             res = self.machine.start(cfg)
         except ConfigError as e:
-            messagebox.showerror(APP_TITLE, "Запуск отклонён:\n%s" % e)
+            messagebox.showerror(APP_TITLE, "Start refused:\n%s" % e)
             return
         self.log_lines = []
         self._paint_log()
         self.mon.close()
         self.connect_deadline = time.time() + 20.0
-        self.status.configure(text="монитор подключается… (порт %s)" % res["monitor_port"])
+        self.status.configure(text="monitor connecting… (port %s)" % res["monitor_port"])
         self.refresh_artifacts()
 
     def on_pause(self):
@@ -928,7 +930,7 @@ class App:
             cfg = self.collect_config()
             validate_config(cfg)
         except ConfigError as e:
-            messagebox.showerror(APP_TITLE, "Конфигурация некорректна:\n%s" % e)
+            messagebox.showerror(APP_TITLE, "Configuration is invalid:\n%s" % e)
             return
         self.machine.stop()
         self.mon.close()
@@ -938,7 +940,7 @@ class App:
         try:
             self.mon.send(obj)
         except OSError as e:
-            self.status.configure(text="монитор недоступен: %s" % e)
+            self.status.configure(text="monitor unavailable: %s" % e)
 
     def _connect_monitor(self):
         port = self.machine.monitor_port
@@ -949,8 +951,8 @@ class App:
                              token=self.machine.monitor_token)
         except OSError:
             return
-        self.badge_mon.configure(text="монитор: на связи", bg="#2f7d32")
-        self.status.configure(text="монитор подключён")
+        self.badge_mon.configure(text="monitor: online", bg="#2f7d32")
+        self.status.configure(text="monitor connected")
         if self.autostart_var.get():
             self._send({"cmd": "continue"})
 
@@ -962,37 +964,37 @@ class App:
         if st["state"] == "running":
             if self.last_state_msg.get("stop_reason") == "end":
                 self.badge_state.configure(
-                    text="прогон завершён (end) — «Стоп» сохранит результаты",
+                    text="run finished (end) — \"Stop\" will keep the results",
                     bg="#2f7d32")
             else:
-                self.badge_state.configure(text="машина работает", bg="#2f7d32")
+                self.badge_state.configure(text="machine running", bg="#2f7d32")
             if self.mon.sock is None and time.time() < self.connect_deadline:
                 self._connect_monitor()
         elif st["state"] == "exited":
-            txt = "прогон завершён (код %s)" % st["exit_code"]
+            txt = "run finished (code %s)" % st["exit_code"]
             self.badge_state.configure(text=txt,
                                        bg="#2f7d32" if st["exit_code"] == 0 else "#a33")
             if self.mon.sock is not None:
                 self.mon.close()
-                self.badge_mon.configure(text="монитор: —", bg="#5b6470")
+                self.badge_mon.configure(text="monitor: —", bg="#5b6470")
                 self.refresh_artifacts()
                 self.refresh_output()
         else:
-            self.badge_state.configure(text="машина выключена", bg="#5b6470")
+            self.badge_state.configure(text="machine off", bg="#5b6470")
         if self.stop_deadline and time.time() > self.stop_deadline:
             self.stop_deadline = 0.0
             if self.machine.status()["state"] == "running":
                 self.machine.stop()
                 self.refresh_artifacts()
-        st_txt = "готов"
+        st_txt = "ready"
         if self.last_state_msg:
-            st_txt = "%s | %s | инстр: %s" % (
+            st_txt = "%s | %s | instr: %s" % (
                 self.last_state_msg.get("stop_reason", "—"),
                 self.last_state_msg.get("mode", "—"),
                 self.last_state_msg.get("executed", "—"))
         taps = st.get("responder") or {}
         self.status.configure(text=st_txt + (
-            " | TAP-респондер: %s" % ("pid %s" % taps["pid"] if taps.get("running") else "стоп")))
+            " | TAP responder: %s" % ("pid %s" % taps["pid"] if taps.get("running") else "stopped")))
         self.root.after(STATUS_POLL_MS, self._poll_status)
 
     def _poll_monitor(self):
@@ -1003,7 +1005,7 @@ class App:
                         self.last_state_msg = payload
                         self._paint_state()
                     elif payload.get("kind") == "reply":
-                        msg = "%s %s: %s" % ("OK" if payload.get("ok") else "ОШИБКА",
+                        msg = "%s %s: %s" % ("OK" if payload.get("ok") else "ERROR",
                                              payload.get("cmd", ""),
                                              payload.get("message", ""))
                         if payload.get("output"):
@@ -1014,12 +1016,12 @@ class App:
                     self.fb.apply(payload)
                     self._render_fb()
                 elif kind == "closed":
-                    self.badge_mon.configure(text="монитор: отключён", bg="#a33")
+                    self.badge_mon.configure(text="monitor: disconnected", bg="#a33")
         self.root.after(MONITOR_POLL_MS, self._poll_monitor)
 
     def _paint_state(self):
         s = self.last_state_msg
-        self.fb_info.configure(text="фреймбуфер: %sx%s" % (self.fb.width or "—",
+        self.fb_info.configure(text="framebuffer: %sx%s" % (self.fb.width or "—",
                                                            self.fb.height or "—"))
         regs = s.get("registers") or {}
         self._paint_mon()
@@ -1028,15 +1030,15 @@ class App:
         s = self.last_state_msg
         regs = s.get("registers") or {}
         body = [
-            "режим: %s   останов: %s   инстр: %s" % (
+            "mode: %s   stop: %s   instr: %s" % (
                 s.get("mode", "—"), s.get("stop_reason", "—"), s.get("executed", "—")),
-            "дизассемблер: %s" % s.get("disassembly", "—"),
+            "disassembler: %s" % s.get("disassembly", "—"),
             "",
         ]
         for k, v in list(regs.items()):
             body.append("%s = %s" % (k, v))
         body.append("")
-        body.append("ответ: " + self.reply_text)
+        body.append("reply: " + self.reply_text)
         txt = "\n".join(body)
         self.mon_out.configure(state="normal")
         self.mon_out.delete("1.0", "end")
@@ -1062,7 +1064,7 @@ class App:
             except tk.TclError:
                 return
         self.fb.dirty.clear()
-        self.fb_info.configure(text="фреймбуфер: %sx%s" % (self.fb.width, self.fb.height))
+        self.fb_info.configure(text="framebuffer: %sx%s" % (self.fb.width, self.fb.height))
 
     # -- tabs actions ------------------------------------------------------
     def on_exec(self):
@@ -1083,7 +1085,7 @@ class App:
 
     def _paint_log(self):
         f = (self.log_filter.get() or "").lower()
-        txt = "\n".join(l for l in self.log_lines if not f or f in l.lower()) or "(пусто)"
+        txt = "\n".join(l for l in self.log_lines if not f or f in l.lower()) or "(empty)"
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.insert("end", txt)
@@ -1114,7 +1116,7 @@ class App:
 
     def on_artifact_dir(self):
         if not self.machine.run_dir:
-            messagebox.showinfo(APP_TITLE, "Прогон ещё не запускался.")
+            messagebox.showinfo(APP_TITLE, "No run has been started yet.")
             return
         path = self.machine.run_dir
         try:
@@ -1123,7 +1125,7 @@ class App:
             else:
                 subprocess.Popen(["xdg-open", path])
         except OSError as e:
-            messagebox.showerror(APP_TITLE, "Не удалось открыть папку: %s" % e)
+            messagebox.showerror(APP_TITLE, "Could not open the folder: %s" % e)
 
     def refresh_snapshots(self):
         for i in self.snap_tree.get_children():
@@ -1137,7 +1139,7 @@ class App:
     def _snap_path(self):
         name = self.snap_name.get().strip()
         if not name:
-            raise ConfigError("укажите имя снапшота")
+            raise ConfigError("specify a snapshot name")
         return os.path.join(self.machine.snap_dir,
                             os.path.basename(name.replace("/", "_")))
 
@@ -1172,32 +1174,32 @@ class App:
                                           "drop": self.tap_drop.get(),
                                           "no_tcp": self.tap_no_tcp.get()})
         except (ConfigError, ValueError) as e:
-            messagebox.showerror(APP_TITLE, "Респондер не запущен:\n%s" % e)
+            messagebox.showerror(APP_TITLE, "Responder not started:\n%s" % e)
             return
-        self.tap_status.configure(text="респондер работает")
+        self.tap_status.configure(text="responder running")
 
     def on_tap_stop(self):
         self.machine.responder_stop()
-        self.tap_status.configure(text="респондер остановлен")
+        self.tap_status.configure(text="responder stopped")
 
     # -- UPKEEP U7: remote-access credential (see _build_net_tab) --------
     def on_copy_access_token(self):
         self.root.clipboard_clear()
         self.root.clipboard_append(self.access_token_var.get())
-        self.status.configure(text="токен доступа скопирован в буфер обмена")
+        self.status.configure(text="access token copied to the clipboard")
 
     def on_rotate_access_token(self):
         if not messagebox.askokcancel(
                 APP_TITLE,
-                "Создать новый токен удалённого доступа?\n\n"
-                "Старый токен перестанет приниматься при следующем старте "
-                "веб-GUI; браузеры, где он уже введён, попросят новый."):
+                "Create a new remote-access token?\n\n"
+                "The old token will stop being accepted at the next start of the "
+                "web GUI; browsers that already have it entered will ask for the new one."):
             return
         tok, _p, _c = launcher.load_or_create_access_token(self.state_dir,
                                                            force_new=True)
         self.access_token_var.set(tok)
         self.status.configure(
-            text="токен доступа заменён (подействует при следующем старте веб-GUI)")
+            text="access token replaced (takes effect at the next web GUI start)")
 
     def open_state_dir(self):
         try:
@@ -1210,11 +1212,11 @@ class App:
 
     def on_about(self):
         messagebox.showinfo(APP_TITLE, (
-            "AuraLite Emulator — графический запуск машин.\n\n"
-            "Обычный режим: мастер создания машин и загрузка с ISO.\n"
-            "Экспертный режим: все опции командной строки, монитор,\n"
-            "артефакты, снапшоты и TAP-респондер.\n\n"
-            "Все запуски строятся строго по SCHEMA — как в CLI."))
+            "AuraLite Emulator — graphical machine launcher.\n\n"
+            "Normal mode: the machine-creation wizard and ISO boot.\n"
+            "Expert mode: every command-line option, the monitor,\n"
+            "artifacts, snapshots and the TAP responder.\n\n"
+            "All launches are built strictly from the SCHEMA — exactly as in the CLI."))
 
     def on_close(self):
         self._save_ui()
@@ -1237,10 +1239,10 @@ class App:
 # ---------------------------------------------------------------------------
 
 KIND_LABELS = [
-    ("iso", "Загрузка с ISO / CD-образа (как в VirtualBox)"),
-    ("disk", "Дисковый образ (USB/SATA диск)"),
-    ("kernel", "Ядро ELF64 напрямую (без прошивки)"),
-    ("empty", "Демо-машина (встроенная прошивка)"),
+    ("iso", "Boot from ISO / CD image (VirtualBox-style)"),
+    ("disk", "Disk image (USB/SATA disk)"),
+    ("kernel", "ELF64 kernel directly (no firmware)"),
+    ("empty", "Demo machine (built-in firmware)"),
 ]
 
 
@@ -1248,7 +1250,7 @@ class Wizard(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("Новая машина")
+        self.title("New machine")
         self.resizable(False, False)
         self.transient(app.root)
         self.kind = tk.StringVar(value="iso")
@@ -1263,9 +1265,9 @@ class Wizard(tk.Toplevel):
         self.body.pack(fill="both", expand=True)
         self.nav = ttk.Frame(self, padding=(12, 8))
         self.nav.pack(fill="x")
-        self.btn_back = ttk.Button(self.nav, text="← Назад", command=self.on_back)
+        self.btn_back = ttk.Button(self.nav, text="← Back", command=self.on_back)
         self.btn_back.pack(side="left")
-        self.btn_next = ttk.Button(self.nav, text="Далее →", command=self.on_next)
+        self.btn_next = ttk.Button(self.nav, text="Next →", command=self.on_next)
         self.btn_next.pack(side="right")
         self.render()
 
@@ -1274,72 +1276,72 @@ class Wizard(tk.Toplevel):
             w.destroy()
         app = self.app
         if self.page == 0:
-            ttk.Label(self.body, text="Шаг 1. Имя и тип машины",
+            ttk.Label(self.body, text="Step 1. Machine name and type",
                       font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
             r = ttk.Frame(self.body)
             r.pack(fill="x", pady=4)
-            ttk.Label(r, text="Имя:").pack(side="left")
+            ttk.Label(r, text="Name:").pack(side="left")
             ttk.Entry(r, textvariable=self.name, width=32).pack(side="left", padx=6)
             for kind, label in KIND_LABELS:
                 ttk.Radiobutton(self.body, text=label, value=kind,
                                 variable=self.kind).pack(anchor="w", pady=2)
-            self.btn_next.configure(text="Далее →")
+            self.btn_next.configure(text="Next →")
             self.btn_back.configure(state="disabled")
         elif self.page == 1:
             kind = self.kind.get()
-            titles = {"iso": "Шаг 2. Выберите ISO-образ",
-                      "disk": "Шаг 2. Выберите дисковый образ",
-                      "kernel": "Шаг 2. Выберите ядро (ELF64)",
-                      "empty": "Шаг 2. Носитель не нужен"}
+            titles = {"iso": "Step 2. Choose an ISO image",
+                      "disk": "Step 2. Choose a disk image",
+                      "kernel": "Step 2. Choose a kernel (ELF64)",
+                      "empty": "Step 2. No medium needed"}
             ttk.Label(self.body, text=titles[kind],
                       font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
             if kind == "empty":
                 ttk.Label(self.body, text=(
-                    "Демо-машина запускает встроенную прошивку без носителей.")).pack(
+                    "The demo machine runs the built-in firmware with no media.")).pack(
                     anchor="w", pady=8)
             else:
                 r = ttk.Frame(self.body)
                 r.pack(fill="x", pady=4)
-                filetypes = [("Все файлы", "*.*")]
+                filetypes = [("All files", "*.*")]
                 if kind == "iso":
-                    filetypes = [("ISO / дисковые образы", "*.iso *.img *.bin"),
-                                 ("Все файлы", "*.*")]
+                    filetypes = [("ISO / disk images", "*.iso *.img *.bin"),
+                                 ("All files", "*.*")]
                 elif kind == "kernel":
-                    filetypes = [("ELF", "*.elf *.bin"), ("Все файлы", "*.*")]
-                ttk.Label(r, text="Файл:").pack(side="left")
+                    filetypes = [("ELF", "*.elf *.bin"), ("All files", "*.*")]
+                ttk.Label(r, text="File:").pack(side="left")
                 ttk.Entry(r, textvariable=self.path, width=46).pack(side="left", padx=6)
 
                 def browse():
                     p = filedialog.askopenfilename(parent=self, filetypes=filetypes)
                     if p:
                         self.path.set(p)
-                ttk.Button(r, text="Обзор…", command=browse).pack(side="left")
+                ttk.Button(r, text="Browse…", command=browse).pack(side="left")
                 if kind == "kernel":
                     r2 = ttk.Frame(self.body)
                     r2.pack(fill="x", pady=4)
                     ttk.Label(r2, text="Initrd:").pack(side="left")
                     ttk.Entry(r2, textvariable=self.initrd, width=46).pack(side="left", padx=6)
-                    ttk.Button(r2, text="Обзор…", command=lambda: (
+                    ttk.Button(r2, text="Browse…", command=lambda: (
                         self.initrd.set(filedialog.askopenfilename(parent=self))
                         or None)).pack(side="left")
                 if kind == "iso":
                     ttk.Separator(self.body, orient="horizontal").pack(fill="x", pady=8)
-                    ttk.Label(self.body, text="Прошивка SeaBIOS (bios.bin):",
+                    ttk.Label(self.body, text="SeaBIOS firmware (bios.bin):",
                               font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
                     r3 = ttk.Frame(self.body)
                     r3.pack(fill="x", pady=4)
                     ttk.Entry(r3, textvariable=self.bios, width=46).pack(
                         side="left", padx=(0, 6))
-                    ttk.Button(r3, text="Обзор…", command=lambda: (
+                    ttk.Button(r3, text="Browse…", command=lambda: (
                         self.bios.set(filedialog.askopenfilename(parent=self))
                         or None)).pack(side="left")
                     if not self.bios.get():
                         ttk.Label(self.body, foreground="#a33", wraplength=520, text=(
-                            "Для загрузки с ISO нужен стоковый SeaBIOS (файл bios.bin, "
-                            "например из пакета Debian «seabios» или с www.seabios.org). "
-                            "Обычный режим подставит его автоматически.")).pack(anchor="w", pady=4)
+                            "Booting from ISO needs stock SeaBIOS (the bios.bin file, "
+                            "e.g. from the Debian \"seabios\" package or from www.seabios.org). "
+                            "Normal mode will substitute it automatically.")).pack(anchor="w", pady=4)
             self.btn_back.configure(state="normal")
-            self.btn_next.configure(text="Далее →")
+            self.btn_next.configure(text="Next →")
         else:
             kind = self.kind.get()
             try:
@@ -1347,27 +1349,27 @@ class Wizard(tk.Toplevel):
             except ConfigError as e:
                 cfg = None
                 err = str(e)
-            ttk.Label(self.body, text="Шаг 3. Проверьте и создайте",
+            ttk.Label(self.body, text="Step 3. Review and create",
                       font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
             if cfg is None:
                 ttk.Label(self.body, foreground="#a33", wraplength=520,
-                          text="Не удалось собрать конфигурацию: %s" % err).pack(
+                          text="Could not build the configuration: %s" % err).pack(
                     anchor="w", pady=8)
             else:
-                lines = ["Имя: %s" % self.name.get().strip(),
-                         "Тип: %s" % dict(KIND_LABELS)[kind]]
+                lines = ["Name: %s" % self.name.get().strip(),
+                         "Type: %s" % dict(KIND_LABELS)[kind]]
                 for k in sorted(cfg):
                     lines.append("  %s = %s" % (k, cfg[k]))
-                ttk.Label(self.body, text="Будет запущено:",
+                ttk.Label(self.body, text="Will be launched:",
                           font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
                 box = tk.Text(self.body, width=64, height=16, wrap="none")
                 box.pack(fill="both", expand=True, pady=4)
                 box.insert("end", "\n".join(lines))
                 box.configure(state="disabled")
-            ttk.Checkbutton(self.body, text="Запустить сразу после создания",
+            ttk.Checkbutton(self.body, text="Start right after creation",
                             variable=self.run_now).pack(anchor="w", pady=6)
             self.btn_back.configure(state="normal")
-            self.btn_next.configure(text="Создать ✓")
+            self.btn_next.configure(text="Create ✓")
 
     def preview_config(self):
         kind = self.kind.get()
@@ -1388,13 +1390,13 @@ class Wizard(tk.Toplevel):
             return
         name = self.name.get().strip()
         if not name:
-            messagebox.showerror(APP_TITLE, "Укажите имя машины.", parent=self)
+            messagebox.showerror(APP_TITLE, "Enter a machine name.", parent=self)
             return
         try:
             cfg = self.preview_config()
             self.app.save_current_preset(name, cfg)
         except ConfigError as e:
-            messagebox.showerror(APP_TITLE, "Машина не создана:\n%s" % e, parent=self)
+            messagebox.showerror(APP_TITLE, "Machine not created:\n%s" % e, parent=self)
             return
         if self.kind.get() == "iso" and self.bios.get().strip():
             self.app.ui["bios"] = self.bios.get().strip()

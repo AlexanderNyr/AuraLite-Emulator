@@ -1,0 +1,1565 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0c77e3a..b3b05b7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,37 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0106 (VIRTIO V1: the modern virtio-pci transport core)
++
++- **`src/virtio.c` implements the shared transport both
++  devices will stand on; nothing attaches in a default
++  machine yet.** Vendor capabilities (common / notify×4 /
++  ISR / device) are laid into the function's own config
++  space and re-asserted after every config write; BAR0 is a
++  relocatable 16 KiB 32-bit window with QEMU's region
++  offsets and the AHCI sizing-probe behaviour. The
++  common-config register file is image-based, so any access
++  width composes and only touched fields take semantics;
++  feature words are masked to the offer, and the D3 gate
++  keeps `FEATURES_OK` iff `VERSION_1` was acked and the
++  device half validates — while the queue engine runs
++  under `DRIVER_OK` regardless, which is what lets the
++  guest's negotiation-free blk driver (finding N1) work
++  against an honest device. The split-ring engine is
++  hard-bounded: ring and buffer ranges must lie inside
++  guest RAM (a descriptor aimed at MMIO copies nothing),
++  malformed chains complete with `len 0` and a log line
++  instead of wedging the ring, completion is synchronous
++  inside the notify write, and reset is a same-instruction
++  wipe. The placement census corrected V0 on one point:
++  `0:04.0` is the opt-in e1000's, so blk/net move to
++  `0:05.0`/`0:06.0` (BARs `0xFEB30000`/`0xFEB34000`, IRQ
++  5/7). Pinned by `tests/test_virtio.c` (13 vectors over a
++  fake echo device at blk's exact coordinates, both guest
++  init rituals replayed verbatim); NC is the new-module
++  compile failure on the 0105 tree plus a mutation check
++  that the `VERSION_1` gate alone holds its vector.
++
+ ### Added — patch 0105 (VIRTIO V0: measured baseline for modern virtio-pci, docs-only)
+ 
+ - **`docs/plans/VIRTIO_PLAN.md` opens the ranked §5 device
+diff --git a/Makefile b/Makefile
+index fe957a8..2776880 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -20,7 +20,7 @@ BENCH_PAIR_REPS ?= 9
+ FUZZ_PROGRAMS ?= 512
+ FUZZ_INSTR    ?= 24
+ 
+-x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h src/disasm.h src/dbg.h src/gdbstub.h src/snapshot.h src/monitor.h src/ws.h
++x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h src/disasm.h src/dbg.h src/gdbstub.h src/snapshot.h src/monitor.h src/ws.h src/virtio.h
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SRC) -o $@ -lm
+ 
+ firmware/firmware.bin: firmware/sample_firmware.nas
+@@ -160,6 +160,12 @@ test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+ 	./test-xhci
+ 	rm -f test-xhci
+ 
++# VIRTIO V1: modern virtio-pci transport core (plan: VIRTIO_PLAN).
++test-virtio: tests/test_virtio.c src/virtio.c src/devices.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio -lm
++	./test-virtio
++	rm -f test-virtio
++
+ test-msi: tests/test_msi.c src/lapic.c src/devices.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
+ 	./test-msi
+@@ -377,7 +383,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -387,7 +393,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -436,4 +442,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 70ad499..96be97b 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,7 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+-| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V1 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -182,15 +182,18 @@ harness reproduction.
+    infrastructure and freezes decisions D1–D7 (split-ring
+    core, one 16 KiB BAR with QEMU's region offsets,
+    synchronous completion on notify, INTx first and
+-   MSI-X last). V1 builds the transport core, V2/V3
+-   virtio-blk with a snapshot-clean RAM image, V4
+-   virtio-net on the same TAP responder, V5 MSI-X +
+-   close-out.
++   MSI-X last). V1 (`0106`) ships that transport core
++   behind `tests/test_virtio.c` — the D3 gate split
++   mutation-pinned, placement corrected against the
++   e1000's conditional 0:04.0 (blk/net: 0:05.0/0:06.0,
++   IRQ5/IRQ7). V2/V3 virtio-blk with a snapshot-clean
++   RAM image next, V4 virtio-net on the same TAP
++   responder, V5 MSI-X + close-out.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+ Every plan in the ledger above except VIRTIO is **CLOSED**.
+-`0105` opens VIRTIO_PLAN (V0, docs-only baseline).
++`0105` opens VIRTIO_PLAN (V0 baseline), `0106` its V1 core.
+ Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index c428315..ad0158c 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1336,18 +1336,23 @@ MTRR probe would brick under a strict whitelist, and POPCNT +
+ RDTSCP graduated from absent/host-halt and an accidental INVLPG
+ alias respectively), and an INIT# under a closed A20 gate fetches
+ its reset vector from flash again (CF5 — the U5 record, fixed on
+-the decode side). VIRTIO_PLAN **V0 is shipped** (docs-only
+-baseline): the guest's modern virtio-blk/virtio-net drivers are
+-censused line-by-line (the net driver negotiates by the book; the
+-blk driver negotiates nothing and reads capacity out of its BAR
+-registers — guest findings N1/N2 filed in the plan), the
+-PCI/BAR/INTx/DMA/snapshot infrastructure is audited sufficient
+-(capability layouts ride in the per-device config space like the
+-xHCI's MSI-X cap; SeaBIOS independently speaks modern virtio for
+-a second proof lane), and decisions D1–D7 freeze the shape:
+-modern-only functions `1AF4:1042/1041`, one 16 KiB BAR with
+-QEMU's common/ISR/device/notify offsets, a shared split-ring
+-core, synchronous completion on notify (snapshot- and
+-determinism-clean by construction), INTx until V5's MSI-X, and
+-the CF rule carried to feature bits — offer exactly what is
+-implemented. V1 builds the transport core next.
++the decode side). VIRTIO_PLAN **V0+V1 are shipped**: V0 censused
++the guest's modern virtio-blk/virtio-net drivers line-by-line
++(the net driver negotiates by the book; the blk driver
++negotiates nothing and reads capacity out of its BAR registers
++— guest findings N1/N2 filed in the plan) and froze decisions
++D1–D7. V1 lands the shared transport core (`src/virtio.c`,
++pinned by `tests/test_virtio.c` driving a fake echo device at
++blk's exact coordinates): vendor capabilities in the function's
++own config space, one relocatable 16 KiB BAR0 with QEMU's
++common/ISR/device/notify offsets, an image-based common-cfg
++register file, the D3 gate split (FEATURES_OK kept iff
++VERSION_1 is acked — mutation-checked — while the queue engine
++runs under DRIVER_OK so the blind guest blk driver still
++transfers), hard-bounded split-ring pop/complete (rings and
++buffers confined to guest RAM; malformed chains complete with
++len 0, never wedge the ring), synchronous reset and
++NO_INTERRUPT-aware INTx. The placement census corrected V0:
++0:04.0 belongs to the opt-in e1000, so blk/net take 0:05.0 /
++0:06.0 on measured-free IRQ5/IRQ7. No device function exists in
++a default machine yet; V2 puts virtio-blk on the core.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+index a726864..bfe05e8 100644
+--- a/docs/plans/VIRTIO_PLAN.md
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -204,3 +204,60 @@ MQ/ctrl queue, virtio-gpu, >1 blk disks, writethrough for vblk.
+ a parent-check of the patch in `patches/` + a sync of
+ STATUS/ROADMAP/CHANGELOG in the same commit. Zero receipt drift in the
+ historical lanes is part of acceptance (D7/rule 2).
++
++## §8 V1 addendum (patch 0106): the transport core
++
++`src/virtio.h`/`src/virtio.c` (core without devices; blk is V2) and
++`tests/test_virtio.c` with a fake echo device at the exact
++coordinates of the future blk. Implemented per D1–D4:
++
++- **PCI**: a modern-only function, revision 1, subsystem = device id;
++  vendor caps in `cfg[0x40..]` (common@`0x40`, notify@`0x50` with
++  multiplier 4, isr@`0x64`, device@`0x74` — only when a config exists),
++  re-asserted after every cfg write (XHCI pattern);
++  32-bit 16 KiB BAR0: an all-ones probe → `0xFFFFC000`, relocation
++  rebinds the window (the `ahci_set_abar` pattern); BAR1–5/ROM = 0.
++- **Common-cfg** — an image-based `0x40` B register file: any
++  access size composes, semantics apply only to the touched
++  fields (selects → features → queues → status). Feature banks,
++  the offer mask (D3), `queue_size`: reading before any write = max,
++  a write >max or 0 → max, a smaller one sticks; `msix_config`/
++  `queue_msix_vector` = `0xFFFF`; an invalid `queue_select` reads
++  zeros and harms no queue.
++- **The D3 FEATURES_OK gate** is pinned discriminatingly: the vector
++  "device bit acked (validator happy), VERSION_1 not" goes red
++  when exactly the VERSION_1 check is removed (mutation NC);
++  the inverse vector pins the validate branch. The guest's blind init (§2.1)
++  passes through a FEATURES_OK rejected in the readback — the status check
++  after the blind write sequence = `ACK|DRIVER|DRIVER_OK`,
++  and the transfer still completes.
++- **Rings**: pop/complete with hard D2 bounds (rings and
++  buffers strictly inside RAM; the DMA helpers refuse a target outside RAM
++  wholesale, including the device's own MMIO). Broken chains:
++  a head outside the table → drop with no used; loop/spill/indirect →
++  completion with len 0 + a log line (budget 8 lines); the queue keeps
++  working after garbage. Interrupt POLICY: ISR bit + INTx on
++  completion if `avail.flags.NO_INTERRUPT` is clear; an ISR read
++  clears the byte and the line.
++- **Reset** is synchronous: status reads 0 immediately, queues/features/
++  addresses wiped, `queue_size` back to max, device-reset callback.
++
++Phase measurements that correct §3:
++
++- **BDF**: `0:04.0` is taken conditionally — the e1000 grabs it under `--tap`
++  (`e1000.c` pci 0,4,0), §3 missed that. Result: **blk 0:05.0,
++  net 0:06.0**; BAR bases `0xFEB30000`/`0xFEB34000` (free behind
++  XHCI `0xFEB20000`+64 KiB).
++- **IRQ**: census of `pic_set_irq` consumers — taken are 0 (PIT),
++  1 (KBC), 8 (RTC), 9 (SCI), 10 (XHCI), 11 (e1000), 14/15 (AHCI);
++  serial/mouse have no lines. Result: **blk IRQ5, net IRQ7**
++  (`cfg[0x3C]`, INTA# pin).
++- `pci_dev.ctx` is taken by `machine_t*` (host bridge), so the core
++  binds the PCI function to `virtio_dev` via a pointer registry.
++
++NC: on the parent (tree 0105) the test does not build (no `virtio.h`)
++— the new-module form per §5; the mutation NC above sits on top.
++Gates: full `make test` (ISO lanes genuinely run with NASM in
++PATH) and `make test-sanitize` — rc 0, 0 findings, test-virtio
++green under ASan/UBSan; no historical drift (the device is connected
++to no lane: there are no functions in the machine yet).
+diff --git a/src/virtio.c b/src/virtio.c
+new file mode 100644
+index 0000000..92cb00c
+--- /dev/null
++++ b/src/virtio.c
+@@ -0,0 +1,558 @@
++/* virtio.c -- VIRTIO V1: the modern (1.x) virtio-pci transport core
++ * (docs/plans/VIRTIO_PLAN.md sections 4-5, decisions D1-D4/D7).
++ *
++ * Layout (D1): one 32-bit memory BAR0 of 16 KiB -- common config at
++ * +0x0000, ISR at +0x1000, device config at +0x2000, notify at
++ * +0x3000 with multiplier 4 (QEMU's offsets; the BAR index is the
++ * one deliberate deviation, and every measured consumer reads it
++ * back from the capability, never assumes it).  The vendor
++ * capabilities ride in the function's own cfg[0x40..] and are
++ * re-asserted after every config write (the XHCI MSI-X precedent:
++ * the default cfg store is fully writable, so RO bytes must be
++ * defended in the write hook).
++ *
++ * The queue engine is synchronous (plan rule 3): a notify write,
++ * an RX ingress or any other device-half trigger walks the avail
++ * ring to completion inside the call.  No request is ever "in
++ * flight" across an instruction boundary, which is what keeps
++ * snapshots and determinism tapes simple (D7).
++ */
++#include <string.h>
++#include "virtio.h"
++#include "pci.h"
++#include "pic.h"
++
++/* ============================== small helpers ============================ */
++
++static uint16_t vio_rd16(machine_t *m, uint64_t pa) { return (uint16_t)mem_read(m, pa, 2); }
++static uint32_t vio_rd32(machine_t *m, uint64_t pa) { return (uint32_t)mem_read(m, pa, 4); }
++static uint64_t vio_rd64(machine_t *m, uint64_t pa) { return mem_read(m, pa, 8); }
++static void vio_wr16(machine_t *m, uint64_t pa, uint16_t v) { mem_write(m, pa, 2, v); }
++static void vio_wr32(machine_t *m, uint64_t pa, uint32_t v) { mem_write(m, pa, 4, v); }
++
++static uint16_t le16_of(const uint8_t *p) {
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++static uint32_t le32_of(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static uint64_t le64_of(const uint8_t *p) {
++    return (uint64_t)le32_of(p) | ((uint64_t)le32_of(p + 4) << 32);
++}
++static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static void put32(uint8_t *p, uint32_t v) {
++    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
++
++/* D2 hard bound: descriptor and ring ranges must live inside guest
++ * RAM.  A descriptor aimed at an MMIO window is rejected here, never
++ * dereferenced -- the core cannot be turned into a confused deputy. */
++static int vio_ram_ok(uint64_t pa, uint64_t len) {
++    return len == 0 || (pa < RAM_SIZE && len <= (uint64_t)RAM_SIZE - pa);
++}
++
++static void vio_bad(virtio_dev_t *v, const char *what, int qi, unsigned detail) {
++    if (v->bad_chains < 8)
++        mlog(&v->m->log, "[virtio] %s: bad chain on queue %d (%s %u)\n",
++             v->pci ? v->pci->name : "?", qi, what, detail);
++    v->bad_chains++;
++}
++
++/* pci_dev -> virtio_dev registry.  pci_dev.ctx belongs to the host
++ * bridge (it carries machine_t*), so the core binds by pointer
++ * identity instead -- at most a handful of functions exist. */
++#define VIO_REGISTRY_MAX 8
++static virtio_dev_t *g_vio[VIO_REGISTRY_MAX];
++static int g_vio_n;
++
++static virtio_dev_t *vio_of_pci(pci_dev_t *d) {
++    for (int i = 0; i < g_vio_n; i++)
++        if (g_vio[i]->pci == d) return g_vio[i];
++    return NULL;
++}
++
++/* ============================== interrupts ============================= */
++
++static void vio_intx_update(virtio_dev_t *v) {
++    int want = v->isr != 0;
++    if (want == v->intx_level) return;
++    v->intx_level = want;
++    if (v->m) pic_set_irq(v->m, v->irq, want);
++}
++
++void virtio_config_changed(virtio_dev_t *v) {
++    v->generation++;
++    v->isr |= VIRTIO_ISR_CONFIG;
++    vio_intx_update(v);
++}
++
++/* ============================== reset (D3) ============================= */
++
++void virtio_reset_device(virtio_dev_t *v) {
++    if (!v || !v->desc) return;
++    v->status = 0;
++    v->isr = 0;
++    v->guest_features = 0;
++    v->dfselect = v->gfselect = 0;
++    v->queue_select = 0;
++    for (int i = 0; i < VIRTIO_MAX_QUEUES; i++) {
++        virtio_queue_t *q = &v->q[i];
++        q->size = (i < v->desc->num_queues) ? v->desc->queue_max[i] : 0;
++        q->enable = 0;
++        q->desc = q->driver = q->device = 0;
++        q->last_avail = 0;
++    }
++    if (v->desc->reset) v->desc->reset(v);
++    vio_intx_update(v);
++}
++
++/* FEATURES_OK gate (D3): the bit is kept iff the driver acked
++ * VERSION_1 (the modern device must reject a feature word without
++ * it) and the device half accepts the rest.  The queue engine's
++ * own gate is separate and lenient -- see virtio_queue_ready. */
++static void vio_set_status(virtio_dev_t *v, uint8_t val) {
++    if (val == 0) { virtio_reset_device(v); return; }
++    if (val & VIO_STATUS_FEATURES_OK) {
++        int ok = (v->guest_features & (1ULL << VIRTIO_F_VERSION_1)) != 0;
++        if (ok && v->desc->validate_features)
++            ok = v->desc->validate_features(v, v->guest_features) == 0;
++        if (!ok) val &= (uint8_t)~VIO_STATUS_FEATURES_OK;
++    }
++    v->status = val;
++}
++
++int virtio_queue_ready(virtio_dev_t *v, int qi) {
++    if (qi < 0 || qi >= v->desc->num_queues) return 0;
++    if (!(v->status & VIO_STATUS_DRIVER_OK)) return 0;
++    virtio_queue_t *q = &v->q[qi];
++    return q->enable && q->size && q->desc && q->driver && q->device;
++}
++
++/* ============================== ring engine ============================ */
++
++/* Ring-region extents (no EVENT_IDX fields exist: the feature is
++ * not offered, so neither ring carries the trailing event word). */
++static int vio_rings_ok(virtio_queue_t *q) {
++    uint32_t n = q->size;
++    return vio_ram_ok(q->desc,   16ull * n)
++        && vio_ram_ok(q->driver, 4ull + 2ull * n)
++        && vio_ram_ok(q->device, 4ull + 8ull * n);
++}
++
++static void vio_used_push(virtio_dev_t *v, int qi, uint16_t head,
++                          uint32_t used_len) {
++    virtio_queue_t *q = &v->q[qi];
++    machine_t *m = v->m;
++    uint16_t used_idx = vio_rd16(m, q->device + 2);
++    uint32_t slot = used_idx % q->size;
++    vio_wr32(m, q->device + 4 + 8ull * slot, head);
++    vio_wr32(m, q->device + 8 + 8ull * slot, used_len);
++    vio_wr16(m, q->device + 2, (uint16_t)(used_idx + 1));
++    /* D2 interrupt policy: no EVENT_IDX, so the avail flags bit is
++     * the whole rule. */
++    if (!(vio_rd16(m, q->driver) & VRING_AVAIL_F_NO_INTERRUPT)) {
++        v->isr |= VIRTIO_ISR_QUEUE;
++        vio_intx_update(v);
++    }
++}
++
++void virtio_complete(virtio_dev_t *v, virtio_req_t *r, uint32_t used_len) {
++    vio_used_push(v, r->queue, r->head, used_len);
++}
++
++int virtio_pop(virtio_dev_t *v, int qi, virtio_req_t *r) {
++    memset(r, 0, sizeof *r);
++    r->v = v;
++    r->queue = qi;
++    if (!virtio_queue_ready(v, qi)) return 0;
++    virtio_queue_t *q = &v->q[qi];
++    machine_t *m = v->m;
++    if (!vio_rings_ok(q)) { vio_bad(v, "ring outside RAM", qi, 0); return 0; }
++
++    uint16_t avail_idx = vio_rd16(m, q->driver + 2);
++    if (avail_idx == q->last_avail) return 0;
++
++    uint16_t head = vio_rd16(m, q->driver + 4 + 2ull * (q->last_avail % q->size));
++    q->last_avail++;
++    if (head >= q->size) {
++        /* The head itself is outside the table: completing it would
++         * hand the guest a used elem for a descriptor it never had.
++         * Drop it (QEMU's "desc index out of range" class). */
++        vio_bad(v, "head index", qi, head);
++        return -1;
++    }
++    r->head = head;
++
++    uint16_t idx = head;
++    int malformed = 0;
++    const char *why = "";
++    for (int count = 0; ; count++) {
++        if (count >= q->size) { malformed = 1; why = "chain loop"; break; }
++        uint64_t dp = q->desc + 16ull * idx;
++        uint64_t addr = vio_rd64(m, dp);
++        uint32_t len  = vio_rd32(m, dp + 8);
++        uint16_t flags = vio_rd16(m, dp + 12);
++        uint16_t next  = vio_rd16(m, dp + 14);
++        if (flags & VRING_DESC_F_INDIRECT) { malformed = 1; why = "indirect not offered"; break; }
++        if (!vio_ram_ok(addr, len))        { malformed = 1; why = "buffer outside RAM"; break; }
++        virtio_seg_t seg = { addr, len };
++        if (flags & VRING_DESC_F_WRITE) { r->in[r->n_in++] = seg;   r->in_len += len; }
++        else                            { r->out[r->n_out++] = seg; r->out_len += len; }
++        if (!(flags & VRING_DESC_F_NEXT)) break;
++        if (next >= q->size) { malformed = 1; why = "next index"; break; }
++        idx = next;
++    }
++    if (malformed) {
++        /* The chain has a trustworthy head but a broken interior:
++         * complete it with len 0 and no data movement, so a polling
++         * guest observes a finished, failed request (for blk the
++         * untouched 0xFF status sentinel says exactly that) instead
++         * of hanging on a descriptor the device swallowed. */
++        vio_bad(v, why, qi, head);
++        vio_used_push(v, qi, head, 0);
++        return -1;
++    }
++    return 1;
++}
++
++/* ============================== DMA helpers ============================ */
++
++uint32_t virtio_dma_read(virtio_dev_t *v, uint64_t pa, void *buf, uint32_t len) {
++    if (!v->m || !vio_ram_ok(pa, len)) return 0;
++    uint8_t *dst = buf;
++    uint32_t done = 0;
++    while (done < len) {
++        uint32_t left = len - done;
++        if (left >= 8) {
++            uint64_t x = mem_read(v->m, pa + done, 8);
++            memcpy(dst + done, &x, 8);
++            done += 8;
++        } else {
++            dst[done] = (uint8_t)mem_read(v->m, pa + done, 1);
++            done += 1;
++        }
++    }
++    return done;
++}
++
++uint32_t virtio_dma_write(virtio_dev_t *v, uint64_t pa, const void *buf, uint32_t len) {
++    if (!v->m || !vio_ram_ok(pa, len)) return 0;
++    const uint8_t *src = buf;
++    uint32_t done = 0;
++    while (done < len) {
++        uint32_t left = len - done;
++        if (left >= 8) {
++            uint64_t x;
++            memcpy(&x, src + done, 8);
++            mem_write(v->m, pa + done, 8, x);
++            done += 8;
++        } else {
++            mem_write(v->m, pa + done, 1, src[done]);
++            done += 1;
++        }
++    }
++    return done;
++}
++
++static uint32_t vio_stream_copy(virtio_req_t *r, const virtio_seg_t *segs,
++                                int n, uint32_t off, void *buf,
++                                uint32_t len, int to_guest) {
++    uint8_t *p = buf;
++    uint32_t done = 0;
++    for (int i = 0; i < n && done < len; i++) {
++        if (off >= segs[i].len) { off -= segs[i].len; continue; }
++        uint32_t chunk = segs[i].len - off;
++        if (chunk > len - done) chunk = len - done;
++        uint32_t moved = to_guest
++            ? virtio_dma_write(r->v, segs[i].addr + off, p + done, chunk)
++            : virtio_dma_read(r->v, segs[i].addr + off, p + done, chunk);
++        done += moved;
++        if (moved < chunk) break;
++        off = 0;
++    }
++    return done;
++}
++
++uint32_t virtio_req_read(virtio_req_t *r, uint32_t off, void *buf, uint32_t len) {
++    return vio_stream_copy(r, r->out, r->n_out, off, buf, len, 0);
++}
++
++uint32_t virtio_req_write(virtio_req_t *r, uint32_t off, const void *buf, uint32_t len) {
++    return vio_stream_copy(r, r->in, r->n_in, off, (void *)buf, len, 1);
++}
++
++/* ============================== common config ========================== */
++/*
++ * The common-cfg block is field-typed (u8 status, u16 queue fields,
++ * u32 feature banks, u64 ring addresses) and guests measured use
++ * exact-width accesses -- but an image-based register file makes
++ * every sub-width or unaligned access compose for free: reads
++ * serialize state into a 0x40 image, writes merge into the image
++ * and re-apply the fields with their semantics.  Fields are applied
++ * selects-first (so queue fields land on the newly selected queue),
++ * status last (so a same-access FEATURES_OK sees the feature word
++ * written alongside it).
++ */
++#define VIO_COMMON_SIZE 0x40
++
++static void vio_common_image(virtio_dev_t *v, uint8_t img[VIO_COMMON_SIZE]) {
++    memset(img, 0, VIO_COMMON_SIZE);
++    uint64_t offered = v->desc->features | (1ULL << VIRTIO_F_VERSION_1);
++    put32(img + 0x00, v->dfselect);
++    put32(img + 0x04, v->dfselect == 0 ? (uint32_t)offered
++                      : v->dfselect == 1 ? (uint32_t)(offered >> 32) : 0);
++    put32(img + 0x08, v->gfselect);
++    put32(img + 0x0C, v->gfselect == 0 ? (uint32_t)v->guest_features
++                      : v->gfselect == 1 ? (uint32_t)(v->guest_features >> 32) : 0);
++    put16(img + 0x10, VIRTIO_MSI_NO_VECTOR);
++    put16(img + 0x12, (uint16_t)v->desc->num_queues);
++    img[0x14] = v->status;
++    img[0x15] = v->generation;
++    put16(img + 0x16, v->queue_select);
++    if (v->queue_select < (unsigned)v->desc->num_queues) {
++        virtio_queue_t *q = &v->q[v->queue_select];
++        put16(img + 0x18, q->size);
++        put16(img + 0x1A, VIRTIO_MSI_NO_VECTOR);
++        put16(img + 0x1C, q->enable);
++        put16(img + 0x1E, v->queue_select);   /* queue_notify_off = index */
++        put64(img + 0x20, q->desc);
++        put64(img + 0x28, q->driver);
++        put64(img + 0x30, q->device);
++    }
++    /* 0x38 queue_notif_config_data / 0x3A queue_reset: read 0 -- the
++     * features behind them are not offered. */
++}
++
++/* Only fields the access actually touched take their semantics --
++ * re-applying the whole image would re-run a status-0 reset on
++ * every queue-register write during early bring-up. */
++static int vio_touched(uint32_t off, int size, uint32_t field, uint32_t flen) {
++    return off < field + flen && off + (uint32_t)size > field;
++}
++
++static void vio_common_apply(virtio_dev_t *v, const uint8_t img[VIO_COMMON_SIZE],
++                             uint32_t off, int size) {
++    uint64_t offered = v->desc->features | (1ULL << VIRTIO_F_VERSION_1);
++    if (vio_touched(off, size, 0x00, 4)) v->dfselect = le32_of(img + 0x00);
++    if (vio_touched(off, size, 0x08, 4)) v->gfselect = le32_of(img + 0x08);
++    /* D3: driver_feature is masked to the offer (QEMU precedent --
++     * an unoffered bit can never become acked state). */
++    if (vio_touched(off, size, 0x0C, 4)) {
++        if (v->gfselect == 0)
++            v->guest_features = (v->guest_features & ~0xFFFFFFFFull)
++                              | (le32_of(img + 0x0C) & (uint32_t)offered);
++        else if (v->gfselect == 1)
++            v->guest_features = (v->guest_features & 0xFFFFFFFFull)
++                              | ((uint64_t)(le32_of(img + 0x0C) & (uint32_t)(offered >> 32)) << 32);
++    }
++    if (vio_touched(off, size, 0x16, 2)) v->queue_select = le16_of(img + 0x16);
++    if (v->queue_select < (unsigned)v->desc->num_queues) {
++        virtio_queue_t *q = &v->q[v->queue_select];
++        if (vio_touched(off, size, 0x18, 2)) {
++            uint16_t want = le16_of(img + 0x18);
++            uint16_t max_size = v->desc->queue_max[v->queue_select];
++            q->size = (want == 0 || want > max_size) ? max_size : want;
++        }
++        if (vio_touched(off, size, 0x1C, 2)) q->enable = le16_of(img + 0x1C) & 1;
++        if (vio_touched(off, size, 0x20, 8)) q->desc   = le64_of(img + 0x20);
++        if (vio_touched(off, size, 0x28, 8)) q->driver = le64_of(img + 0x28);
++        if (vio_touched(off, size, 0x30, 8)) q->device = le64_of(img + 0x30);
++    }
++    if (vio_touched(off, size, 0x14, 1)) vio_set_status(v, img[0x14]);
++}
++
++static uint64_t vio_common_read(virtio_dev_t *v, uint32_t off, int size) {
++    uint8_t img[VIO_COMMON_SIZE + 8];
++    memset(img, 0, sizeof img);
++    vio_common_image(v, img);
++    uint64_t val = 0;
++    for (int i = 0; i < size && off + i < sizeof img; i++)
++        val |= (uint64_t)img[off + i] << (8 * i);
++    return val;
++}
++
++static void vio_common_write(virtio_dev_t *v, uint32_t off, int size, uint64_t val) {
++    uint8_t img[VIO_COMMON_SIZE + 8];
++    memset(img, 0, sizeof img);
++    vio_common_image(v, img);
++    for (int i = 0; i < size && off + i < sizeof img; i++)
++        img[off + i] = (uint8_t)(val >> (8 * i));
++    vio_common_apply(v, img, off, size);
++}
++
++/* ============================== BAR0 MMIO ============================== */
++
++static uint64_t vio_mmio_read(void *ctx, uint64_t addr, int size) {
++    virtio_dev_t *v = ctx;
++    if (size <= 0 || size > 8) return 0;
++    uint32_t off = (uint32_t)(addr - v->bar_base);
++    if (off < VIRTIO_OFF_ISR) return vio_common_read(v, off, size);
++    if (off < VIRTIO_OFF_DEVICE) {
++        /* ISR: the byte at +0 reads-and-clears (which is what drops
++         * the INTx level); the rest of the page reads 0. */
++        if (off != VIRTIO_OFF_ISR) return 0;
++        uint8_t isr = v->isr;
++        v->isr = 0;
++        vio_intx_update(v);
++        return isr;
++    }
++    if (off < VIRTIO_OFF_NOTIFY) {
++        uint32_t doff = off - VIRTIO_OFF_DEVICE;
++        uint64_t val = 0;
++        for (int i = 0; i < size; i++) {
++            uint8_t b = (v->desc->config && doff + i < v->desc->config_len)
++                      ? v->desc->config[doff + i] : 0;
++            val |= (uint64_t)b << (8 * i);
++        }
++        return val;
++    }
++    return 0;   /* notify page: write-only for a device that does not
++                 * offer NOTIF_CONFIG_DATA */
++}
++
++static void vio_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
++    virtio_dev_t *v = ctx;
++    if (size <= 0 || size > 8) return;
++    uint32_t off = (uint32_t)(addr - v->bar_base);
++    if (off < VIRTIO_OFF_ISR) { vio_common_write(v, off, size, val); return; }
++    if (off < VIRTIO_OFF_DEVICE) return;                    /* ISR: RO */
++    if (off < VIRTIO_OFF_NOTIFY) {
++        if (v->desc->config_write)
++            v->desc->config_write(v, off - VIRTIO_OFF_DEVICE,
++                                  (uint32_t)val, size);
++        return;
++    }
++    unsigned qi = (off - VIRTIO_OFF_NOTIFY) / VIRTIO_NOTIFY_MULT;
++    if (qi < (unsigned)v->desc->num_queues && v->desc->notify)
++        v->desc->notify(v, (int)qi);
++}
++
++/* ============================== BAR plumbing =========================== */
++
++static void vio_set_bar(virtio_dev_t *v, uint32_t base) {
++    int enabled = base != 0;
++    v->bar_base = base & ~(VIRTIO_BAR_SIZE - 1u);
++    if (!v->m) return;
++    for (mmio_region_t *r = v->m->mmio_list; r; r = r->next) {
++        if (r->ctx == v && r->size == VIRTIO_BAR_SIZE) {
++            r->base = v->bar_base;
++            r->enabled = enabled;
++            return;
++        }
++    }
++}
++
++static uint32_t vio_bar_value(virtio_dev_t *v, pci_dev_t *d) {
++    if (v->bar_probe) return ~(VIRTIO_BAR_SIZE - 1u) & 0xFFFFFFF0u;
++    return le32_of(d->cfg + 0x10);
++}
++
++/* Vendor capabilities (virtio 1.x 4.1.4): common(1), notify(2, with
++ * the multiplier), isr(3), device(4 -- only when the device has a
++ * config space to point at).  Page-granular `length` like QEMU, so
++ * a driver mapping by length always covers the structure. */
++static void vio_seed_caps(virtio_dev_t *v) {
++    pci_dev_t *d = v->pci;
++    static const struct { uint8_t at, type, len, next; uint16_t off; } caps[4] = {
++        { 0x40, 1, 16, 0x50, VIRTIO_OFF_COMMON },
++        { 0x50, 2, 20, 0x64, VIRTIO_OFF_NOTIFY },
++        { 0x64, 3, 16, 0x74, VIRTIO_OFF_ISR    },
++        { 0x74, 4, 16, 0x00, VIRTIO_OFF_DEVICE },
++    };
++    int ncap = v->desc->config_len ? 4 : 3;
++    d->cfg[0x06] |= 0x10;                       /* Status: Cap List */
++    d->cfg[0x34] = 0x40;                        /* Capabilities Ptr */
++    memset(d->cfg + 0x40, 0, 0x50);
++    for (int i = 0; i < ncap; i++) {
++        uint8_t *c = d->cfg + caps[i].at;
++        c[0] = 0x09;                            /* vendor-specific */
++        c[1] = (i + 1 < ncap) ? caps[i].next : 0x00;
++        c[2] = caps[i].len;
++        c[3] = caps[i].type;
++        c[4] = 0;                               /* BAR 0 */
++        put32(c + 8, caps[i].off);
++        put32(c + 12, 0x1000);
++    }
++    put32(d->cfg + 0x50 + 16, VIRTIO_NOTIFY_MULT);
++}
++
++static uint64_t vio_cfg_read(pci_dev_t *d, int reg, int size) {
++    virtio_dev_t *v = vio_of_pci(d);
++    if (!v || size <= 0 || size > 8) return 0;
++    uint32_t bar = vio_bar_value(v, d);
++    uint64_t value = 0;
++    for (int i = 0; i < size; i++) {
++        int off = reg + i;
++        uint8_t byte = 0;
++        if (off >= 0x10 && off < 0x14)
++            byte = (uint8_t)(bar >> (8 * (off - 0x10)));
++        else if (!((off >= 0x14 && off < 0x28) || (off >= 0x30 && off < 0x34))
++                 && off >= 0 && off < 256)
++            byte = d->cfg[off];
++        value |= (uint64_t)byte << (8 * i);
++    }
++    return value;
++}
++
++static void vio_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
++    virtio_dev_t *v = vio_of_pci(d);
++    if (!v || size <= 0 || size > 8) return;
++    if (reg == 0x10 && size == 4 && (uint32_t)val == 0xFFFFFFFFu) {
++        v->bar_probe = 1;
++        return;
++    }
++    int touches_bar = reg < 0x14 && reg + size > 0x10;
++    if (touches_bar) v->bar_probe = 0;
++    pci_default_cfg_write(d, reg, size, val);
++    /* BAR1..5 and the expansion-ROM BAR are not implemented. */
++    memset(d->cfg + 0x14, 0, 0x14);
++    memset(d->cfg + 0x30, 0, 4);
++    if (touches_bar) {
++        uint32_t base = le32_of(d->cfg + 0x10) & ~(VIRTIO_BAR_SIZE - 1u) & ~0xFu;
++        put32(d->cfg + 0x10, base);      /* 32-bit memory BAR: type 0 */
++        vio_set_bar(v, base);
++    }
++    vio_seed_caps(v);                    /* RO bytes survive any write */
++}
++
++/* ============================== attach ================================= */
++
++void virtio_pci_add(machine_t *m, virtio_dev_t *v, int pci_dev_no,
++                    const char *name, uint16_t device_id,
++                    uint8_t class_, uint8_t subclass, uint8_t progif,
++                    uint32_t bar_base, int irq,
++                    const virtio_device_desc_t *desc, void *ctx) {
++    memset(v, 0, sizeof *v);
++    v->m = m;
++    v->desc = desc;
++    v->ctx = ctx;
++    v->irq = irq;
++    v->bar_base = bar_base;
++
++    pci_dev_t *p = pci_add_device(m, 0, pci_dev_no, 0, name,
++                                  VIRTIO_PCI_VENDOR, device_id,
++                                  class_, subclass, progif);
++    v->pci = p;
++    p->cfg[0x08] = 0x01;                             /* revision 1 */
++    /* subsystem vendor 1af4, subsystem id = device id (QEMU modern) */
++    p->cfg[0x2C] = 0xF4; p->cfg[0x2D] = 0x1A;
++    p->cfg[0x2E] = (uint8_t)device_id; p->cfg[0x2F] = (uint8_t)(device_id >> 8);
++    p->cfg[0x3C] = (uint8_t)irq;                     /* Interrupt Line */
++    p->cfg[0x3D] = 0x01;                             /* Interrupt Pin INTA# */
++    put32(p->cfg + 0x10, bar_base);                  /* seeded BAR0 */
++    p->cfg_read = vio_cfg_read;
++    p->cfg_write = vio_cfg_write;
++    vio_seed_caps(v);
++
++    virtio_reset_device(v);
++    mem_register_mmio(m, bar_base, VIRTIO_BAR_SIZE,
++                      vio_mmio_read, vio_mmio_write, v, name);
++    int known = 0;
++    for (int i = 0; i < g_vio_n; i++) known |= g_vio[i] == v;
++    if (!known && g_vio_n < VIO_REGISTRY_MAX) g_vio[g_vio_n++] = v;
++    mlog(&m->log, "[virtio] %s 1af4:%04x at 0:%02d.0 BAR0 0x%x IRQ %d (%d queues)\n",
++         name, device_id, pci_dev_no, bar_base, irq, desc->num_queues);
++}
+diff --git a/src/virtio.h b/src/virtio.h
+new file mode 100644
+index 0000000..2041fd1
+--- /dev/null
++++ b/src/virtio.h
+@@ -0,0 +1,195 @@
++/* virtio.h -- VIRTIO V1: the modern (1.x) virtio-pci transport core
++ * (docs/plans/VIRTIO_PLAN.md).  Split virtqueues, vendor-capability
++ * transport, synchronous completion on notify.  Device halves
++ * (virtio-blk V2, virtio-net V4) plug in through virtio_device_desc_t.
++ *
++ * What the core advertises is exactly what it implements (plan rule
++ * 1): the transport offer is VIRTIO_F_VERSION_1 and nothing else
++ * (no INDIRECT_DESC 28, no EVENT_IDX 29, no PACKED 34); the device
++ * desc adds its own feature bits, each pinned by a vector in the
++ * phase that offers it.  Interrupts are legacy INTx behind the ISR
++ * byte; MSI-X arrives in V5, so msix_config / queue_msix_vector
++ * read VIRTIO_MSI_NO_VECTOR and no MSI-X capability exists.
++ *
++ * The consumer contract is measured (V0 section 2): the guest's
++ * virtio-net driver negotiates by the book and re-reads
++ * FEATURES_OK, while its virtio-blk driver negotiates nothing and
++ * goes straight to DRIVER_OK (findings N1/N2).  Decision D3 splits
++ * the difference exactly where QEMU does: FEATURES_OK survives iff
++ * VERSION_1 was acked (the spec's readback), but the queue engine
++ * runs under DRIVER_OK + queue_enable regardless, so the blind
++ * driver still transfers.  Both halves are pinned in
++ * tests/test_virtio.c.
++ */
++#ifndef EMU_VIRTIO_H
++#define EMU_VIRTIO_H
++
++#include <stdint.h>
++#include "machine.h"
++
++struct pci_dev;
++
++/* ---- PCI identity (D1) ------------------------------------------------- */
++#define VIRTIO_PCI_VENDOR     0x1AF4
++#define VIRTIO_PCI_NET_ID     0x1041   /* modern device ids: 0x1040+type */
++#define VIRTIO_PCI_BLK_ID     0x1042
++#define VIRTIO_BLK_PCI_DEV    5        /* 0:05.0 (0:04.0 is the opt-in e1000) */
++#define VIRTIO_NET_PCI_DEV    6        /* 0:06.0 */
++#define VIRTIO_BLK_BAR_BASE   0xFEB30000u
++#define VIRTIO_NET_BAR_BASE   0xFEB34000u
++#define VIRTIO_BLK_IRQ        5        /* measured free ISA lines (V1 census:
++                                        * 0 PIT, 1 KBC, 8 RTC, 9 SCI, 10 XHCI,
++                                        * 11 e1000, 14/15 AHCI are taken) */
++#define VIRTIO_NET_IRQ        7
++
++/* One 32-bit memory BAR0, 16 KiB, QEMU's region offsets (D1). */
++#define VIRTIO_BAR_SIZE       0x4000u
++#define VIRTIO_OFF_COMMON     0x0000
++#define VIRTIO_OFF_ISR        0x1000
++#define VIRTIO_OFF_DEVICE     0x2000
++#define VIRTIO_OFF_NOTIFY     0x3000
++#define VIRTIO_NOTIFY_MULT    4
++
++/* ---- transport feature bits & status bits ------------------------------ */
++#define VIRTIO_F_VERSION_1    32
++#define VIRTIO_MSI_NO_VECTOR  0xFFFF
++
++#define VIO_STATUS_ACK        0x01
++#define VIO_STATUS_DRIVER     0x02
++#define VIO_STATUS_DRIVER_OK  0x04
++#define VIO_STATUS_FEATURES_OK 0x08
++#define VIO_STATUS_NEEDS_RESET 0x40
++#define VIO_STATUS_FAILED     0x80
++
++/* ---- split-ring constants ---------------------------------------------- */
++#define VRING_DESC_F_NEXT     1
++#define VRING_DESC_F_WRITE    2
++#define VRING_DESC_F_INDIRECT 4
++#define VRING_AVAIL_F_NO_INTERRUPT 1
++#define VRING_USED_F_NO_NOTIFY     1
++
++#define VIRTIO_ISR_QUEUE      0x01
++#define VIRTIO_ISR_CONFIG     0x02
++
++#define VIRTIO_MAX_QUEUES     4
++#define VIRTIO_MAX_QSIZE      256
++
++/* One guest-memory segment of a descriptor chain.  "out" segments are
++ * device-readable (driver -> device), "in" segments device-writable. */
++typedef struct {
++    uint64_t addr;
++    uint32_t len;
++} virtio_seg_t;
++
++/* A popped chain (virtio_pop).  The struct is ~8 KiB by design (a
++ * 256-entry chain worst case): device code keeps one as scratch in
++ * its own state instead of on a deep stack. */
++typedef struct virtio_req {
++    struct virtio_dev *v;
++    int      queue;
++    uint16_t head;                 /* descriptor index for the used elem */
++    int      n_out, n_in;
++    uint32_t out_len, in_len;      /* summed byte counts */
++    virtio_seg_t out[VIRTIO_MAX_QSIZE];
++    virtio_seg_t in[VIRTIO_MAX_QSIZE];
++} virtio_req_t;
++
++/* Device-half description: everything device-specific the core needs.
++ * `features` holds device bits only; the core ORs in VERSION_1.
++ * Callbacks may be NULL: no notify (device polls via its own tick),
++ * no feature validation (accept any subset), no reset extras,
++ * read-only device config. */
++struct virtio_dev;
++typedef struct {
++    uint64_t      features;
++    int           num_queues;
++    uint16_t      queue_max[VIRTIO_MAX_QUEUES];
++    const uint8_t *config;        /* device-config bytes (may be NULL) */
++    uint32_t      config_len;
++    void (*notify)(struct virtio_dev *v, int queue);
++    int  (*validate_features)(struct virtio_dev *v, uint64_t acked);
++    void (*reset)(struct virtio_dev *v);
++    void (*config_write)(struct virtio_dev *v, uint32_t off,
++                         uint32_t val, int size);
++} virtio_device_desc_t;
++
++typedef struct {
++    uint16_t size;                /* effective size (max until written) */
++    uint16_t enable;
++    uint64_t desc, driver, device;
++    uint16_t last_avail;          /* avail idx last consumed by the core */
++} virtio_queue_t;
++
++typedef struct virtio_dev {
++    machine_t        *m;
++    struct pci_dev   *pci;
++    const virtio_device_desc_t *desc;
++    void             *ctx;        /* device-driver state (blk/net struct) */
++    uint32_t          bar_base;
++    int               bar_probe;
++    int               irq;
++    uint8_t           status;
++    uint8_t           isr;
++    uint8_t           generation;       /* config_generation (D3: still
++                                         * unless virtio_config_changed) */
++    int               intx_level;
++    uint64_t          guest_features;   /* acked, masked to the offer */
++    uint32_t          dfselect, gfselect;
++    uint16_t          queue_select;
++    unsigned          bad_chains;       /* D2: log budget for bad chains */
++    virtio_queue_t    q[VIRTIO_MAX_QUEUES];
++} virtio_dev_t;
++
++/* Register one modern virtio PCI function: seeds config space
++ * (revision 1, subsystem vendor 1af4 with the subsystem id equal
++ * to the device id -- no measured consumer reads either), lays
++ * the vendor capabilities into cfg[0x40..], installs the BAR0
++ * MMIO window at `bar_base` and arms INTx on `irq`.  `v` is
++ * caller-owned storage (the device half keeps it inside its own
++ * state struct). */
++void virtio_pci_add(machine_t *m, virtio_dev_t *v, int pci_dev_no,
++                    const char *name, uint16_t device_id,
++                    uint8_t class_, uint8_t subclass, uint8_t progif,
++                    uint32_t bar_base, int irq,
++                    const virtio_device_desc_t *desc, void *ctx);
++
++/* Full synchronous device reset -- the same path a guest triggers by
++ * writing 0 to device_status (status reads back 0 immediately). */
++void virtio_reset_device(virtio_dev_t *v);
++
++/* The queue engine's run gate (D3): DRIVER_OK set and queue enabled,
++ * with ring addresses programmed. */
++int  virtio_queue_ready(virtio_dev_t *v, int qi);
++
++/* Pop one chain from queue `qi`'s avail ring into `r`.
++ * Returns 1 when `r` holds a valid chain, 0 when the ring is empty,
++ * -1 when a malformed chain was consumed and completed with len 0
++ * (the burst caller should simply keep popping). */
++int  virtio_pop(virtio_dev_t *v, int qi, virtio_req_t *r);
++
++/* Publish the used element for a popped chain (used_len = bytes the
++ * device wrote into the in-segments) and raise INTx per the
++ * NO_INTERRUPT policy (D2). */
++void virtio_complete(virtio_dev_t *v, virtio_req_t *r, uint32_t used_len);
++
++/* Config-change interrupt (ISR bit 1 + generation bump).  No current
++ * device mutates config after attach, but the wire is core-owned. */
++void virtio_config_changed(virtio_dev_t *v);
++
++/* Data movement helpers over a popped chain's segment streams.
++ * Offsets are stream offsets (0 = first byte of the first segment);
++ * short copies truncate and return the byte count moved. */
++uint32_t virtio_req_read(virtio_req_t *r, uint32_t off,
++                         void *buf, uint32_t len);        /* out -> buf */
++uint32_t virtio_req_write(virtio_req_t *r, uint32_t off,
++                          const void *buf, uint32_t len); /* buf -> in */
++
++/* Bounds-checked DMA against guest RAM (D2): a range that leaves
++ * RAM copies nothing and returns 0, so a hostile or buggy guest can
++ * never aim a descriptor at an MMIO window. */
++uint32_t virtio_dma_read(virtio_dev_t *v, uint64_t pa,
++                         void *buf, uint32_t len);
++uint32_t virtio_dma_write(virtio_dev_t *v, uint64_t pa,
++                          const void *buf, uint32_t len);
++
++#endif /* EMU_VIRTIO_H */
+diff --git a/tests/test_virtio.c b/tests/test_virtio.c
+new file mode 100644
+index 0000000..1d53031
+--- /dev/null
++++ b/tests/test_virtio.c
+@@ -0,0 +1,548 @@
++/* tests/test_virtio.c -- VIRTIO V1 vectors: the modern virtio-pci
++ * transport core (docs/plans/VIRTIO_PLAN.md, decisions D1-D4).
++ *
++ * The fixture is the full machine (devices_init_common) with a fake
++ * echo device attached at the exact coordinates virtio-blk will use
++ * (0:05.0, BAR 0xFEB30000, IRQ 5), so V2 inherits pinned placement.
++ * PCI config goes through the real 0xCF8/0xCFC mechanism, MMIO
++ * through mem_read/mem_write and rings live in guest RAM: the
++ * vectors see precisely what the measured guests see -- the
++ * by-the-book virtio-net flow (full negotiation, FEATURES_OK and
++ * queue_enable readback) and the virtio-blk flow (no negotiation at
++ * all, straight to DRIVER_OK -- finding N1, kept working by the D3
++ * gate split).
++ *
++ * The echo device: offers device feature bit 0 and refuses
++ * FEATURES_OK without it (validate_features), has two queues
++ * (max 8 and 16) and an 8-byte device config; on notify it pops
++ * chains and copies the out-stream onto the in-stream.
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++#include "harness.h"
++#include "virtio.h"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static machine_t M;   /* static: machine_t is ~2.8MB */
++
++#define VBAR        0xFEB30000u
++#define CCD(off)    (VBAR + (off))            /* common cfg */
++#define ISR_AT      (VBAR + 0x1000u)
++#define DCFG(off)   (VBAR + 0x2000u + (off))
++#define NOTIFY(q)   (VBAR + 0x3000u + (q) * 4u)
++#define FAKE_BIT    (1ull << 0)
++
++/* guest RAM testbed (ring pages, 2 MiB area, no firmware above) */
++#define Q0_DESC   0x200000u
++#define Q0_AVAIL  0x201000u
++#define Q0_USED   0x202000u
++#define Q1_DESC   0x210000u
++#define Q1_AVAIL  0x211000u
++#define Q1_USED   0x212000u
++#define BUF0      0x220000u     /* 4 pages of descriptor buffers */
++#define BUF1      0x221000u
++
++static uint8_t  rd8 (uint32_t a) { return (uint8_t) mem_read(&M, a, 1); }
++static uint16_t rd16(uint32_t a) { return (uint16_t)mem_read(&M, a, 2); }
++static uint32_t rd32(uint32_t a) { return (uint32_t)mem_read(&M, a, 4); }
++static uint64_t rd64(uint32_t a) { return mem_read(&M, a, 8); }
++static void wr8 (uint32_t a, uint8_t v)  { mem_write(&M, a, 1, v); }
++static void wr16(uint32_t a, uint16_t v) { mem_write(&M, a, 2, v); }
++static void wr32(uint32_t a, uint32_t v) { mem_write(&M, a, 4, v); }
++static void wr64(uint32_t a, uint64_t v) { mem_write(&M, a, 8, v); }
++
++/* PCI mechanism #1 (test_xhci.c recipe), function 0:05.0 */
++#define VDEV 5
++static void pci_addr(int reg) {
++    io_write(&M, 0xCF8, 4, 0x80000000u | ((uint32_t)VDEV << 11) | ((uint32_t)reg & 0xFCu));
++}
++static uint32_t pci_rd32(int reg) { pci_addr(reg); return (uint32_t)io_read(&M, 0xCFC, 4); }
++static void pci_wr32(int reg, uint32_t v) { pci_addr(reg); io_write(&M, 0xCFC, 4, v); }
++static uint8_t pci_rd8(int reg) { pci_addr(reg); return (uint8_t)io_read(&M, 0xCFC + (reg & 3), 1); }
++
++/* ------------------------- the fake echo device ------------------------ */
++typedef struct {
++    virtio_dev_t vio;
++    virtio_req_t req;          /* ~8 KiB scratch, out of the stack  */
++    int notifies, validates, resets, cfgwrites;
++    uint32_t cfgw_off, cfgw_val; int cfgw_size;
++} fake_t;
++static fake_t g_fake;
++
++static const uint8_t g_fake_cfg[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE };
++
++static void fake_notify(virtio_dev_t *v, int qi) {
++    fake_t *f = v->ctx;
++    f->notifies++;
++    int rc;
++    while ((rc = virtio_pop(v, qi, &f->req)) != 0) {
++        if (rc < 0) continue;                       /* malformed: core ate it */
++        uint8_t tmp[512];
++        uint32_t n = virtio_req_read(&f->req, 0, tmp, sizeof tmp);
++        uint32_t w = virtio_req_write(&f->req, 0, tmp, n);
++        virtio_complete(v, &f->req, w);
++    }
++}
++static int fake_validate(virtio_dev_t *v, uint64_t acked) {
++    fake_t *f = v->ctx;
++    f->validates++;
++    return (acked & FAKE_BIT) ? 0 : -1;             /* bit 0 is mandatory here */
++}
++static void fake_reset(virtio_dev_t *v) { ((fake_t *)v->ctx)->resets++; }
++static void fake_cfg_write(virtio_dev_t *v, uint32_t off, uint32_t val, int size) {
++    fake_t *f = v->ctx;
++    f->cfgwrites++;
++    f->cfgw_off = off; f->cfgw_val = val; f->cfgw_size = size;
++}
++static const virtio_device_desc_t g_fake_desc = {
++    .features = FAKE_BIT,
++    .num_queues = 2,
++    .queue_max = { 8, 16 },
++    .config = g_fake_cfg,
++    .config_len = sizeof g_fake_cfg,
++    .notify = fake_notify,
++    .validate_features = fake_validate,
++    .reset = fake_reset,
++    .config_write = fake_cfg_write,
++};
++
++static void fake_add(void) {
++    virtio_pci_add(&M, &g_fake.vio, VIRTIO_BLK_PCI_DEV, "virtio-fake",
++                   VIRTIO_PCI_BLK_ID, 0x01, 0x80, 0x00,
++                   VIRTIO_BLK_BAR_BASE, VIRTIO_BLK_IRQ, &g_fake_desc, &g_fake);
++}
++
++/* ----------------------- guest-side helper rituals --------------------- */
++static void dev_status(uint8_t st) { wr8(CCD(0x14), st); }
++
++/* The virtio-net.c ritual: reset, ACK, DRIVER, exchange features,
++ * FEATURES_OK (re-read!), queue dance, DRIVER_OK. */
++static void full_init(void) {
++    dev_status(0);
++    dev_status(0x01);
++    dev_status(0x01 | 0x02);
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 0x01);        /* ack bit 0 */
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 0x01);        /* ack VERSION_1 */
++    dev_status(0x01 | 0x02 | 0x08);
++}
++
++/* The virtio_blk.c ritual verbatim: no feature traffic at all --
++ * status = 0; = ACK|DRIVER; |= FEATURES_OK; |= DRIVER_OK.  The two
++ * RMWs read back whatever the device decided about FEATURES_OK. */
++static void blind_init(void) {
++    dev_status(0);
++    dev_status(1 | 2);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++}
++
++static void queue_setup(int qi, uint32_t desc, uint32_t avail, uint32_t used) {
++    memset(M.ram + desc, 0, 0x3000);
++    wr16(CCD(0x16), (uint16_t)qi);
++    wr16(CCD(0x18), rd16(CCD(0x18)));                 /* take the offered size */
++    wr64(CCD(0x20), desc);
++    wr64(CCD(0x28), avail);
++    wr64(CCD(0x30), used);
++    wr16(CCD(0x1C), 1);
++}
++
++struct tdesc { uint64_t addr; uint32_t len; uint16_t flags, next; };
++static void put_desc(uint32_t table, int i, uint64_t addr, uint32_t len,
++                     uint16_t flags, uint16_t next) {
++    struct tdesc d = { addr, len, flags, next };
++    memcpy(M.ram + table + 16u * (uint32_t)i, &d, sizeof d);
++}
++static uint16_t used_idx(uint32_t used) {
++    return (uint16_t)(M.ram[used + 2] | (M.ram[used + 3] << 8));
++}
++static void used_elem(uint32_t used, int slot, uint32_t *id, uint32_t *len) {
++    memcpy(id,  M.ram + used + 4 + 8 * slot, 4);
++    memcpy(len, M.ram + used + 8 + 8 * slot, 4);
++}
++static void avail_post(uint32_t avail, int slot, uint16_t head) {
++    M.ram[avail + 4 + 2 * slot] = (uint8_t)head;
++    M.ram[avail + 5 + 2 * slot] = (uint8_t)(head >> 8);
++    uint16_t idx = (uint16_t)(M.ram[avail + 2] | (M.ram[avail + 3] << 8));
++    idx++;
++    M.ram[avail + 2] = (uint8_t)idx;
++    M.ram[avail + 3] = (uint8_t)(idx >> 8);
++}
++static int irq5(void) { return (M.pic.master.lines & (1u << 5)) != 0; }
++
++static int log_has(const char *needle) {
++    for (int i = 0; i < M.log.count; i++)
++        if (strstr(M.log.lines[i], needle)) return 1;
++    return 0;
++}
++
++/* ------------------------------ vectors -------------------------------- */
++static void v_pci_identity(void) {
++    int f0 = fails;
++    /* the guest probe: vendor 1AF4 anywhere on bus 0 finds 0:05.0 */
++    int found = -1;
++    for (int d = 0; d < 32 && found < 0; d++) {
++        io_write(&M, 0xCF8, 4, 0x80000000u | ((uint32_t)d << 11));
++        if ((io_read(&M, 0xCFC, 4) & 0xFFFFu) == 0x1AF4u) found = d;
++    }
++    EXPECT(found == 5, "1AF4 scan finds dev 5 (got %d)", found);
++    EXPECT(pci_rd32(0x00) == 0x10421AF4u, "1af4:1042 (got %08x)", pci_rd32(0x00));
++    EXPECT(pci_rd32(0x08) == 0x01800001u, "class 01/80/00 rev 1 (got %08x)", pci_rd32(0x08));
++    EXPECT(pci_rd32(0x2C) == 0x10421AF4u, "subsystem 1af4:1042 (got %08x)", pci_rd32(0x2C));
++    EXPECT(pci_rd8(0x3C) == 5, "interrupt line 5 (got %u)", pci_rd8(0x3C));
++    EXPECT(pci_rd8(0x3D) == 1, "interrupt pin INTA#");
++    EXPECT(pci_rd32(0x10) == VBAR, "BAR0 seeded (got %08x)", pci_rd32(0x10));
++    EXPECT(pci_rd32(0x14) == 0 && pci_rd32(0x24) == 0 && pci_rd32(0x30) == 0,
++           "unimplemented BARs read 0");
++    if (fails == f0) printf("ok pci identity: 1af4:1042 at 0:05.0 IRQ5 INTA#\n");
++}
++
++static void v_caps(void) {
++    int f0 = fails;
++    EXPECT((pci_rd8(0x06) & 0x10) != 0, "status: capabilities list");
++    uint8_t cap = pci_rd8(0x34) & 0xFC;
++    EXPECT(cap == 0x40, "capabilities pointer 0x40 (got %02x)", cap);
++    static const struct { uint8_t type, len; uint32_t off; } want[4] = {
++        { 1, 16, 0x0000 }, { 2, 20, 0x3000 }, { 3, 16, 0x1000 }, { 4, 16, 0x2000 },
++    };
++    for (int i = 0; i < 4; i++) {
++        EXPECT(cap != 0, "cap %d present", i);
++        EXPECT(pci_rd8(cap) == 0x09, "cap %d vendor", i);
++        EXPECT(pci_rd8(cap + 2) == want[i].len, "cap %d len %u (got %u)",
++               i, want[i].len, pci_rd8(cap + 2));
++        EXPECT(pci_rd8(cap + 3) == want[i].type, "cap %d type %u (got %u)",
++               i, want[i].type, pci_rd8(cap + 3));
++        EXPECT(pci_rd8(cap + 4) == 0, "cap %d in BAR0", i);
++        EXPECT(pci_rd32(cap + 8) == want[i].off, "cap %d off 0x%x (got %08x)",
++               i, want[i].off, pci_rd32(cap + 8));
++        EXPECT(pci_rd32(cap + 12) == 0x1000u, "cap %d length 0x1000", i);
++        if (want[i].type == 2)
++            EXPECT(pci_rd32(cap + 16) == 4u, "notify multiplier 4 (got %u)",
++                   pci_rd32(cap + 16));
++        cap = pci_rd8(cap + 1) & 0xFC;
++    }
++    EXPECT(cap == 0, "cap chain terminates");
++    /* cfg writes cannot vandalise the RO capability bytes */
++    pci_wr32(0x40, 0xDEADBEEFu);
++    EXPECT(pci_rd8(0x40) == 0x09 && pci_rd8(0x43) == 1, "caps re-asserted after cfg write");
++    if (fails == f0) printf("ok caps: common/notify(x4)/isr/device chain at 0x40\n");
++}
++
++static void v_bar_probe(void) {
++    int f0 = fails;
++    pci_wr32(0x10, 0xFFFFFFFFu);
++    EXPECT(pci_rd32(0x10) == 0xFFFFC000u, "BAR0 probe mask 16 KiB (got %08x)", pci_rd32(0x10));
++    pci_wr32(0x14, 0xFFFFFFFFu);
++    EXPECT(pci_rd32(0x14) == 0, "BAR1 probe reads 0");
++    pci_wr32(0x10, 0xFEB40000u);                       /* relocate 64 KiB up */
++    EXPECT(pci_rd32(0x10) == 0xFEB40000u, "BAR0 relocated");
++    EXPECT((uint16_t)mem_read(&M, 0xFEB40012u, 2) == 2, "num_queues decodes at the new base");
++    pci_wr32(0x10, VBAR);                              /* restore for later vectors */
++    EXPECT(rd16(CCD(0x12)) == 2, "num_queues back at the seeded base");
++    if (fails == f0) printf("ok bar probe: mask + relocation + restore\n");
++}
++
++static void v_features(void) {
++    int f0 = fails;
++    dev_status(0);
++    dev_status(1); dev_status(3);
++    /* offer banks: bit0 (fake) low, VERSION_1 high, nothing else */
++    wr32(CCD(0x00), 0); EXPECT(rd32(CCD(0x04)) == 0x1u, "device features low");
++    wr32(CCD(0x00), 1); EXPECT(rd32(CCD(0x04)) == 0x1u, "device features high = VERSION_1");
++    wr32(CCD(0x00), 2); EXPECT(rd32(CCD(0x04)) == 0u, "device features bank 2 = 0");
++    /* acked word is masked to the offer even when the guest sprays 1s */
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 0xFFFFFFFFu);
++    EXPECT(rd32(CCD(0x0C)) == 0x1u, "driver features masked low (got %08x)", rd32(CCD(0x0C)));
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 0xFFFFFFFFu);
++    EXPECT(rd32(CCD(0x0C)) == 0x1u, "driver features masked high");
++    /* FEATURES_OK gate, half 1: the device bit is acked (validator
++     * satisfied) but VERSION_1 is not -> rejected by the VERSION_1
++     * rule alone (mutation-discriminating: each gate kills this
++     * vector only if the other is removed) */
++    dev_status(0); dev_status(1); dev_status(3);
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 1);           /* ack bit 0 only */
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    EXPECT(!(rd8(CCD(0x14)) & 8), "FEATURES_OK cleared: no VERSION_1 acked (net shape)");
++    /* half 2: VERSION_1 alone, validate_features demands bit 0 too */
++    int v0 = g_fake.validates;
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 0);
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 1);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    EXPECT(!(rd8(CCD(0x14)) & 8), "FEATURES_OK cleared: validate_features said no");
++    EXPECT(g_fake.validates > v0, "validate_features was consulted");
++    /* half 3: the legal set sticks */
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 1);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    EXPECT((rd8(CCD(0x14)) & 8) != 0, "FEATURES_OK kept: VERSION_1 + device bit");
++    dev_status(0);
++    if (fails == f0) printf("ok features: banks, offer mask, FEATURES_OK gate (D3)\n");
++}
++
++static void v_queue_regs(void) {
++    int f0 = fails;
++    full_init();
++    EXPECT(rd16(CCD(0x10)) == 0xFFFF, "msix_config reads NO_VECTOR before V5");
++    EXPECT(rd8(CCD(0x15)) == 0, "config_generation still");
++    wr16(CCD(0x16), 1);
++    EXPECT(rd16(CCD(0x18)) == 16, "q1 size reads the max before any write");
++    wr16(CCD(0x18), 99);
++    EXPECT(rd16(CCD(0x18)) == 16, "q1 size write clamps to the max (99->16)");
++    wr16(CCD(0x18), 8);
++    EXPECT(rd16(CCD(0x18)) == 8, "q1 smaller size sticks (net driver writes 16 of 16)");
++    wr16(CCD(0x18), 0);
++    EXPECT(rd16(CCD(0x18)) == 16, "q1 size write 0 falls back to the max");
++    EXPECT(rd16(CCD(0x1A)) == 0xFFFF, "queue_msix_vector NO_VECTOR");
++    EXPECT(rd16(CCD(0x1E)) == 1, "q1 notify_off = queue index");
++    /* 64-bit ring pointers, guest shape (one 8-byte MMIO write)... */
++    wr64(CCD(0x20), 0x210000);
++    EXPECT(rd64(CCD(0x20)) == 0x210000u, "queue_desc 8-byte write");
++    /* ...and as two 32-bit halves: the low write must keep the high */
++    wr64(CCD(0x28), 0x100000000ull);
++    wr32(CCD(0x28), 0x211000);
++    EXPECT(rd64(CCD(0x28)) == 0x100211000ull, "queue_driver halves compose (got %llx)",
++           (unsigned long long)rd64(CCD(0x28)));
++    wr16(CCD(0x1C), 1);
++    EXPECT(rd16(CCD(0x1C)) == 1, "queue_enable readback 1 (net driver checks!)");
++    wr16(CCD(0x1C), 0);
++    EXPECT(rd16(CCD(0x1C)) == 0, "queue_enable readback 0");
++    /* a bogus queue_select reads the spec's empty hand and harms none */
++    wr16(CCD(0x16), 7);
++    EXPECT(rd16(CCD(0x18)) == 0 && rd16(CCD(0x1C)) == 0 && rd64(CCD(0x20)) == 0,
++           "queue_select beyond num_queues reads 0");
++    wr64(CCD(0x20), 0xDEAD0000);
++    wr16(CCD(0x16), 1);
++    EXPECT(rd64(CCD(0x20)) == 0x210000u, "bogus-select writes did not reach q1");
++    dev_status(0);
++    if (fails == f0) printf("ok queue regs: size clamp/stick, enable readback, halves, bogus select\n");
++}
++
++/* One PING -> PONG-sized echo over q0 with the caller's init ritual. */
++static void echo_round(const char *tag) {
++    memset(M.ram + Q0_DESC, 0, 0x3000);
++    memset(M.ram + BUF0, 0, 0x2000);
++    queue_setup(0, Q0_DESC, Q0_AVAIL, Q0_USED);
++    memcpy(M.ram + BUF0, "PING", 4);
++    put_desc(Q0_DESC, 0, BUF0,        4, VRING_DESC_F_NEXT, 1);
++    put_desc(Q0_DESC, 1, BUF0 + 0x100, 4, VRING_DESC_F_WRITE, 0);
++    int n0 = g_fake.notifies;
++    avail_post(Q0_AVAIL, 0, 0);
++    wr16(NOTIFY(0), 0);                                /* guest writes queue idx */
++    EXPECT(g_fake.notifies == n0 + 1, "%s: notify reached the device", tag);
++    EXPECT(used_idx(Q0_USED) == 1, "%s: used idx advanced synchronously", tag);
++    uint32_t id, len;
++    used_elem(Q0_USED, 0, &id, &len);
++    EXPECT(id == 0 && len == 4, "%s: used elem {0,4} (got {%u,%u})", tag, id, len);
++    EXPECT(memcmp(M.ram + BUF0 + 0x100, "PING", 4) == 0, "%s: bytes landed in the in-seg", tag);
++    /* spill-over checks: the out-seg and its neighbours are untouched */
++    EXPECT(memcmp(M.ram + BUF0, "PING", 4) == 0 && M.ram[BUF0 + 0x104] == 0,
++           "%s: no stray writes", tag);
++}
++
++static void v_echo_net_shape(void) {
++    int f0 = fails;
++    full_init();
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));         /* DRIVER_OK */
++    EXPECT((rd8(CCD(0x14)) & 0x0F) == 0x0F, "status ACK|DRIVER|FEATURES_OK|DRIVER_OK");
++    echo_round("net-shape");
++    /* completion interrupt: ISR byte set, line up; read drops both */
++    EXPECT(irq5(), "INTx asserted after completion");
++    EXPECT(rd8(ISR_AT) == 1, "ISR reads queue bit");
++    EXPECT(!irq5() && rd8(ISR_AT) == 0, "ISR read cleared byte and line");
++    dev_status(0);
++    if (fails == f0) printf("ok echo (net shape): full negotiation, ISR/INTx read-ack\n");
++}
++
++static void v_echo_blk_shape(void) {
++    int f0 = fails;
++    blind_init();                                      /* virtio_blk.c, verbatim */
++    /* FEATURES_OK was rejected (nothing acked) -- visible in the very
++     * readback the guest driver never looks at (finding N1) ... */
++    EXPECT((rd8(CCD(0x14)) & 0x0F) == (0x01 | 0x02 | 0x04),
++           "blind init: FEATURES_OK rejected in readback (got %02x)", rd8(CCD(0x14)));
++    /* ... and per D3 the engine still runs under DRIVER_OK, so the
++     * guest's used-idx poll succeeds instead of timing out. */
++    echo_round("blk-shape");
++    dev_status(0);
++    if (fails == f0) printf("ok echo (blk shape): lenient engine under rejected FEATURES_OK\n");
++}
++
++static void v_second_queue(void) {
++    int f0 = fails;
++    full_init();
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    memset(M.ram + BUF1, 0, 0x1000);
++    queue_setup(1, Q1_DESC, Q1_AVAIL, Q1_USED);
++    memcpy(M.ram + BUF1, "QUEUE1", 6);
++    put_desc(Q1_DESC, 0, BUF1,        6, VRING_DESC_F_NEXT, 1);
++    put_desc(Q1_DESC, 1, BUF1 + 0x80, 6, VRING_DESC_F_WRITE, 0);
++    avail_post(Q1_AVAIL, 0, 0);
++    wr16(NOTIFY(1), 1);                                /* q1's own doorbell */
++    EXPECT(used_idx(Q1_USED) == 1, "q1 completed via notify_off*mult doorbell");
++    EXPECT(memcmp(M.ram + BUF1 + 0x80, "QUEUE1", 6) == 0, "q1 payload echoed");
++    EXPECT(used_idx(Q0_USED) == 0 || memcmp(M.ram + BUF0 + 0x100, "PING", 4) == 0,
++           "q0 rings undisturbed by q1 traffic");
++    dev_status(0);
++    if (fails == f0) printf("ok second queue: independent doorbell per queue\n");
++}
++
++static void v_no_interrupt(void) {
++    int f0 = fails;
++    full_init();
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    memset(M.ram + Q0_DESC, 0, 0x3000);
++    memset(M.ram + BUF0, 0, 0x2000);
++    queue_setup(0, Q0_DESC, Q0_AVAIL, Q0_USED);
++    M.ram[Q0_AVAIL] = VRING_AVAIL_F_NO_INTERRUPT;      /* avail flags */
++    put_desc(Q0_DESC, 0, BUF0, 2, VRING_DESC_F_NEXT, 1);
++    put_desc(Q0_DESC, 1, BUF0 + 0x100, 2, VRING_DESC_F_WRITE, 0);
++    avail_post(Q0_AVAIL, 0, 0);
++    wr16(NOTIFY(0), 0);
++    EXPECT(used_idx(Q0_USED) == 1, "request still completed");
++    EXPECT(rd8(ISR_AT) == 0 && !irq5(), "NO_INTERRUPT: no ISR, no line");
++    dev_status(0);
++    if (fails == f0) printf("ok no-interrupt: avail NO_INTERRUPT wins over completion\n");
++}
++
++static void v_malformed(void) {
++    int f0 = fails;
++    full_init();
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    memset(M.ram + Q0_DESC, 0, 0x3000);
++    memset(M.ram + BUF0, 0, 0x2000);
++    queue_setup(0, Q0_DESC, Q0_AVAIL, Q0_USED);
++    uint16_t before = used_idx(Q0_USED);
++    /* (a) head outside the table: dropped, NO used elem published */
++    avail_post(Q0_AVAIL, 0, 500);
++    wr16(NOTIFY(0), 0);
++    EXPECT(used_idx(Q0_USED) == before, "head 500 dropped without a used elem");
++    /* (b) self-looping chain: completed len 0, guest sees a failure */
++    put_desc(Q0_DESC, 0, BUF0, 4, VRING_DESC_F_NEXT, 0);
++    avail_post(Q0_AVAIL, 1, 0);
++    wr16(NOTIFY(0), 0);
++    uint32_t id, len;
++    used_elem(Q0_USED, before, &id, &len);
++    EXPECT(used_idx(Q0_USED) == before + 1 && len == 0, "loop chain completed len 0");
++    /* (c) buffer spilling past RAM end: rejected, len 0 */
++    put_desc(Q0_DESC, 0, RAM_SIZE - 2, 16, VRING_DESC_F_WRITE, 0);
++    avail_post(Q0_AVAIL, 2, 0);
++    wr16(NOTIFY(0), 0);
++    used_elem(Q0_USED, before + 1, &id, &len);
++    EXPECT(used_idx(Q0_USED) == before + 2 && len == 0, "RAM-spilling buffer completed len 0");
++    /* (d) indirect flag (never offered): rejected, len 0 */
++    put_desc(Q0_DESC, 0, BUF0, 16, VRING_DESC_F_INDIRECT, 0);
++    avail_post(Q0_AVAIL, 3, 0);
++    wr16(NOTIFY(0), 0);
++    used_elem(Q0_USED, before + 2, &id, &len);
++    EXPECT(used_idx(Q0_USED) == before + 3 && len == 0, "indirect chain completed len 0");
++    EXPECT(log_has("bad chain"), "bad chains hit the device log");
++    /* the ring still works after the garbage: last_avail stayed sane */
++    memcpy(M.ram + BUF0, "OK", 2);
++    put_desc(Q0_DESC, 0, BUF0, 2, VRING_DESC_F_NEXT, 1);
++    put_desc(Q0_DESC, 1, BUF0 + 0x100, 2, VRING_DESC_F_WRITE, 0);
++    avail_post(Q0_AVAIL, 4, 0);
++    wr16(NOTIFY(0), 0);
++    used_elem(Q0_USED, before + 3, &id, &len);
++    EXPECT(used_idx(Q0_USED) == before + 4 && len == 2 &&
++           memcmp(M.ram + BUF0 + 0x100, "OK", 2) == 0, "good chain after garbage");
++    dev_status(0);
++    if (fails == f0) printf("ok malformed: head/loop/spill/indirect all bounded (D2)\n");
++}
++
++static void v_reset(void) {
++    int f0 = fails;
++    blind_init();
++    echo_round("pre-reset");
++    int r0 = g_fake.resets;
++    dev_status(0);
++    EXPECT(rd8(CCD(0x14)) == 0, "status reads 0 immediately after reset write");
++    EXPECT(g_fake.resets > r0, "device reset callback ran");
++    wr16(CCD(0x16), 0);
++    EXPECT(rd16(CCD(0x1C)) == 0, "queue_enable cleared by reset");
++    EXPECT(rd64(CCD(0x20)) == 0 && rd64(CCD(0x30)) == 0, "ring addresses cleared");
++    EXPECT(rd16(CCD(0x18)) == 8, "queue_size back to max");
++    wr32(CCD(0x08), 0);
++    EXPECT(rd32(CCD(0x0C)) == 0, "acked features cleared");
++    /* a notify against the reset device is inert (DRIVER_OK gone) */
++    uint16_t u = used_idx(Q0_USED);
++    avail_post(Q0_AVAIL, 3, 0);
++    wr16(NOTIFY(0), 0);
++    EXPECT(used_idx(Q0_USED) == u, "post-reset notify processes nothing");
++    (void)rd8(ISR_AT);
++    EXPECT(!irq5(), "no dangling INTx after reset");
++    if (fails == f0) printf("ok reset: synchronous, queues/features wiped, inert notify\n");
++}
++
++static void v_device_config(void) {
++    int f0 = fails;
++    for (int i = 0; i < 8; i++)
++        EXPECT(rd8(DCFG(i)) == g_fake_cfg[i], "device cfg byte %d", i);
++    uint64_t lo64;
++    memcpy(&lo64, g_fake_cfg, 8);
++    EXPECT(rd64(DCFG(0)) == lo64, "device cfg qword read composes");
++    EXPECT(rd32(DCFG(0x40)) == 0, "device cfg beyond config_len reads 0");
++    int w0 = g_fake.cfgwrites;
++    wr32(DCFG(4), 0xA5A5A5A5u);
++    EXPECT(g_fake.cfgwrites == w0 + 1 && g_fake.cfgw_off == 4 &&
++           g_fake.cfgw_val == 0xA5A5A5A5u && g_fake.cfgw_size == 4,
++           "config write routed to the device half");
++    EXPECT(rd8(DCFG(4)) == g_fake_cfg[4], "core does not own config bytes");
++    if (fails == f0) printf("ok device config: reads serve desc bytes, writes call back\n");
++}
++
++static void v_dma_bounds(void) {
++    int f0 = fails;
++    uint8_t buf[16];
++    memset(buf, 0x5A, sizeof buf);
++    /* writes that would leave RAM copy nothing, and in-RAM tails
++     * of a spilling range are NOT partially written */
++    M.ram[RAM_SIZE - 1] = 0xAA;
++    EXPECT(virtio_dma_write(&g_fake.vio, RAM_SIZE - 2, buf, 8) == 0,
++           "spilling dma_write refused whole");
++    EXPECT(M.ram[RAM_SIZE - 1] == 0xAA, "no partial spill write");
++    EXPECT(virtio_dma_read(&g_fake.vio, RAM_SIZE - 2, buf, 8) == 0,
++           "spilling dma_read refused whole");
++    /* descriptor aimed at the device's own MMIO must never land */
++    EXPECT(virtio_dma_write(&g_fake.vio, VBAR, buf, 4) == 0,
++           "MMIO-aimed dma_write refused");
++    /* stream copies truncate at the shorter stream */
++    blind_init();
++    memset(M.ram + Q0_DESC, 0, 0x3000);
++    memset(M.ram + BUF0, 0, 0x2000);
++    queue_setup(0, Q0_DESC, Q0_AVAIL, Q0_USED);
++    memcpy(M.ram + BUF0, "WXYZ", 4);
++    put_desc(Q0_DESC, 0, BUF0, 4, 0, 0);                /* out only, 4 bytes */
++    avail_post(Q0_AVAIL, 0, 0);
++    wr16(NOTIFY(0), 0);
++    uint32_t id, len;
++    used_elem(Q0_USED, 0, &id, &len);
++    EXPECT(len == 0, "echo into a zero-length in-stream completes len 0");
++    dev_status(0);
++    if (fails == f0) printf("ok dma bounds: spill/MMIO refused, stream truncation sane\n");
++}
++
++int main(void) {
++    setup_machine(&M);
++    devices_init_common(&M);
++    fake_add();
++    v_pci_identity();
++    v_caps();
++    v_bar_probe();
++    v_features();
++    v_queue_regs();
++    v_echo_net_shape();
++    v_echo_blk_shape();
++    v_second_queue();
++    v_no_interrupt();
++    v_malformed();
++    v_reset();
++    v_device_config();
++    v_dma_bounds();
++    devices_done(&M);
++    if (fails) { printf("test-virtio: %d FAILED\n", fails); return 1; }
++    puts("test-virtio: all vectors passed");
++    return 0;
++}

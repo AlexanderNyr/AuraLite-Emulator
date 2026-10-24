@@ -35,12 +35,13 @@ maps to exactly one plan below.
 | [`docs/plans/TOOLING_PLAN.md`](docs/plans/TOOLING_PLAN.md) | ✅ **CLOSED** (T0–T5 delivered, `0056`–`0061`) | measured baseline (trace = log ring, receipts 5 → 0; static monitor mock; no stop/inspect/persist/remote facility), then trace disassembly, run-control REPL, **gdbstub**, snapshots, live WebSocket monitor for `web/monitor.html` — all opt-in and non-perturbing | T0–T5 |
 | [`docs/plans/COMPAT_PLAN.md`](docs/plans/COMPAT_PLAN.md) | ✅ **CLOSED** (G0–G6 done ✅; `0062`–`0065`) | the north-star integration: SeaBIOS → stage2 → flat kernel load → shell; ACPI/e820 surfaces; 4-vCPU BIOS SMP (`--lpc=ich9 --smp=4`) with `irqapwake` + `smpstress` passing | G0–G6 |
 | [`docs/plans/FPU_PLAN.md`](docs/plans/FPU_PLAN.md) | ✅ **CLOSED** (F0–F4 done ✅; `0072`–`0075`) | a real x87: IEEE 854 double-extended register file (bit-exact 80-bit), FLD/FST/FSTP/FILD/FIST env + FXSAVE/FNSAVE format bytes, arithmetic/compare with the measured FCW/FSW semantics, the eight transcendentals on host silicon, FBLD/FBSTP packed BCD, and the F4 integration gates (`--kernel=` receipts pair x2 + snapshot x87-file byte-stability) | F0–F4 |
-| GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+| GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, "Normal"/"Expert", wizard, "pick ISO -> Start"); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
 | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
 | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
 | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
 | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
 | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | ✅ done (closed `0110`) | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -170,10 +171,44 @@ harness reproduction.
    finally the U5 A20 reset-fetch record reproduced and
    fixed decode-side. The ranked device backlog (virtio
    first) in the plan §5 is the next plan's material.
+6. **VIRTIO_PLAN (V0–V5)** — modern virtio-pci for the
+   drivers the guest already ships (§5 rank 1): V0
+   censuses both consumers against AuraLite-OS@da89be4
+   (the spec-faithful net driver and the blk driver that
+   negotiates nothing and reads capacity out of its BAR
+   registers — guest findings N1/N2 filed, device stays
+   honest via a FEATURES_OK gate plus a lenient queue
+   engine), audits the PCI/BAR/INTx/DMA/snapshot
+   infrastructure and freezes decisions D1–D7 (split-ring
+   core, one 16 KiB BAR with QEMU's region offsets,
+   synchronous completion on notify, INTx first and
+   MSI-X last). V1 (`0106`) ships that transport core
+   behind `tests/test_virtio.c` — the D3 gate split
+   mutation-pinned, placement corrected against the
+   e1000's conditional 0:04.0 (blk/net: 0:05.0/0:06.0,
+   IRQ5/IRQ7); V2 (`0107`) puts virtio-blk on it
+   (`--virtio-blk=` + GUI field, RAM-copy image, honest
+   statuses, full snapshot with a present-only section);
+   V3 (`0108`) proves it on stock SeaBIOS (it boots from
+   the virtio disk, deterministically, across a
+   mid-boot snapshot) and fixes the pre-existing
+   post-enumeration snapshot refusal those experiments
+   cornered (XHCI BAR0 rebind ordering); V4 (`0109`) adds
+   virtio-net on the same TAP responder (MAC-only offer,
+   ingress-only RX, header-stripping TX, snapshot refusal
+   with either TAP NIC); V5 (`0110`) closes the plan:
+   MSI-X on both functions (table/PBA in the notify-page
+   tail, per-source pending through `msi_deliver`, INTx
+   retiring under Enable, the plane snapshot-clean) plus
+   an honest blk FLUSH (`VIRTIO_BLK_F_FLUSH` over the
+   volatile-layer-free synchronous engine) and the final
+   offer-vs-vectors audit.
 
 ## Immediate queue (recent shipped patches)
 
-Every plan in the ledger above is **CLOSED**. Recent patches:
+Every plan in the ledger above is **CLOSED**.
+`0105`–`0110` run VIRTIO_PLAN V0–V5 to completion.
+Recent patches:
 
 - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
@@ -189,8 +224,8 @@ Every plan in the ledger above is **CLOSED**. Recent patches:
   S6 row, ROADMAP, CHANGELOG.~~ shipped.
 
 - ~~`0070` — GUI G2: the native tkinter desktop application
-  (`tools/gui_app.py`, «Обычный»/«Экспертный», wizard, «выбери ISO ->
-  Пуск» via the `bios.bin`+`--sata=iso` recipe), plain ISO boot
+  (`tools/gui_app.py`, "Normal"/"Expert", wizard, "pick ISO ->
+  Start" via the `bios.bin`+`--sata=iso` recipe), plain ISO boot
   acceptance (`tools/mkiso.py` + `tests/fixtures/bootstub.nas` +
   `tests/test_iso_boot.py`, `make test-gui`/`make test-iso`), plus
   measured fixes: IDENTIFY byte-pair swap + CHS words (stock SeaBIOS

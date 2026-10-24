@@ -259,7 +259,12 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
      * LAPIC relocated or globally disabled loads equivalently. */
     pci_snap(m, &s->pub);
     ahci_snap(m, &s->pub);
-    if (s->loading && !s->failed) lapic_sync_mmio(m);
+    virtio_blk_snap(m, &s->pub);   /* V2: opt-in; no records when absent */
+    /* XHCI's BAR0 rebind rides in devices_snap (below), after the map
+     * comparison -- replay it here from the restored cfg bytes, or a
+     * post-enumeration snapshot never loads (VIRTIO V3, see
+     * xhci_rebind). */
+    if (s->loading && !s->failed) { lapic_sync_mmio(m); xhci_rebind(m); }
     mmio_rec(m, s);
     devices_snap(m, &s->pub);
     if (m->disk) sio_sparse(&s->pub, "disk.usb", m->disk, m->disk_len);
@@ -276,7 +281,7 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
 }
 
 static int refuse(const snap_cfg_t *cfg, const char *what) {
-    if (cfg && cfg->tap) { fprintf(stderr, "[snapshot] %s refused: --tap connects the e1000 to host socket state outside the machine\n", what); return 1; }
+    if (cfg && cfg->tap) { fprintf(stderr, "[snapshot] %s refused: a TAP-attached NIC (--tap/--virtio-net) connects host socket state outside the machine\n", what); return 1; }
     if (cfg && cfg->sata_wt) { fprintf(stderr, "[snapshot] %s refused: --sata-writethrough makes host image files part of the machine state\n", what); return 1; }
     return 0;
 }

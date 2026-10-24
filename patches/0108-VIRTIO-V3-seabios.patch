@@ -1,0 +1,426 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 71ce74b..ee5597e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,29 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0108 (VIRTIO V3: SeaBIOS proof lane + a snapshot fix it cornered)
++
++- **Stock SeaBIOS boots from our virtio-blk.**
++  `tests/test_virtio_seabios.py` attaches the boot-stub
++  image *only* through `--virtio-blk` (the USB stick gets
++  a non-bootable zero image), and the firmware's own
++  modern virtio driver parses the caps, relocates the BAR
++  in its pciinit, negotiates and reads LBA0 through the
++  queue — a second consumer with zero AuraLite code in
++  the loop. The lane also snapshot-saves mid-SeaBIOS and
++  continues from the load to a **byte-identical**
++  end-`[stats]` as the uninterrupted boot.
++- **Fixed (pre-existing, no virtio involvement): snapshots
++  taken after SeaBIOS relocated the XHCI BAR0 refused to
++  load** — the driver's MMIO-map comparison ran before
++  `devices_snap`, where `xhci_snap` rebinds the BAR.
++  `xhci_rebind()` now replays the base from the config
++  bytes `pci_snap` restored, ahead of the comparison;
++  the file format is unchanged and pre-fix snapshots
++  load. The lane's plain-`--sata` control pair pins it:
++  on the 0107 tree the boot leg is green and every
++  snapshot leg is red.
++
+ ### Added — patch 0107 (VIRTIO V2: virtio-blk)
+ 
+ - **The guest's modern virtio-blk driver now has a disk to
+diff --git a/Makefile b/Makefile
+index a548c34..fb98b7a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -328,6 +328,12 @@ test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py
+ test-iso: x86emu tests/test_iso_boot.py tools/mkiso.py tests/fixtures/bootstub.nas
+ 	python3 tests/test_iso_boot.py
+ 
++# VIRTIO V3: SeaBIOS boots from the modern virtio-blk + snapshot continuity
++# (also pins the XHCI BAR0 rebind over a plain --sata pair).  Same skip
++# discipline as test-iso (stock SeaBIOS + NASM).
++test-virtio-seabios: x86emu tests/test_virtio_seabios.py tests/test_iso_boot.py tests/fixtures/bootstub.nas
++	python3 tests/test_virtio_seabios.py
++
+ gui: x86emu firmware/firmware.bin disk/disk.img
+ 	@echo "AuraLite Emulator -- desktop GUI (close the window to exit)"
+ 	python3 tools/gui_app.py
+@@ -389,7 +395,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+diff --git a/ROADMAP.md b/ROADMAP.md
+index a9495c9..fc3911c 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,7 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+-| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V2 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V3 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -188,14 +188,18 @@ harness reproduction.
+    e1000's conditional 0:04.0 (blk/net: 0:05.0/0:06.0,
+    IRQ5/IRQ7); V2 (`0107`) puts virtio-blk on it
+    (`--virtio-blk=` + GUI field, RAM-copy image, honest
+-   statuses, full snapshot with a present-only section).
+-   V3 is the SeaBIOS proof lane, V4 virtio-net on the
+-   same TAP responder, V5 MSI-X + close-out.
++   statuses, full snapshot with a present-only section);
++   V3 (`0108`) proves it on stock SeaBIOS (it boots from
++   the virtio disk, deterministically, across a
++   mid-boot snapshot) and fixes the pre-existing
++   post-enumeration snapshot refusal those experiments
++   cornered (XHCI BAR0 rebind ordering). V4 virtio-net
++   on the same TAP responder, V5 MSI-X + close-out.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+ Every plan in the ledger above except VIRTIO is **CLOSED**.
+-`0105` opens VIRTIO_PLAN, `0106` its core, `0107` virtio-blk.
++`0105`–`0108` run VIRTIO_PLAN V0–V3.
+ Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index bc8b5de..8ab4acc 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1336,7 +1336,7 @@ MTRR probe would brick under a strict whitelist, and POPCNT +
+ RDTSCP graduated from absent/host-halt and an accidental INVLPG
+ alias respectively), and an INIT# under a closed A20 gate fetches
+ its reset vector from flash again (CF5 — the U5 record, fixed on
+-the decode side). VIRTIO_PLAN **V0–V2 are shipped**: V0 censused
++the decode side). VIRTIO_PLAN **V0–V3 are shipped**: V0 censused
+ the guest's modern virtio-blk/virtio-net drivers line-by-line
+ (the net driver negotiates by the book; the blk driver
+ negotiates nothing and reads capacity out of its BAR registers
+@@ -1356,5 +1356,16 @@ general gather/scatter IN/OUT with the status byte pinned to
+ the in-stream tail, `S_IOERR` on range/length and `S_UNSUPP`
+ on every unadvertised type (FLUSH waits for V5 rather than
+ faking success), and full snapshot support whose record
+-stream is untouched when the flag is absent. V3 next: the
+-SeaBIOS modern-virtio proof lane, then virtio-net.
++stream is untouched when the flag is absent. V3 proves the
++stack against a second, independent consumer: stock SeaBIOS
++boots an MBR stub from the virtio disk (it parses the same
++caps, relocates the BAR in its own pciinit and reads LBA0
++through the queue), and a mid-SeaBIOS snapshot save/load
++finishes with byte-identical run statistics to the
++uninterrupted boot. Building that lane caught a pre-existing
++snapshot defect with no virtio involvement — xhci_snap's
++BAR0 rebind ran after the MMIO-map comparison, so any
++post-enumeration snapshot refused to load; `xhci_rebind`
++now replays the base from the restored config bytes before
++the comparison (file format untouched, pre-fix snapshots
++load). V4 next: virtio-net on the same core.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+index af086cf..6083951 100644
+--- a/docs/plans/VIRTIO_PLAN.md
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -10,7 +10,7 @@
+ | V0 | baseline: consumers, infrastructure, decisions D1–D7 | ✅ this patch (0105) |
+ | V1 | transport core `src/virtio.c` + unit harness | ⏳ |
+ | V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ✅ patch 0107 (§9) |
+-| V3 | blk integration: SeaBIOS lane, determinism | ⏳ |
++| V3 | blk integration: SeaBIOS lane, determinism | ✅ patch 0108 (§10) |
+ | V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ⏳ |
+ | V5 | MSI-X + blk FLUSH + close-out audit | ⏳ |
+ 
+@@ -302,3 +302,39 @@ NC: the parent has no `virtio_blk_test_add` (new-module
+ full `make test` + sanitize rc 0, 0 findings; the smoke
+ `x86emu --virtio-blk=disk/disk.img` raises the function and does not
+ break the firmware boot (the device's SeaBIOS lane is V3, as in §5).
++
++## §10 V3 addendum (patch 0108): SeaBIOS lane + a snapshot defect
++
++`tests/test_virtio_seabios.py` (+ `make test-virtio-seabios`, in
++`make test`): stock SeaBIOS — a second, independent consumer of the
++transport — boots an MBR stub from an image attached **only**
++via `--virtio-blk` (the USB stick gets a zero non-bootable image:
++the marker can only arrive through the queue). From the very first run:
++the firmware parses the caps itself, relocates the BAR in its own
++pciinit, negotiates and reads LBA0 → `AURA_ISO_BOOT_OK`.
++
++The lane caught a **pre-existing snapshot defect, not a virtio one**:
++loading any snapshot taken after SeaBIOS had
++relocated the XHCI BAR0 was refused with "MMIO map differs ...
++(XHCI BAR0)" — reproduced on the plain `--sata` recipe.
++Cause: the snapshot driver compares the MMIO map before
++`devices_snap`, while the XHCI rebind lives inside `devices_snap`
++(`xhci_snap`); AHCI never had the problem precisely because its
++rebind sits before the comparison. The fix (file format untouched,
++old snapshots load — measured on a "pre-fix" snapshot):
++`xhci_rebind()` replays the base from the cfg bytes
++restored by `pci_snap`, next to `lapic_sync_mmio`;
++`xhci_snap` later applies the same base from the serialized
++controller.
++
++Lane legs: V boot; S save-mid-SeaBIOS
++(60M budget — the marker not yet printed, verified) → load
++→ marker + **the final `[stats]` byte-identical to the uninterrupted
++run** (`executed_steps=120334760, instr_count=1288199080`
++in both: machine determinism survives save/load with blk);
++C control: the same pair on `--sata` (pins the rebind fix itself).
++NC on the 0107 tree: V green, S/S-determinism/C red —
++discrimination exactly on the fix. The lane is not in sanitize
++(SeaBIOS-under-ASan is covered by test-iso; blk's snapshot serialization —
++by a unit vector under ASan). Gates: `make test` + sanitize rc 0,
++0 findings.
+diff --git a/src/snapshot.c b/src/snapshot.c
+index 5284b8c..4c1b1d6 100644
+--- a/src/snapshot.c
++++ b/src/snapshot.c
+@@ -260,7 +260,11 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
+     pci_snap(m, &s->pub);
+     ahci_snap(m, &s->pub);
+     virtio_blk_snap(m, &s->pub);   /* V2: opt-in; no records when absent */
+-    if (s->loading && !s->failed) lapic_sync_mmio(m);
++    /* XHCI's BAR0 rebind rides in devices_snap (below), after the map
++     * comparison -- replay it here from the restored cfg bytes, or a
++     * post-enumeration snapshot never loads (VIRTIO V3, see
++     * xhci_rebind). */
++    if (s->loading && !s->failed) { lapic_sync_mmio(m); xhci_rebind(m); }
+     mmio_rec(m, s);
+     devices_snap(m, &s->pub);
+     if (m->disk) sio_sparse(&s->pub, "disk.usb", m->disk, m->disk_len);
+diff --git a/src/snapshot.h b/src/snapshot.h
+index a670fdc..03574dd 100644
+--- a/src/snapshot.h
++++ b/src/snapshot.h
+@@ -38,6 +38,7 @@ struct serial_state;
+ void serial_snap(struct serial_state *ser, snap_t *s);   /* serial.c   */
+ void pci_snap(machine_t *m, snap_t *s);       /* pci.c                 */
+ void pci_ecam_map(machine_t *m, uint64_t base);  /* pci.c: replay a run-time ECAM window */
++void xhci_rebind(machine_t *m);               /* xhci.c: replay a relocated BAR0 (V3) */
+ 
+ /* --- whole-machine save/load */
+ typedef struct {
+diff --git a/src/xhci.c b/src/xhci.c
+index 7a2bf35..6d6653f 100644
+--- a/src/xhci.c
++++ b/src/xhci.c
+@@ -1021,3 +1021,31 @@ void xhci_snap(machine_t *m, snap_t *s) {
+         xhci_set_base(&g_xhci, g_xhci.base);
+     }
+ }
++
++/* VIRTIO V3: snapshot load replays a firmware-relocated BAR0.
++ *
++ * The snapshot driver compares the live MMIO map before
++ * devices_snap runs -- but xhci_snap (which restores the
++ * serialized BAR0 base) lives inside devices_snap, so every
++ * snapshot taken after a SeaBIOS PCI enumeration moved BAR0
++ * refused to load ("MMIO map differs ... (XHCI BAR0)"):
++ * measured identically with plain --sata, no virtio involved.
++ * ahci_snap never had the problem because it both runs and
++ * rebinds before the comparison.  This replay takes the base
++ * from the config bytes pci_snap has just restored -- the
++ * enumeration's own assignment -- and rebinds the decode to
++ * it; xhci_snap later re-applies the same base from the
++ * serialized controller struct, so the two can never drift. */
++void xhci_rebind(machine_t *m) {
++    xhci_t *x = &g_xhci;
++    if (!x->m) x->m = m;
++    for (pci_dev_t *d = m->pci_devices; d; d = d->next) {
++        if (d->bus == 0 && d->dev == 20 && d->func == 0) {
++            uint64_t bar = 0;
++            for (int i = 0; i < 8; i++)
++                bar |= (uint64_t)d->cfg[0x10 + i] << (8 * i);
++            xhci_set_base(x, bar & ~(uint64_t)(XHCI_MMIO_SIZE - 1u) & ~0xFull);
++            return;
++        }
++    }
++}
+diff --git a/tests/test_virtio_seabios.py b/tests/test_virtio_seabios.py
+new file mode 100644
+index 0000000..be840fd
+--- /dev/null
++++ b/tests/test_virtio_seabios.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""tests/test_virtio_seabios.py -- VIRTIO V3 integration lane.
++
++Stock SeaBIOS is the second measured consumer of the modern
++virtio transport (V0 census section 2.3): its own virtio-blk
++driver parses the vendor capabilities, programs the queue and
++reads LBA0 through the split ring -- nothing AuraLite-shaped in
++the loop.  The boot stub (tests/fixtures/bootstub.nas, shared
++with the ISO lanes) sits at LBA0 of a raw image attached ONLY
++through --virtio-blk; the USB stick gets a zero image with no
++0xAA55, so the marker can come through the virtio queue or not
++at all.
++
++Lanes:
++  V  SeaBIOS boots the stub from the virtio-blk disk.
++  S  snapshot mid-work: save during SeaBIOS (budget-capped,
++     marker not yet printed), load, continue -- the marker must
++     still arrive, and the end [stats] must be byte-identical
++     to the uninterrupted lane V (executed_steps + instr_count:
++     the deterministic machine loses nothing across a
++     save/load that carries the blk transport and image).
++  C  control: the same snapshot pair over plain --sata.  This
++     pins the pre-existing defect V3 fixed -- xhci_snap's BAR0
++     rebind ran *after* the snapshot MMIO-map comparison, so
++     every post-enumeration snapshot refused to load (measured
++     on the parent with zero virtio involvement).
++
++Like the ISO lanes, everything SKIPs (never fails) when stock
++SeaBIOS or NASM is missing, and V/S skip on builds that predate
++--virtio-blk (unknown option -> usage).  C has no such excuse:
++on a pre-V3 build it FAILS, which is its job.
++"""
++import argparse
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, "tests"))
++import test_iso_boot as iso   # find_bios/build_stub, same fixtures  # noqa: E402
++
++MARKER = iso.MARKER
++STATS = re.compile(r"\[stats\] vcpu=0 executed_steps=(\d+) instr_count=(\d+)")
++SAVE_BUDGET = "60000000"      # < the ~120M executed steps to the marker
++FULL_BUDGET = "2000000000"
++
++fails = 0
++
++
++def check(cond, label):
++    global fails
++    if cond:
++        print("ok  ", label)
++    else:
++        print("FAIL", label)
++        fails += 1
++
++
++def skip(label):
++    print("skip", label)
++
++
++def run(emu, bios, tmp, tag, extra):
++    """One emulator run; returns (rc, marker, stats-pair-or-None, tail)."""
++    log = os.path.join(tmp, tag + ".log.txt")
++    argv = [emu, "--rom=" + bios, "--lpc=ich9", *extra, "--log=" + log]
++    r = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True,
++                       timeout=300)
++    txt = ""
++    try:
++        with open(log, "r", encoding="utf-8", errors="replace") as f:
++            txt = f.read()
++    except OSError:
++        pass
++    tail = (r.stdout or "") + (r.stderr or "")
++    m = STATS.search(tail)
++    stats = (int(m.group(1)), int(m.group(2))) if m else None
++    return r.returncode, MARKER in txt or MARKER in tail, stats, tail
++
++
++def snapshot_pair(emu, bios, tmp, tag, extra):
++    """save mid-boot, then load and continue.  Returns (ok, stats)."""
++    snap = os.path.join(tmp, tag + ".snap")
++    rc, marker, _s, _t = run(emu, bios, tmp, tag + "-save",
++                             [*extra, "--max-instr=" + SAVE_BUDGET,
++                              "--snapshot-save=" + snap, "--stats"])
++    if rc != 0 or marker or not os.path.isfile(snap):
++        return False, None     # marker this early = the budget lied
++    rc, marker, stats, _t = run(emu, bios, tmp, tag + "-load",
++                                 [*extra, "--snapshot-load=" + snap,
++                                  "--max-instr=" + FULL_BUDGET, "--stats"])
++    return rc == 0 and marker, stats
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--bios", default=None)
++    ap.add_argument("--emu", default=os.path.join(ROOT, "x86emu"))
++    a = ap.parse_args()
++
++    if not os.path.isfile(a.emu):
++        print("test_virtio_seabios: %s not found -- run make first" % a.emu,
++              file=sys.stderr)
++        return 2
++    bios = iso.find_bios(a.bios)
++    if not bios:
++        skip("V/S/C SeaBIOS virtio-blk lanes (no stock SeaBIOS bios.bin)")
++        print("test_virtio_seabios: PASS (skipped)")
++        return 0
++
++    tmp = tempfile.mkdtemp(prefix="vblk-")
++    try:
++        stub = iso.build_stub(tmp)
++        if not stub:
++            skip("V/S/C SeaBIOS virtio-blk lanes (NASM not available)")
++            print("test_virtio_seabios: PASS (skipped)")
++            return 0
++        with open(stub, "rb") as f:
++            boot = f.read()
++        mbr = os.path.join(tmp, "mbr.img")
++        zero = os.path.join(tmp, "zero.img")
++        with open(mbr, "wb") as f:
++            f.write(boot + b"\x00" * (1048576 - len(boot)))
++        with open(zero, "wb") as f:
++            f.write(b"\x00" * 1048576)
++        disk = ["--disk=" + zero]
++
++        probe = subprocess.run([a.emu, "--virtio-blk=" + mbr,
++                                "--max-instr=1"],
++                               cwd=ROOT, capture_output=True, text=True,
++                               timeout=60)
++        have_virtio = not (probe.returncode != 0
++                           and "usage:" in (probe.stderr or ""))
++        if not have_virtio:
++            skip("V SeaBIOS boots from virtio-blk (--virtio-blk: V2 not in this build)")
++            skip("S snapshot continuity over virtio-blk (same)")
++        else:
++            vextra = ["--virtio-blk=" + mbr, *disk]
++            rc, marker, vstats, tail = run(
++                a.emu, bios, tmp, "v",
++                [*vextra, "--max-instr=" + FULL_BUDGET, "--stats"])
++            check(rc == 0 and marker,
++                  "V SeaBIOS boots the stub from the virtio-blk disk")
++            if not marker:
++                print(tail[-2000:])
++            ok, sstats = snapshot_pair(a.emu, bios, tmp, "s", vextra)
++            check(ok, "S snapshot save/load across virtio-blk mid-boot")
++            check(vstats is not None and vstats == sstats,
++                  "S determinism: end [stats] identical to the "
++                  "uninterrupted run (%r vs %r)" % (vstats, sstats))
++
++        ok, _s = snapshot_pair(a.emu, bios, tmp, "c",
++                               ["--sata=" + mbr, *disk])
++        check(ok, "C control: post-enumeration snapshot loads (--sata pair)")
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++    print("test_virtio_seabios: %s" % ("FAIL" if fails else "PASS"))
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

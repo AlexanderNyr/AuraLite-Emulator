@@ -458,7 +458,7 @@ def test_remote_gate(emu):
                 pass
             time.sleep(0.1)
         text = raw.decode("utf-8", errors="replace")
-        check("X86EMU_TOKEN" not in text and "Токен" in text,
+        check("X86EMU_TOKEN" not in text and "Access token" in text,
               "U7 remote: bare / is the login form, no token embedded")
 
         tok_path = os.path.join(tmp, TOKEN_FILE)
@@ -471,7 +471,7 @@ def test_remote_gate(emu):
               "U7 remote: access-token file exists, 0600, strong")
 
         code, _hd, raw = http_raw(port, "/?token=wrong", headers=good)
-        check(b"X86EMU_TOKEN" not in raw and "Неверный".encode() in raw,
+        check(b"X86EMU_TOKEN" not in raw and "Wrong".encode() in raw,
               "U7 remote: a wrong token stays on the login form")
         code, hd, raw = http_raw(port, "/?token=%s" % tok, headers=good)
         check(code == 200 and b"X86EMU_TOKEN" in raw

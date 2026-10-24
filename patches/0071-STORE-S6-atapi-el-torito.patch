@@ -104,7 +104,7 @@ index 639ccbd..f1e40ca 100644
 +- **Lane C of `tests/test_iso_boot.py` is live** (it SKIP-gated on
 +  `usage:` until this patch): stock SeaBIOS boots the 1 MiB El Torito
 +  test ISO from `--cdrom=` and prints the stub's `AURA_ISO_BOOT_OK`
-+  (measured 7.9 s wall).  The GUI's «Загрузка с ISO» now uses the same
++  (measured 7.9 s wall).  The GUI's "Boot from ISO" now uses the same
 +  path (`normal_config("iso")` -> `--cdrom=`), expert mode exposes the
 +  option through the SCHEMA.
 +
@@ -113,13 +113,13 @@ index 639ccbd..f1e40ca 100644
 +
 +- **`tools/gui_app.py`: the native desktop application.**  tkinter
 +  (Python stdlib only -- no browser, no third-party packages), Russian
-+  UI, two switchable modes: **Обычный** (machine list, big transport
++  UI, two switchable modes: **Normal** (machine list, big transport
 +  buttons, live screen, three-step *new machine* wizard with boot-media
-+  kinds iso/disk/kernel/empty) and **Экспертный** (the full SCHEMA
++  kinds iso/disk/kernel/empty) and **Expert** (the full SCHEMA
 +  option surface, monitor console, artifacts, snapshots, TAP responder,
 +  run logs).  Both modes share the G1 core (`tools/launcher.py`
 +  Machine/MonitorClient); the frame buffer renders through the
-+  `FB\x01` protocol, end-stop semantics stay T5 («Стоп» sends `quit`,
++  `FB\x01` protocol, end-stop semantics stay T5 ("Stop" sends `quit`,
 +  the emulator prints stats and writes artifacts).
 +- **«Select an ISO and start» boots it, like VirtualBox/VMware.**  The
 +  wizard's ISO kind builds
@@ -174,7 +174,7 @@ index 17ca136..c73f508 100644
 --- a/README.md
 +++ b/README.md
 @@ -209,7 +209,7 @@ stub's `AURA_ISO_BOOT_OK` marker after stock SeaBIOS reads its MBR off
- the SATA-attached image -- the exact path the GUI's «Загрузка с ISO»
+ the SATA-attached image -- the exact path the GUI's "Boot from ISO"
  takes.  It SKIPs (exit 0) without `nasm` or a stock SeaBIOS `bios.bin`
  (found via `--bios`, `$AURALITE_BIOS`, `~/.x86emu-gui`, or the repo);
 -the CD/El Torito lane SKIPs until `--cdrom` (STORE S6) exists.  Note
@@ -204,8 +204,8 @@ index edc61ae..d82a9db 100644
 +  S6 row, ROADMAP, CHANGELOG.~~ shipped.
 +
 +- ~~`0070` — GUI G2: the native tkinter desktop application
-+  (`tools/gui_app.py`, «Обычный»/«Экспертный», wizard, «выбери ISO ->
-+  Пуск» via the `bios.bin`+`--sata=iso` recipe), plain ISO boot
++  (`tools/gui_app.py`, "Normal"/"Expert", wizard, "pick ISO ->
++  Start" via the `bios.bin`+`--sata=iso` recipe), plain ISO boot
 +  acceptance (`tools/mkiso.py` + `tests/fixtures/bootstub.nas` +
 +  `tests/test_iso_boot.py`, `make test-gui`/`make test-iso`), plus
 +  measured fixes: IDENTIFY byte-pair swap + CHS words (stock SeaBIOS
@@ -227,8 +227,8 @@ index dac74c4..495d8f0 100644
 +#### E. Full BIOS Boot
 +
 +> The desktop GUI automates this exact recipe: `gui.bat` (or
-+> `build.bat gui`) -> «Обычный» -> create machine -> pick the ISO ->
-+> «Пуск» (see README «GUI»).  The manual command below remains the
++> `build.bat gui`) -> "Normal" -> create machine -> pick the ISO ->
++> "Start" (see README "GUI").  The manual command below remains the
 +> reference. (`SeaBIOS → Stage 2 → AuraLite-OS Kernel Shell`, 1 or 4 vCPUs)
  With `bios.bin` (SeaBIOS 1.16.3, 128 KiB) and `auralite.iso`:
  ```bat
@@ -928,9 +928,9 @@ index 313b2dc..dc1dd9b 100644
        kernel -- direct ELF64 kernel boot (no firmware);
        empty  -- the built-in sample firmware demo with no media.
 @@ -136,7 +137,7 @@ def normal_config(kind, path=None, bios=None, initrd=None):
-             raise ConfigError("ISO-образ не найден: %s" % path)
+             raise ConfigError("ISO image not found: %s" % path)
          if not bios or not os.path.isfile(bios):
-             raise ConfigError("нужен bios.bin (стоковый SeaBIOS) — укажите файл в мастере")
+             raise ConfigError("bios.bin is required (stock SeaBIOS) — pick the file in the wizard")
 -        cfg.update({"rom": bios, "lpc": "ich9", "sata": path,
 +        cfg.update({"rom": bios, "lpc": "ich9", "cdrom": path,
                      "max_instr": ISO_MAX_INSTR})

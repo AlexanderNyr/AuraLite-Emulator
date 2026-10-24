@@ -1,0 +1,330 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2f2d3fb..0c77e3a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,32 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0105 (VIRTIO V0: measured baseline for modern virtio-pci, docs-only)
++
++- **`docs/plans/VIRTIO_PLAN.md` opens the ranked §5 device
++  backlog's first item.** Both guest drivers are censused
++  against AuraLite-OS@da89be4: `virtio_net.c` negotiates by
++  the book (requires `VERSION_1`, verifies `FEATURES_OK`
++  readback and `queue_enable`, 12-byte header, INTx + ISR-
++  read ack), while `virtio_blk.c` negotiates nothing, never
++  re-reads status, and takes its capacity from PCI config
++  `0x10/0x14` — its own BAR values (guest findings N1/N2;
++  the device stays honest: a `VERSION_1`-gated
++  `FEATURES_OK` readback with a QEMU-lenient queue engine
++  behind it). The house side audits clean for the work:
++  vendor capabilities ride in the per-device config space
++  (xHCI MSI-X precedent), BAR sizing/relocation is the AHCI
++  pattern, 8-byte MMIO reaches handlers whole, INTx is the
++  `pic_set_irq` board wire, SeaBIOS independently speaks
++  modern (1.0) virtio-blk for a second proof lane.
++  Decisions D1–D7 freeze the shape — modern-only functions
++  `1AF4:1042/1041`, one 16 KiB BAR with QEMU's region
++  offsets, a shared split-ring core with synchronous
++  completion on notify, INTx first / MSI-X in V5, opt-in
++  like `--tap` so every historical tape keeps its receipt,
++  and the CPU_FEATURES rule applied to feature bits:
++  offer exactly what is implemented. No code in this patch.
++
+ ### Fixed — patch 0104 (CPU-features CF5: the U5 A20 record, reproduced and closed)
+ 
+ - **An INIT# with the A20 gate shut now fetches the reset vector
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 9d5733d..70ad499 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,6 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -170,10 +171,27 @@ harness reproduction.
+    finally the U5 A20 reset-fetch record reproduced and
+    fixed decode-side. The ranked device backlog (virtio
+    first) in the plan §5 is the next plan's material.
++6. **VIRTIO_PLAN (V0–V5)** — modern virtio-pci for the
++   drivers the guest already ships (§5 rank 1): V0
++   censuses both consumers against AuraLite-OS@da89be4
++   (the spec-faithful net driver and the blk driver that
++   negotiates nothing and reads capacity out of its BAR
++   registers — guest findings N1/N2 filed, device stays
++   honest via a FEATURES_OK gate plus a lenient queue
++   engine), audits the PCI/BAR/INTx/DMA/snapshot
++   infrastructure and freezes decisions D1–D7 (split-ring
++   core, one 16 KiB BAR with QEMU's region offsets,
++   synchronous completion on notify, INTx first and
++   MSI-X last). V1 builds the transport core, V2/V3
++   virtio-blk with a snapshot-clean RAM image, V4
++   virtio-net on the same TAP responder, V5 MSI-X +
++   close-out.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above is **CLOSED**. Recent patches:
++Every plan in the ledger above except VIRTIO is **CLOSED**.
++`0105` opens VIRTIO_PLAN (V0, docs-only baseline).
++Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index f70cb44..c428315 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1336,5 +1336,18 @@ MTRR probe would brick under a strict whitelist, and POPCNT +
+ RDTSCP graduated from absent/host-halt and an accidental INVLPG
+ alias respectively), and an INIT# under a closed A20 gate fetches
+ its reset vector from flash again (CF5 — the U5 record, fixed on
+-the decode side). Next material is the plan's §5 device backlog,
+-modern virtio first.
++the decode side). VIRTIO_PLAN **V0 is shipped** (docs-only
++baseline): the guest's modern virtio-blk/virtio-net drivers are
++censused line-by-line (the net driver negotiates by the book; the
++blk driver negotiates nothing and reads capacity out of its BAR
++registers — guest findings N1/N2 filed in the plan), the
++PCI/BAR/INTx/DMA/snapshot infrastructure is audited sufficient
++(capability layouts ride in the per-device config space like the
++xHCI's MSI-X cap; SeaBIOS independently speaks modern virtio for
++a second proof lane), and decisions D1–D7 freeze the shape:
++modern-only functions `1AF4:1042/1041`, one 16 KiB BAR with
++QEMU's common/ISR/device/notify offsets, a shared split-ring
++core, synchronous completion on notify (snapshot- and
++determinism-clean by construction), INTx until V5's MSI-X, and
++the CF rule carried to feature bits — offer exactly what is
++implemented. V1 builds the transport core next.
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index a075440..63b04bf 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -572,7 +572,9 @@ evidence supports:
+    `drivers/virtio/`), probed *after* AHCI
+    (`kernel/kernel.c:449` vs `:462`), so AHCI stays
+    primary — a STORE/NET-shaped plan with a shared
+-   virtqueue core.
++   virtqueue core. **Promoted: `docs/plans/VIRTIO_PLAN.md`
++   (V0 shipped as 0105 — consumer census incl. guest
++   findings N1/N2, decisions D1–D7).**
+ 2. **Responder bare-SYN tuple restart** (UPKEEP §5):
+    RFC 9293 wants a challenge ACK; one `tools/` file plus
+    the U6 vectors' home.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+new file mode 100644
+index 0000000..a726864
+--- /dev/null
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -0,0 +1,206 @@
++# VIRTIO_PLAN — modern (1.x) virtio-pci block, then net
++
++> Started from CPU_FEATURES_PLAN §5 rank 1. **V0 (this phase, docs-only):**
++> a consumer census and a measured baseline; code starts at V1.
++
++## §0 Status
++
++| phase | contents | status |
++|---|---|---|
++| V0 | baseline: consumers, infrastructure, decisions D1–D7 | ✅ this patch (0105) |
++| V1 | transport core `src/virtio.c` + unit harness | ⏳ |
++| V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ⏳ |
++| V3 | blk integration: SeaBIOS lane, determinism | ⏳ |
++| V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ⏳ |
++| V5 | MSI-X + blk FLUSH + close-out audit | ⏳ |
++
++## §1 Rules (inherited)
++
++1. **Advertise exactly what is implemented** (the CPU_FEATURES contract, now
++   applied to virtio feature bits): a bit appears in `device_feature` in the same
++   phase where its semantics are pinned by a vector. Initial offer sets:
++   transport = `VERSION_1` only (no INDIRECT 28, EVENT_IDX 29,
++   PACKED 34); blk = nothing; net = `MAC`. Not offering is spec-legal.
++2. **Opt-in devices**: with no flags there are no PCI functions — all historical
++   lanes (K, firmware, U5, SeaBIOS) keep byte-exact receipts (precedent:
++   the e1000 without `--tap`).
++3. **Synchronous completion on notify** — no background DMA threads;
++   determinism and snapshots never see "the middle of a request" (AHCI precedent).
++4. **GUI parity**: every CLI flag gains a GUI field in the same phase.
++5. The snapshot layout never changes silently; new state goes through
++   `*_snap` sections and `pci_snap` tags (config identity).
++
++## §2 Baseline: consumers (measured on AuraLite-OS@da89be4)
++
++### 2.1 virtio-blk — `drivers/virtio_blk/virtio_blk.c` (the kernel calls
++`virtio_blk_init()` from `kernel.c:462`, after AHCI)
++
++The contract the device must hold:
++
++- probe: `1AF4:1042`, else `1AF4:1001`; the BAR is memory, only the low
++  dword is read, base < 4 GiB; cap chain from status.bit4/`0x34`;
++  cap types 1 (common) and 2 (notify + multiplier at +16) are mandatory.
++- **Feature negotiation is NOT performed**: the driver never reads `device_feature`,
++  never writes `driver_feature`, sets `FEATURES_OK|DRIVER_OK` blindly and
++  never re-reads status. **Finding N1** (see §6).
++- queue 0: `queue_size` is read, clamped to 256, written back;
++  64-bit MMIO writes of `queue_desc/driver/device`; `queue_enable=1`.
++- **capacity is read from PCI config `0x10/0x14` (BAR0/BAR1!)** —
++  **finding N2**; besides printing there are no consumers (`grep`: 0 external
++  calls of `virtio_blk_read/write/sector_count` — the x86 block stack does not go
++  through virtio-blk yet; the visible proof is the init output lines).
++- request: a 3-descriptor chain (hdr 16 B `{type,rsv,sector}`,
++  data ≤ 8 sectors, status 1 B, `S_OK=0`); completion by polling
++  `used->idx` (no interrupts awaited); notify writes the queue number (0).
++
++### 2.2 virtio-net — `drivers/virtio_net/virtio_net.c` (net.c:1129,
++fallback when the e1000 is absent and the stack comes up on it)
++
++- probe `1AF4:1041`|`1AF4:1000`; caps 1/2/3/4 are all parsed.
++- **Full negotiation**: requires `VERSION_1`, writes
++  `VERSION_1|(MAC?)`, sets `FEATURES_OK` and **re-reads** —
++  the device must keep the bit for a legal set.
++- queues 0 (RX) / 1 (TX); `queue_size` is clamped to 16 and written
++  back; `queue_enable` is re-read and verified.
++- frame: a 12-byte `virtio_net_hdr` (with `num_buffers`, VERSION_1 form);
++  RX — single 2048 B WRITE descriptors, prefilled after `DRIVER_OK`;
++  `used.len` = hdr+frame; TX — one descriptor, polled completion.
++- INTx: the line comes from cfg `0x3C`, the handler reads the ISR cap (ack), wakes
++  the waiters; the MAC comes from device-cfg when `F_MAC` is offered.
++
++### 2.3 Second consumer: SeaBIOS
++
++`strings bios.bin` contains `init_virtio_blk`, `using modern (1.0)`
++virtio mode, vendor-cap parsing — the lane firmware has the modern path;
++it gives an independent e2e proof for blk without building the OS.
++
++### 2.4 Out of scope: virtio-gpu (the guest has a driver, `kernel.c:640`) —
++scanout semantics needed, a separate plan; virtio-mmio/vpci are other
++architectures, not x86.
++
++## §3 Infrastructure audit (AuraLite-Emulator@2e586c0)
++
++- **PCI** (`src/pci.c`, 185 lines): `cfg[256]` + per-device `cfg_read/write`
++  hooks; no caps machinery exists or is needed — the device places the
++  vendor caps in its own `cfg[]` (precedent: the XHCI MSI-X cap at `0x90`).
++  ECAM exists; `pci_snap` saves configs by BDF tags (refusal on
++  a device-list mismatch — snapshot identity for free).
++- **BARs**: pre-assigned in `devices.c`, guest relocation follows the
++  `ahci_set_abar` + "probe latch" pattern (an all-ones write → size mask,
++  `ahci.c:670/689`). Free BDF slots: taken are 00.0, 01.0, 01.2,
++  02.0, 03.0, 20.0, 31.0/2/3 → virtio: `04.0` (blk), `05.0` (net).
++- **MMIO/DMA**: `mem.c:228/287` — accesses reach handlers at their full
++  size (8-byte `queue_desc` writes are OK); the device's reads of guest rings
++  go through `mem_read/write` as in AHCI/XHCI.
++- **Interrupts**: `pic_set_irq(m, line, level)` (fan-out into the I/O APIC
++  inside, CHIPSET H7); lines taken: AHCI 14/15 (`AHCI_IRQ0=14`),
++  XHCI 10; a free line to be measured in V1 (candidates 11/5/7).
++  MSI/MSI-X infrastructure exists (`msi_deliver`, the XHCI table) — V5.
++- **Disks**: `machine_t.sata_img[ctrl][port]` — the whole file in RAM
++  (`main.c:24-26` loader), snapshots serialize it (`ahci_snap`);
++  writethrough ⇒ snapshot refusal (`snap_cfg_t.sata_wt`).
++- **Network**: the e1000 is opt-in via `--tap` → UDP datagrams = frames, endpoint
++  `127.0.0.1:8080` (responder `tools/tap_responder.py`); RX polling —
++  `e1000_tick()` from `devices.c:579`; injection C-API `e1000_rx_frame`,
++  counters `e1000_tx_stats` — vnet mirrors both; TAP ⇒ snapshot refusal
++  (`snap_cfg_t.tap`).
++- **Tests**: device-model unit lanes `tests/test_xhci.c`,
++  `tests/test_net.c`, `tests/test_ahci.c` — the pattern for `test_virtio.c`.
++
++## §4 Decisions
++
++**D1 — layout.** Modern-only functions `1AF4:1042`/`1AF4:1041`, revision
++1. One 32-bit memory BAR0 (16 KiB): common `+0x0000`, ISR `+0x1000`,
++device-cfg `+0x2000`, notify `+0x3000`, multiplier 4 — offsets as in
++QEMU (`hw/virtio/virtio-pci.c:2227-2242`, measured at HEAD);
++deviation from QEMU only in the BAR index (QEMU uses 64-bit BAR4): the caps are
++self-describing, both consumers read the index from the cap (verified
++in the guest code and SeaBIOS strings). BAR pre-assignment + relocation (AHCI).
++
++**D2 — the ring.** Split virtqueue, one shared core: chain walking with hard
++bounds (address+length inside RAM, chain length ≤ `queue_size`),
++broken chains — an error in the device's protocol (blk `S_IOERR`, net —
++a drop) + logging of the first N. Completion is synchronous in the notify handler;
++an interrupt fires when `used.idx` grew and `avail.flags.NO_INTERRUPT`
++is clear (without EVENT_IDX that is the whole rule).
++
++**D3 — status/features.** `driver_feature` writes are masked to the offer
++(QEMU precedent). `FEATURES_OK` is kept ⇔ `VERSION_1` was acked
++(otherwise the bit is cleared in the readback — the guest's net driver
++checks this). The queue engine works under
++`DRIVER_OK && queue_enable` **regardless** of FEATURES_OK's fate —
++otherwise the guest's blind blk driver (§2.1, finding N1) would not work;
++QEMU has the same leniency in practice (`virtio_validate_features` rejects
++only the IOMMU_PLATFORM mismatch and device-specific combos,
++measured at `hw/virtio/virtio.c:2292+`). The deviation from a strict
++reading of the spec is deliberate and pinned by vectors on both sides.
++Reset (`status=0`) is synchronous and full; `config_generation` does not
++change after attach (there are no config-change events yet).
++
++**D4 — interrupts.** INTx only until V5: `msix_config`/
++`queue_msix_vector` = `0xFFFF`, no MSI-X cap. ISR byte:
++bit 0 = queue, bit 1 = config; a read clears it; the INTx line mirrors
++`isr != 0` (level, `pic_set_irq` on change).
++
++**D5 — blk.** Offer: `VERSION_1` only; device-cfg = `capacity`
++(512-byte sectors) per the uapi `virtio_blk.h`. Types IN=0/OUT=1 (general
++gather/scatter over segments), out of range → `S_IOERR(1)`,
++unknown type → `S_UNSUPP(2)`. Image: a RAM copy of the file (like
++`sata_img`), `--virtio-blk=path` + GUI; snapshot — full support
++(an image section like AHCI's); writethrough — not in V2.
++
++**D6 — net.** Offer: `VERSION_1|MAC`; device-cfg = `mac[6]`; hdr
++12 B, `num_buffers=1` on RX; a frame longer than the buffer chain — a drop +
++counter (no multi-buffer promised without MRG_RXBUF). Backend: the same TAP
++UDP endpoint; `--virtio-net[=host:port]` (bare = `127.0.0.1:8080`);
++a simultaneous `--tap` (e1000) is refused at startup — one owner of
++the endpoint; `virtio_net_tick()` next to `e1000_tick`; snapshot refusal
++through `snap_cfg_t.tap`.
++
++**D7 — determinism.** Opt-in ⇒ zero receipt drift; synchronicity ⇒
++a snapshot between notifies cannot land "inside" a request; core state
++(common-cfg registers, queue addresses/sizes, `last_avail_idx`,
++ISR, the blk image) goes into snapshots from V2; the rings live in guest RAM.
++
++## §5 Phases (each: code + vectors + NC + gates + docs + patch)
++
++- **V1 core.** `src/virtio.h/c`: transport state, filling the cfg space with caps,
++  common-cfg/ISR/notify MMIO, feature banks,
++  the D3 FEATURES_OK gate, reset, the ring engine, INTx. `tests/test_virtio.c`
++  with a fake sink device (`test_xhci.c` shape). Measure
++  a free IRQ line. The new-module NC caveat (X1 precedent):
++  the vectors live with the API; the parent is "no symbols".
++- **V2 blk.** The device on the core: IN/OUT/UNSUPPORTED statuses, the RAM
++  image, `--virtio-blk=`, a GUI field, `virtio_snap` (transport+image),
++  guest-shaped vectors (including the blind init without negotiation).
++- **V3 blk integration.** A SeaBIOS lane (the firmware probes modern virtio-blk
++  — the check is in the lane's boot logo), a mid-run snapshot lane,
++  docs (may merge into V2 if the volume is small).
++- **V4 net.** The device: RX/TX on the core, MAC, the TAP backend per D6,
++  `virtio_net_rx_frame`+statistics for lanes, GUI, guest-shaped vectors
++  (prefill, hdr-12, recycle, IRQ-wake via ISR-read).
++- **V5 MSI-X + close-out.** An MSI-X cap + table in the BAR page for
++  both functions (`msix_config`/`queue_msix_vector` live), blk
++  `FLUSH(9)` with pinned semantics, a final inventory of the offer
++  against the vectors, plan closure.
++
++Deliberately deferred: indirect/EVENT_IDX/PACKED (no consumer),
++MQ/ctrl queue, virtio-gpu, >1 blk disks, writethrough for vblk.
++
++## §6 Findings register (guest side — not ours to fix, but record them)
++
++- **N1**: the guest's `virtio_blk_init` performs no feature negotiation and never
++  checks FEATURES_OK — against a strictly-spec device it would go
++  live in a "rejected" state. Our device stays compatible
++  via D3; the guest should fix this one day (as in its net driver).
++- **N2**: blk capacity is read from PCI `0x10/0x14` (the BAR0/BAR1 values)
++  instead of the device-cfg cap — the printout will show garbage on any correct
++  device, ours included. We implement device-cfg capacity honestly.
++
++## §7 Gates for every phase
++
++`make test` (full, with `AURALITE_BIOS`) + `make test-sanitize` +
++a negative control (the new vectors are red on the parent) +
++a parent-check of the patch in `patches/` + a sync of
++STATUS/ROADMAP/CHANGELOG in the same commit. Zero receipt drift in the
++historical lanes is part of acceptance (D7/rule 2).

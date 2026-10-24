@@ -178,7 +178,7 @@ if not defined PY (
   echo [build.bat] Python 3 is required for the GUI launcher.
   exit /b 1
 )
-echo [build.bat] Starting the AuraLite Emulator desktop GUI (закройте окно, чтобы выйти)...
+echo [build.bat] Starting the AuraLite Emulator desktop GUI (close the window to exit)...
 %PY% tools\gui_app.py
 exit /b %ERRORLEVEL%
 

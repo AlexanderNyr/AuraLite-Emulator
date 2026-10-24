@@ -1,0 +1,1090 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d68d6bc..f8cd969 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,62 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0110 (VIRTIO V5: MSI-X + blk FLUSH, plan closed)
++
++- **MSI-X on both virtio functions** (blk 0:05.0, net
++  0:06.0): the `0x11` capability terminates the vendor
++  cap chain at cfg `0x84`, the vector table and PBA
++  live in the BAR0 notify-page tail (`+0x3800`/`+0x3C00`,
++  BIR 0 — no BAR moved, the SeaBIOS lane is untouched),
++  and the table holds `queues + 1` entries (config
++  source plus per-queue). `msix_config` and
++  `queue_msix_vector` are live: assignments latch,
++  read back, and an out-of-table value reads back
++  `NO_VECTOR` (the QEMU rule a driver relies on when
++  it receives fewer vectors than it asked for).
++  Delivery is decided at raise time like the XHCI's:
++  with Enable=0 the INTx pin speaks off the ISR byte
++  (which latches in every mode); with Enable=1 the pin
++  stays silent and each source raises its own pending
++  flag — the MSI_PLAN §2 "source keeps its pending
++  state" rule generalised from one level to per-source
++  flags because virtio completions are edges. The PBA
++  projects those flags through the assigned vectors,
++  and an unmask/Function-Mask clear/Enable edge (or a
++  snapshot load) releases held messages through the
++  MSI M2 `msi_deliver` core. A device reset re-arms
++  the assignments but keeps the table and Enable
++  (PCI-function state); power-on entries start masked.
++  The whole plane serialises inside the blk transport
++  record — which thereby grew, so pre-V5 `--virtio-blk`
++  snapshots now refuse with the explicit
++  "different build" message (flagless runs keep the
++  historical byte stream).
++- **blk FLUSH**: `VIRTIO_BLK_F_FLUSH` (feature bit 9)
++  is offered and request type 4 completes `S_OK`
++  with used 1, its sector field ignored. The barrier
++  is honest because the engine is synchronous — a
++  write's bytes are in the RAM image before its
++  completion is visible, so there is no volatile
++  layer to drain and the S_OK promises nothing the
++  medium doesn't already keep. GET_ID/DISCARD/
++  WRITE_ZEROES stay unoffered and answer S_UNSUPP,
++  pinned alongside.
++- Pinned in all three suites: the core fake walks cap
++  shape, assignment clamp, power-on masks, pre-/post-
++  enable routing, per-vector mask + PBA hold/release,
++  Function Mask, the config vector (generation in
++  step), NO_VECTOR silence under Enable, the INTx
++  hand-back and reset planes; blk adds the FLUSH
++  vectors and proves the MSI-X plane across a
++  snapshot load; net proves RX/TX on their own
++  vectors with IRQ7 retired. Negative controls: the
++  0109 tree is red on exactly these rows; INTx-gate,
++  unmask-scan and FLUSH-bit mutations each burn their
++  own assertions. With this, VIRTIO_PLAN V0–V5 is
++  complete: every advertised bit on either device has
++  a vector behind it.
++
+ ### Added — patch 0109 (VIRTIO V4: virtio-net on the shared core)
+ 
+ - **Modern virtio-net** (`1af4:1041` at 0:06.0, IRQ7,
+diff --git a/ROADMAP.md b/ROADMAP.md
+index b3069b8..e69e761 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,7 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+-| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V4 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | ✅ done (closed `0110`) | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -196,13 +196,18 @@ harness reproduction.
+    cornered (XHCI BAR0 rebind ordering); V4 (`0109`) adds
+    virtio-net on the same TAP responder (MAC-only offer,
+    ingress-only RX, header-stripping TX, snapshot refusal
+-   with either TAP NIC). V5 remains: MSI-X + blk FLUSH +
+-   close-out.
++   with either TAP NIC); V5 (`0110`) closes the plan:
++   MSI-X on both functions (table/PBA in the notify-page
++   tail, per-source pending through `msi_deliver`, INTx
++   retiring under Enable, the plane snapshot-clean) plus
++   an honest blk FLUSH (`VIRTIO_BLK_F_FLUSH` over the
++   volatile-layer-free synchronous engine) and the final
++   offer-vs-vectors audit.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above except VIRTIO is **CLOSED**.
+-`0105`–`0109` run VIRTIO_PLAN V0–V4.
++Every plan in the ledger above is **CLOSED**.
++`0105`–`0110` run VIRTIO_PLAN V0–V5 to completion.
+ Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 7da4291..d07ab21 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1381,5 +1381,18 @@ guest-posted buffers only on ingress with the zeroed
+ 12-byte header (`num_buffers=1`) the guest skips before
+ its ethertype check, TX gathers the chain and strips
+ the header; snapshots refuse with either TAP NIC
+-attached, exactly as before. Remaining: V5 MSI-X +
+-blk FLUSH + close-out.
++attached, exactly as before. V5 closes the plan with
++**MSI-X on both functions** — the capability at the end
++of the vendor chain, table/PBA in the notify page's
++tail, live `msix_config`/`queue_msix_vector` (an
++out-of-table assignment reads back NO_VECTOR, the QEMU
++rule Linux leans on), INTx retiring under Enable=1,
++per-source pending flags projected through the PBA
++and released by `msi_deliver` on unmask, the whole
++plane snapshot-clean inside the transport record — and
++**blk FLUSH** (`VIRTIO_BLK_F_FLUSH` offered, type 4
++honoured), which is honest precisely because the
++synchronous engine has no volatile layer for the
++barrier to drain. Final inventory: every advertised bit
++on either device has a vector behind it, and every
++unadvertised request type still earns S_UNSUPP.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+index 7c259f3..95d9898 100644
+--- a/docs/plans/VIRTIO_PLAN.md
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -8,11 +8,11 @@
+ | phase | contents | status |
+ |---|---|---|
+ | V0 | baseline: consumers, infrastructure, decisions D1–D7 | ✅ this patch (0105) |
+-| V1 | transport core `src/virtio.c` + unit harness | ⏳ |
++| V1 | transport core `src/virtio.c` + unit harness | ✅ patch 0106 (§8) |
+ | V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ✅ patch 0107 (§9) |
+ | V3 | blk integration: SeaBIOS lane, determinism | ✅ patch 0108 (§10) |
+ | V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ✅ patch 0109 (§11) |
+-| V5 | MSI-X + blk FLUSH + close-out audit | ⏳ |
++| V5 | MSI-X + blk FLUSH + close-out audit | ✅ patch 0110 (§12) — plan closed |
+ 
+ ## §1 Rules (inherited)
+ 
+@@ -375,3 +375,63 @@ hdr assertion. GUI: the `virtio_net` schema + the
+ "VirtIO net TAP" row. Gates: `make test` rc 0 (SeaBIOS/ISO
+ lanes not skipped), sanitize rc 0, 0 findings. Remaining is V5:
+ MSI-X + blk FLUSH + close-out.
++
++## §12 V5 shipped (patch 0110) — plan closed
++
++**MSI-X in the core** (`src/virtio.c`), MSI M1/M3 shape: the capability
++`0x11` in cfg at `0x84` terminates the chain after the vendor caps (RO
++defended by the same re-seed on every write), the table in the tail of the
++notify page of BAR0 (`+0x3800`, 16 B entries), the PBA at `+0x3C00`.
++Table size is `queues+1` (blk 2, net 3); the notify BAR was not
++grown, all window addresses unchanged, the SeaBIOS lane green without
++edits. `msix_config`/`queue_msix_vector` are live: a write past
++the table reads back NO_VECTOR (the QEMU rule
++Linux leans on when falling back). The route is decided at raise
++time: Enable=0 — INTx off the ISR byte (the byte
++latches always, QEMU shape); Enable=1 — the pin is silent (PCI),
++the source (0=config, 1+i=queue i) raises its own
++pending flag — the MSI_PLAN §2 "the source keeps its pending state" rule
++generalised from the XHCI's single level to per-source flags, because
++virtio completions are edges; the PBA shows these flags
++through the assigned vectors, unmasking (entry unmask /
++function-mask clear / enable edge / snapshot load)
++releases the message through `msi_deliver`. A device reset
++re-arms the assignments; the table and Enable are PCI state and
++survive a reset; the table starts masked at power-on. NO_VECTOR under
++Enable=1: there is no signal — honestly, and the guest has nothing to grab the
++pin with. The whole plane rides in the serialized `virtio_dev_t` (the
++xhci_snap precedent: the struct grew, so pre-V5 `--virtio-blk`
++snapshots are refused with the honest "different build" line —
++the flagless stream is byte-for-byte as before); the blk snapshot vector
++proves: after a load the completion arrives on the
++restored vector.
++
++**blk FLUSH:** the `VIRTIO_BLK_F_FLUSH` offer (bit 9), request
++type 4 (verified against the Linux uapi; the plan's "FLUSH(9)" in §5 was
++the bit) completes with `S_OK`, used 1, the sector ignored.
++Honesty comes from the synchronous machine: the write's bytes are already in the
++RAM image before its completion is visible, so the barrier does not
++promise more than the medium holds. GET_ID/DISCARD/
++WRITE_ZEROES stay off the offer and keep getting S_UNSUPP.
++
++NC: the `0109` parent + the new suites are red exactly on the V5 sur-
++face (cap chain, FLUSH, deliveries, snapshot vector);
++mutations: dropping the INTx gate burns exactly the 2 retired asserts,
++dropping the unmask scan — a cascade of pending asserts, withdrawing the
++FLUSH bit — identity. Final inventory of the offer
++against the vectors: transport `VERSION_1` (V1 vectors), blk
++`FLUSH` (v_flush + identity), net `MAC` (v_identity) — every
++advertised bit has a vector, no unadvertised type ever
++completes successfully. The MSI-X plane is pinned in three
++suites: core fake (delivery/masks/PBA/config vector/
++NO_VECTOR/INTx hand-over), blk (snapshot), net (RX/TX vectors,
++IRQ7 retired). Gates: `make test` rc 0 (SeaBIOS/ISO not
++skipped), sanitize rc 0, 0 findings.
++
++**Plan total (V0–V5, `0105`–`0110`):** the two measured guests and
++SeaBIOS ride modern virtio-pci (D1–D7 untouched by a single edit);
++deferred out of scope (§5): indirect/EVENT_IDX/PACKED, MQ/
++ctrl queue, virtio-gpu, >1 blk disks, writethrough vblk,
++`queue_notif_config_data`/queue_reset (there are no feature bits
++behind them). Guest findings N1/N2 (§6) remain open on the guest's side
++— the device stays compatible with them via D3.
+diff --git a/src/virtio.c b/src/virtio.c
+index 61fec81..b15bd54 100644
+--- a/src/virtio.c
++++ b/src/virtio.c
+@@ -21,6 +21,7 @@
+ #include "virtio.h"
+ #include "pci.h"
+ #include "pic.h"
++#include "lapic.h"   /* msi_deliver (MSI M2) */
+ 
+ /* ============================== small helpers ============================ */
+ 
+@@ -74,10 +75,65 @@ static virtio_dev_t *vio_of_pci(pci_dev_t *d) {
+     return NULL;
+ }
+ 
+-/* ============================== interrupts ============================= */
++/* ============================== interrupts =============================
++ *
++ * Two planes (route decided at raise time, like XHCI's M3):
++ * - MSI-X disabled: the classic INTx level, driven off the ISR byte
++ *   (which latches in every mode, QEMU-style, so an ISR read-ack
++ *   works no matter how the guest routes delivery).
++ * - MSI-X enabled: INTx must stay silent (PCI rule); each source
++ *   raises a per-source pending flag and an unmasked, vector-
++ *   assigned source fires its table message immediately.  A masked
++ *   source just keeps the flag (it is what the PBA reports through
++ *   the assigned vector) until an unmask, a Function-Mask clear or
++ *   an Enable edge re-evaluates it -- the MSI_PLAN 2 rule that the
++ *   source keeps its own pending state, extended from the XHCI's
++ *   single level to per-source flags because virtio completions
++ *   are edges, not levels. */
++
++static int vio_msix_nvec(virtio_dev_t *v) { return v->desc->num_queues + 1; }
++
++static uint16_t vio_msix_assign(virtio_dev_t *v, uint16_t vec) {
++    if (vec != VIRTIO_MSI_NO_VECTOR && vec >= vio_msix_nvec(v))
++        return VIRTIO_MSI_NO_VECTOR;      /* QEMU: unassignable -> none */
++    return vec;
++}
++
++static uint16_t vio_src_vector(virtio_dev_t *v, int src) {
++    return src == 0 ? v->msix_config : v->q[src - 1].msix_vector;
++}
++
++static void vio_msix_try(virtio_dev_t *v, int src) {
++    if (!v->msix_enable || !v->msix_pending[src]) return;
++    uint16_t vec = vio_src_vector(v, src);
++    if (vec == VIRTIO_MSI_NO_VECTOR || vec >= vio_msix_nvec(v)) {
++        v->msix_pending[src] = 0;         /* nowhere to deliver, ever */
++        return;
++    }
++    if (v->msix_fmask || (v->msix_table[vec].ctrl & 1u)) return;
++    v->msix_pending[src] = 0;
++    if (v->m)
++        msi_deliver(v->m,
++                    ((uint64_t)v->msix_table[vec].addr_hi << 32) |
++                        v->msix_table[vec].addr_lo,
++                    v->msix_table[vec].data);
++}
++
++/* An interrupt event on source `src` (0=config, 1+i=queue i).  Under
++ * INTx the ISR latch the caller just set is the whole record. */
++static void vio_msix_raise(virtio_dev_t *v, int src) {
++    if (!v->msix_enable) return;
++    v->msix_pending[src] = 1;
++    vio_msix_try(v, src);
++}
++
++static void vio_msix_scan(virtio_dev_t *v) {
++    for (int src = 0; src < vio_msix_nvec(v); src++)
++        vio_msix_try(v, src);
++}
+ 
+ static void vio_intx_update(virtio_dev_t *v) {
+-    int want = v->isr != 0;
++    int want = (v->isr != 0) && !v->msix_enable;
+     if (want == v->intx_level) return;
+     v->intx_level = want;
+     if (v->m) pic_set_irq(v->m, v->irq, want);
+@@ -87,6 +143,7 @@ void virtio_config_changed(virtio_dev_t *v) {
+     v->generation++;
+     v->isr |= VIRTIO_ISR_CONFIG;
+     vio_intx_update(v);
++    vio_msix_raise(v, 0);
+ }
+ 
+ /* ============================== reset (D3) ============================= */
+@@ -104,7 +161,13 @@ void virtio_reset_device(virtio_dev_t *v) {
+         q->enable = 0;
+         q->desc = q->driver = q->device = 0;
+         q->last_avail = 0;
++        q->msix_vector = VIRTIO_MSI_NO_VECTOR;
+     }
++    /* Vector assignments are device state (reset re-arms them);
++     * the MSI-X table and Enable/Function-Mask are PCI-function
++     * state and survive a device reset untouched (XHCI rule). */
++    v->msix_config = VIRTIO_MSI_NO_VECTOR;
++    memset(v->msix_pending, 0, sizeof v->msix_pending);
+     if (v->desc->reset) v->desc->reset(v);
+     vio_intx_update(v);
+ }
+@@ -152,10 +215,13 @@ static void vio_used_push(virtio_dev_t *v, int qi, uint16_t head,
+     vio_wr32(m, q->device + 8 + 8ull * slot, used_len);
+     vio_wr16(m, q->device + 2, (uint16_t)(used_idx + 1));
+     /* D2 interrupt policy: no EVENT_IDX, so the avail flags bit is
+-     * the whole rule. */
++     * the whole rule.  The ISR byte latches in every mode; the INTx
++     * level retires under MSI-X and the queue's own vector fires
++     * instead (V5). */
+     if (!(vio_rd16(m, q->driver) & VRING_AVAIL_F_NO_INTERRUPT)) {
+         v->isr |= VIRTIO_ISR_QUEUE;
+         vio_intx_update(v);
++        vio_msix_raise(v, qi + 1);
+     }
+ }
+ 
+@@ -307,7 +373,7 @@ static void vio_common_image(virtio_dev_t *v, uint8_t img[VIO_COMMON_SIZE]) {
+     put32(img + 0x08, v->gfselect);
+     put32(img + 0x0C, v->gfselect == 0 ? (uint32_t)v->guest_features
+                       : v->gfselect == 1 ? (uint32_t)(v->guest_features >> 32) : 0);
+-    put16(img + 0x10, VIRTIO_MSI_NO_VECTOR);
++    put16(img + 0x10, v->msix_config);
+     put16(img + 0x12, (uint16_t)v->desc->num_queues);
+     img[0x14] = v->status;
+     img[0x15] = v->generation;
+@@ -315,7 +381,7 @@ static void vio_common_image(virtio_dev_t *v, uint8_t img[VIO_COMMON_SIZE]) {
+     if (v->queue_select < (unsigned)v->desc->num_queues) {
+         virtio_queue_t *q = &v->q[v->queue_select];
+         put16(img + 0x18, q->size);
+-        put16(img + 0x1A, VIRTIO_MSI_NO_VECTOR);
++        put16(img + 0x1A, q->msix_vector);
+         put16(img + 0x1C, q->enable);
+         put16(img + 0x1E, v->queue_select);   /* queue_notify_off = index */
+         put64(img + 0x20, q->desc);
+@@ -348,6 +414,8 @@ static void vio_common_apply(virtio_dev_t *v, const uint8_t img[VIO_COMMON_SIZE]
+             v->guest_features = (v->guest_features & 0xFFFFFFFFull)
+                               | ((uint64_t)(le32_of(img + 0x0C) & (uint32_t)(offered >> 32)) << 32);
+     }
++    if (vio_touched(off, size, 0x10, 2))
++        v->msix_config = vio_msix_assign(v, le16_of(img + 0x10));
+     if (vio_touched(off, size, 0x16, 2)) v->queue_select = le16_of(img + 0x16);
+     if (v->queue_select < (unsigned)v->desc->num_queues) {
+         virtio_queue_t *q = &v->q[v->queue_select];
+@@ -356,6 +424,8 @@ static void vio_common_apply(virtio_dev_t *v, const uint8_t img[VIO_COMMON_SIZE]
+             uint16_t max_size = v->desc->queue_max[v->queue_select];
+             q->size = (want == 0 || want > max_size) ? max_size : want;
+         }
++        if (vio_touched(off, size, 0x1A, 2))
++            q->msix_vector = vio_msix_assign(v, le16_of(img + 0x1A));
+         if (vio_touched(off, size, 0x1C, 2)) q->enable = le16_of(img + 0x1C) & 1;
+         if (vio_touched(off, size, 0x20, 8)) q->desc   = le64_of(img + 0x20);
+         if (vio_touched(off, size, 0x28, 8)) q->driver = le64_of(img + 0x28);
+@@ -385,6 +455,67 @@ static void vio_common_write(virtio_dev_t *v, uint32_t off, int size, uint64_t v
+ 
+ /* ============================== BAR0 MMIO ============================== */
+ 
++/* V5: MSI-X table (RW) + PBA (RO) in the notify page tail.  The table
++ * is image-based like the common config, so sub-dword guest accesses
++ * compose.  The PBA projects each source's pending flag through its
++ * assigned vector (NO_VECTOR sources never show). */
++#define VIO_MSIX_TABLE_END(v) \
++    ((uint32_t)VIRTIO_OFF_MSIX_TABLE + 16u * (uint32_t)vio_msix_nvec(v))
++
++static void vio_msix_image(virtio_dev_t *v, uint8_t *img) {
++    for (int i = 0; i < vio_msix_nvec(v); i++) {
++        put32(img + 16 * i + 0,  v->msix_table[i].addr_lo);
++        put32(img + 16 * i + 4,  v->msix_table[i].addr_hi);
++        put32(img + 16 * i + 8,  v->msix_table[i].data);
++        put32(img + 16 * i + 12, v->msix_table[i].ctrl);
++    }
++}
++
++static void vio_msix_table_write(virtio_dev_t *v, uint32_t off, int size,
++                                 uint64_t val) {
++    uint8_t img[(VIRTIO_MAX_QUEUES + 1) * 16];
++    memset(img, 0, sizeof img);
++    vio_msix_image(v, img);
++    uint32_t at = off - VIRTIO_OFF_MSIX_TABLE;
++    for (int i = 0; i < size && at + i < sizeof img; i++)
++        img[at + i] = (uint8_t)(val >> (8 * i));
++    for (int i = 0; i < vio_msix_nvec(v); i++) {
++        v->msix_table[i].addr_lo = le32_of(img + 16 * i + 0);
++        v->msix_table[i].addr_hi = le32_of(img + 16 * i + 4);
++        v->msix_table[i].data    = le32_of(img + 16 * i + 8);
++        /* control: bit 0 is the per-vector mask, the rest reads 0 */
++        v->msix_table[i].ctrl    = le32_of(img + 16 * i + 12) & 1u;
++    }
++    vio_msix_scan(v);   /* an unmask here may release a pending message */
++}
++
++static uint64_t vio_msix_read(virtio_dev_t *v, uint32_t off, int size) {
++    uint8_t img[(VIRTIO_MAX_QUEUES + 1) * 16 + 8];
++    memset(img, 0, sizeof img);
++    uint64_t val = 0;
++    if (off >= VIRTIO_OFF_MSIX_TABLE && off < VIO_MSIX_TABLE_END(v)) {
++        vio_msix_image(v, img);
++        uint32_t at = off - VIRTIO_OFF_MSIX_TABLE;
++        for (int i = 0; i < size && at + i < sizeof img; i++)
++            val |= (uint64_t)img[at + i] << (8 * i);
++        return val;
++    }
++    if (off >= VIRTIO_OFF_MSIX_PBA && off < VIRTIO_OFF_MSIX_PBA + 8u) {
++        uint32_t bits = 0;
++        for (int src = 0; src < vio_msix_nvec(v); src++) {
++            uint16_t vec = vio_src_vector(v, src);
++            if (v->msix_pending[src] && vec < vio_msix_nvec(v))
++                bits |= 1u << vec;
++        }
++        put32(img, bits);
++        uint32_t at = off - VIRTIO_OFF_MSIX_PBA;
++        for (int i = 0; i < size && at + i < 8; i++)
++            val |= (uint64_t)img[at + i] << (8 * i);
++        return val;
++    }
++    return 0;
++}
++
+ static uint64_t vio_mmio_read(void *ctx, uint64_t addr, int size) {
+     virtio_dev_t *v = ctx;
+     if (size <= 0 || size > 8) return 0;
+@@ -409,8 +540,9 @@ static uint64_t vio_mmio_read(void *ctx, uint64_t addr, int size) {
+         }
+         return val;
+     }
+-    return 0;   /* notify page: write-only for a device that does not
+-                 * offer NOTIF_CONFIG_DATA */
++    return vio_msix_read(v, off, size);   /* notify page: the doorbells
++                 * themselves are write-only (no NOTIF_CONFIG_DATA);
++                 * the MSI-X table/PBA in the page tail read here */
+ }
+ 
+ static void vio_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+@@ -425,6 +557,12 @@ static void vio_mmio_write(void *ctx, uint64_t addr, int size, uint64_t val) {
+                                   (uint32_t)val, size);
+         return;
+     }
++    if (off >= VIRTIO_OFF_MSIX_TABLE && off < VIO_MSIX_TABLE_END(v)) {
++        vio_msix_table_write(v, off, size, val);
++        return;
++    }
++    if (off >= VIRTIO_OFF_MSIX_PBA && off < VIRTIO_OFF_MSIX_PBA + 8u)
++        return;                                            /* PBA: RO */
+     unsigned qi = (off - VIRTIO_OFF_NOTIFY) / VIRTIO_NOTIFY_MULT;
+     if (qi < (unsigned)v->desc->num_queues && v->desc->notify)
+         v->desc->notify(v, (int)qi);
+@@ -469,7 +607,7 @@ static void vio_seed_caps(virtio_dev_t *v) {
+     for (int i = 0; i < ncap; i++) {
+         uint8_t *c = d->cfg + caps[i].at;
+         c[0] = 0x09;                            /* vendor-specific */
+-        c[1] = (i + 1 < ncap) ? caps[i].next : 0x00;
++        c[1] = (i + 1 < ncap) ? caps[i].next : VIRTIO_CAP_MSIX;
+         c[2] = caps[i].len;
+         c[3] = caps[i].type;
+         c[4] = 0;                               /* BAR 0 */
+@@ -477,6 +615,18 @@ static void vio_seed_caps(virtio_dev_t *v) {
+         put32(c + 12, 0x1000);
+     }
+     put32(d->cfg + 0x50 + 16, VIRTIO_NOTIFY_MULT);
++    /* V5: MSI-X capability terminates the chain (XHCI M1 shape).
++     * Table Size-1 and both offsets are RO and re-asserted on every
++     * cfg write; Enable/Function-Mask are the guest's bits, captured
++     * into the device state in vio_cfg_write BEFORE this re-seed. */
++    uint8_t *mc = d->cfg + VIRTIO_CAP_MSIX;
++    mc[0] = 0x11;                               /* Capability ID: MSI-X */
++    mc[1] = 0x00;                               /* Next: end of list */
++    put16(mc + 2, (uint16_t)((vio_msix_nvec(v) - 1)
++                  | (v->msix_fmask ? 0x4000 : 0)
++                  | (v->msix_enable ? 0x8000 : 0)));
++    put32(mc + 4, VIRTIO_OFF_MSIX_TABLE);       /* BIR 0 in low bits */
++    put32(mc + 8, VIRTIO_OFF_MSIX_PBA);
+ }
+ 
+ static uint64_t vio_cfg_read(pci_dev_t *d, int reg, int size) {
+@@ -515,7 +665,22 @@ static void vio_cfg_write(pci_dev_t *d, int reg, int size, uint64_t val) {
+         put32(d->cfg + 0x10, base);      /* 32-bit memory BAR: type 0 */
+         vio_set_bar(v, base);
+     }
++    /* V5: capture the MSI-X Message Control RW bits before the
++     * re-seed below rewrites the cap around them.  A write that
++     * never touched the cap leaves the seeded bits in place, so
++     * this capture is a no-op then. */
++    int old_enable = v->msix_enable;
++    uint16_t mctl = le16_of(d->cfg + VIRTIO_CAP_MSIX + 2);
++    v->msix_enable = (mctl & 0x8000) != 0;
++    v->msix_fmask  = (mctl & 0x4000) != 0;
+     vio_seed_caps(v);                    /* RO bytes survive any write */
++    /* Route edges: disabling hands the latched ISR back to INTx and
++     * retires the pending flags with it; enabling or unmasking may
++     * release a held message. */
++    if (old_enable && !v->msix_enable)
++        memset(v->msix_pending, 0, sizeof v->msix_pending);
++    vio_intx_update(v);
++    vio_msix_scan(v);
+ }
+ 
+ /* ============================== attach ================================= */
+@@ -531,6 +696,9 @@ void virtio_pci_add(machine_t *m, virtio_dev_t *v, int pci_dev_no,
+     v->ctx = ctx;
+     v->irq = irq;
+     v->bar_base = bar_base;
++    /* MSI-X power-on: every table entry masked (the XHCI rule). */
++    for (int i = 0; i < VIRTIO_MAX_QUEUES + 1; i++)
++        v->msix_table[i].ctrl = 1;
+ 
+     pci_dev_t *p = pci_add_device(m, 0, pci_dev_no, 0, name,
+                                   VIRTIO_PCI_VENDOR, device_id,
+@@ -574,9 +742,14 @@ void virtio_snap(virtio_dev_t *v, snap_t *s, const char *tag) {
+         v->m = m; v->pci = p; v->desc = d; v->ctx = c;
+         /* pci_snap restored the cfg BAR bytes but does not rebind the
+          * decode; the serialized live base does (ahci_snap rule), and
+-         * the INTx level is re-driven from the restored ISR byte. */
++         * the INTx level is re-driven from the restored ISR byte.
++         * The MSI-X plane rides in the same struct image (table,
++         * enable, assignments, pending); a source that was pending
++         * at save time re-fires on load exactly as it would have on
++         * the next unmask of the uninterrupted run. */
+         vio_set_bar(v, v->bar_base);
+         v->intx_level = 0;
+         vio_intx_update(v);
++        vio_msix_scan(v);
+     }
+ }
+diff --git a/src/virtio.h b/src/virtio.h
+index a50c004..8129233 100644
+--- a/src/virtio.h
++++ b/src/virtio.h
+@@ -8,8 +8,11 @@
+  * (no INDIRECT_DESC 28, no EVENT_IDX 29, no PACKED 34); the device
+  * desc adds its own feature bits, each pinned by a vector in the
+  * phase that offers it.  Interrupts are legacy INTx behind the ISR
+- * byte; MSI-X arrives in V5, so msix_config / queue_msix_vector
+- * read VIRTIO_MSI_NO_VECTOR and no MSI-X capability exists.
++ * byte until the guest turns on the MSI-X capability (V5): then the
++ * pin retires and queue/config sources fire the vectors the guest
++ * assigned through msix_config / queue_msix_vector, with the table
++ * and PBA living in the BAR0 tail like the XHCI's (MSI M1/M3 shape,
++ * including masked-pending release on unmask).
+  *
+  * The consumer contract is measured (V0 section 2): the guest's
+  * virtio-net driver negotiates by the book and re-reads
+@@ -50,6 +53,14 @@ struct pci_dev;
+ #define VIRTIO_OFF_DEVICE     0x2000
+ #define VIRTIO_OFF_NOTIFY     0x3000
+ #define VIRTIO_NOTIFY_MULT    4
++/* V5: MSI-X table/PBA in the notify page's unused tail (the
++ * doorbells consume 4 bytes per queue at its head).  The notify
++ * capability keeps its QEMU offset and page length; drivers map
++ * the BAR and hit table/PBA through the MSI-X cap's own offsets,
++ * which is exactly where QEMU puts them relative to the page. */
++#define VIRTIO_OFF_MSIX_TABLE 0x3800
++#define VIRTIO_OFF_MSIX_PBA   0x3C00
++#define VIRTIO_CAP_MSIX       0x84     /* cfg offset, after vendor caps */
+ 
+ /* ---- transport feature bits & status bits ------------------------------ */
+ #define VIRTIO_F_VERSION_1    32
+@@ -119,6 +130,7 @@ typedef struct {
+     uint16_t enable;
+     uint64_t desc, driver, device;
+     uint16_t last_avail;          /* avail idx last consumed by the core */
++    uint16_t msix_vector;         /* queue_msix_vector (V5) */
+ } virtio_queue_t;
+ 
+ typedef struct virtio_dev {
+@@ -139,6 +151,25 @@ typedef struct virtio_dev {
+     uint16_t          queue_select;
+     unsigned          bad_chains;       /* D2: log budget for bad chains */
+     virtio_queue_t    q[VIRTIO_MAX_QUEUES];
++
++    /* --- MSI-X (V5) ------------------------------------------------------
++     * Table size is num_queues+1 (entry 0 serves the config source
++     * when the guest assigns it, queues take the rest); the table
++     * lives in caller-visible MMIO, each entry 16 bytes.  Pending
++     * is kept per interrupt SOURCE (index 0 = config, 1+i = queue i)
++     * rather than per vector, in the MSI_PLAN 2 shape: the source
++     * keeps its own pending state and an unmask re-evaluates it.
++     * The PBA reads the sources' bits projected through their
++     * assigned vectors.  Enable/Function-Mask are the Message
++     * Control RW bits; the table + these bits are PCI-function
++     * state (they survive a device reset, which only re-arms the
++     * vector assignments to NO_VECTOR). */
++    uint16_t          msix_config;
++    struct { uint32_t addr_lo, addr_hi, data, ctrl; }
++                      msix_table[VIRTIO_MAX_QUEUES + 1];
++    uint8_t           msix_pending[VIRTIO_MAX_QUEUES + 1];
++    int               msix_enable;
++    int               msix_fmask;
+ } virtio_dev_t;
+ 
+ /* Register one modern virtio PCI function: seeds config space
+@@ -177,8 +208,9 @@ int  virtio_queue_ready(virtio_dev_t *v, int qi);
+ int  virtio_pop(virtio_dev_t *v, int qi, virtio_req_t *r);
+ 
+ /* Publish the used element for a popped chain (used_len = bytes the
+- * device wrote into the in-segments) and raise INTx per the
+- * NO_INTERRUPT policy (D2). */
++ * device wrote into the in-segments) and signal per the NO_INTERRUPT
++ * policy (D2): INTx off the ISR byte, or the queue's MSI-X vector
++ * when the guest enabled MSI-X (V5). */
+ void virtio_complete(virtio_dev_t *v, virtio_req_t *r, uint32_t used_len);
+ 
+ /* Config-change interrupt (ISR bit 1 + generation bump).  No current
+diff --git a/src/virtio_blk.c b/src/virtio_blk.c
+index ecdb3dd..7630fbd 100644
+--- a/src/virtio_blk.c
++++ b/src/virtio_blk.c
+@@ -11,10 +11,13 @@
+  *
+  * Completion is synchronous inside the notify write (house rule):
+  * the polling guest observes its used-idx advance by the time the
+- * doorbell store retires.  Feature offer is VERSION_1 only; in
+- * particular FLUSH is NOT advertised until V5 gives it pinned
+- * semantics, so type-4 requests (like every unknown type) earn an
+- * honest S_UNSUPP rather than a fake success.
++ * doorbell store retires.  The offer is VERSION_1 + FLUSH (V5):
++ * FLUSH (feature bit 9, request type 4) is honest here precisely
++ * because there is no volatile layer to drain -- a write's bytes
++ * are already in the RAM image before its completion is visible,
++ * so the barrier S_OK never promises more durability than the
++ * medium (a RAM copy) itself has.  Every other unadvertised type
++ * still earns S_UNSUPP.
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -25,9 +28,11 @@
+ #define VBLK_SECTOR       512u
+ #define VBLK_QSIZE        128          /* offered max (guest clamps to 256) */
+ 
++#define VBLK_F_FLUSH      9            /* feature bit (VIRTIO_BLK_F_FLUSH) */
++
+ #define VBLK_T_IN         0            /* read  */
+ #define VBLK_T_OUT        1            /* write */
+-#define VBLK_T_FLUSH      4
++#define VBLK_T_FLUSH      4            /* request type (feature bit 9) */
+ #define VBLK_T_GET_ID     8
+ 
+ #define VBLK_S_OK         0
+@@ -85,10 +90,16 @@ static void vblk_process(vblk_t *b, virtio_req_t *r) {
+     uint32_t type = le32(hdr + 0);
+     uint64_t sector = le64(hdr + 8);
+ 
++    if (type == VBLK_T_FLUSH) {
++        /* V5: header + status only, no data stream, sector ignored.
++         * Honest because completion is synchronous: every earlier
++         * write is already in the image when this S_OK lands. */
++        vblk_finish(b, r, VBLK_S_OK, 1);
++        return;
++    }
+     if (type != VBLK_T_IN && type != VBLK_T_OUT) {
+-        /* FLUSH / GET_ID / DISCARD / WRITE_ZEROES / garbage: none of
+-         * their feature bits are offered, so the truthful answer is
+-         * UNSUPP (FLUSH semantics are promised only in V5). */
++        /* GET_ID / DISCARD / WRITE_ZEROES / garbage: none of their
++         * feature bits are offered, so the truthful answer is UNSUPP. */
+         vblk_finish(b, r, VBLK_S_UNSUPP, 1);
+         return;
+     }
+@@ -145,7 +156,7 @@ static void vblk_publish(machine_t *m, vblk_t *b) {
+     b->capacity = b->img_len / VBLK_SECTOR;
+     for (int i = 0; i < 8; i++) b->config[i] = (uint8_t)(b->capacity >> (8 * i));
+     memset(&g_vblk_desc, 0, sizeof g_vblk_desc);
+-    g_vblk_desc.features = 0;                      /* D5: VERSION_1 only */
++    g_vblk_desc.features = 1ULL << VBLK_F_FLUSH;   /* D5 + V5 FLUSH */
+     g_vblk_desc.num_queues = 1;
+     g_vblk_desc.queue_max[0] = VBLK_QSIZE;
+     g_vblk_desc.config = b->config;
+diff --git a/tests/test_virtio.c b/tests/test_virtio.c
+index 1d53031..d369095 100644
+--- a/tests/test_virtio.c
++++ b/tests/test_virtio.c
+@@ -24,6 +24,7 @@
+ #include "devices.h"
+ #include "harness.h"
+ #include "virtio.h"
++#include "lapic.h"     /* V5: observe MSI-X delivery */
+ 
+ static int fails;
+ #define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+@@ -225,11 +226,20 @@ static void v_caps(void) {
+                    pci_rd32(cap + 16));
+         cap = pci_rd8(cap + 1) & 0xFC;
+     }
+-    EXPECT(cap == 0, "cap chain terminates");
++    /* V5: the MSI-X capability terminates the chain */
++    EXPECT(cap == 0x84, "MSI-X cap follows the vendor caps (got %02x)", cap);
++    EXPECT(pci_rd8(cap) == 0x11, "capability id 0x11 (MSI-X)");
++    EXPECT((pci_rd32(cap) >> 16) == 2u, "Message Control: table size 3, off");
++    EXPECT(pci_rd32(cap + 4) == 0x3800u, "table at BAR0+0x3800 (BIR 0)");
++    EXPECT(pci_rd32(cap + 8) == 0x3C00u, "PBA at BAR0+0x3C00 (BIR 0)");
++    EXPECT(pci_rd8(cap + 1) == 0, "cap chain terminates at MSI-X");
+     /* cfg writes cannot vandalise the RO capability bytes */
+     pci_wr32(0x40, 0xDEADBEEFu);
+     EXPECT(pci_rd8(0x40) == 0x09 && pci_rd8(0x43) == 1, "caps re-asserted after cfg write");
+-    if (fails == f0) printf("ok caps: common/notify(x4)/isr/device chain at 0x40\n");
++    pci_wr32(0x84, 0x00000000u);        /* size bits are RO too */
++    EXPECT(pci_rd8(0x84) == 0x11 && (pci_rd32(0x84) >> 16) == 2u,
++           "MSI-X cap RO fields re-asserted");
++    if (fails == f0) printf("ok caps: common/notify(x4)/isr/device + MSI-X at 0x84\n");
+ }
+ 
+ static void v_bar_probe(void) {
+@@ -285,7 +295,7 @@ static void v_features(void) {
+ static void v_queue_regs(void) {
+     int f0 = fails;
+     full_init();
+-    EXPECT(rd16(CCD(0x10)) == 0xFFFF, "msix_config reads NO_VECTOR before V5");
++    EXPECT(rd16(CCD(0x10)) == 0xFFFF, "msix_config reads NO_VECTOR at reset");
+     EXPECT(rd8(CCD(0x15)) == 0, "config_generation still");
+     wr16(CCD(0x16), 1);
+     EXPECT(rd16(CCD(0x18)) == 16, "q1 size reads the max before any write");
+@@ -295,7 +305,7 @@ static void v_queue_regs(void) {
+     EXPECT(rd16(CCD(0x18)) == 8, "q1 smaller size sticks (net driver writes 16 of 16)");
+     wr16(CCD(0x18), 0);
+     EXPECT(rd16(CCD(0x18)) == 16, "q1 size write 0 falls back to the max");
+-    EXPECT(rd16(CCD(0x1A)) == 0xFFFF, "queue_msix_vector NO_VECTOR");
++    EXPECT(rd16(CCD(0x1A)) == 0xFFFF, "queue_msix_vector NO_VECTOR at reset");
+     EXPECT(rd16(CCD(0x1E)) == 1, "q1 notify_off = queue index");
+     /* 64-bit ring pointers, guest shape (one 8-byte MMIO write)... */
+     wr64(CCD(0x20), 0x210000);
+@@ -524,6 +534,140 @@ static void v_dma_bounds(void) {
+     if (fails == f0) printf("ok dma bounds: spill/MMIO refused, stream truncation sane\n");
+ }
+ 
++/* ---------------------------- V5: MSI-X ------------------------------ */
++#define MSIX_AT(entry, word) (VBAR + 0x3800u + 16u * (entry) + 4u * (word))
++#define PBA_AT (VBAR + 0x3C00u)
++
++static int msi_take(void) {
++    int v = lapic_intack(&M);
++    if (v >= 0) mem_write(&M, 0xFEE000B0u, 4, 0);       /* EOI */
++    return v;
++}
++static void msix_ctl(uint16_t mc) {        /* Message Control RW bits */
++    pci_wr32(0x84, ((uint32_t)mc << 16) | 0x11u);
++}
++static void msix_entry(int i, uint32_t vec, int unmask) {
++    wr32(MSIX_AT(i, 0), 0xFEE00000u);      /* msg addr: BSP, physical */
++    wr32(MSIX_AT(i, 1), 0);
++    wr32(MSIX_AT(i, 2), vec);              /* msg data: the bare vector */
++    wr32(MSIX_AT(i, 3), unmask ? 0u : 1u); /* vector control */
++}
++static void msix_assign(int qi, uint16_t vec) {
++    wr16(CCD(0x16), (uint16_t)qi);
++    wr16(CCD(0x1A), vec);
++}
++
++/* Continuing pings (echo_round restarts its rings on purpose, which
++ * would desync last_avail across rounds; the slot cursors live here). */
++static int msix_slot[2];
++static void msix_ping(int qi, const char *payload, uint32_t n) {
++    uint32_t desc  = qi ? Q1_DESC  : Q0_DESC;
++    uint32_t avail = qi ? Q1_AVAIL : Q0_AVAIL;
++    uint32_t used  = qi ? Q1_USED  : Q0_USED;
++    uint32_t buf   = qi ? BUF1     : BUF0;
++    memcpy(M.ram + buf, payload, n);
++    memset(M.ram + buf + 0x100, 0, n);
++    put_desc(desc, 0, buf,        n, VRING_DESC_F_NEXT, 1);
++    put_desc(desc, 1, buf + 0x100, n, VRING_DESC_F_WRITE, 0);
++    uint16_t before = used_idx(used);
++    avail_post(avail, msix_slot[qi]++, 0);
++    wr16(NOTIFY(qi), qi);
++    EXPECT(used_idx(used) == before + 1, "msix ping q%d completed", qi);
++    EXPECT(memcmp(M.ram + buf + 0x100, payload, n) == 0, "msix ping q%d echoed", qi);
++}
++
++static void v_msix(void) {
++    int f0 = fails;
++    M.lapic.svr |= 0x100u;                 /* APIC software-enable */
++    EXPECT(lapic_deliverable(&M) < 0, "LAPIC quiet at start");
++    dev_status(0);
++    EXPECT(rd32(MSIX_AT(0, 3)) == 1u && rd32(MSIX_AT(1, 3)) == 1u &&
++           rd32(MSIX_AT(2, 3)) == 1u, "MSI-X table masked at power-on");
++    /* assignments latch and read back; a value past the table size
++     * clamps to NO_VECTOR (the QEMU readback rule -- Linux checks
++     * exactly this when it falls back to fewer vectors) */
++    wr16(CCD(0x10), 0);
++    EXPECT(rd16(CCD(0x10)) == 0, "msix_config assigned 0");
++    msix_assign(0, 1);
++    EXPECT(rd16(CCD(0x1A)) == 1, "q0 assigned vector 1");
++    msix_assign(1, 7);
++    EXPECT(rd16(CCD(0x1A)) == 0xFFFF, "vector past the table -> NO_VECTOR");
++    /* a device reset re-arms the assignments (device state) */
++    full_init();
++    EXPECT(rd16(CCD(0x10)) == 0xFFFF, "reset re-armed msix_config");
++    wr16(CCD(0x16), 1);
++    EXPECT(rd16(CCD(0x1A)) == 0xFFFF, "reset re-armed queue vectors");
++    queue_setup(0, Q0_DESC, Q0_AVAIL, Q0_USED);
++    queue_setup(1, Q1_DESC, Q1_AVAIL, Q1_USED);
++    msix_slot[0] = msix_slot[1] = 0;
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));          /* DRIVER_OK */
++    msix_entry(0, 0x53, 1);
++    msix_entry(1, 0x51, 1);
++    msix_entry(2, 0x52, 1);
++    EXPECT(rd32(MSIX_AT(1, 2)) == 0x51u && rd32(MSIX_AT(2, 0)) == 0xFEE00000u,
++           "table entries read back");
++    wr16(CCD(0x10), 0);
++    msix_assign(0, 1);
++    msix_assign(1, 2);
++    /* MSI-X still off: INTx is the plane that talks */
++    msix_ping(0, "IN", 2);
++    EXPECT(irq5() && lapic_deliverable(&M) < 0, "pre-enable: INTx fires, no message");
++    EXPECT(rd8(ISR_AT) == 1 && !irq5(), "ISR read-ack drops the line");
++    /* Enable: the pin retires, per-queue messages land in the LAPIC */
++    msix_ctl(0x8000);
++    EXPECT(((pci_rd32(0x84) >> 16) & 0x8000u) != 0, "Enable bit reads back");
++    msix_ping(0, "P0", 2);
++    EXPECT(!irq5(), "INTx retired under MSI-X");
++    EXPECT(msi_take() == 0x51, "q0 completion arrived as message 0x51");
++    EXPECT(rd8(ISR_AT) == 1, "ISR byte still latches under MSI-X");
++    msix_ping(1, "P1", 2);
++    EXPECT(msi_take() == 0x52, "q1 completed on its own vector 0x52");
++    (void)rd8(ISR_AT);
++    /* per-vector mask: the event pends; the PBA shows it through
++     * the assigned vector; the unmask releases exactly one message */
++    wr32(MSIX_AT(1, 3), 1);
++    msix_ping(0, "M0", 2);
++    EXPECT(lapic_deliverable(&M) < 0, "masked vector delivers nothing");
++    EXPECT(rd32(PBA_AT) == (1u << 1), "PBA bit for the held completion");
++    wr32(MSIX_AT(1, 3), 0);
++    EXPECT(msi_take() == 0x51, "unmask released the pending message");
++    EXPECT(rd32(PBA_AT) == 0, "PBA drained after release");
++    (void)rd8(ISR_AT);
++    /* Function Mask: the same holding pattern one level up */
++    msix_ctl(0xC000);
++    msix_ping(1, "F1", 2);
++    EXPECT(lapic_deliverable(&M) < 0 && rd32(PBA_AT) == (1u << 2),
++           "Function Mask holds q1 pending");
++    msix_ctl(0x8000);
++    EXPECT(msi_take() == 0x52, "function unmask released 0x52");
++    (void)rd8(ISR_AT);
++    /* the config source rides vector 0, generation in step */
++    uint8_t gen0 = rd8(CCD(0x15));
++    virtio_config_changed(&g_fake.vio);
++    EXPECT(msi_take() == 0x53, "config change arrived on vector 0");
++    EXPECT(rd8(CCD(0x15)) == (uint8_t)(gen0 + 1), "config_generation advanced");
++    (void)rd8(ISR_AT);
++    /* an unassigned queue under Enable=1 has no wire at all: PCI
++     * forbids the pin once MSI-X is on (the QEMU rule) */
++    msix_assign(1, 0xFFFF);
++    msix_ping(1, "NV", 2);
++    EXPECT(lapic_deliverable(&M) < 0 && !irq5() && rd32(PBA_AT) == 0,
++           "NO_VECTOR queue: no message, no pin, no PBA bit");
++    (void)rd8(ISR_AT);
++    /* disabling hands the plane back to INTx */
++    msix_ctl(0x0000);
++    msix_ping(0, "OF", 2);
++    EXPECT(irq5() && lapic_deliverable(&M) < 0, "disable: INTx back in charge");
++    EXPECT(rd8(ISR_AT) == 1 && !irq5(), "ISR read-ack after hand-off");
++    /* the table itself is PCI-plane state: a device reset keeps
++     * the messages and only re-arms the assignments */
++    EXPECT(rd32(MSIX_AT(1, 2)) == 0x51u, "table data intact at the end");
++    dev_status(0);
++    EXPECT(rd32(MSIX_AT(1, 2)) == 0x51u, "device reset keeps the MSI-X table");
++    EXPECT(rd16(CCD(0x10)) == 0xFFFF, "while the assignments re-arm");
++    if (fails == f0) printf("ok msix: delivery, masks + PBA, config vector, INTx hand-off\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -541,6 +685,7 @@ int main(void) {
+     v_reset();
+     v_device_config();
+     v_dma_bounds();
++    v_msix();
+     devices_done(&M);
+     if (fails) { printf("test-virtio: %d FAILED\n", fails); return 1; }
+     puts("test-virtio: all vectors passed");
+diff --git a/tests/test_virtio_blk.c b/tests/test_virtio_blk.c
+index cdb87e2..102a5cb 100644
+--- a/tests/test_virtio_blk.c
++++ b/tests/test_virtio_blk.c
+@@ -21,6 +21,7 @@
+ #include "devices.h"
+ #include "harness.h"
+ #include "snapshot.h"
++#include "lapic.h"     /* V5: observe the restored MSI-X delivery */
+ #include "virtio.h"
+ 
+ static int fails;
+@@ -136,7 +137,8 @@ static uint8_t xfer(uint32_t type, uint64_t sector, uint32_t bytes,
+ static void v_identity(void) {
+     int f0 = fails;
+     wr32(CCD(0x00), 0);
+-    EXPECT(rd32(CCD(0x04)) == 0, "no device feature bits offered (D5)");
++    EXPECT(rd32(CCD(0x04)) == (1u << 9),
++           "exactly VIRTIO_BLK_F_FLUSH offered (D5+V5; got %08x)", rd32(CCD(0x04)));
+     wr32(CCD(0x00), 1);
+     EXPECT(rd32(CCD(0x04)) == 1, "transport offers exactly VERSION_1");
+     EXPECT(rd16(CCD(0x12)) == 1, "one queue");
+@@ -145,7 +147,7 @@ static void v_identity(void) {
+     /* the honest capacity, where the spec keeps it */
+     EXPECT(rd64(DCFG(0)) == IMG_SECTORS, "device-config capacity = 64 sectors");
+     EXPECT(rd32(DCFG(8)) == 0, "config beyond capacity reads 0 (no extra fields offered)");
+-    if (fails == f0) printf("ok identity: VERSION_1-only, capacity in device cfg\n");
++    if (fails == f0) printf("ok identity: VERSION_1 + FLUSH, capacity in device cfg\n");
+ }
+ 
+ static void v_read_guest_shape(void) {
+@@ -213,6 +215,28 @@ static void v_split_chain(void) {
+     if (fails == f0) printf("ok split chain: stream copy crosses descriptors\n");
+ }
+ 
++/* V5: FLUSH is advertised (feature bit 9) and pinned.  On a
++ * synchronous RAM-copy engine the barrier is honest by construction:
++ * the write's bytes were already in the image before its own
++ * completion was visible, so FLUSH answers S_OK with no data stream
++ * and the following read must see the write. */
++static void v_flush(void) {
++    int f0 = fails;
++    uint32_t used;
++    for (int i = 0; i < 512; i++) M.ram[DATAB + i] = (uint8_t)(0x5A ^ (i & 0xF));
++    EXPECT(xfer(1, 11, 512, &used) == 0, "write before flush");
++    EXPECT(xfer(4, 0, 0, &used) == 0 && used == 1,
++           "FLUSH (type 4) -> S_OK, used 1 (status only)");
++    EXPECT(xfer(4, 0xFFFFFFFFull, 0, &used) == 0,
++           "FLUSH ignores its sector field");
++    memset(M.ram + DATAB, 0, 512);
++    EXPECT(xfer(0, 11, 512, &used) == 0, "read after flush");
++    int back = 1;
++    for (int i = 0; i < 512; i++) back &= M.ram[DATAB + i] == (uint8_t)(0x5A ^ (i & 0xF));
++    EXPECT(back, "bytes written before the flush are what reads see");
++    if (fails == f0) printf("ok flush: feature 9 + type 4, S_OK, ordering honest\n");
++}
++
+ static void v_requests_refused(void) {
+     int f0 = fails;
+     uint32_t used;
+@@ -225,9 +249,11 @@ static void v_requests_refused(void) {
+     /* length discipline */
+     EXPECT(xfer(0, 0, 511, &used) == 1, "non-sector-multiple length -> S_IOERR");
+     EXPECT(xfer(0, 0, 0, &used) == 1, "zero-length read -> S_IOERR");
+-    /* unadvertised types: FLUSH(4), GET_ID(8), garbage(99) */
+-    EXPECT(xfer(4, 0, 0, &used) == 2 && used == 1, "FLUSH not advertised -> S_UNSUPP");
++    /* unadvertised types: GET_ID(8), DISCARD(11), WRITE_ZEROES(13),
++     * garbage(99) -- FLUSH(4) left this list in V5 (v_flush pins it) */
+     EXPECT(xfer(8, 0, 20, &used) == 2, "GET_ID -> S_UNSUPP");
++    EXPECT(xfer(11, 0, 512, &used) == 2 && used == 1, "DISCARD -> S_UNSUPP");
++    EXPECT(xfer(13, 0, 512, &used) == 2, "WRITE_ZEROES -> S_UNSUPP");
+     EXPECT(xfer(99, 0, 512, &used) == 2, "unknown type -> S_UNSUPP");
+     if (fails == f0) printf("ok refusals: IOERR on range/length, UNSUPP off the offer\n");
+ }
+@@ -249,14 +275,33 @@ static void v_short_header(void) {
+ }
+ 
+ /* Runs last on purpose: snap_load rewrites the whole machine image. */
++static int msi_take(void) {
++    int v = lapic_intack(&M);
++    if (v >= 0) mem_write(&M, 0xFEE000B0u, 4, 0);       /* EOI */
++    return v;
++}
++
+ static void v_snapshot(void) {
+     int f0 = fails;
+     guest_full_init();
+     zero_rings();
++    /* V5: the MSI-X plane rides in the serialized transport.  Program
++     * it before the save -- table entry, assignment, Enable -- and
++     * drain one delivery, so the post-load completion below can only
++     * arrive through the RESTORED state. */
++    M.lapic.svr |= 0x100u;
++    wr32(VBAR + 0x3800u + 16u + 0u,  0xFEE00000u);
++    wr32(VBAR + 0x3800u + 16u + 8u,  0xA5u);
++    wr32(VBAR + 0x3800u + 16u + 12u, 0u);
++    wr16(CCD(0x16), 0);
++    wr16(CCD(0x1A), 1);
++    io_write(&M, 0xCF8, 4, 0x80000000u | (5u << 11) | 0x84u);
++    io_write(&M, 0xCFC, 4, (0x8000u << 16) | 0x11u);    /* MSI-X Enable */
+     /* write a marker sector, snapshot, trample the image, load */
+     for (int i = 0; i < 512; i++) M.ram[DATAB + i] = (uint8_t)(0xA0 + (i & 7));
+     uint32_t used;
+     EXPECT(xfer(1, 9, 512, &used) == 0, "marker write before snapshot");
++    EXPECT(msi_take() == 0xA5, "marker write signalled over MSI-X pre-save");
+     static const snap_cfg_t CFG = { "Haswell", 0, 0 };
+     const char *path = "/tmp/test_virtio_blk.snap";
+     EXPECT(snap_save(&M, path, &CFG) == 0, "snapshot saves with blk attached");
+@@ -271,14 +316,17 @@ static void v_snapshot(void) {
+      * so re-derive the test cursor from used progress. */
+     EXPECT(rd16(CCD(0x1C)) == 1, "queue still enabled after load (transport restored)");
+     EXPECT(rd64(DCFG(0)) == IMG_SECTORS, "capacity intact after load");
++    EXPECT(rd16(CCD(0x1A)) == 1, "queue MSI-X vector assignment restored");
++    EXPECT(rd32(VBAR + 0x3800u + 16u + 8u) == 0xA5u, "MSI-X table message restored");
+     /* post at the restored avail position: read avail idx from RAM */
+     avail_seq = (uint16_t)(M.ram[QAVAIL + 2] | (M.ram[QAVAIL + 3] << 8));
+     uint8_t st = xfer(0, 9, 512, &used);
+     int marker = 1;
+     for (int i = 0; i < 512; i++) marker &= M.ram[DATAB + i] == (uint8_t)(0xA0 + (i & 7));
+     EXPECT(st == 0 && marker, "saved image state, not the trample, answers reads");
++    EXPECT(msi_take() == 0xA5, "post-load completion arrived on the restored vector");
+     dev_status(0);
+-    if (fails == f0) printf("ok snapshot: transport + image round-trip, requests continue\n");
++    if (fails == f0) printf("ok snapshot: transport (+MSI-X) + image round-trip, requests continue\n");
+ }
+ 
+ int main(void) {
+@@ -290,6 +338,7 @@ int main(void) {
+     v_read_guest_shape();
+     v_write_readback();
+     v_split_chain();
++    v_flush();
+     v_requests_refused();
+     v_short_header();
+     v_snapshot();
+diff --git a/tests/test_virtio_net.c b/tests/test_virtio_net.c
+index ad17842..7145234 100644
+--- a/tests/test_virtio_net.c
++++ b/tests/test_virtio_net.c
+@@ -22,6 +22,7 @@
+ #include "harness.h"
+ #include "virtio.h"
+ #include "virtio_net.h"
++#include "lapic.h"     /* V5: observe MSI-X delivery */
+ 
+ static int fails;
+ #define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+@@ -270,6 +271,56 @@ static void v_not_ready(void) {
+     if (fails == f0) printf("ok not-ready: ingress waits for DRIVER_OK like the spec dance\n");
+ }
+ 
++/* V5: the same guest shape over MSI-X.  RX and TX completions must
++ * land as LAPIC messages on their own queue vectors, and the IRQ7
++ * pin (the whole wake path of v_rx_path) must retire while Enable=1. */
++static int msi_take(void) {
++    int v = lapic_intack(&M);
++    if (v >= 0) mem_write(&M, 0xFEE000B0u, 4, 0);       /* EOI */
++    return v;
++}
++
++static void v_msix(void) {
++    int f0 = fails;
++    M.lapic.svr |= 0x100u;
++    guest_init(2, NULL);
++    /* entry 1 -> RX queue (LAPIC vector 0x61), entry 2 -> TX (0x62) */
++    static const struct { int entry; uint32_t vec; } tab[2] = { { 1, 0x61 }, { 2, 0x62 } };
++    for (int i = 0; i < 2; i++) {
++        uint32_t at = VBAR + 0x3800u + 16u * (uint32_t)tab[i].entry;
++        wr32(at + 0u, 0xFEE00000u);
++        wr32(at + 8u, tab[i].vec);
++        wr32(at + 12u, 0u);
++    }
++    wr16(CCD(0x16), 0); wr16(CCD(0x1A), 1);
++    wr16(CCD(0x16), 1); wr16(CCD(0x1A), 2);
++    io_write(&M, 0xCF8, 4, 0x80000000u | (6u << 11) | 0x84u);
++    io_write(&M, 0xCFC, 4, (0x8000u << 16) | 0x11u);    /* MSI-X Enable */
++    io_write(&M, 0xCF8, 4, 0x80000000u | (6u << 11) | 0x84u);
++    EXPECT(((io_read(&M, 0xCFC, 4) >> 16) & 0xFFFFu) == 0x8002u,
++           "net Message Control: table size 3, enabled");
++    uint8_t frame[48];
++    frame_pattern(frame, sizeof frame, 0x44);
++    virtio_net_rx_frame(&M, frame, sizeof frame);
++    EXPECT(ring16(Q0U, 2) == 1, "RX completed under MSI-X");
++    EXPECT(msi_take() == 0x61, "RX arrived on queue 0's vector");
++    EXPECT(!irq7(), "IRQ7 pin silent under MSI-X");
++    EXPECT(memcmp(M.ram + RXBUF(0) + 12, frame, sizeof frame) == 0,
++           "frame intact behind the header");
++    (void)rd8(ISR_AT);
++    memset(M.ram + TXBUF, 0, 12);
++    frame_pattern(M.ram + TXBUF + 12, 40, 0x51);
++    put_desc(Q1D, 0, TXBUF, 52, 0, 0);
++    post(Q1A, 0);
++    wr16(NOTIFY(1), 1);
++    EXPECT(ring16(Q1U, 2) == 1, "TX completed under MSI-X");
++    EXPECT(msi_take() == 0x62, "TX arrived on queue 1's vector");
++    dev_status(0);
++    io_write(&M, 0xCF8, 4, 0x80000000u | (6u << 11) | 0x84u);
++    io_write(&M, 0xCFC, 4, 0x11u);                      /* MSI-X off */
++    if (fails == f0) printf("ok msix: rx/tx on per-queue vectors, IRQ7 retired\n");
++}
++
+ int main(void) {
+     setup_machine(&M);
+     devices_init_common(&M);
+@@ -280,6 +331,7 @@ int main(void) {
+     v_rx_truncate();
+     v_tx_path();
+     v_not_ready();
++    v_msix();
+     devices_done(&M);
+     if (fails) { printf("test-virtio-net: %d FAILED\n", fails); return 1; }
+     puts("test-virtio-net: all vectors passed");

@@ -1,0 +1,982 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b3b05b7..71ce74b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,33 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0107 (VIRTIO V2: virtio-blk)
++
++- **The guest's modern virtio-blk driver now has a disk to
++  find.** `1af4:1042` at 0:05.0 (IRQ5), `--virtio-blk=path`
++  (RAM-copy image, fatal on an unreadable file) with the
++  matching "VirtIO disk" field in the expert GUI and the
++  launcher schema — and nothing exists without the flag,
++  so every historical receipt stands. Reads/writes stream
++  sector-wise across arbitrary descriptor splits, the
++  status byte always lands at the in-stream tail,
++  out-of-range or non-sector-multiple requests earn
++  `S_IOERR`, and every type outside the offer (FLUSH
++  included, until V5 pins its semantics) earns `S_UNSUPP`
++  instead of a counterfeit success. Device config is the
++  honest 8-byte capacity (the guest driver will still
++  print its BAR values as the capacity — guest finding N2,
++  device truth is where the spec keeps it). Snapshots are
++  fully supported through a present-only section: the
++  record stream of a machine without the flag is
++  byte-identical to before, while with the flag the
++  transport state and the whole image round-trip and
++  requests continue over the restored rings. Seven guest-
++  shaped vectors in `tests/test_virtio_blk.c` (the blind
++  N1 init replayed verbatim included); NC = missing
++  symbols on the parent plus an `S_UNSUPP→S_OK` mutation
++  that reddens exactly the FLUSH vector.
++
+ ### Added — patch 0106 (VIRTIO V1: the modern virtio-pci transport core)
+ 
+ - **`src/virtio.c` implements the shared transport both
+diff --git a/Makefile b/Makefile
+index 2776880..a548c34 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -150,22 +150,28 @@ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
+ # FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
+ # snapshot byte-stability of the x87 file across fresh runs).
+ test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
+ 	./test-fpu-gate
+ 	rm -f test-fpu-gate
+ 
+ # XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
+ test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-xhci -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio.c src/virtio_blk.c -o test-xhci -lm
+ 	./test-xhci
+ 	rm -f test-xhci
+ 
+ # VIRTIO V1: modern virtio-pci transport core (plan: VIRTIO_PLAN).
+ test-virtio: tests/test_virtio.c src/virtio.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio -lm
+ 	./test-virtio
+ 	rm -f test-virtio
+ 
++# VIRTIO V2: modern virtio-blk device (guest-shaped vectors + snapshot).
++test-virtio-blk: tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/devices.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio-blk -lm
++	./test-virtio-blk
++	rm -f test-virtio-blk
++
+ test-msi: tests/test_msi.c src/lapic.c src/devices.c
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
+ 	./test-msi
+@@ -291,7 +297,7 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
+ # test-snapshot: split-run identity lanes on real workloads (the frozen
+ # guest lanes SKIP unless KERNEL/INITRD are set).
+ test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+ 	./test-snap
+ 	rm -f test-snap
+ 
+@@ -383,7 +389,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -393,7 +399,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -442,4 +448,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 96be97b..a9495c9 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,7 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+-| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V1 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V2 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -186,14 +186,16 @@ harness reproduction.
+    behind `tests/test_virtio.c` — the D3 gate split
+    mutation-pinned, placement corrected against the
+    e1000's conditional 0:04.0 (blk/net: 0:05.0/0:06.0,
+-   IRQ5/IRQ7). V2/V3 virtio-blk with a snapshot-clean
+-   RAM image next, V4 virtio-net on the same TAP
+-   responder, V5 MSI-X + close-out.
++   IRQ5/IRQ7); V2 (`0107`) puts virtio-blk on it
++   (`--virtio-blk=` + GUI field, RAM-copy image, honest
++   statuses, full snapshot with a present-only section).
++   V3 is the SeaBIOS proof lane, V4 virtio-net on the
++   same TAP responder, V5 MSI-X + close-out.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+ Every plan in the ledger above except VIRTIO is **CLOSED**.
+-`0105` opens VIRTIO_PLAN (V0 baseline), `0106` its V1 core.
++`0105` opens VIRTIO_PLAN, `0106` its core, `0107` virtio-blk.
+ Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index ad0158c..bc8b5de 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1336,23 +1336,25 @@ MTRR probe would brick under a strict whitelist, and POPCNT +
+ RDTSCP graduated from absent/host-halt and an accidental INVLPG
+ alias respectively), and an INIT# under a closed A20 gate fetches
+ its reset vector from flash again (CF5 — the U5 record, fixed on
+-the decode side). VIRTIO_PLAN **V0+V1 are shipped**: V0 censused
++the decode side). VIRTIO_PLAN **V0–V2 are shipped**: V0 censused
+ the guest's modern virtio-blk/virtio-net drivers line-by-line
+ (the net driver negotiates by the book; the blk driver
+ negotiates nothing and reads capacity out of its BAR registers
+ — guest findings N1/N2 filed in the plan) and froze decisions
+-D1–D7. V1 lands the shared transport core (`src/virtio.c`,
+-pinned by `tests/test_virtio.c` driving a fake echo device at
+-blk's exact coordinates): vendor capabilities in the function's
+-own config space, one relocatable 16 KiB BAR0 with QEMU's
+-common/ISR/device/notify offsets, an image-based common-cfg
+-register file, the D3 gate split (FEATURES_OK kept iff
+-VERSION_1 is acked — mutation-checked — while the queue engine
+-runs under DRIVER_OK so the blind guest blk driver still
+-transfers), hard-bounded split-ring pop/complete (rings and
+-buffers confined to guest RAM; malformed chains complete with
+-len 0, never wedge the ring), synchronous reset and
+-NO_INTERRUPT-aware INTx. The placement census corrected V0:
+-0:04.0 belongs to the opt-in e1000, so blk/net take 0:05.0 /
+-0:06.0 on measured-free IRQ5/IRQ7. No device function exists in
+-a default machine yet; V2 puts virtio-blk on the core.
++D1–D7. V1 landed the shared transport core (`src/virtio.c`):
++vendor capabilities in the function's own config space, one
++relocatable 16 KiB BAR0 with QEMU's offsets, an image-based
++common-cfg register file, the mutation-checked D3 gate split
++(FEATURES_OK kept iff VERSION_1 is acked, queue engine lenient
++under DRIVER_OK so the blind guest blk driver still transfers),
++hard-RAM-bounded split rings, synchronous reset, INTx. V2 puts
++**virtio-blk** on that core: `1af4:1042` at 0:05.0 on IRQ5
++(the placement census moved blk/net off the e1000's
++conditional 0:04.0), a RAM-copy image behind `--virtio-blk=`
++with the matching GUI field, honest capacity in device-config,
++general gather/scatter IN/OUT with the status byte pinned to
++the in-stream tail, `S_IOERR` on range/length and `S_UNSUPP`
++on every unadvertised type (FLUSH waits for V5 rather than
++faking success), and full snapshot support whose record
++stream is untouched when the flag is absent. V3 next: the
++SeaBIOS modern-virtio proof lane, then virtio-net.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+index bfe05e8..af086cf 100644
+--- a/docs/plans/VIRTIO_PLAN.md
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -9,7 +9,7 @@
+ |---|---|---|
+ | V0 | baseline: consumers, infrastructure, decisions D1–D7 | ✅ this patch (0105) |
+ | V1 | transport core `src/virtio.c` + unit harness | ⏳ |
+-| V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ⏳ |
++| V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ✅ patch 0107 (§9) |
+ | V3 | blk integration: SeaBIOS lane, determinism | ⏳ |
+ | V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ⏳ |
+ | V5 | MSI-X + blk FLUSH + close-out audit | ⏳ |
+@@ -261,3 +261,44 @@ NC: on the parent (tree 0105) the test does not build
+ PATH) and `make test-sanitize` — rc 0, 0 findings, test-virtio
+ green under ASan/UBSan; no historical drift (the device is connected
+ to no lane: there are no functions in the machine yet).
++
++## §9 V2 addendum (patch 0107): virtio-blk
++
++`src/virtio_blk.c/h` on the V1 core + `virtio_snap` in the core (transport
++state) + vectors in `tests/test_virtio_blk.c` (7 vectors).
++
++- **Device (D5):** `1AF4:1042` class 01/80 at `0:05.0`,
++  queue max 128, device-cfg = exactly `capacity`
++  (`img_len/512`, the file tail ignored). The image is a RAM copy
++  (`--virtio-blk=path`, attach from main after `devices_init`,
++  an unreadable file = fatal exit 1 as with `--tap`). IN/OUT requests with
++  general gather/scatter over the streams (per-sector chunks through
++  the core's stream helpers); the status byte = **the last byte of
++  the in-stream** (the guest's and SeaBIOS's shapes converge in one place);
++  `used_len` = what was actually written to in (IN: data+1, OUT/errors: 1).
++  Range/length not a multiple of 512 → `S_IOERR`; FLUSH/GET_ID/
++  anything off the offer → `S_UNSUPP` (FLUSH only in V5, once its
++  semantics are pinned, no fake OK). A truncated header
++  (<16 B in out) completes with `S_IOERR` if there is at least one in byte.
++- **GUI parity:** the `virtio_blk` path key in the `tools/launcher.py`
++  SCHEMA + the "VirtIO disk (image, 0:05.0)" row in the expert
++  storage tab of `gui_app.py`; `test-gui` green.
++- **Snapshot:** `virtio_blk_snap` is called from `snapshot.c::visit`
++  next to `ahci_snap` (before the MMIO-map comparison: BAR rebind +
++  INTx re-assertion from the restored ISR inside
++  `virtio_snap`). The section is *present-only*: without the flag the record stream
++  is byte-identical to history; blk↔no-blk crossings are refused by the
++  `pci_snap` identity; the image — `snap_sparse` "disk.vblk"
++  (the record length refuses a differently sized file at load).
++  The round-trip is pinned by a vector: after saving, the image is trampled
++  through the device; after loading, the saved state is what reads back
++  and requests continue over the restored rings.
++- **Linking:** `snapshot.c` pulls in `virtio_blk_snap`, so
++  `virtio.c`+`virtio_blk.c` were added to the 4 link lines with
++  snapshot.c (fpu-gate/xhci/virtio/snap) — the `ahci_snap` precedent.
++
++NC: the parent has no `virtio_blk_test_add` (new-module form);
++the `S_UNSUPP→S_OK` mutation burns exactly the FLUSH vector. Gates:
++full `make test` + sanitize rc 0, 0 findings; the smoke
++`x86emu --virtio-blk=disk/disk.img` raises the function and does not
++break the firmware boot (the device's SeaBIOS lane is V3, as in §5).
+diff --git a/src/devices.h b/src/devices.h
+index 7fbec7f..2ea4bab 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -26,6 +26,13 @@ void vbe_mode_disable(machine_t *m);
+  * the guest's e1000_send() spins on DD with a bounded PAUSE budget). */
+ void e1000_test_add(machine_t *m);
+ int  e1000_attach(machine_t *m, const char *hostport);
++
++/* VIRTIO V2: modern virtio-blk (src/virtio_blk.c on the V1 core).
++ * Opt-in like the e1000: no PCI function exists until attached.
++ * The test entry takes a caller-owned image; the CLI entry reads
++ * the whole host file into RAM (the sata_img convention). */
++int  virtio_blk_attach(machine_t *m, const char *path);
++void virtio_blk_test_add(machine_t *m, uint8_t *img, size_t len);
+ void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
+ void e1000_tick(void);
+ void e1000_tx_stats(uint64_t *sent, uint64_t *dropped);   /* N1 wire counters */
+diff --git a/src/main.c b/src/main.c
+index b1ad886..d9cc263 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -156,6 +156,7 @@ int main(int argc, char **argv) {
+     const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
+     const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
+     const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
++    const char *vblk_arg = NULL;    /* --virtio-blk=path: modern virtio-blk (VIRTIO V2, opt-in) */
+     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
+                                      * land in the host image files too */
+     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+@@ -193,6 +194,7 @@ int main(int argc, char **argv) {
+         else if (!strcmp(argv[i], "--stats")) cfg_stats = 1;   /* PERF P0 */
+         else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
++        else if (!strncmp(argv[i], "--virtio-blk=", 13)) vblk_arg = argv[i]+13;   /* VIRTIO V2 */
+         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
+         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
+         else if (!strncmp(argv[i], "--keys-at=", 10)) {
+@@ -262,6 +264,7 @@ int main(int argc, char **argv) {
+                    "          [--smp=N] run N real vCPUs (max 8; use with --cpus=N for --kernel or --lpc=ich9 for BIOS SMP, K6/G6)\n"
+                    "                      skips --rom entirely and starts at the ELF entry\n"
+                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
++                   "          [--virtio-blk=img] raw image on a modern virtio-blk 1af4:1042 at 0:05.0 (VIRTIO V2)\n"
+                    "          [--cdrom=img] ISO on an ATAPI CD -- ctrl 0 port 1, El Torito boot (STORE S6)\n"
+                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
+                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
+@@ -370,6 +373,14 @@ int main(int argc, char **argv) {
+         mlog(&m->log, "[e1000] --tap attach failed (want host:port, default port 8080)");
+         return 1;
+     }
++    /* VIRTIO V2: --virtio-blk=path attaches the opt-in modern
++     * virtio-blk (1af4:1042 at 0:05.0) with a RAM copy of the image.
++     * Without the flag the function does not exist and every
++     * historical tape keeps its receipt (plan rule 2). */
++    if (vblk_arg && virtio_blk_attach(m, vblk_arg) != 0) {
++        mlog(&m->log, "[virtio-blk] --virtio-blk attach failed for %s", vblk_arg);
++        return 1;
++    }
+     if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
+         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
+         return 1;
+diff --git a/src/snapshot.c b/src/snapshot.c
+index 440c8a4..5284b8c 100644
+--- a/src/snapshot.c
++++ b/src/snapshot.c
+@@ -259,6 +259,7 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
+      * LAPIC relocated or globally disabled loads equivalently. */
+     pci_snap(m, &s->pub);
+     ahci_snap(m, &s->pub);
++    virtio_blk_snap(m, &s->pub);   /* V2: opt-in; no records when absent */
+     if (s->loading && !s->failed) lapic_sync_mmio(m);
+     mmio_rec(m, s);
+     devices_snap(m, &s->pub);
+diff --git a/src/snapshot.h b/src/snapshot.h
+index 1a8a529..a670fdc 100644
+--- a/src/snapshot.h
++++ b/src/snapshot.h
+@@ -33,6 +33,7 @@ static inline void snap_sparse(snap_t *s, const char *tag, uint8_t *buf, size_t
+ /* --- module visitors (defined next to the state they own) */
+ void devices_snap(machine_t *m, snap_t *s);   /* devices.c (+ serial)  */
+ void ahci_snap(machine_t *m, snap_t *s);      /* ahci.c                */
++void virtio_blk_snap(machine_t *m, snap_t *s); /* virtio_blk.c (V2)    */
+ struct serial_state;
+ void serial_snap(struct serial_state *ser, snap_t *s);   /* serial.c   */
+ void pci_snap(machine_t *m, snap_t *s);       /* pci.c                 */
+diff --git a/src/virtio.c b/src/virtio.c
+index 92cb00c..61fec81 100644
+--- a/src/virtio.c
++++ b/src/virtio.c
+@@ -556,3 +556,27 @@ void virtio_pci_add(machine_t *m, virtio_dev_t *v, int pci_dev_no,
+     mlog(&m->log, "[virtio] %s 1af4:%04x at 0:%02d.0 BAR0 0x%x IRQ %d (%d queues)\n",
+          name, device_id, pci_dev_no, bar_base, irq, desc->num_queues);
+ }
++
++/* ============================== snapshot =============================== */
++
++void virtio_snap(virtio_dev_t *v, snap_t *s, const char *tag) {
++    virtio_dev_t t = *v;
++    if (!snap_loading(s)) {
++        t.m = NULL; t.pci = NULL; t.desc = NULL; t.ctx = NULL;
++    }
++    snap_bytes(s, tag, &t, sizeof t);
++    if (snap_loading(s)) {
++        machine_t *m = v->m;
++        pci_dev_t *p = v->pci;
++        const virtio_device_desc_t *d = v->desc;
++        void *c = v->ctx;
++        *v = t;
++        v->m = m; v->pci = p; v->desc = d; v->ctx = c;
++        /* pci_snap restored the cfg BAR bytes but does not rebind the
++         * decode; the serialized live base does (ahci_snap rule), and
++         * the INTx level is re-driven from the restored ISR byte. */
++        vio_set_bar(v, v->bar_base);
++        v->intx_level = 0;
++        vio_intx_update(v);
++    }
++}
+diff --git a/src/virtio.h b/src/virtio.h
+index 2041fd1..a50c004 100644
+--- a/src/virtio.h
++++ b/src/virtio.h
+@@ -26,6 +26,7 @@
+ 
+ #include <stdint.h>
+ #include "machine.h"
++#include "snapshot.h"
+ 
+ struct pci_dev;
+ 
+@@ -157,6 +158,14 @@ void virtio_pci_add(machine_t *m, virtio_dev_t *v, int pci_dev_no,
+  * writing 0 to device_status (status reads back 0 immediately). */
+ void virtio_reset_device(virtio_dev_t *v);
+ 
++/* Snapshot visitor for the transport state (D7): status/features,
++ * queue addresses+sizes+consumed cursor, ISR, BAR placement; the
++ * load leg rebinds the live BAR window and re-drives INTx (the
++ * ahci_snap placement rule -- virtio_blk_snap runs from
++ * snapshot.c's visit() next to ahci_snap, before the MMIO map is
++ * compared).  Host pointers never enter the file. */
++void virtio_snap(virtio_dev_t *v, snap_t *s, const char *tag);
++
+ /* The queue engine's run gate (D3): DRIVER_OK set and queue enabled,
+  * with ring addresses programmed. */
+ int  virtio_queue_ready(virtio_dev_t *v, int qi);
+diff --git a/src/virtio_blk.c b/src/virtio_blk.c
+new file mode 100644
+index 0000000..ecdb3dd
+--- /dev/null
++++ b/src/virtio_blk.c
+@@ -0,0 +1,211 @@
++/* virtio_blk.c -- VIRTIO V2: virtio-blk on the V1 core (D5).
++ *
++ * Request model (virtio 1.x section 5.2): a 16-byte header
++ * {type, reserved, sector} at the head of the out-stream, data in
++ * the middle (out-stream for writes, in-stream for reads), and the
++ * status byte as the LAST byte of the in-stream -- which is what
++ * makes both the guest's three-descriptor chain and SeaBIOS's
++ * split chains land in the same place.  used_len counts bytes
++ * actually written into the writable side (data+1 on a read, 1 on
++ * a write or an error).
++ *
++ * Completion is synchronous inside the notify write (house rule):
++ * the polling guest observes its used-idx advance by the time the
++ * doorbell store retires.  Feature offer is VERSION_1 only; in
++ * particular FLUSH is NOT advertised until V5 gives it pinned
++ * semantics, so type-4 requests (like every unknown type) earn an
++ * honest S_UNSUPP rather than a fake success.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "virtio.h"
++#include "virtio_blk.h"
++
++#define VBLK_SECTOR       512u
++#define VBLK_QSIZE        128          /* offered max (guest clamps to 256) */
++
++#define VBLK_T_IN         0            /* read  */
++#define VBLK_T_OUT        1            /* write */
++#define VBLK_T_FLUSH      4
++#define VBLK_T_GET_ID     8
++
++#define VBLK_S_OK         0
++#define VBLK_S_IOERR      1
++#define VBLK_S_UNSUPP     2
++
++typedef struct {
++    machine_t   *m;
++    virtio_dev_t vio;
++    virtio_req_t req;                  /* ~8 KiB scratch (echo pattern) */
++    uint8_t     *img;
++    size_t       img_len;
++    uint64_t     capacity;             /* sectors */
++    uint8_t      config[8];            /* capacity LE, the whole config */
++    int          attached;
++    unsigned     err_logs;             /* first-N protocol error budget */
++} vblk_t;
++
++static vblk_t g_vblk;
++static virtio_device_desc_t g_vblk_desc;   /* filled at attach (config ptr) */
++
++static void vblk_err(vblk_t *b, const char *what, uint64_t a, uint64_t c) {
++    if (b->err_logs < 8)
++        mlog(&b->m->log, "[virtio-blk] request error: %s (%llu, %llu)\n",
++             what, (unsigned long long)a, (unsigned long long)c);
++    b->err_logs++;
++}
++
++static uint32_t le32(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static uint64_t le64(const uint8_t *p) {
++    return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
++}
++
++/* Finish one request: the status byte is always the last byte of
++ * the in-stream (when the guest gave us a writable byte at all). */
++static void vblk_finish(vblk_t *b, virtio_req_t *r,
++                        uint8_t status, uint32_t used_len) {
++    if (r->in_len >= 1)
++        virtio_req_write(r, r->in_len - 1, &status, 1);
++    else
++        used_len = 0;
++    virtio_complete(&b->vio, r, used_len);
++}
++
++static void vblk_process(vblk_t *b, virtio_req_t *r) {
++    uint8_t hdr[16];
++    if (virtio_req_read(r, 0, hdr, sizeof hdr) < sizeof hdr) {
++        vblk_err(b, "header shorter than 16 bytes", le32(hdr), r->out_len);
++        vblk_finish(b, r, VBLK_S_IOERR, 1);
++        return;
++    }
++    uint32_t type = le32(hdr + 0);
++    uint64_t sector = le64(hdr + 8);
++
++    if (type != VBLK_T_IN && type != VBLK_T_OUT) {
++        /* FLUSH / GET_ID / DISCARD / WRITE_ZEROES / garbage: none of
++         * their feature bits are offered, so the truthful answer is
++         * UNSUPP (FLUSH semantics are promised only in V5). */
++        vblk_finish(b, r, VBLK_S_UNSUPP, 1);
++        return;
++    }
++
++    uint32_t data_len = (type == VBLK_T_IN)
++        ? (r->in_len >= 1 ? r->in_len - 1 : 0)
++        : (r->out_len >= 16 ? r->out_len - 16 : 0);
++    uint64_t count = data_len / VBLK_SECTOR;
++    if (data_len == 0 || data_len % VBLK_SECTOR != 0 ||
++        sector > b->capacity || count > b->capacity - sector) {
++        vblk_err(b, (type == VBLK_T_IN) ? "read out of range" : "write out of range",
++                 sector, count);
++        vblk_finish(b, r, VBLK_S_IOERR, 1);
++        return;
++    }
++
++    /* Sector-chunked streams: the core's stream copy crosses
++     * descriptor boundaries, so split chains (SeaBIOS, the guest's
++     * 3-descriptor form, anything between) are all the same here. */
++    uint8_t buf[VBLK_SECTOR];
++    uint64_t base = sector * VBLK_SECTOR;
++    for (uint32_t done = 0; done < data_len; done += VBLK_SECTOR) {
++        if (type == VBLK_T_IN) {
++            if (virtio_req_write(r, done, b->img + base + done, VBLK_SECTOR)
++                    != VBLK_SECTOR) {
++                vblk_finish(b, r, VBLK_S_IOERR, 1);
++                return;
++            }
++        } else {
++            if (virtio_req_read(r, 16 + done, buf, VBLK_SECTOR) != VBLK_SECTOR) {
++                vblk_finish(b, r, VBLK_S_IOERR, 1);
++                return;
++            }
++            memcpy(b->img + base + done, buf, VBLK_SECTOR);
++        }
++    }
++    vblk_finish(b, r, VBLK_S_OK,
++                type == VBLK_T_IN ? data_len + 1 : 1);
++}
++
++static void vblk_notify(virtio_dev_t *v, int qi) {
++    vblk_t *b = v->ctx;
++    if (qi != 0) return;
++    for (;;) {
++        int rc = virtio_pop(v, 0, &b->req);
++        if (rc == 0) break;
++        if (rc < 0) continue;          /* malformed: core already finished it */
++        vblk_process(b, &b->req);
++    }
++}
++
++static void vblk_publish(machine_t *m, vblk_t *b) {
++    b->m = m;
++    b->capacity = b->img_len / VBLK_SECTOR;
++    for (int i = 0; i < 8; i++) b->config[i] = (uint8_t)(b->capacity >> (8 * i));
++    memset(&g_vblk_desc, 0, sizeof g_vblk_desc);
++    g_vblk_desc.features = 0;                      /* D5: VERSION_1 only */
++    g_vblk_desc.num_queues = 1;
++    g_vblk_desc.queue_max[0] = VBLK_QSIZE;
++    g_vblk_desc.config = b->config;
++    g_vblk_desc.config_len = sizeof b->config;
++    g_vblk_desc.notify = vblk_notify;
++    virtio_pci_add(m, &b->vio, VIRTIO_BLK_PCI_DEV, "virtio-blk",
++                   VIRTIO_PCI_BLK_ID, 0x01, 0x80, 0x00,
++                   VIRTIO_BLK_BAR_BASE, VIRTIO_BLK_IRQ, &g_vblk_desc, b);
++    b->attached = 1;
++}
++
++void virtio_blk_test_add(machine_t *m, uint8_t *img, size_t len) {
++    memset(&g_vblk, 0, sizeof g_vblk);
++    g_vblk.img = img;
++    g_vblk.img_len = len;
++    vblk_publish(m, &g_vblk);
++}
++
++int virtio_blk_attach(machine_t *m, const char *path) {
++    FILE *f = fopen(path, "rb");
++    if (!f) {
++        mlog(&m->log, "[virtio-blk] cannot open %s\n", path);
++        return -1;
++    }
++    fseek(f, 0, SEEK_END);
++    long n = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    uint8_t *img = NULL;
++    if (n > 0) {
++        img = malloc((size_t)n);
++        if (img && fread(img, 1, (size_t)n, f) != (size_t)n) {
++            free(img);
++            img = NULL;
++        }
++    }
++    fclose(f);
++    if (!img) {
++        mlog(&m->log, "[virtio-blk] cannot read %s\n", path);
++        return -1;
++    }
++    memset(&g_vblk, 0, sizeof g_vblk);
++    g_vblk.img = img;
++    g_vblk.img_len = (size_t)n;
++    vblk_publish(m, &g_vblk);
++    mlog(&m->log, "[virtio-blk] attached %s (%zu bytes, %llu sectors)\n",
++         path, g_vblk.img_len, (unsigned long long)g_vblk.capacity);
++    return 0;
++}
++
++int virtio_blk_present(void) { return g_vblk.attached; }
++
++/* Present-only section (snapshot.c visit() calls this unconditionally):
++ * a machine without the opt-in function produces exactly the
++ * historical record stream, and the pci.%02x.%02x.%x identity check
++ * refuses blk<->no-blk crossings before this record is reached.
++ * The image goes through the same sparse record as the SATA images,
++ * whose length field refuses a differently-sized file at load. */
++void virtio_blk_snap(machine_t *m, snap_t *s) {
++    (void)m;
++    if (!g_vblk.attached) return;
++    virtio_snap(&g_vblk.vio, s, "dev.vblk");
++    snap_sparse(s, "disk.vblk", g_vblk.img, g_vblk.img_len);
++}
+diff --git a/src/virtio_blk.h b/src/virtio_blk.h
+new file mode 100644
+index 0000000..1aba49c
+--- /dev/null
++++ b/src/virtio_blk.h
+@@ -0,0 +1,31 @@
++/* virtio_blk.h -- VIRTIO V2: modern virtio-blk on the V1 transport
++ * core (docs/plans/VIRTIO_PLAN.md, decision D5).  One queue, a RAM
++ * copy of the host image (the sata_img convention: reads/writes hit
++ * the in-memory copy, the host file is never rewritten), the honest
++ * 8-byte device config (`capacity` in 512-byte sectors -- the
++ * guest's own driver reads it out of the wrong place, finding N2,
++ * but the bytes are where the spec puts them), and no device
++ * feature bits beyond the transport's VERSION_1.
++ */
++#ifndef EMU_VIRTIO_BLK_H
++#define EMU_VIRTIO_BLK_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include "machine.h"
++#include "snapshot.h"
++
++/* CLI entry (--virtio-blk=path): reads the whole host image into
++ * RAM and publishes the 1af4:1042 function at 0:05.0.  0 ok,
++ * -1 with the reason already logged (main treats it as fatal --
++ * a disk that silently is not there is worse than a refusal). */
++int  virtio_blk_attach(machine_t *m, const char *path);
++
++/* Unit entry (e1000_test_add shape): caller-owned image buffer,
++ * no file IO. */
++void virtio_blk_test_add(machine_t *m, uint8_t *img, size_t len);
++
++int  virtio_blk_present(void);
++void virtio_blk_snap(machine_t *m, snap_t *s);
++
++#endif /* EMU_VIRTIO_BLK_H */
+diff --git a/tests/test_virtio_blk.c b/tests/test_virtio_blk.c
+new file mode 100644
+index 0000000..cdb87e2
+--- /dev/null
++++ b/tests/test_virtio_blk.c
+@@ -0,0 +1,300 @@
++/* tests/test_virtio_blk.c -- VIRTIO V2 vectors: the virtio-blk device
++ * half on the V1 transport (docs/plans/VIRTIO_PLAN.md, decision D5).
++ *
++ * The request forms are the measured guest's (AuraLite-OS
++ * drivers/virtio_blk/virtio_blk.c): the blind status ritual
++ * (0; ACK|DRIVER; |=FEATURES_OK; |=DRIVER_OK, no feature traffic,
++ * finding N1), the three-descriptor chain (16-byte header, data,
++ * one status byte), completion observed by polling used-idx.
++ * Everything the guest would touch goes through real PCI config,
++ * BAR MMIO and guest-RAM rings on the full machine fixture.
++ *
++ * One vector pins the device-config truth: capacity is the u64 at
++ * the head of the device-config region.  The guest driver reads it
++ * from PCI config 0x10/0x14 instead (its own BAR values -- finding
++ * N2, guest-side); nothing here colludes with that.
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++#include "harness.h"
++#include "snapshot.h"
++#include "virtio.h"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static machine_t M;
++
++#define VBAR       0xFEB30000u
++#define CCD(off)   (VBAR + (off))
++#define DCFG(off)  (VBAR + 0x2000u + (off))
++#define NOTIFY0    (VBAR + 0x3000u)
++
++#define IMG_SECTORS 64
++static uint8_t IMG[IMG_SECTORS * 512];
++
++/* ring + buffer area (guest RAM at 2 MiB) */
++#define QDESC  0x200000u
++#define QAVAIL 0x201000u
++#define QUSED  0x202000u
++#define HDRB   0x210000u     /* request header page     */
++#define DATAB  0x211000u     /* data page               */
++#define STATB  0x212000u     /* status page             */
++
++static uint8_t  rd8 (uint32_t a) { return (uint8_t) mem_read(&M, a, 1); }
++static uint16_t rd16(uint32_t a) { return (uint16_t)mem_read(&M, a, 2); }
++static uint32_t rd32(uint32_t a) { return (uint32_t)mem_read(&M, a, 4); }
++static uint64_t rd64(uint32_t a) { return mem_read(&M, a, 8); }
++static void wr8 (uint32_t a, uint8_t v)  { mem_write(&M, a, 1, v); }
++static void wr16(uint32_t a, uint16_t v) { mem_write(&M, a, 2, v); }
++static void wr32(uint32_t a, uint32_t v) { mem_write(&M, a, 4, v); }
++static void wr64(uint32_t a, uint64_t v) { mem_write(&M, a, 8, v); }
++
++static void dev_status(uint8_t st) { wr8(CCD(0x14), st); }
++
++/* drivers/virtio_blk/virtio_blk.c, verbatim. */
++static void guest_blind_init(void) {
++    dev_status(0);
++    dev_status(1 | 2);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    wr16(CCD(0x16), 0);
++    wr16(CCD(0x18), rd16(CCD(0x18)));          /* read, clamp, write back */
++    wr64(CCD(0x20), QDESC);
++    wr64(CCD(0x28), QAVAIL);
++    wr64(CCD(0x30), QUSED);
++    wr16(CCD(0x1C), 1);
++}
++
++/* The by-the-book ritual (net shape) against a VERSION_1-only offer. */
++static void guest_full_init(void) {
++    dev_status(0); dev_status(1); dev_status(3);
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), 0);    /* acked: nothing local */
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 1);    /* acked: VERSION_1 */
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    wr16(CCD(0x16), 0);
++    wr16(CCD(0x18), rd16(CCD(0x18)));
++    wr64(CCD(0x20), QDESC);
++    wr64(CCD(0x28), QAVAIL);
++    wr64(CCD(0x30), QUSED);
++    wr16(CCD(0x1C), 1);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++}
++
++struct tdesc { uint64_t addr; uint32_t len; uint16_t flags, next; };
++static void put_desc(int i, uint64_t addr, uint32_t len, uint16_t flags, uint16_t next) {
++    struct tdesc d = { addr, len, flags, next };
++    memcpy(M.ram + QDESC + 16u * (uint32_t)i, &d, sizeof d);
++}
++static uint16_t used_idx(void) {
++    return (uint16_t)(M.ram[QUSED + 2] | (M.ram[QUSED + 3] << 8));
++}
++static void used_elem(int slot, uint32_t *id, uint32_t *len) {
++    memcpy(id,  M.ram + QUSED + 4 + 8 * slot, 4);
++    memcpy(len, M.ram + QUSED + 8 + 8 * slot, 4);
++}
++static unsigned avail_seq;
++static void post(uint16_t head) {
++    M.ram[QAVAIL + 4 + 2 * avail_seq] = (uint8_t)head;
++    M.ram[QAVAIL + 5 + 2 * avail_seq] = (uint8_t)(head >> 8);
++    avail_seq++;
++    M.ram[QAVAIL + 2] = (uint8_t)avail_seq;
++    M.ram[QAVAIL + 3] = (uint8_t)(avail_seq >> 8);
++    wr16(NOTIFY0, 0);
++}
++static void zero_rings(void) {
++    memset(M.ram + QDESC, 0, 0x3000);
++    avail_seq = 0;
++}
++
++/* One guest-shaped transfer: header desc + data desc + status desc.
++ * Returns the status byte; *used receives the used-elem len. */
++static uint8_t xfer(uint32_t type, uint64_t sector, uint32_t bytes,
++                    uint32_t *used) {
++    memset(M.ram + HDRB, 0, 16);
++    memcpy(M.ram + HDRB, &type, 4);
++    memcpy(M.ram + HDRB + 8, &sector, 8);
++    M.ram[STATB] = 0xFF;                            /* guest sentinel */
++    put_desc(0, HDRB, 16, VRING_DESC_F_NEXT, 1);
++    put_desc(1, DATAB, bytes,
++             VRING_DESC_F_NEXT | (type == 0 ? VRING_DESC_F_WRITE : 0), 2);
++    put_desc(2, STATB, 1, VRING_DESC_F_WRITE, 0);
++    uint16_t before = used_idx();
++    post(0);
++    uint32_t id = 0xFEFE, len = 0xFEFE;
++    used_elem(before, &id, &len);
++    if (used) *used = len;
++    EXPECT(used_idx() == before + 1 && id == 0,
++           "xfer type %u completed synchronously (idx %u->%u id %u)",
++           type, before, used_idx(), id);
++    return M.ram[STATB];
++}
++
++static void v_identity(void) {
++    int f0 = fails;
++    wr32(CCD(0x00), 0);
++    EXPECT(rd32(CCD(0x04)) == 0, "no device feature bits offered (D5)");
++    wr32(CCD(0x00), 1);
++    EXPECT(rd32(CCD(0x04)) == 1, "transport offers exactly VERSION_1");
++    EXPECT(rd16(CCD(0x12)) == 1, "one queue");
++    wr16(CCD(0x16), 0);
++    EXPECT(rd16(CCD(0x18)) == 128, "queue max 128 (got %u)", rd16(CCD(0x18)));
++    /* the honest capacity, where the spec keeps it */
++    EXPECT(rd64(DCFG(0)) == IMG_SECTORS, "device-config capacity = 64 sectors");
++    EXPECT(rd32(DCFG(8)) == 0, "config beyond capacity reads 0 (no extra fields offered)");
++    if (fails == f0) printf("ok identity: VERSION_1-only, capacity in device cfg\n");
++}
++
++static void v_read_guest_shape(void) {
++    int f0 = fails;
++    guest_blind_init();                    /* N1 ritual, then poll */
++    EXPECT((rd8(CCD(0x14)) & 0x0F) == 0x07,
++           "blind init: FEATURES_OK rejected, DRIVER_OK set");
++    zero_rings();
++    memset(M.ram + DATAB, 0, 0x1000);
++    uint32_t used;
++    uint8_t st = xfer(0, 2, 1024, &used);              /* T_IN, LBA 2, 2 sectors */
++    EXPECT(st == 0, "S_OK (got %u)", st);
++    EXPECT(used == 1025, "used len = data + status (got %u)", used);
++    EXPECT(memcmp(M.ram + DATAB, IMG + 2 * 512, 1024) == 0, "sector bytes exact");
++    dev_status(0);
++    if (fails == f0) printf("ok read: guest chain, S_OK, byte-exact, used 1025\n");
++}
++
++static void v_write_readback(void) {
++    int f0 = fails;
++    guest_full_init();
++    EXPECT((rd8(CCD(0x14)) & 0x0F) == 0x0F, "full negotiation sticks on blk too");
++    zero_rings();
++    for (int i = 0; i < 512; i++) M.ram[DATAB + i] = (uint8_t)(i * 7 + 3);
++    uint32_t used;
++    uint8_t st = xfer(1, 5, 512, &used);               /* T_OUT, LBA 5 */
++    EXPECT(st == 0 && used == 1, "write S_OK, used 1 (st %u used %u)", st, used);
++    int landed = 1;
++    for (int i = 0; i < 512; i++) landed &= IMG[5 * 512 + i] == (uint8_t)(i * 7 + 3);
++    EXPECT(landed, "image holds the written sector");
++    memset(M.ram + DATAB, 0, 512);
++    st = xfer(0, 5, 512, &used);
++    int back = 1;
++    for (int i = 0; i < 512; i++) back &= M.ram[DATAB + i] == (uint8_t)(i * 7 + 3);
++    EXPECT(st == 0 && back, "read-back returns the written bytes");
++    if (fails == f0) printf("ok write+readback: RAM image is the disk\n");
++}
++
++static void v_split_chain(void) {
++    int f0 = fails;
++    /* still under the full init from v_write_readback: one sector
++     * read into two 256-byte pieces + separate status descriptor --
++     * the status byte must land in the LAST piece (in-stream tail),
++     * i.e. in the one-byte status desc, not in the data. */
++    memset(M.ram + DATAB, 0, 0x1000);
++    memset(M.ram + HDRB, 0, 16);
++    uint32_t type = 0;
++    uint64_t sector = 7;
++    memcpy(M.ram + HDRB, &type, 4);
++    memcpy(M.ram + HDRB + 8, &sector, 8);
++    M.ram[STATB] = 0xFF;
++    put_desc(0, HDRB, 16, VRING_DESC_F_NEXT, 1);
++    put_desc(1, DATAB,        256, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE, 2);
++    put_desc(2, DATAB + 0x400, 256, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE, 3);
++    put_desc(3, STATB, 1, VRING_DESC_F_WRITE, 0);
++    uint16_t before = used_idx();
++    post(0);
++    uint32_t id, len;
++    used_elem(before, &id, &len);
++    EXPECT(used_idx() == before + 1 && len == 513, "split read used 513 (got %u)", len);
++    EXPECT(M.ram[STATB] == 0, "status in the tail descriptor (got %u)", M.ram[STATB]);
++    EXPECT(memcmp(M.ram + DATAB, IMG + 7 * 512, 256) == 0 &&
++           memcmp(M.ram + DATAB + 0x400, IMG + 7 * 512 + 256, 256) == 0,
++           "both halves carry their part of the sector");
++    if (fails == f0) printf("ok split chain: stream copy crosses descriptors\n");
++}
++
++static void v_requests_refused(void) {
++    int f0 = fails;
++    uint32_t used;
++    /* range: last sector is 63; 64 and beyond refuse with IOERR */
++    EXPECT(xfer(0, IMG_SECTORS, 512, &used) == 1 && used == 1, "LBA == capacity -> S_IOERR");
++    EXPECT(xfer(1, IMG_SECTORS - 1, 1024, &used) == 1, "write spilling past end -> S_IOERR");
++    EXPECT(xfer(0, 0xFFFFFFFFull, 512, &used) == 1, "absurd LBA -> S_IOERR (no wrap)");
++    /* boundary sanity: the last whole sector still works */
++    EXPECT(xfer(0, IMG_SECTORS - 1, 512, &used) == 0, "last sector reads fine");
++    /* length discipline */
++    EXPECT(xfer(0, 0, 511, &used) == 1, "non-sector-multiple length -> S_IOERR");
++    EXPECT(xfer(0, 0, 0, &used) == 1, "zero-length read -> S_IOERR");
++    /* unadvertised types: FLUSH(4), GET_ID(8), garbage(99) */
++    EXPECT(xfer(4, 0, 0, &used) == 2 && used == 1, "FLUSH not advertised -> S_UNSUPP");
++    EXPECT(xfer(8, 0, 20, &used) == 2, "GET_ID -> S_UNSUPP");
++    EXPECT(xfer(99, 0, 512, &used) == 2, "unknown type -> S_UNSUPP");
++    if (fails == f0) printf("ok refusals: IOERR on range/length, UNSUPP off the offer\n");
++}
++
++static void v_short_header(void) {
++    int f0 = fails;
++    memset(M.ram + HDRB, 0, 16);
++    M.ram[STATB] = 0xFF;
++    put_desc(0, HDRB, 8, VRING_DESC_F_NEXT, 1);        /* truncated header */
++    put_desc(1, STATB, 1, VRING_DESC_F_WRITE, 0);
++    uint16_t before = used_idx();
++    post(0);
++    uint32_t id, len;
++    used_elem(before, &id, &len);
++    EXPECT(used_idx() == before + 1, "short header still completes");
++    EXPECT(M.ram[STATB] == 1 && len == 1, "short header -> S_IOERR at the status byte");
++    dev_status(0);
++    if (fails == f0) printf("ok short header: completed as S_IOERR, never parsed\n");
++}
++
++/* Runs last on purpose: snap_load rewrites the whole machine image. */
++static void v_snapshot(void) {
++    int f0 = fails;
++    guest_full_init();
++    zero_rings();
++    /* write a marker sector, snapshot, trample the image, load */
++    for (int i = 0; i < 512; i++) M.ram[DATAB + i] = (uint8_t)(0xA0 + (i & 7));
++    uint32_t used;
++    EXPECT(xfer(1, 9, 512, &used) == 0, "marker write before snapshot");
++    static const snap_cfg_t CFG = { "Haswell", 0, 0 };
++    const char *path = "/tmp/test_virtio_blk.snap";
++    EXPECT(snap_save(&M, path, &CFG) == 0, "snapshot saves with blk attached");
++    for (int i = 0; i < 512; i++) M.ram[DATAB + i] = 0x11;
++    EXPECT(xfer(1, 9, 512, &used) == 0, "image trampled after save");
++    EXPECT(snap_load(&M, path, &CFG) == 0, "snapshot loads");
++    remove(path);
++    memset(M.ram + DATAB, 0, 512);
++    /* NB: the load rebuilt the ring state from the saved machine;
++     * avail_seq on the test side must follow the restored cursor.
++     * The device side (last_avail) was restored with the transport,
++     * so re-derive the test cursor from used progress. */
++    EXPECT(rd16(CCD(0x1C)) == 1, "queue still enabled after load (transport restored)");
++    EXPECT(rd64(DCFG(0)) == IMG_SECTORS, "capacity intact after load");
++    /* post at the restored avail position: read avail idx from RAM */
++    avail_seq = (uint16_t)(M.ram[QAVAIL + 2] | (M.ram[QAVAIL + 3] << 8));
++    uint8_t st = xfer(0, 9, 512, &used);
++    int marker = 1;
++    for (int i = 0; i < 512; i++) marker &= M.ram[DATAB + i] == (uint8_t)(0xA0 + (i & 7));
++    EXPECT(st == 0 && marker, "saved image state, not the trample, answers reads");
++    dev_status(0);
++    if (fails == f0) printf("ok snapshot: transport + image round-trip, requests continue\n");
++}
++
++int main(void) {
++    setup_machine(&M);
++    devices_init_common(&M);
++    for (int i = 0; i < IMG_SECTORS * 512; i++) IMG[i] = (uint8_t)(i / 512 + (i & 0x3F));
++    virtio_blk_test_add(&M, IMG, sizeof IMG);
++    v_identity();
++    v_read_guest_shape();
++    v_write_readback();
++    v_split_chain();
++    v_requests_refused();
++    v_short_header();
++    v_snapshot();
++    devices_done(&M);
++    if (fails) { printf("test-virtio-blk: %d FAILED\n", fails); return 1; }
++    puts("test-virtio-blk: all vectors passed");
++    return 0;
++}
+diff --git a/tools/gui_app.py b/tools/gui_app.py
+index 5df6094..0f9a5f4 100644
+--- a/tools/gui_app.py
++++ b/tools/gui_app.py
+@@ -632,6 +632,7 @@ class App:
+         row_path("sata2", "ahci2: port 0")
+         row_path("sata2_port1", "ahci2: port 1")
+         row_bool("sata_writethrough", "Write-through")
++        row_path("virtio_blk", "VirtIO disk (image, 0:05.0)")
+         section("Video")
+         row_str("vbe", "VBE mode (e.g. 1024x768x32 / off)")
+         row_bool("no_fb", "No framebuffer")
+diff --git a/tools/launcher.py b/tools/launcher.py
+index a320d06..75baafd 100644
+--- a/tools/launcher.py
++++ b/tools/launcher.py
+@@ -95,6 +95,7 @@ SCHEMA = {
+     "sata2":          {"flag": "--sata2=",         "type": "path"},
+     "sata2_port1":    {"flag": "--sata2-port1=",   "type": "path"},
+     "sata_writethrough": {"flag": "--sata-writethrough", "type": "bool"},
++    "virtio_blk":     {"flag": "--virtio-blk=",     "type": "path"},   # VIRTIO V2
+     # video
+     "cdrom":          {"flag": "--cdrom=",         "type": "path"},   # STORE S6
+     "vbe":            {"flag": "--vbe=",           "type": "str", "regex": r"^(\d{1,5}x\d{1,5}x(4|8|15|16|24|32)|off)$"},

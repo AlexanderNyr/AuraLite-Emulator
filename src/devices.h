@@ -26,6 +26,20 @@ void vbe_mode_disable(machine_t *m);
  * the guest's e1000_send() spins on DD with a bounded PAUSE budget). */
 void e1000_test_add(machine_t *m);
 int  e1000_attach(machine_t *m, const char *hostport);
+
+/* VIRTIO V4: modern virtio-net (src/virtio_net.c on the V1 core).
+ * Same opt-in/TAP discipline as the e1000, mutually exclusive
+ * with it (one TAP endpoint owner; main enforces). */
+int  virtio_net_attach(machine_t *m, const char *hostport);
+void virtio_net_test_add(machine_t *m);
+void virtio_net_tick(void);
+
+/* VIRTIO V2: modern virtio-blk (src/virtio_blk.c on the V1 core).
+ * Opt-in like the e1000: no PCI function exists until attached.
+ * The test entry takes a caller-owned image; the CLI entry reads
+ * the whole host file into RAM (the sata_img convention). */
+int  virtio_blk_attach(machine_t *m, const char *path);
+void virtio_blk_test_add(machine_t *m, uint8_t *img, size_t len);
 void e1000_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
 void e1000_tick(void);
 void e1000_tx_stats(uint64_t *sent, uint64_t *dropped);   /* N1 wire counters */

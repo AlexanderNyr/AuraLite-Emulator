@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -20,7 +20,7 @@ BENCH_PAIR_REPS ?= 9
 FUZZ_PROGRAMS ?= 512
 FUZZ_INSTR    ?= 24
 
-x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h src/disasm.h src/dbg.h src/gdbstub.h src/snapshot.h src/monitor.h src/ws.h
+x86emu: $(SRC) src/cpu.h src/machine.h src/platform.h src/pci.h src/devices.h src/disasm.h src/dbg.h src/gdbstub.h src/snapshot.h src/monitor.h src/ws.h src/virtio.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SRC) -o $@ -lm
 
 firmware/firmware.bin: firmware/sample_firmware.nas
@@ -40,13 +40,13 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
 	./test-cpu
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu -lm
 	./test-fpu
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-usb -lm
 	./test-usb
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-pam -lm
 	./test-pam
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-video -lm
 	./test-video
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-net -lm
 	./test-net
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
 	./test-pic
@@ -79,7 +79,7 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
 # Vectors pin both identities, the untouched class/header fields, the host
 # bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
 test-compat: tests/test_compat.c tests/harness.h src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-compat -lm
 	./test-compat
 	rm -f test-compat
 
@@ -150,18 +150,36 @@ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
 # FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
 # snapshot byte-stability of the x87 file across fresh runs).
 test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/virtio_net.c -o test-fpu-gate -lm
 	./test-fpu-gate
 	rm -f test-fpu-gate
 
 # XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
 test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-xhci -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio.c src/virtio_blk.c src/virtio_net.c -o test-xhci -lm
 	./test-xhci
 	rm -f test-xhci
 
+# VIRTIO V1: modern virtio-pci transport core (plan: VIRTIO_PLAN).
+test-virtio: tests/test_virtio.c src/virtio.c src/devices.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio_net.c -o test-virtio -lm
+	./test-virtio
+	rm -f test-virtio
+
+# VIRTIO V2: modern virtio-blk device (guest-shaped vectors + snapshot).
+test-virtio-blk: tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/devices.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio_net.c -o test-virtio-blk -lm
+	./test-virtio-blk
+	rm -f test-virtio-blk
+
+# VIRTIO V4: modern virtio-net device (guest-shaped RX/TX vectors).
+test-virtio-net: tests/test_virtio_net.c src/virtio.c src/virtio_net.c src/devices.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_net.c src/virtio.c src/virtio_net.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio-net -lm
+	./test-virtio-net
+	rm -f test-virtio-net
+
 test-msi: tests/test_msi.c src/lapic.c src/devices.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-msi -lm
 	./test-msi
 	rm -f test-msi
 
@@ -285,7 +303,7 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
 # test-snapshot: split-run identity lanes on real workloads (the frozen
 # guest lanes SKIP unless KERNEL/INITRD are set).
 test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/virtio_net.c -o test-snap -lm
 	./test-snap
 	rm -f test-snap
 
@@ -311,13 +329,19 @@ test-gui: x86emu firmware/firmware.bin disk/disk.img tests/test_gui_launcher.py 
 	python3 tests/test_gui_launcher.py
 	python3 tests/test_gui_app.py
 
-# Plain ISO boot (GUI "Загрузка с ISO"): needs stock SeaBIOS bios.bin (AURALITE_BIOS
+# Plain ISO boot (GUI "Boot from ISO"): needs stock SeaBIOS bios.bin (AURALITE_BIOS
 # or ~/.x86emu-gui/bios.bin) and NASM; lanes skip cleanly without them.
 test-iso: x86emu tests/test_iso_boot.py tools/mkiso.py tests/fixtures/bootstub.nas
 	python3 tests/test_iso_boot.py
 
+# VIRTIO V3: SeaBIOS boots from the modern virtio-blk + snapshot continuity
+# (also pins the XHCI BAR0 rebind over a plain --sata pair).  Same skip
+# discipline as test-iso (stock SeaBIOS + NASM).
+test-virtio-seabios: x86emu tests/test_virtio_seabios.py tests/test_iso_boot.py tests/fixtures/bootstub.nas
+	python3 tests/test_virtio_seabios.py
+
 gui: x86emu firmware/firmware.bin disk/disk.img
-	@echo "AuraLite Emulator -- desktop GUI (закройте окно, чтобы выйти)"
+	@echo "AuraLite Emulator -- desktop GUI (close the window to exit)"
 	python3 tools/gui_app.py
 
 gui-web: x86emu firmware/firmware.bin disk/disk.img
@@ -377,7 +401,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso
+test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu
@@ -387,7 +411,7 @@ test-video-modes: x86emu
 # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
 test-sanitize:
 	$(MAKE) clean
-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 
 # PERF P5: confidence intervals are reports; guest work/clock equality is a
 # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
@@ -436,4 +460,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
 	rm -f diff_fuzz
 
 clean:
-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf

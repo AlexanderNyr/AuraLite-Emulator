@@ -6,7 +6,7 @@
 Two lanes share one test ISO (tools/mkiso.py + tests/fixtures/bootstub.nas):
   Q  quick route   --rom=bios.bin --lpc=ich9 --sata=test.iso
      SeaBIOS reads the MBR at LBA 0 of the SATA-attached image (the
-     documented recipe, docs/WINDOWS.md E / GUI "Загрузка с ISO");
+     documented recipe, docs/WINDOWS.md E / GUI "Boot from ISO");
   C  CD route      --rom=bios.bin --lpc=ich9 --cdrom=test.iso
      SeaBIOS reads the El Torito catalog from an ATAPI CD (STORE S6).
 

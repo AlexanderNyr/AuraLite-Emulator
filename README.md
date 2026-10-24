@@ -50,12 +50,12 @@ double-click `gui.bat`) starts the **AuraLite Emulator desktop application** —
 a native window (tkinter, Python standard library only — no browser and no
 third-party packages) with two switchable modes:
 
-- **Обычный (Normal)** — VirtualBox/VMware style: a machine list, big
+- **Normal** — VirtualBox/VMware style: a machine list, big
   start/pause/stop buttons, the live screen, and a three-step *new machine*
   wizard.  Pick an **ISO** and press Start — that is the whole procedure
   (stock SeaBIOS `bios.bin` + the ISO on a SATA port, the documented
   `docs/WINDOWS.md` recipe, wired automatically).
-- **Экспертный (Expert)** — the full option surface: every CLI option,
+- **Expert** — the full option surface: every CLI option,
   the monitor console (`regs`, `info break`, `exec`/`savevm`/`loadvm`),
   artifacts, snapshots, the TAP responder and run logs.
 
@@ -86,11 +86,11 @@ outside the repository.  For plain ISO boot the app looks for a stock
 SeaBIOS (`bios.bin`, e.g. from the Debian/Ubuntu `seabios` package or
 seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
 a user-picked copy. At the post-mortem
-"end" stop the page keeps the final state visible; **Остановить** sends the
+"end" stop the page keeps the final state visible; **Stop** sends the
 monitor's `quit` so the emulator prints its stats and writes the artifacts
 before exiting. Access is authenticated (UPKEEP U7): on loopback the page
 carries its token automatically; on any other bind the visitor must enter
-the access token shown by the desktop GUI (expert mode, «Сеть» tab), and
+the access token shown by the desktop GUI (expert mode, "Network" tab), and
 the transport is plaintext HTTP — still keep the launcher on loopback
 unless remote access is intentional.
 
@@ -215,7 +215,7 @@ vectors in `tests/test_gui_launcher.py` and the desktop app vectors in
 The ISO lane builds a 1 MiB El Torito test image in memory
 (`tools/mkiso.py` + `tests/fixtures/bootstub.nas`) and must see the boot
 stub's `AURA_ISO_BOOT_OK` marker after stock SeaBIOS reads its MBR off
-the SATA-attached image -- the exact path the GUI's «Загрузка с ISO»
+the SATA-attached image -- the exact path the GUI's "Boot from ISO"
 takes.  It SKIPs (exit 0) without `nasm` or a stock SeaBIOS `bios.bin`
 (found via `--bios`, `$AURALITE_BIOS`, `~/.x86emu-gui`, or the repo);
 the CD lane boots the same ISO through `--cdrom=` (ATAPI + El Torito).  Note

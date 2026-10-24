@@ -1,0 +1,952 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ee5597e..d68d6bc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,44 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0109 (VIRTIO V4: virtio-net on the shared core)
++
++- **Modern virtio-net** (`1af4:1041` at 0:06.0, IRQ7,
++  BAR0 `0xFEB34000`) on the V1 transport, behind
++  `--virtio-net[=host:port]` with the matching GUI row.
++  The feature offer is exactly `VIRTIO_NET_F_MAC`;
++  device-config carries the 6-byte MAC
++  `52:54:00:12:34:56` and nothing else (the guest reads
++  it as a u64 through its cap function — no
++  STATUS/MTU/MQ fields exist without their feature
++  bits). RX=0/TX=1 are offered at 128 entries; the
++  guest's chosen 16 and its DMA pointers round-trip
++  through the core untouched.
++- The backend is the **existing TAP/UDP responder**
++  (default `127.0.0.1:8080`); `--tap` and
++  `--virtio-net` are mutually exclusive — one host
++  endpoint. RX consumes guest-posted buffers only on
++  ingress (the doorbell never "completes" the posted
++  prefill), writes the zeroed 12-byte header with
++  `num_buffers=1` and `used.len = 12 + payload`;
++  no-buffer/no-room frames count as honest drops and
++  oversize payloads truncate to the offered buffer
++  like the e1000. TX gathers the chain, strips the
++  12-byte header and reports used 0. Snapshots are
++  refused with either TAP NIC attached (the refusal
++  text is generalised; flagless runs keep the
++  historical byte stream).
++- Pinned by `tests/test_virtio_net.c` in the guest
++  driver's own shape: identity/MAC, by-the-book
++  negotiation (FEATURES_OK kept exactly for
++  VERSION_1|MAC, dropped after a bad accept — the
++  by-the-book twin of blk's N1), RX frame + IRQ7 +
++  ISR-read ack, buffer recycle/starvation, truncate
++  with canaries, split-chain TX gather, short-chain
++  refusal, pre-DRIVER_OK ingress. Negative controls:
++  the parent tree has no module; a `num_buffers`
++  mutation burns exactly the header assertion.
++
+ ### Added — patch 0108 (VIRTIO V3: SeaBIOS proof lane + a snapshot fix it cornered)
+ 
+ - **Stock SeaBIOS boots from our virtio-blk.**
+diff --git a/Makefile b/Makefile
+index fb98b7a..bb887a3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,7 +7,7 @@ CPPFLAGS ?= -Isrc
+ SRC := $(wildcard src/*.c)
+ 
+ .DELETE_ON_ERROR:
+-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
++.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+ all: x86emu
+ 
+ # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
+@@ -40,13 +40,13 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
+ 	./test-cpu
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu -lm
+ 	./test-fpu
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-usb -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_usb.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-usb -lm
+ 	./test-usb
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-pam -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pam.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-pam -lm
+ 	./test-pam
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-video -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_video.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-video -lm
+ 	./test-video
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-net -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_net.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-net -lm
+ 	./test-net
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pic.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c -o test-pic -lm
+ 	./test-pic
+@@ -79,7 +79,7 @@ test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c
+ # Vectors pin both identities, the untouched class/header fields, the host
+ # bridge and AHCI functions, and Q35 PAM under the ICH9 identity.
+ test-compat: tests/test_compat.c tests/harness.h src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-compat -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_compat.c src/ahci.c src/xhci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-compat -lm
+ 	./test-compat
+ 	rm -f test-compat
+ 
+@@ -150,30 +150,36 @@ test-kload: tests/test_kload.c tests/kload_fixture.elf src/kloader.c
+ # FPU F4: the integration gate (--kernel= payload receipts pair x2, plus
+ # snapshot byte-stability of the x87 file across fresh runs).
+ test-fpu-gate: tests/test_fpu_gate.c tests/fpu_payload.elf src/kloader.c src/snapshot.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-fpu-gate -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fpu_gate.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/kloader.c src/acpi.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/virtio_net.c -o test-fpu-gate -lm
+ 	./test-fpu-gate
+ 	rm -f test-fpu-gate
+ 
+ # XHCI X1: PCI identity + register file vectors (plan: XHCI_PLAN).
+ test-xhci: tests/test_xhci.c src/xhci.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio.c src/virtio_blk.c -o test-xhci -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_xhci.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio.c src/virtio_blk.c src/virtio_net.c -o test-xhci -lm
+ 	./test-xhci
+ 	rm -f test-xhci
+ 
+ # VIRTIO V1: modern virtio-pci transport core (plan: VIRTIO_PLAN).
+ test-virtio: tests/test_virtio.c src/virtio.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio_net.c -o test-virtio -lm
+ 	./test-virtio
+ 	rm -f test-virtio
+ 
+ # VIRTIO V2: modern virtio-blk device (guest-shaped vectors + snapshot).
+ test-virtio-blk: tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio-blk -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_blk.c src/virtio.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c src/virtio_net.c -o test-virtio-blk -lm
+ 	./test-virtio-blk
+ 	rm -f test-virtio-blk
+ 
++# VIRTIO V4: modern virtio-net device (guest-shaped RX/TX vectors).
++test-virtio-net: tests/test_virtio_net.c src/virtio.c src/virtio_net.c src/devices.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_virtio_net.c src/virtio.c src/virtio_net.c src/virtio_blk.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/snapshot.c -o test-virtio-net -lm
++	./test-virtio-net
++	rm -f test-virtio-net
++
+ test-msi: tests/test_msi.c src/lapic.c src/devices.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c -o test-msi -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_msi.c src/xhci.c src/ahci.c src/devices.c src/e1000.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/serial.c src/virtio.c src/virtio_net.c -o test-msi -lm
+ 	./test-msi
+ 	rm -f test-msi
+ 
+@@ -297,7 +303,7 @@ test-gdbstub-nc: tests/integration/t3_gdbstub_nc.sh tests/test_gdbstub.py src/gd
+ # test-snapshot: split-run identity lanes on real workloads (the frozen
+ # guest lanes SKIP unless KERNEL/INITRD are set).
+ test-snap: tests/test_snapshot.c tests/harness.h src/snapshot.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c
+-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-snap -lm
++	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_snapshot.c src/snapshot.c src/virtio.c src/virtio_blk.c src/xhci.c src/devices.c src/ahci.c src/e1000.c src/serial.c src/pci.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c src/virtio_net.c -o test-snap -lm
+ 	./test-snap
+ 	rm -f test-snap
+ 
+@@ -395,7 +401,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
+               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
+ 	sh tests/integration/n3_net_e2e.sh
+ 
+-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
++test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
+ 
+ # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
+ test-video-modes: x86emu
+@@ -405,7 +411,7 @@ test-video-modes: x86emu
+ # C10 sanitizer lanes: same suites under ASan+UBSan. CI runs this target.
+ test-sanitize:
+ 	$(MAKE) clean
+-	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
++	$(MAKE) test-unit test-compat test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-disasm test-dbg test-snap test-monitor-codec test-monitor test-gui test-iso CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
+ 
+ # PERF P5: confidence intervals are reports; guest work/clock equality is a
+ # deterministic gate.  No implicit binary rebuild (sanitizers must not leak
+@@ -454,4 +460,4 @@ fuzz: tests/diff_fuzz.c tests/harness.h src/cpu.c src/mem.c src/io.c src/platfor
+ 	rm -f diff_fuzz
+ 
+ clean:
+-	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
++	rm -f x86emu x86emu-bench x86dis test-disasm test-dbg test-snap test-monitor-codec test-compat test-cpu test-usb test-pam test-video test-net test-table test-pic test-pit test-rtc test-kbc test-chipset test-lapic test-ioapic test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-perf test-perf-mem test-tlb framebuffer.ppm tests/kload_fixture.elf tests/fpu_payload.elf
+diff --git a/ROADMAP.md b/ROADMAP.md
+index fc3911c..b3069b8 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -41,7 +41,7 @@ maps to exactly one plan below.
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+ | [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+-| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V3 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
++| [`docs/plans/VIRTIO_PLAN.md`](docs/plans/VIRTIO_PLAN.md) | 🚧 V0–V4 done | modern (1.x) virtio-pci for the guest's existing drivers (§5 backlog rank 1): a shared split-ring transport core, then virtio-blk (RAM image, snapshot-clean), then virtio-net on the TAP responder, MSI-X last; offer exactly what is implemented, opt-in so historical tapes keep their receipts | V0–V5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -193,13 +193,16 @@ harness reproduction.
+    the virtio disk, deterministically, across a
+    mid-boot snapshot) and fixes the pre-existing
+    post-enumeration snapshot refusal those experiments
+-   cornered (XHCI BAR0 rebind ordering). V4 virtio-net
+-   on the same TAP responder, V5 MSI-X + close-out.
++   cornered (XHCI BAR0 rebind ordering); V4 (`0109`) adds
++   virtio-net on the same TAP responder (MAC-only offer,
++   ingress-only RX, header-stripping TX, snapshot refusal
++   with either TAP NIC). V5 remains: MSI-X + blk FLUSH +
++   close-out.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+ Every plan in the ledger above except VIRTIO is **CLOSED**.
+-`0105`–`0108` run VIRTIO_PLAN V0–V3.
++`0105`–`0109` run VIRTIO_PLAN V0–V4.
+ Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 8ab4acc..7da4291 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1368,4 +1368,18 @@ BAR0 rebind ran after the MMIO-map comparison, so any
+ post-enumeration snapshot refused to load; `xhci_rebind`
+ now replays the base from the restored config bytes before
+ the comparison (file format untouched, pre-fix snapshots
+-load). V4 next: virtio-net on the same core.
++load). V4 puts **virtio-net** on the same core:
++`1af4:1041` at 0:06.0 on IRQ7, the offer is exactly
++`VIRTIO_NET_F_MAC` (this guest driver negotiates by the
++book — FEATURES_OK is kept precisely when VERSION_1|MAC
++is accepted, mutation-pinned where it matters),
++device-config is the 6-byte QEMU MAC, RX=0/TX=1 offered
++at 128. The backend is the existing TAP/UDP responder
++behind `--virtio-net[=host:port]` (mutually exclusive
++with `--tap` — one host endpoint), RX consumes
++guest-posted buffers only on ingress with the zeroed
++12-byte header (`num_buffers=1`) the guest skips before
++its ethertype check, TX gathers the chain and strips
++the header; snapshots refuse with either TAP NIC
++attached, exactly as before. Remaining: V5 MSI-X +
++blk FLUSH + close-out.
+diff --git a/docs/plans/VIRTIO_PLAN.md b/docs/plans/VIRTIO_PLAN.md
+index 6083951..7c259f3 100644
+--- a/docs/plans/VIRTIO_PLAN.md
++++ b/docs/plans/VIRTIO_PLAN.md
+@@ -11,7 +11,7 @@
+ | V1 | transport core `src/virtio.c` + unit harness | ⏳ |
+ | V2 | virtio-blk: image, CLI/GUI, snapshot, vectors | ✅ patch 0107 (§9) |
+ | V3 | blk integration: SeaBIOS lane, determinism | ✅ patch 0108 (§10) |
+-| V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ⏳ |
++| V4 | virtio-net: RX/TX, TAP backend, GUI, vectors | ✅ patch 0109 (§11) |
+ | V5 | MSI-X + blk FLUSH + close-out audit | ⏳ |
+ 
+ ## §1 Rules (inherited)
+@@ -338,3 +338,40 @@ NC on the 0107 tree: V green, S/S-determinism/C re
+ (SeaBIOS-under-ASan is covered by test-iso; blk's snapshot serialization —
+ by a unit vector under ASan). Gates: `make test` + sanitize rc 0,
+ 0 findings.
++
++## §11 V4 shipped (patch 0109)
++
++`src/virtio_net.c/.h` — modern virtio-net on the shared core:
++`1af4:1041` @0:06.0, BAR0 `0xFEB34000`, IRQ7 (V1 placement);
++the offer is only `VIRTIO_NET_F_MAC` (the guest acks
++`VERSION_1|MAC` and demands FEATURES_OK — a contrast with N1),
++device-config is exactly 6 bytes `52:54:00:12:34:56` (the guest reads it
++as a u64 through the function — extra bytes are forbidden with the
++STATUS bit off), queues RX=0/TX=1 with offered max 128 (the guest
++programs 16, the DMA pointers round-trip byte-exactly through the core).
++Backend — the same TAP/UDP as the e1000's (D6): CLI
++`--virtio-net[=host:port]`, default `127.0.0.1:8080`;
++`--tap`+`--virtio-net` are mutually exclusive (one endpoint).
++RX consumes buffers only on ingress (the doorbell only
++advances last_avail: the guest's posted prefill is never "completed" by
++kicks), the 12-byte header is all zeros except
++`num_buffers=1`, `used.len = 12+payload`, no-queue/no-buffer —
++honest drop counter, oversize is truncated per the e1000
++precedent. TX gathers the chain, strips the 12-byte header,
++used len is always 0; without a socket (unit mode) — the drop counter;
++`virtio_net_stats()` — rx/tx/dropped for the lanes. Snapshots with
++a TAP-attached NIC are refused, as with `--tap` (the message
++was generalised in main/snapshot — `snap_cfg.tap` covers both
++forms; without flags the stream is byte-for-byte historical). Vectors in
++`tests/test_virtio_net.c` — guest shape: identity/MAC,
++by-the-book negotiation (FEATURES_OK kept —
++MAC+VERSION_1 accepted, a broken attempt drops it), prefill and
++recycle, RX frame+IRQ7/ISR-ack, starve→drop, truncate with
++canaries past in-len, TX single/split gather, a short
++chain bounded, ingress before DRIVER_OK — drop. NC: the parent
++without `src/virtio_net.h` — compile-fail (the new-module
++caveat); the `num_buffers=1→0` mutation burns exactly the
++hdr assertion. GUI: the `virtio_net` schema + the
++"VirtIO net TAP" row. Gates: `make test` rc 0 (SeaBIOS/ISO
++lanes not skipped), sanitize rc 0, 0 findings. Remaining is V5:
++MSI-X + blk FLUSH + close-out.
+diff --git a/src/devices.c b/src/devices.c
+index a0c9949..37a675d 100644
+--- a/src/devices.c
++++ b/src/devices.c
+@@ -577,6 +577,7 @@ void devices_tick(machine_t *m) {
+         ehci_walk(m, g_ehci.base);
+     uhci_tick(m);
+     e1000_tick();            /* NET N0: TAP datagrams -> RX ring */
++    virtio_net_tick();       /* VIRTIO V4: same cadence, other owner */
+     pm_tick(m);              /* PM P1: TMR overflow -> TMR_STS -> SCI */
+ }
+ 
+diff --git a/src/devices.h b/src/devices.h
+index 2ea4bab..6f0d512 100644
+--- a/src/devices.h
++++ b/src/devices.h
+@@ -27,6 +27,13 @@ void vbe_mode_disable(machine_t *m);
+ void e1000_test_add(machine_t *m);
+ int  e1000_attach(machine_t *m, const char *hostport);
+ 
++/* VIRTIO V4: modern virtio-net (src/virtio_net.c on the V1 core).
++ * Same opt-in/TAP discipline as the e1000, mutually exclusive
++ * with it (one TAP endpoint owner; main enforces). */
++int  virtio_net_attach(machine_t *m, const char *hostport);
++void virtio_net_test_add(machine_t *m);
++void virtio_net_tick(void);
++
+ /* VIRTIO V2: modern virtio-blk (src/virtio_blk.c on the V1 core).
+  * Opt-in like the e1000: no PCI function exists until attached.
+  * The test entry takes a caller-owned image; the CLI entry reads
+diff --git a/src/main.c b/src/main.c
+index d9cc263..50eb0b5 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -157,6 +157,8 @@ int main(int argc, char **argv) {
+     const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
+     const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
+     const char *vblk_arg = NULL;    /* --virtio-blk=path: modern virtio-blk (VIRTIO V2, opt-in) */
++    const char *vnet_arg = NULL;    /* --virtio-net[=host:port]: modern virtio-net (VIRTIO V4, opt-in) */
++    int vnet_on = 0;
+     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
+                                      * land in the host image files too */
+     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
+@@ -195,6 +197,8 @@ int main(int argc, char **argv) {
+         else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
+         else if (!strncmp(argv[i], "--virtio-blk=", 13)) vblk_arg = argv[i]+13;   /* VIRTIO V2 */
++        else if (!strcmp(argv[i], "--virtio-net")) { vnet_on = 1; vnet_arg = ""; }  /* VIRTIO V4 */
++        else if (!strncmp(argv[i], "--virtio-net=", 13)) { vnet_on = 1; vnet_arg = argv[i]+13; }
+         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
+         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
+         else if (!strncmp(argv[i], "--keys-at=", 10)) {
+@@ -257,6 +261,8 @@ int main(int argc, char **argv) {
+                    "          [--no-fb] no linear framebuffer: VGA text mode 3 box (VIDEO V1)\n"
+                   "          [--vbe=WxHxBPP|off] harness-side VBE mode-set through the dispi (VIDEO V3)\n"
+                   "          [--tap=host:port] e1000 + TAP socket (NET N0; ground rule 127.0.0.1:8080)\n"
++                  "          [--virtio-net[=host:port]] modern virtio-net 1af4:1041 on the same TAP rule;\n"
++                  "                      mutually exclusive with --tap (VIRTIO V4)\n"
+                    "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n"
+                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
+                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
+@@ -381,6 +387,17 @@ int main(int argc, char **argv) {
+         mlog(&m->log, "[virtio-blk] --virtio-blk attach failed for %s", vblk_arg);
+         return 1;
+     }
++    /* VIRTIO V4 (D6): one TAP endpoint, one owner -- the e1000 and
++     * virtio-net would both drive 127.0.0.1:8080 datagrams, so the
++     * combination is refused instead of silently splitting frames. */
++    if (vnet_on && tap_arg) {
++        mlog(&m->log, "[virtio-net] --virtio-net and --tap are mutually exclusive (one TAP endpoint)");
++        return 1;
++    }
++    if (vnet_on && virtio_net_attach(m, vnet_arg) != 0) {
++        mlog(&m->log, "[virtio-net] --virtio-net attach failed (want host:port, default 127.0.0.1:8080)");
++        return 1;
++    }
+     if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
+         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
+         return 1;
+@@ -487,7 +504,7 @@ int main(int argc, char **argv) {
+ 
+     /* TOOLING T4: restore a saved machine before any tool attaches, so the
+      * debugger, the trace and the run loop all start from it. */
+-    snap_cfg_t snapcfg = { platform_by_name(platform_name)->name, tap_arg != NULL, sata_wt };
++    snap_cfg_t snapcfg = { platform_by_name(platform_name)->name, (tap_arg != NULL || vnet_on), sata_wt };
+     g_snapcfg = snapcfg;
+     dbg_snap_hook = repl_snapshot;
+     if (snap_load_path && snap_load(m, snap_load_path, &snapcfg) != 0) {
+diff --git a/src/snapshot.c b/src/snapshot.c
+index 4c1b1d6..73eede0 100644
+--- a/src/snapshot.c
++++ b/src/snapshot.c
+@@ -281,7 +281,7 @@ static void visit(machine_t *m, sio_t *s, const snap_cfg_t *cfg) {
+ }
+ 
+ static int refuse(const snap_cfg_t *cfg, const char *what) {
+-    if (cfg && cfg->tap) { fprintf(stderr, "[snapshot] %s refused: --tap connects the e1000 to host socket state outside the machine\n", what); return 1; }
++    if (cfg && cfg->tap) { fprintf(stderr, "[snapshot] %s refused: a TAP-attached NIC (--tap/--virtio-net) connects host socket state outside the machine\n", what); return 1; }
+     if (cfg && cfg->sata_wt) { fprintf(stderr, "[snapshot] %s refused: --sata-writethrough makes host image files part of the machine state\n", what); return 1; }
+     return 0;
+ }
+diff --git a/src/snapshot.h b/src/snapshot.h
+index 03574dd..e870257 100644
+--- a/src/snapshot.h
++++ b/src/snapshot.h
+@@ -43,7 +43,7 @@ void xhci_rebind(machine_t *m);               /* xhci.c: replay a relocated BAR0
+ /* --- whole-machine save/load */
+ typedef struct {
+     const char *platform;   /* platform name (shape)                     */
+-    int tap;                /* --tap: host socket state -> refused       */
++    int tap;                /* --tap/--virtio-net: host socket -> refused */
+     int sata_wt;            /* --sata-writethrough: host files -> refused*/
+ } snap_cfg_t;
+ 
+diff --git a/src/virtio_net.c b/src/virtio_net.c
+new file mode 100644
+index 0000000..297c6b3
+--- /dev/null
++++ b/src/virtio_net.c
+@@ -0,0 +1,192 @@
++/* virtio_net.c -- VIRTIO V4: virtio-net on the V1 core (D6).
++ *
++ * The guest contract is the measured by-the-book driver
++ * (drivers/virtio_net/virtio_net.c): two queues (0 RX, 1 TX)
++ * used at size 16, a 12-byte virtio_net_hdr with num_buffers
++ * under VERSION_1 even without MRG_RXBUF, single-descriptor
++ * 2048-byte RX buffers it recycles, used.len = hdr + frame,
++ * and an INTx handler that acks by reading the ISR byte.
++ * Everything here is shaped so that driver's checks pass
++ * verbatim; nothing beyond MAC is offered, because nothing
++ * beyond MAC is implemented (plan rule 1).
++ *
++ * RX buffers are consumed by ingress (virtio_net_rx_frame /
++ * virtio_net_tick), never by the RX doorbell -- the guest's
++ * rx_fill notify is a no-op here, like on hardware.  TX frames
++ * are gathered across the chain's readable segments, the
++ * header stripped, and the datagram handed to the same TAP
++ * UDP endpoint the e1000 uses; completion never depends on a
++ * responder being up (the e1000 N4 rule), and counters are
++ * the only per-frame trace.
++ */
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include "virtio.h"
++#include "virtio_net.h"
++
++#define VNET_F_MAC        (1ull << 5)
++#define VNET_HDR_LEN      12
++#define VNET_QSIZE        128          /* offered max; guest clamps to 16 */
++#define VNET_BUF          2048
++
++static const uint8_t VNET_MAC[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++
++typedef struct {
++    machine_t   *m;
++    virtio_dev_t vio;
++    virtio_req_t req;
++    int          tap_fd;
++    int          attached;
++    uint8_t      config[6];            /* mac (the whole config) */
++    uint8_t      txbuf[VNET_BUF];      /* one gathered frame + hdr */
++    uint64_t     tx_sent, tx_dropped;
++    uint64_t     rx_done, rx_dropped, rx_truncated;
++} vnet_t;
++
++static vnet_t g_vnet;
++static virtio_device_desc_t g_vnet_desc;
++
++/* ---------------------------------- TX ---------------------------------- */
++
++static void vnet_tx(vnet_t *n) {
++    for (;;) {
++        int rc = virtio_pop(&n->vio, 1, &n->req);
++        if (rc == 0) break;
++        if (rc < 0) continue;          /* malformed: core finished it */
++        virtio_req_t *r = &n->req;
++        if (r->out_len < VNET_HDR_LEN || r->out_len > VNET_BUF) {
++            n->tx_dropped++;           /* no header, or never gatherable */
++        } else {
++            uint32_t got = virtio_req_read(r, 0, n->txbuf, r->out_len);
++            const uint8_t *frame = n->txbuf + VNET_HDR_LEN;
++            unsigned flen = got >= VNET_HDR_LEN ? got - VNET_HDR_LEN : 0;
++            if (n->tap_fd >= 0 &&
++                send(n->tap_fd, frame, flen, 0) == (ssize_t)flen)
++                n->tx_sent++;
++            else
++                n->tx_dropped++;
++        }
++        virtio_complete(&n->vio, r, 0);
++    }
++}
++
++static void vnet_notify(virtio_dev_t *v, int qi) {
++    if (qi == 1) vnet_tx(v->ctx);
++    /* qi == 0: RX buffers are for the ingress path; the doorbell
++     * alone must not consume them. */
++}
++
++/* ---------------------------------- RX ---------------------------------- */
++
++void virtio_net_rx_frame(machine_t *m, const uint8_t *frame, unsigned len) {
++    vnet_t *n = &g_vnet;
++    if (m != n->m || !n->attached) return;
++    if (!virtio_queue_ready(&n->vio, 0)) { n->rx_dropped++; return; }
++    for (;;) {
++        int rc = virtio_pop(&n->vio, 0, &n->req);
++        if (rc == 0) { n->rx_dropped++; return; }        /* no buffer: drop */
++        if (rc < 0) continue;                            /* ate a bad one */
++        virtio_req_t *r = &n->req;
++        if (r->in_len <= VNET_HDR_LEN) {                 /* unusable buffer */
++            virtio_complete(&n->vio, r, 0);
++            n->rx_dropped++;
++            return;
++        }
++        uint32_t room = r->in_len - VNET_HDR_LEN;
++        uint32_t payload = len < room ? len : room;
++        if (payload < len) n->rx_truncated++;
++        uint8_t hdr[VNET_HDR_LEN] = { 0 };
++        hdr[10] = 1;                                     /* num_buffers */
++        virtio_req_write(r, 0, hdr, VNET_HDR_LEN);
++        virtio_req_write(r, VNET_HDR_LEN, frame, payload);
++        virtio_complete(&n->vio, r, VNET_HDR_LEN + payload);
++        n->rx_done++;
++        return;
++    }
++}
++
++void virtio_net_tick(void) {
++    /* pull TAP datagrams into the RX queue at the device cadence
++     * (e1000_tick's exact discipline) */
++    vnet_t *n = &g_vnet;
++    if (n->tap_fd < 0 || !n->attached) return;
++    uint8_t buf[VNET_BUF];
++    for (int i = 0; i < 8; i++) {
++        ssize_t got = recv(n->tap_fd, buf, sizeof buf, 0);
++        if (got <= 0) break;
++        virtio_net_rx_frame(n->m, buf, (unsigned)got);
++    }
++}
++
++void virtio_net_stats(uint64_t *tx_sent, uint64_t *tx_dropped,
++                      uint64_t *rx_done, uint64_t *rx_dropped) {
++    if (tx_sent)    *tx_sent    = g_vnet.tx_sent;
++    if (tx_dropped) *tx_dropped = g_vnet.tx_dropped;
++    if (rx_done)    *rx_done    = g_vnet.rx_done;
++    if (rx_dropped) *rx_dropped = g_vnet.rx_dropped;
++}
++
++/* -------------------------------- attach -------------------------------- */
++
++static void vnet_publish(machine_t *m, vnet_t *n) {
++    n->m = m;
++    memcpy(n->config, VNET_MAC, sizeof VNET_MAC);
++    memset(&g_vnet_desc, 0, sizeof g_vnet_desc);
++    g_vnet_desc.features = VNET_F_MAC;             /* D6: MAC and no more */
++    g_vnet_desc.num_queues = 2;
++    g_vnet_desc.queue_max[0] = VNET_QSIZE;
++    g_vnet_desc.queue_max[1] = VNET_QSIZE;
++    g_vnet_desc.config = n->config;
++    g_vnet_desc.config_len = sizeof n->config;
++    g_vnet_desc.notify = vnet_notify;
++    virtio_pci_add(m, &n->vio, VIRTIO_NET_PCI_DEV, "virtio-net",
++                   VIRTIO_PCI_NET_ID, 0x02, 0x00, 0x00,
++                   VIRTIO_NET_BAR_BASE, VIRTIO_NET_IRQ, &g_vnet_desc, n);
++    n->attached = 1;
++}
++
++void virtio_net_test_add(machine_t *m) {
++    memset(&g_vnet, 0, sizeof g_vnet);
++    g_vnet.tap_fd = -1;                            /* frames counted, dropped */
++    vnet_publish(m, &g_vnet);
++}
++
++/* NET N0 ground rule shared with the e1000: the fixed endpoint
++ * 127.0.0.1:8080 (UDP).  main refuses --tap + --virtio-net in one
++ * run -- one endpoint, one owner. */
++int virtio_net_attach(machine_t *m, const char *hostport) {
++    char host[64] = "127.0.0.1";
++    unsigned port = 8080;
++    if (hostport && strchr(hostport, ':')) {
++        if (sscanf(hostport, "%63[^:]:%u", host, &port) != 2) return -1;
++    } else if (hostport && hostport[0]) {
++        snprintf(host, sizeof host, "%s", hostport);
++    }
++    int fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) return -1;
++    struct sockaddr_in sa;
++    memset(&sa, 0, sizeof sa);
++    sa.sin_family = AF_INET;
++    sa.sin_port = htons((uint16_t)port);
++    sa.sin_addr.s_addr = inet_addr(host);
++    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
++        close(fd);
++        return -1;
++    }
++    fcntl(fd, F_SETFL, O_NONBLOCK);
++    memset(&g_vnet, 0, sizeof g_vnet);
++    g_vnet.tap_fd = fd;
++    vnet_publish(m, &g_vnet);
++    mlog(&m->log, "[virtio-net] TAP endpoint %s:%u (UDP), MAC 52:54:00:12:34:56\n",
++         host, port);
++    return 0;
++}
++
++int virtio_net_present(void) { return g_vnet.attached; }
+diff --git a/src/virtio_net.h b/src/virtio_net.h
+new file mode 100644
+index 0000000..4319d85
+--- /dev/null
++++ b/src/virtio_net.h
+@@ -0,0 +1,42 @@
++/* virtio_net.h -- VIRTIO V4: modern virtio-net on the V1 transport
++ * core (docs/plans/VIRTIO_PLAN.md, decision D6).  RX queue 0 /
++ * TX queue 1, the 12-byte VERSION_1 header, feature offer
++ * VERSION_1 | VIRTIO_NET_F_MAC and nothing else -- the exact set
++ * the guest's by-the-book driver negotiates.  The backend is the
++ * same TAP UDP endpoint the e1000 uses (one owner only: main
++ * refuses --tap together with --virtio-net), and snapshots are
++ * refused while attached for the same reason (--tap today).
++ */
++#ifndef EMU_VIRTIO_NET_H
++#define EMU_VIRTIO_NET_H
++
++#include <stdint.h>
++#include "machine.h"
++
++/* CLI entry (--virtio-net[=host:port]): binds the TAP endpoint
++ * (empty hostport = the 127.0.0.1:8080 ground rule) and publishes
++ * the 1af4:1041 function at 0:06.0.  0 ok, -1 on failure. */
++int  virtio_net_attach(machine_t *m, const char *hostport);
++
++/* Unit entry (e1000_test_add shape): the device model, no socket;
++ * TX frames count as dropped, RX is driven by virtio_net_rx_frame. */
++void virtio_net_test_add(machine_t *m);
++
++int  virtio_net_present(void);
++
++/* One Ethernet frame into the guest's RX queue (the e1000_rx_frame
++ * contract): dropped silently with a counter when the queue is
++ * not ready or out of buffers; a frame longer than the guest's
++ * buffer is truncated (the e1000 precedent) -- counted too. */
++void virtio_net_rx_frame(machine_t *m, const uint8_t *frame, unsigned len);
++
++/* TAP ingress at the device cadence (devices_tick, next to
++ * e1000_tick): up to 8 datagrams per call. */
++void virtio_net_tick(void);
++
++/* Lane observability (e1000_tx_stats shape): the device logs
++ * nothing per frame, so harnesses read counters instead. */
++void virtio_net_stats(uint64_t *tx_sent, uint64_t *tx_dropped,
++                      uint64_t *rx_done, uint64_t *rx_dropped);
++
++#endif /* EMU_VIRTIO_NET_H */
+diff --git a/tests/test_virtio_net.c b/tests/test_virtio_net.c
+new file mode 100644
+index 0000000..ad17842
+--- /dev/null
++++ b/tests/test_virtio_net.c
+@@ -0,0 +1,287 @@
++/* tests/test_virtio_net.c -- VIRTIO V4 vectors: the virtio-net device
++ * half on the V1 transport (docs/plans/VIRTIO_PLAN.md, decision D6).
++ *
++ * The guest side is replayed from AuraLite-OS
++ * drivers/virtio_net/virtio_net.c: full negotiation (requires
++ * VERSION_1, acks VERSION_1|(MAC if offered), re-reads both
++ * FEATURES_OK and queue_enable), queue size clamped to 16 at
++ * queue setup, MAC read from the device-config region when F_MAC
++ * is offered, RX prefilled after DRIVER_OK with single
++ * 2048-byte write descriptors, used.len = 12-byte header + frame,
++ * descriptor recycled by re-posting, completion both polled and
++ * interrupt-woken (line from cfg 0x3C, ack = ISR read).
++ * Frames enter through virtio_net_rx_frame (the e1000_rx_frame
++ * lane seam); the TAP socket leg itself is the e1000's existing
++ * infrastructure, exercised by the net e2e lanes.
++ */
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "devices.h"
++#include "harness.h"
++#include "virtio.h"
++#include "virtio_net.h"
++
++static int fails;
++#define EXPECT(cond, ...) do { if (!(cond)) { printf("FAIL " __VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static machine_t M;
++
++#define VBAR       0xFEB34000u
++#define CCD(off)   (VBAR + (off))
++#define ISR_AT     (VBAR + 0x1000u)
++#define DCFG(off)  (VBAR + 0x2000u + (off))
++#define NOTIFY(q)  (VBAR + 0x3000u + (q) * 4u)
++
++#define Q0D 0x200000u
++#define Q0A 0x201000u
++#define Q0U 0x202000u
++#define Q1D 0x210000u
++#define Q1A 0x211000u
++#define Q1U 0x212000u
++#define RXBUF(i) (0x220000u + (uint32_t)(i) * 0x1000u)
++#define TXBUF    0x228000u
++
++static uint8_t  rd8 (uint32_t a) { return (uint8_t) mem_read(&M, a, 1); }
++static uint16_t rd16(uint32_t a) { return (uint16_t)mem_read(&M, a, 2); }
++static uint32_t rd32(uint32_t a) { return (uint32_t)mem_read(&M, a, 4); }
++static void wr8 (uint32_t a, uint8_t v)  { mem_write(&M, a, 1, v); }
++static void wr16(uint32_t a, uint16_t v) { mem_write(&M, a, 2, v); }
++static void wr32(uint32_t a, uint32_t v) { mem_write(&M, a, 4, v); }
++static void wr64(uint32_t a, uint64_t v) { mem_write(&M, a, 8, v); }
++
++static void dev_status(uint8_t st) { wr8(CCD(0x14), st); }
++static int irq7(void) { return (M.pic.master.lines & (1u << 7)) != 0; }
++
++struct tdesc { uint64_t addr; uint32_t len; uint16_t flags, next; };
++static void put_desc(uint32_t table, int i, uint64_t addr,
++                     uint32_t len, uint16_t flags, uint16_t next) {
++    struct tdesc d = { addr, len, flags, next };
++    memcpy(M.ram + table + 16u * (uint32_t)i, &d, sizeof d);
++}
++static uint16_t ring16(uint32_t a, uint32_t off) {
++    return (uint16_t)(M.ram[a + off] | (M.ram[a + off + 1] << 8));
++}
++static void used_elem(uint32_t used, int slot, uint32_t *id, uint32_t *len) {
++    memcpy(id,  M.ram + used + 4 + 8 * slot, 4);
++    memcpy(len, M.ram + used + 8 + 8 * slot, 4);
++}
++static void post(uint32_t avail, uint16_t head) {
++    uint16_t idx = ring16(avail, 2);
++    M.ram[avail + 4 + 2 * idx] = (uint8_t)head;
++    M.ram[avail + 5 + 2 * idx] = (uint8_t)(head >> 8);
++    idx++;
++    M.ram[avail + 2] = (uint8_t)idx;
++    M.ram[avail + 3] = (uint8_t)(idx >> 8);
++}
++
++/* drivers/virtio_net/virtio_net.c: reset, ACK, DRIVER, read feats,
++ * ack VERSION_1|MAC, FEATURES_OK (re-read!), queues at size 16
++ * (enable re-read!), DRIVER_OK, then rx_fill.  Fills `mac`. */
++static void guest_init(int rx_buffers, uint8_t mac[6]) {
++    dev_status(0);
++    dev_status(1);
++    dev_status(1 | 2);
++    wr32(CCD(0x00), 0); uint32_t lo = rd32(CCD(0x04));
++    wr32(CCD(0x00), 1); uint32_t hi = rd32(CCD(0x04));
++    EXPECT(hi & 1u, "guest: VERSION_1 is offered");
++    uint32_t want_lo = (lo & (1u << 5)) ? (1u << 5) : 0;      /* VIRTIO_NET_F_MAC */
++    wr32(CCD(0x08), 0); wr32(CCD(0x0C), want_lo);
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 1);                  /* VERSION_1 */
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    EXPECT((rd8(CCD(0x14)) & 8) != 0, "guest: FEATURES_OK re-reads set");
++    if (mac && (want_lo & (1u << 5)))
++        for (int i = 0; i < 6; i++) mac[i] = rd8(DCFG(i));
++    static const uint32_t roots[2][3] = { { Q0D, Q0A, Q0U }, { Q1D, Q1A, Q1U } };
++    for (int qi = 0; qi < 2; qi++) {
++        memset(M.ram + roots[qi][0], 0, 0x3000);
++        wr16(CCD(0x16), (uint16_t)qi);
++        uint16_t qsz = rd16(CCD(0x18));
++        if (qsz > 16) qsz = 16;                              /* VNET_Q_SIZE */
++        wr16(CCD(0x18), qsz);
++        wr64(CCD(0x20), roots[qi][0]);
++        wr64(CCD(0x28), roots[qi][1]);
++        wr64(CCD(0x30), roots[qi][2]);
++        wr16(CCD(0x1C), 1);
++        EXPECT(rd16(CCD(0x1C)) == 1, "guest: queue_enable %d reads back 1", qi);
++        EXPECT(rd16(CCD(0x1E)) == qi, "guest: notify_off q%d", qi);
++    }
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    for (int i = 0; i < rx_buffers; i++) {                   /* rx_fill */
++        memset(M.ram + RXBUF(i), 0, 0x1000);
++        put_desc(Q0D, i, RXBUF(i), 2048, VRING_DESC_F_WRITE, 0);
++        post(Q0A, (uint16_t)i);
++    }
++    wr16(NOTIFY(0), 0);
++}
++
++static void frame_pattern(uint8_t *f, unsigned len, unsigned seed) {
++    for (unsigned i = 0; i < len; i++) f[i] = (uint8_t)(seed + i * 3 + (i >> 4));
++}
++
++static void v_identity(void) {
++    int f0 = fails;
++    wr32(CCD(0x00), 0);
++    EXPECT(rd32(CCD(0x04)) == (1u << 5), "offer = exactly VIRTIO_NET_F_MAC (D6)");
++    wr32(CCD(0x00), 1);
++    EXPECT(rd32(CCD(0x04)) == 1u, "plus VERSION_1 from the transport");
++    EXPECT(rd16(CCD(0x12)) == 2, "two queues (RX, TX)");
++    static const uint8_t MAC[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++    for (int i = 0; i < 6; i++)
++        EXPECT(rd8(DCFG(i)) == MAC[i], "device-cfg mac byte %d", i);
++    EXPECT(rd16(DCFG(6)) == 0, "no status word: F_STATUS not offered");
++    if (fails == f0) printf("ok identity: VERSION_1|MAC, mac in device cfg, 2 queues\n");
++}
++
++static void v_rx_path(void) {
++    int f0 = fails;
++    uint8_t mac[6] = { 0 };
++    guest_init(2, mac);
++    EXPECT(mac[0] == 0x52 && mac[5] == 0x56, "guest read the offered MAC");
++    uint8_t frame[64];
++    frame_pattern(frame, sizeof frame, 0x21);
++    virtio_net_rx_frame(&M, frame, sizeof frame);
++    EXPECT(ring16(Q0U, 2) == 1, "one RX buffer completed");
++    uint32_t id, len;
++    used_elem(Q0U, 0, &id, &len);
++    EXPECT(id == 0 && len == 12 + 64, "used = hdr+frame (id %u len %u)", id, len);
++    uint8_t *buf = M.ram + RXBUF(0);
++    int hdr_ok = 1;
++    for (int i = 0; i < 12; i++) hdr_ok &= buf[i] == (i == 10 ? 1 : 0);
++    EXPECT(hdr_ok, "12-byte hdr zero except num_buffers=1");
++    EXPECT(memcmp(buf + 12, frame, 64) == 0, "frame bytes behind the header");
++    /* the interrupt half of the guest's life */
++    EXPECT(irq7(), "INTx (IRQ7) asserted on RX completion");
++    EXPECT(rd8(ISR_AT) == 1, "guest IRQ handler: ISR ack reads queue bit");
++    EXPECT(!irq7() && rd8(ISR_AT) == 0, "ack dropped the line");
++    uint64_t s, d, rd_, rdr;
++    virtio_net_stats(&s, &d, &rd_, &rdr);
++    EXPECT(rd_ == 1 && rdr == 0, "rx counters (done %llu dropped %llu)",
++           (unsigned long long)rd_, (unsigned long long)rdr);
++    if (fails == f0) printf("ok rx: hdr-12 frame, used len, IRQ-wake via ISR ack\n");
++}
++
++static void v_rx_recycle_and_starve(void) {
++    int f0 = fails;
++    /* continues v_rx_path's init: 2 buffers, one consumed. */
++    uint8_t frame[100];
++    frame_pattern(frame, sizeof frame, 0x77);
++    virtio_net_rx_frame(&M, frame, sizeof frame);            /* second buffer */
++    EXPECT(ring16(Q0U, 2) == 2, "second buffer completed");
++    (void)rd8(ISR_AT);
++    /* ring starved now: the frame must drop, the ring must not move */
++    uint64_t s, d, rd_, rdr;
++    virtio_net_stats(&s, &d, &rd_, &rdr);
++    virtio_net_rx_frame(&M, frame, sizeof frame);
++    uint64_t rdr2;
++    virtio_net_stats(&s, &d, &rd_, &rdr2);
++    EXPECT(ring16(Q0U, 2) == 2 && rdr2 == rdr + 1, "starved ring drops + counts");
++    /* the guest recycles: re-post descriptor 0 and the frame lands */
++    put_desc(Q0D, 0, RXBUF(0), 2048, VRING_DESC_F_WRITE, 0);
++    post(Q0A, 0);
++    frame_pattern(frame, 40, 0x05);
++    virtio_net_rx_frame(&M, frame, 40);
++    EXPECT(ring16(Q0U, 2) == 3, "recycled descriptor takes the next frame");
++    EXPECT(memcmp(M.ram + RXBUF(0) + 12, frame, 40) == 0, "in the recycled buffer");
++    if (fails == f0) printf("ok rx recycle/starve: buffer economy is the guest's\n");
++}
++
++static void v_rx_truncate(void) {
++    int f0 = fails;
++    /* one buffer left in the ring (desc 1 was consumed; recycle it) */
++    put_desc(Q0D, 1, RXBUF(1), 2048, VRING_DESC_F_WRITE, 0);
++    post(Q0A, 1);
++    static uint8_t big[3000];
++    frame_pattern(big, sizeof big, 0x40);
++    uint16_t before = ring16(Q0U, 2);
++    virtio_net_rx_frame(&M, big, sizeof big);
++    uint32_t id, len;
++    used_elem(Q0U, before, &id, &len);
++    EXPECT(ring16(Q0U, 2) == before + 1 && len == 2048,
++           "oversize frame truncated to the buffer (used %u)", len);
++    EXPECT(memcmp(M.ram + RXBUF(1) + 12, big, 2036) == 0,
++           "payload = the first 2036 bytes, no spill past the buffer");
++    dev_status(0);
++    if (fails == f0) printf("ok rx truncate: fits the buffer, never writes past it\n");
++}
++
++static void v_tx_path(void) {
++    int f0 = fails;
++    guest_init(1, NULL);
++    uint64_t ts0, td0, x, y;
++    virtio_net_stats(&ts0, &td0, &x, &y);
++    /* guest shape: one descriptor, hdr(12, zeroed) + frame */
++    memset(M.ram + TXBUF, 0, 12);
++    frame_pattern(M.ram + TXBUF + 12, 60, 0x33);
++    put_desc(Q1D, 0, TXBUF, 72, 0, 0);
++    post(Q1A, 0);
++    wr16(NOTIFY(1), 1);
++    uint32_t id, len;
++    used_elem(Q1U, 0, &id, &len);
++    EXPECT(ring16(Q1U, 2) == 1 && len == 0,
++           "TX completed synchronously, used 0 (idx elem len %u)", len);
++    /* gathered: header in its own descriptor, frame in the next */
++    put_desc(Q1D, 1, TXBUF, 12, VRING_DESC_F_NEXT, 2);
++    put_desc(Q1D, 2, TXBUF + 12, 60, 0, 0);
++    post(Q1A, 1);
++    wr16(NOTIFY(1), 1);
++    EXPECT(ring16(Q1U, 2) == 2, "split TX chain gathered + completed");
++    /* header shorter than 12 bytes total: completed, never sent */
++    put_desc(Q1D, 3, TXBUF, 6, 0, 0);
++    post(Q1A, 3);
++    wr16(NOTIFY(1), 1);
++    EXPECT(ring16(Q1U, 2) == 3, "short TX chain completes, no wedge");
++    uint64_t ts, td;
++    virtio_net_stats(&ts, &td, &x, &y);
++    EXPECT(ts == ts0 && td == td0 + 3,
++           "socketless unit mode counts 3 dropped, 0 sent (completion first)");
++    dev_status(0);
++    if (fails == f0) printf("ok tx: single+split gather, short chain bounded, stats honest\n");
++}
++
++static void v_not_ready(void) {
++    int f0 = fails;
++    /* queues programmed but DRIVER_OK never set: nothing may land */
++    dev_status(0); dev_status(1); dev_status(3);
++    wr32(CCD(0x08), 1); wr32(CCD(0x0C), 1);
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 8));
++    memset(M.ram + Q0D, 0, 0x3000);
++    wr16(CCD(0x16), 0);
++    wr16(CCD(0x18), 16);
++    wr64(CCD(0x20), Q0D); wr64(CCD(0x28), Q0A); wr64(CCD(0x30), Q0U);
++    wr16(CCD(0x1C), 1);
++    memset(M.ram + RXBUF(0), 0, 0x1000);
++    put_desc(Q0D, 0, RXBUF(0), 2048, VRING_DESC_F_WRITE, 0);
++    post(Q0A, 0);
++    uint8_t frame[32];
++    frame_pattern(frame, sizeof frame, 0x19);
++    uint64_t s, d, rd_, rdr;
++    virtio_net_stats(&s, &d, &rd_, &rdr);
++    virtio_net_rx_frame(&M, frame, sizeof frame);
++    uint64_t rdr2;
++    virtio_net_stats(&s, &d, &rd_, &rdr2);
++    EXPECT(ring16(Q0U, 2) == 0 && rdr2 == rdr + 1,
++           "RX before DRIVER_OK drops, buffer unconsumed");
++    dev_status((uint8_t)(rd8(CCD(0x14)) | 4));
++    virtio_net_rx_frame(&M, frame, sizeof frame);
++    EXPECT(ring16(Q0U, 2) == 1, "the same buffer serves once DRIVER_OK lands");
++    dev_status(0);
++    if (fails == f0) printf("ok not-ready: ingress waits for DRIVER_OK like the spec dance\n");
++}
++
++int main(void) {
++    setup_machine(&M);
++    devices_init_common(&M);
++    virtio_net_test_add(&M);
++    v_identity();
++    v_rx_path();
++    v_rx_recycle_and_starve();
++    v_rx_truncate();
++    v_tx_path();
++    v_not_ready();
++    devices_done(&M);
++    if (fails) { printf("test-virtio-net: %d FAILED\n", fails); return 1; }
++    puts("test-virtio-net: all vectors passed");
++    return 0;
++}
+diff --git a/tools/gui_app.py b/tools/gui_app.py
+index 0f9a5f4..1da7e26 100644
+--- a/tools/gui_app.py
++++ b/tools/gui_app.py
+@@ -638,6 +638,7 @@ class App:
+         row_bool("no_fb", "No framebuffer")
+         section("Network")
+         row_str("tap", "TAP (host:port)")
++        row_str("virtio_net", "VirtIO net TAP (host:port, no e1000)")
+         section("Run")
+         row_int("max_instr", "Instruction limit")
+         row_bool("stats", "Statistics")
+diff --git a/tools/launcher.py b/tools/launcher.py
+index 75baafd..7f8ad0f 100644
+--- a/tools/launcher.py
++++ b/tools/launcher.py
+@@ -102,6 +102,7 @@ SCHEMA = {
+     "no_fb":          {"flag": "--no-fb",          "type": "bool"},
+     # network
+     "tap":            {"flag": "--tap=",           "type": "str", "regex": r"^[A-Za-z0-9_.\-]{1,64}:\d{1,5}$"},
++    "virtio_net":     {"flag": "--virtio-net=",    "type": "str", "regex": r"^[A-Za-z0-9_.\-]{1,64}:\d{1,5}$"},   # VIRTIO V4
+     # run
+     "max_instr":      {"flag": "--max-instr=",     "type": "int", "min": 0, "max": 10 ** 15},
+     "stats":          {"flag": "--stats",          "type": "bool"},

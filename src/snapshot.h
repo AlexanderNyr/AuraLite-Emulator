@@ -33,15 +33,17 @@ static inline void snap_sparse(snap_t *s, const char *tag, uint8_t *buf, size_t 
 /* --- module visitors (defined next to the state they own) */
 void devices_snap(machine_t *m, snap_t *s);   /* devices.c (+ serial)  */
 void ahci_snap(machine_t *m, snap_t *s);      /* ahci.c                */
+void virtio_blk_snap(machine_t *m, snap_t *s); /* virtio_blk.c (V2)    */
 struct serial_state;
 void serial_snap(struct serial_state *ser, snap_t *s);   /* serial.c   */
 void pci_snap(machine_t *m, snap_t *s);       /* pci.c                 */
 void pci_ecam_map(machine_t *m, uint64_t base);  /* pci.c: replay a run-time ECAM window */
+void xhci_rebind(machine_t *m);               /* xhci.c: replay a relocated BAR0 (V3) */
 
 /* --- whole-machine save/load */
 typedef struct {
     const char *platform;   /* platform name (shape)                     */
-    int tap;                /* --tap: host socket state -> refused       */
+    int tap;                /* --tap/--virtio-net: host socket -> refused */
     int sata_wt;            /* --sata-writethrough: host files -> refused*/
 } snap_cfg_t;
 

@@ -572,7 +572,9 @@ evidence supports:
    `drivers/virtio/`), probed *after* AHCI
    (`kernel/kernel.c:449` vs `:462`), so AHCI stays
    primary — a STORE/NET-shaped plan with a shared
-   virtqueue core.
+   virtqueue core. **Promoted: `docs/plans/VIRTIO_PLAN.md`
+   (V0 shipped as 0105 — consumer census incl. guest
+   findings N1/N2, decisions D1–D7).**
 2. **Responder bare-SYN tuple restart** (UPKEEP §5):
    RFC 9293 wants a challenge ACK; one `tools/` file plus
    the U6 vectors' home.

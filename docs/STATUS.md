@@ -1336,5 +1336,63 @@ MTRR probe would brick under a strict whitelist, and POPCNT +
 RDTSCP graduated from absent/host-halt and an accidental INVLPG
 alias respectively), and an INIT# under a closed A20 gate fetches
 its reset vector from flash again (CF5 — the U5 record, fixed on
-the decode side). Next material is the plan's §5 device backlog,
-modern virtio first.
+the decode side). VIRTIO_PLAN **V0–V3 are shipped**: V0 censused
+the guest's modern virtio-blk/virtio-net drivers line-by-line
+(the net driver negotiates by the book; the blk driver
+negotiates nothing and reads capacity out of its BAR registers
+— guest findings N1/N2 filed in the plan) and froze decisions
+D1–D7. V1 landed the shared transport core (`src/virtio.c`):
+vendor capabilities in the function's own config space, one
+relocatable 16 KiB BAR0 with QEMU's offsets, an image-based
+common-cfg register file, the mutation-checked D3 gate split
+(FEATURES_OK kept iff VERSION_1 is acked, queue engine lenient
+under DRIVER_OK so the blind guest blk driver still transfers),
+hard-RAM-bounded split rings, synchronous reset, INTx. V2 puts
+**virtio-blk** on that core: `1af4:1042` at 0:05.0 on IRQ5
+(the placement census moved blk/net off the e1000's
+conditional 0:04.0), a RAM-copy image behind `--virtio-blk=`
+with the matching GUI field, honest capacity in device-config,
+general gather/scatter IN/OUT with the status byte pinned to
+the in-stream tail, `S_IOERR` on range/length and `S_UNSUPP`
+on every unadvertised type (FLUSH waits for V5 rather than
+faking success), and full snapshot support whose record
+stream is untouched when the flag is absent. V3 proves the
+stack against a second, independent consumer: stock SeaBIOS
+boots an MBR stub from the virtio disk (it parses the same
+caps, relocates the BAR in its own pciinit and reads LBA0
+through the queue), and a mid-SeaBIOS snapshot save/load
+finishes with byte-identical run statistics to the
+uninterrupted boot. Building that lane caught a pre-existing
+snapshot defect with no virtio involvement — xhci_snap's
+BAR0 rebind ran after the MMIO-map comparison, so any
+post-enumeration snapshot refused to load; `xhci_rebind`
+now replays the base from the restored config bytes before
+the comparison (file format untouched, pre-fix snapshots
+load). V4 puts **virtio-net** on the same core:
+`1af4:1041` at 0:06.0 on IRQ7, the offer is exactly
+`VIRTIO_NET_F_MAC` (this guest driver negotiates by the
+book — FEATURES_OK is kept precisely when VERSION_1|MAC
+is accepted, mutation-pinned where it matters),
+device-config is the 6-byte QEMU MAC, RX=0/TX=1 offered
+at 128. The backend is the existing TAP/UDP responder
+behind `--virtio-net[=host:port]` (mutually exclusive
+with `--tap` — one host endpoint), RX consumes
+guest-posted buffers only on ingress with the zeroed
+12-byte header (`num_buffers=1`) the guest skips before
+its ethertype check, TX gathers the chain and strips
+the header; snapshots refuse with either TAP NIC
+attached, exactly as before. V5 closes the plan with
+**MSI-X on both functions** — the capability at the end
+of the vendor chain, table/PBA in the notify page's
+tail, live `msix_config`/`queue_msix_vector` (an
+out-of-table assignment reads back NO_VECTOR, the QEMU
+rule Linux leans on), INTx retiring under Enable=1,
+per-source pending flags projected through the PBA
+and released by `msi_deliver` on unmask, the whole
+plane snapshot-clean inside the transport record — and
+**blk FLUSH** (`VIRTIO_BLK_F_FLUSH` offered, type 4
+honoured), which is honest precisely because the
+synchronous engine has no volatile layer for the
+barrier to drain. Final inventory: every advertised bit
+on either device has a vector behind it, and every
+unadvertised request type still earns S_UNSUPP.

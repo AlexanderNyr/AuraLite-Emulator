@@ -89,7 +89,7 @@ index 64eaf95..0265a8a 100644
 +  neither process lists nor the run's `argv.json` — and the proxy and
 +  the desktop GUI present it automatically. Beyond loopback the
 +  credential is the state-dir `access-token` file (0600), shown and
-+  rotated from the desktop GUI (expert «Сеть»), entered once at a
++  rotated from the desktop GUI (expert "Network"), entered once at a
 +  login form; startup prints the plaintext warning because the token
 +  is the only credential on bare HTTP. A direct `--monitor=` takes
 +  `--monitor-token=` or `$X86EMU_MONITOR_TOKEN`; a non-loopback
@@ -118,13 +118,13 @@ index c73f508..a950d19 100644
 +++ b/README.md
 @@ -88,8 +88,11 @@ seabios.org) in the state dir, the repo, or `$AURALITE_BIOS`, and remembers
  a user-picked copy. At the post-mortem
- "end" stop the page keeps the final state visible; **Остановить** sends the
+ "end" stop the page keeps the final state visible; **Stop** sends the
  monitor's `quit` so the emulator prints its stats and writes the artifacts
 -before exiting. There is no authentication — same rules as the live
 -monitor: keep the launcher on loopback unless remote access is intentional.
 +before exiting. Access is authenticated (UPKEEP U7): on loopback the page
 +carries its token automatically; on any other bind the visitor must enter
-+the access token shown by the desktop GUI (expert mode, «Сеть» tab), and
++the access token shown by the desktop GUI (expert mode, "Network" tab), and
 +the transport is plaintext HTTP — still keep the launcher on loopback
 +unless remote access is intentional.
  
@@ -285,7 +285,7 @@ index da37fb7..53ef05f 100644
 +persistent state-dir file `access-token` (0600,
 +`load_or_create_access_token`), the page embeds nothing
 +until it is presented (login form), and the desktop GUI
-+displays and rotates it (expert → «Сеть»), no terminal
++displays and rotates it (expert → "Network"), no terminal
 +involved. Each machine run gets its own monitor capability
 +delivered to the emulator in `X86EMU_MONITOR_TOKEN` — never
 +in argv, so it stays out of process lists and `argv.json` —
@@ -962,7 +962,7 @@ index 7a08590..523fe80 100644
 +                pass
 +            time.sleep(0.1)
 +        text = raw.decode("utf-8", errors="replace")
-+        check("X86EMU_TOKEN" not in text and "Токен" in text,
++        check("X86EMU_TOKEN" not in text and "Access token" in text,
 +              "U7 remote: bare / is the login form, no token embedded")
 +
 +        tok_path = os.path.join(tmp, TOKEN_FILE)
@@ -975,7 +975,7 @@ index 7a08590..523fe80 100644
 +              "U7 remote: access-token file exists, 0600, strong")
 +
 +        code, _hd, raw = http_raw(port, "/?token=wrong", headers=good)
-+        check(b"X86EMU_TOKEN" not in raw and "Неверный".encode() in raw,
++        check(b"X86EMU_TOKEN" not in raw and "Wrong".encode() in raw,
 +              "U7 remote: a wrong token stays on the login form")
 +        code, hd, raw = http_raw(port, "/?token=%s" % tok, headers=good)
 +        check(code == 200 and b"X86EMU_TOKEN" in raw
@@ -1234,34 +1234,34 @@ index dc1dd9b..5df6094 100644
          buf = b""
          while b"\r\n\r\n" not in buf:
 @@ -724,6 +729,33 @@ class App:
-             "8080/8081/8082 (AURALITE_TAP_PORT) — см. docs/plans/NET_PLAN.md.")).pack(
+             "8080/8081/8082 family (AURALITE_TAP_PORT) — see docs/plans/NET_PLAN.md.")).pack(
              anchor="w", pady=8)
  
 +        # UPKEEP U7: the remote-access credential for the web launcher,
 +        # managed here in the GUI -- no terminal is ever needed to see or
 +        # rotate it. Plaintext-transport warning included on purpose.
-+        tokbox = ttk.LabelFrame(self.tab_net, text="Удалённый доступ (веб-GUI)",
++        tokbox = ttk.LabelFrame(self.tab_net, text="Remote access (web GUI)",
 +                                padding=6)
 +        tokbox.pack(fill="x", pady=(8, 2))
 +        row = ttk.Frame(tokbox)
 +        row.pack(fill="x")
-+        ttk.Label(row, text="Токен доступа:").pack(side="left")
++        ttk.Label(row, text="Access token:").pack(side="left")
 +        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir)
 +        self.access_token_var = tk.StringVar(value=tok)
 +        ttk.Entry(row, textvariable=self.access_token_var, width=52,
 +                  state="readonly").pack(side="left", padx=4)
-+        ttk.Button(row, text="Копировать",
++        ttk.Button(row, text="Copy",
 +                   command=self.on_copy_access_token).pack(side="left")
-+        ttk.Button(row, text="Заменить токен",
++        ttk.Button(row, text="Replace token",
 +                   command=self.on_rotate_access_token).pack(side="left", padx=4)
 +        ttk.Label(tokbox, foreground="#666", wraplength=640, justify="left",
-+                  text=("Нужен, когда веб-GUI (launcher) запущен на сетевом адресе "
-+                        "вне этого компьютера: вводится один раз на странице входа. "
-+                        "Замена подействует при следующем старте веб-GUI. Внимание: "
-+                        "соединение веб-GUI не шифруется (HTTP) — токен пересекает "
-+                        "сеть открытым текстом; не открывайте доступ в недоверенных "
-+                        "сетях. Доступ только с этого компьютера токен не требует — "
-+                        "он встроен в страницу автоматически.")).pack(
++                  text=("Needed when the web GUI (launcher) runs on a network address "
++                        "outside this computer: entered once on the sign-in page. "
++                        "A replacement takes effect at the next web GUI start. Warning: "
++                        "the web GUI connection is not encrypted (HTTP) — the token crosses "
++                        "the network in clear text; do not open access on untrusted "
++                        "networks. Access from this computer only needs no token — "
++                        "it is built into the page automatically.")).pack(
 +                  anchor="w", pady=4)
 +
      def _build_log_tab(self):
@@ -1276,29 +1276,29 @@ index dc1dd9b..5df6094 100644
 +                             token=self.machine.monitor_token)
          except OSError:
              return
-         self.badge_mon.configure(text="монитор: на связи", bg="#2f7d32")
+         self.badge_mon.configure(text="monitor: online", bg="#2f7d32")
 @@ -1147,6 +1180,25 @@ class App:
          self.machine.responder_stop()
-         self.tap_status.configure(text="респондер остановлен")
+         self.tap_status.configure(text="responder stopped")
  
 +    # -- UPKEEP U7: remote-access credential (see _build_net_tab) --------
 +    def on_copy_access_token(self):
 +        self.root.clipboard_clear()
 +        self.root.clipboard_append(self.access_token_var.get())
-+        self.status.configure(text="токен доступа скопирован в буфер обмена")
++        self.status.configure(text="access token copied to the clipboard")
 +
 +    def on_rotate_access_token(self):
 +        if not messagebox.askokcancel(
 +                APP_TITLE,
-+                "Создать новый токен удалённого доступа?\n\n"
-+                "Старый токен перестанет приниматься при следующем старте "
-+                "веб-GUI; браузеры, где он уже введён, попросят новый."):
++                "Create a new remote-access token?\n\n"
++                "The old token will stop being accepted at the next start of the "
++                "web GUI; browsers that already have it entered will ask for the new one."):
 +            return
 +        tok, _p, _c = launcher.load_or_create_access_token(self.state_dir,
 +                                                           force_new=True)
 +        self.access_token_var.set(tok)
 +        self.status.configure(
-+            text="токен доступа заменён (подействует при следующем старте веб-GUI)")
++            text="access token replaced (takes effect at the next web GUI start)")
 +
      def open_state_dir(self):
          try:
@@ -1516,7 +1516,7 @@ index 01d84ac..a320d06 100644
 +_LOGIN_PAGE = """<!doctype html>
 +<html lang="ru"><head><meta charset="utf-8">
 +<meta name="viewport" content="width=device-width,initial-scale=1">
-+<title>AuraLite Emulator — доступ по токену</title>
++<title>AuraLite Emulator — token access</title>
 +<style>body{background:#0b1020;color:#e7efff;font:15px/1.5 ui-monospace,Consolas,monospace;
 +display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
 +.box{background:#121a2d;border:1px solid #263451;border-radius:10px;padding:26px 30px;max-width:520px}
@@ -1525,17 +1525,17 @@ index 01d84ac..a320d06 100644
 +button{margin-top:12px;padding:9px 16px;border:1px solid #34758a;border-radius:7px;
 +background:#15557a;color:#d9f3ff;font:inherit;cursor:pointer}
 +.err{color:#ff8585}.dim{color:#8fa2c2}</style></head><body>
-+<div class="box"><h1>AuraLite Emulator — удалённый доступ</h1>
-+<p>Интерфейс запущен на сетевом адресе и требует токен доступа.</p>
-+<p class="dim">Токен виден в настольном приложении AuraLite Emulator
-+(режим «Эксперт» → вкладка «Сеть») и хранится в каталоге состояния GUI,
-+файл <code>access-token</code>. Там же его можно заменить.</p>
++<div class="box"><h1>AuraLite Emulator — remote access</h1>
++<p>The interface is served on a network address and requires an access token.</p>
++<p class="dim">The token is shown in the AuraLite Emulator desktop app
++(Expert mode → "Network" tab) and stored in the GUI state directory,
++in the <code>access-token</code> file. It can also be replaced there.</p>
 +%(error)s
 +<form method="get" action="/">
-+<label>Токен доступа<br><input name="token" type="password" autocomplete="off" autofocus></label>
-+<br><button type="submit">Войти</button></form>
-+<p class="dim">Внимание: соединение не шифруется (HTTP). Не используйте
-+этот доступ в недоверенных сетях.</p>
++<label>Access token<br><input name="token" type="password" autocomplete="off" autofocus></label>
++<br><button type="submit">Sign in</button></form>
++<p class="dim">Warning: the connection is not encrypted (HTTP). Do not use
++this access on untrusted networks.</p>
 +</div></body></html>
 +"""
 +
@@ -1602,7 +1602,7 @@ index 01d84ac..a320d06 100644
 +        if not authorized:
 +            error = ""
 +            if any(k == "token" for k in parse_qs(urlparse(self.path).query)):
-+                error = '<p class="err">Неверный токен. Попробуйте ещё раз.</p>'
++                error = '<p class="err">Wrong token. Please try again.</p>'
 +            body = (_LOGIN_PAGE % {"error": error}).encode("utf-8")
 +            self.send_response(200)
 +            self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1752,7 +1752,7 @@ index c350078..e01608c 100644
    let j={};try{j=await r.json()}catch(_e){}
    if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
 @@ -462,7 +465,7 @@ function cfgToForm(c){
- /* ---------------- WebSocket (протокол монитора) ---------------- */
+ /* ---------------- WebSocket (monitor protocol) ---------------- */
  function wsURL(){
    const proto=location.protocol==='https:'?'wss://':'ws://';
 -  return proto+location.host+'/ws';
@@ -1764,9 +1764,9 @@ index c350078..e01608c 100644
      const a=await api('/api/artifacts');
      $('#artRows').innerHTML=a.entries.map(e=>
        `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
--      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Скачать</button></a></td></tr>`).join('')
-+      <td><a href="/api/artifact/${encodeURIComponent(e.name)}?token=${encodeURIComponent(window.X86EMU_TOKEN||'')}"><button class="small">Скачать</button></a></td></tr>`).join('')
-       ||'<tr><td colspan="4">— нет файлов —</td></tr>';
+-      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Download</button></a></td></tr>`).join('')
++      <td><a href="/api/artifact/${encodeURIComponent(e.name)}?token=${encodeURIComponent(window.X86EMU_TOKEN||'')}"><button class="small">Download</button></a></td></tr>`).join('')
+       ||'<tr><td colspan="4">— no files —</td></tr>';
    }catch(e){}
  }
 diff --git a/web/monitor.html b/web/monitor.html

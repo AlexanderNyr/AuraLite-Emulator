@@ -7,6 +7,231 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Changed — patch 0111 (EN: the whole tree in English, no Cyrillic anywhere)
+
+- **Every line of human text in the repository is now English.**
+  Documentation (README, this changelog, ROADMAP, `docs/WINDOWS.md`,
+  the UPKEEP and VIRTIO plan files, the PERF P4 research note), both
+  GUIs (the tkinter application and the web UI — labels, statuses,
+  help, toasts, error text), the launcher's token page and startup
+  messages, comments in the Makefile and `build.bat`, and the token
+  strings the GUI tests assert on ("Access token", "Wrong token")
+  were translated one-to-one. The translation was applied through
+  an exact line map (1129 unique lines), so layout, punctuation
+  balance and code structure are unchanged; a byte scan of the
+  working tree reports zero Cyrillic lead bytes outside `.git`.
+- **The `patches/` archive is translated in place too.** The
+  historical patch files carried the same Russian texts (GUI strings
+  and plan files of their phases); they were passed through the same
+  line map, keeping the `+`/`-`/context structure. A translated
+  archive no longer applies byte-for-byte onto its parent commit —
+  it is now a readable record; the byte-exact source of every phase
+  remains the git history, and the user-side cumulative patch
+  (`AuraLite-all-vs-github.patch`) is regenerated from the actual
+  GitHub `main` and verified against the new tree. Past CHANGELOG
+  entries keep their factual "(in Russian)" mentions of the time.
+
+### Added — patch 0110 (VIRTIO V5: MSI-X + blk FLUSH, plan closed)
+
+- **MSI-X on both virtio functions** (blk 0:05.0, net
+  0:06.0): the `0x11` capability terminates the vendor
+  cap chain at cfg `0x84`, the vector table and PBA
+  live in the BAR0 notify-page tail (`+0x3800`/`+0x3C00`,
+  BIR 0 — no BAR moved, the SeaBIOS lane is untouched),
+  and the table holds `queues + 1` entries (config
+  source plus per-queue). `msix_config` and
+  `queue_msix_vector` are live: assignments latch,
+  read back, and an out-of-table value reads back
+  `NO_VECTOR` (the QEMU rule a driver relies on when
+  it receives fewer vectors than it asked for).
+  Delivery is decided at raise time like the XHCI's:
+  with Enable=0 the INTx pin speaks off the ISR byte
+  (which latches in every mode); with Enable=1 the pin
+  stays silent and each source raises its own pending
+  flag — the MSI_PLAN §2 "source keeps its pending
+  state" rule generalised from one level to per-source
+  flags because virtio completions are edges. The PBA
+  projects those flags through the assigned vectors,
+  and an unmask/Function-Mask clear/Enable edge (or a
+  snapshot load) releases held messages through the
+  MSI M2 `msi_deliver` core. A device reset re-arms
+  the assignments but keeps the table and Enable
+  (PCI-function state); power-on entries start masked.
+  The whole plane serialises inside the blk transport
+  record — which thereby grew, so pre-V5 `--virtio-blk`
+  snapshots now refuse with the explicit
+  "different build" message (flagless runs keep the
+  historical byte stream).
+- **blk FLUSH**: `VIRTIO_BLK_F_FLUSH` (feature bit 9)
+  is offered and request type 4 completes `S_OK`
+  with used 1, its sector field ignored. The barrier
+  is honest because the engine is synchronous — a
+  write's bytes are in the RAM image before its
+  completion is visible, so there is no volatile
+  layer to drain and the S_OK promises nothing the
+  medium doesn't already keep. GET_ID/DISCARD/
+  WRITE_ZEROES stay unoffered and answer S_UNSUPP,
+  pinned alongside.
+- Pinned in all three suites: the core fake walks cap
+  shape, assignment clamp, power-on masks, pre-/post-
+  enable routing, per-vector mask + PBA hold/release,
+  Function Mask, the config vector (generation in
+  step), NO_VECTOR silence under Enable, the INTx
+  hand-back and reset planes; blk adds the FLUSH
+  vectors and proves the MSI-X plane across a
+  snapshot load; net proves RX/TX on their own
+  vectors with IRQ7 retired. Negative controls: the
+  0109 tree is red on exactly these rows; INTx-gate,
+  unmask-scan and FLUSH-bit mutations each burn their
+  own assertions. With this, VIRTIO_PLAN V0–V5 is
+  complete: every advertised bit on either device has
+  a vector behind it.
+
+### Added — patch 0109 (VIRTIO V4: virtio-net on the shared core)
+
+- **Modern virtio-net** (`1af4:1041` at 0:06.0, IRQ7,
+  BAR0 `0xFEB34000`) on the V1 transport, behind
+  `--virtio-net[=host:port]` with the matching GUI row.
+  The feature offer is exactly `VIRTIO_NET_F_MAC`;
+  device-config carries the 6-byte MAC
+  `52:54:00:12:34:56` and nothing else (the guest reads
+  it as a u64 through its cap function — no
+  STATUS/MTU/MQ fields exist without their feature
+  bits). RX=0/TX=1 are offered at 128 entries; the
+  guest's chosen 16 and its DMA pointers round-trip
+  through the core untouched.
+- The backend is the **existing TAP/UDP responder**
+  (default `127.0.0.1:8080`); `--tap` and
+  `--virtio-net` are mutually exclusive — one host
+  endpoint. RX consumes guest-posted buffers only on
+  ingress (the doorbell never "completes" the posted
+  prefill), writes the zeroed 12-byte header with
+  `num_buffers=1` and `used.len = 12 + payload`;
+  no-buffer/no-room frames count as honest drops and
+  oversize payloads truncate to the offered buffer
+  like the e1000. TX gathers the chain, strips the
+  12-byte header and reports used 0. Snapshots are
+  refused with either TAP NIC attached (the refusal
+  text is generalised; flagless runs keep the
+  historical byte stream).
+- Pinned by `tests/test_virtio_net.c` in the guest
+  driver's own shape: identity/MAC, by-the-book
+  negotiation (FEATURES_OK kept exactly for
+  VERSION_1|MAC, dropped after a bad accept — the
+  by-the-book twin of blk's N1), RX frame + IRQ7 +
+  ISR-read ack, buffer recycle/starvation, truncate
+  with canaries, split-chain TX gather, short-chain
+  refusal, pre-DRIVER_OK ingress. Negative controls:
+  the parent tree has no module; a `num_buffers`
+  mutation burns exactly the header assertion.
+
+### Added — patch 0108 (VIRTIO V3: SeaBIOS proof lane + a snapshot fix it cornered)
+
+- **Stock SeaBIOS boots from our virtio-blk.**
+  `tests/test_virtio_seabios.py` attaches the boot-stub
+  image *only* through `--virtio-blk` (the USB stick gets
+  a non-bootable zero image), and the firmware's own
+  modern virtio driver parses the caps, relocates the BAR
+  in its pciinit, negotiates and reads LBA0 through the
+  queue — a second consumer with zero AuraLite code in
+  the loop. The lane also snapshot-saves mid-SeaBIOS and
+  continues from the load to a **byte-identical**
+  end-`[stats]` as the uninterrupted boot.
+- **Fixed (pre-existing, no virtio involvement): snapshots
+  taken after SeaBIOS relocated the XHCI BAR0 refused to
+  load** — the driver's MMIO-map comparison ran before
+  `devices_snap`, where `xhci_snap` rebinds the BAR.
+  `xhci_rebind()` now replays the base from the config
+  bytes `pci_snap` restored, ahead of the comparison;
+  the file format is unchanged and pre-fix snapshots
+  load. The lane's plain-`--sata` control pair pins it:
+  on the 0107 tree the boot leg is green and every
+  snapshot leg is red.
+
+### Added — patch 0107 (VIRTIO V2: virtio-blk)
+
+- **The guest's modern virtio-blk driver now has a disk to
+  find.** `1af4:1042` at 0:05.0 (IRQ5), `--virtio-blk=path`
+  (RAM-copy image, fatal on an unreadable file) with the
+  matching "VirtIO disk" field in the expert GUI and the
+  launcher schema — and nothing exists without the flag,
+  so every historical receipt stands. Reads/writes stream
+  sector-wise across arbitrary descriptor splits, the
+  status byte always lands at the in-stream tail,
+  out-of-range or non-sector-multiple requests earn
+  `S_IOERR`, and every type outside the offer (FLUSH
+  included, until V5 pins its semantics) earns `S_UNSUPP`
+  instead of a counterfeit success. Device config is the
+  honest 8-byte capacity (the guest driver will still
+  print its BAR values as the capacity — guest finding N2,
+  device truth is where the spec keeps it). Snapshots are
+  fully supported through a present-only section: the
+  record stream of a machine without the flag is
+  byte-identical to before, while with the flag the
+  transport state and the whole image round-trip and
+  requests continue over the restored rings. Seven guest-
+  shaped vectors in `tests/test_virtio_blk.c` (the blind
+  N1 init replayed verbatim included); NC = missing
+  symbols on the parent plus an `S_UNSUPP→S_OK` mutation
+  that reddens exactly the FLUSH vector.
+
+### Added — patch 0106 (VIRTIO V1: the modern virtio-pci transport core)
+
+- **`src/virtio.c` implements the shared transport both
+  devices will stand on; nothing attaches in a default
+  machine yet.** Vendor capabilities (common / notify×4 /
+  ISR / device) are laid into the function's own config
+  space and re-asserted after every config write; BAR0 is a
+  relocatable 16 KiB 32-bit window with QEMU's region
+  offsets and the AHCI sizing-probe behaviour. The
+  common-config register file is image-based, so any access
+  width composes and only touched fields take semantics;
+  feature words are masked to the offer, and the D3 gate
+  keeps `FEATURES_OK` iff `VERSION_1` was acked and the
+  device half validates — while the queue engine runs
+  under `DRIVER_OK` regardless, which is what lets the
+  guest's negotiation-free blk driver (finding N1) work
+  against an honest device. The split-ring engine is
+  hard-bounded: ring and buffer ranges must lie inside
+  guest RAM (a descriptor aimed at MMIO copies nothing),
+  malformed chains complete with `len 0` and a log line
+  instead of wedging the ring, completion is synchronous
+  inside the notify write, and reset is a same-instruction
+  wipe. The placement census corrected V0 on one point:
+  `0:04.0` is the opt-in e1000's, so blk/net move to
+  `0:05.0`/`0:06.0` (BARs `0xFEB30000`/`0xFEB34000`, IRQ
+  5/7). Pinned by `tests/test_virtio.c` (13 vectors over a
+  fake echo device at blk's exact coordinates, both guest
+  init rituals replayed verbatim); NC is the new-module
+  compile failure on the 0105 tree plus a mutation check
+  that the `VERSION_1` gate alone holds its vector.
+
+### Added — patch 0105 (VIRTIO V0: measured baseline for modern virtio-pci, docs-only)
+
+- **`docs/plans/VIRTIO_PLAN.md` opens the ranked §5 device
+  backlog's first item.** Both guest drivers are censused
+  against AuraLite-OS@da89be4: `virtio_net.c` negotiates by
+  the book (requires `VERSION_1`, verifies `FEATURES_OK`
+  readback and `queue_enable`, 12-byte header, INTx + ISR-
+  read ack), while `virtio_blk.c` negotiates nothing, never
+  re-reads status, and takes its capacity from PCI config
+  `0x10/0x14` — its own BAR values (guest findings N1/N2;
+  the device stays honest: a `VERSION_1`-gated
+  `FEATURES_OK` readback with a QEMU-lenient queue engine
+  behind it). The house side audits clean for the work:
+  vendor capabilities ride in the per-device config space
+  (xHCI MSI-X precedent), BAR sizing/relocation is the AHCI
+  pattern, 8-byte MMIO reaches handlers whole, INTx is the
+  `pic_set_irq` board wire, SeaBIOS independently speaks
+  modern (1.0) virtio-blk for a second proof lane.
+  Decisions D1–D7 freeze the shape — modern-only functions
+  `1AF4:1042/1041`, one 16 KiB BAR with QEMU's region
+  offsets, a shared split-ring core with synchronous
+  completion on notify, INTx first / MSI-X in V5, opt-in
+  like `--tap` so every historical tape keeps its receipt,
+  and the CPU_FEATURES rule applied to feature bits:
+  offer exactly what is implemented. No code in this patch.
+
 ### Fixed — patch 0104 (CPU-features CF5: the U5 A20 record, reproduced and closed)
 
 - **An INIT# with the A20 gate shut now fetches the reset vector
@@ -235,7 +460,7 @@ patch has its own immediate parent; entries name measured defects and gates.
   neither process lists nor the run's `argv.json` — and the proxy and
   the desktop GUI present it automatically. Beyond loopback the
   credential is the state-dir `access-token` file (0600), shown and
-  rotated from the desktop GUI (expert «Сеть»), entered once at a
+  rotated from the desktop GUI (expert "Network"), entered once at a
   login form; startup prints the plaintext warning because the token
   is the only credential on bare HTTP. A direct `--monitor=` takes
   `--monitor-token=` or `$X86EMU_MONITOR_TOKEN`; a non-loopback
@@ -943,7 +1168,7 @@ patch has its own immediate parent; entries name measured defects and gates.
 - **Lane C of `tests/test_iso_boot.py` is live** (it SKIP-gated on
   `usage:` until this patch): stock SeaBIOS boots the 1 MiB El Torito
   test ISO from `--cdrom=` and prints the stub's `AURA_ISO_BOOT_OK`
-  (measured 7.9 s wall).  The GUI's «Загрузка с ISO» now uses the same
+  (measured 7.9 s wall).  The GUI's "Boot from ISO" now uses the same
   path (`normal_config("iso")` -> `--cdrom=`), expert mode exposes the
   option through the SCHEMA.
 
@@ -952,13 +1177,13 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 - **`tools/gui_app.py`: the native desktop application.**  tkinter
   (Python stdlib only -- no browser, no third-party packages), Russian
-  UI, two switchable modes: **Обычный** (machine list, big transport
+  UI, two switchable modes: **Normal** (machine list, big transport
   buttons, live screen, three-step *new machine* wizard with boot-media
-  kinds iso/disk/kernel/empty) and **Экспертный** (the full SCHEMA
+  kinds iso/disk/kernel/empty) and **Expert** (the full SCHEMA
   option surface, monitor console, artifacts, snapshots, TAP responder,
   run logs).  Both modes share the G1 core (`tools/launcher.py`
   Machine/MonitorClient); the frame buffer renders through the
-  `FB\x01` protocol, end-stop semantics stay T5 («Стоп» sends `quit`,
+  `FB\x01` protocol, end-stop semantics stay T5 ("Stop" sends `quit`,
   the emulator prints stats and writes artifacts).
 - **«Select an ISO and start» boots it, like VirtualBox/VMware.**  The
   wizard's ISO kind builds
@@ -1029,7 +1254,7 @@ patch has its own immediate parent; entries name measured defects and gates.
   PPM artifacts), presets, the 502/404 refusals and path-traversal
   rejection (41 vectors).
 - **T5 end-stop semantics kept.**  At the post-mortem stop the page shows
-  the final state; «Остановить» sends the monitor's `quit` first so the
+  the final state; "Stop" sends the monitor's `quit` first so the
   emulator prints stats/receipts and writes artifacts (SIGTERM is only the
   fallback), then `api/stop`.
 - Integration: `make gui`, `make test-gui` (in `make test` and

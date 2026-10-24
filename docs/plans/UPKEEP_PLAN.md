@@ -631,7 +631,7 @@ is unchanged; beyond loopback the credential is the
 persistent state-dir file `access-token` (0600,
 `load_or_create_access_token`), the page embeds nothing
 until it is presented (login form), and the desktop GUI
-displays and rotates it (expert → «Сеть»), no terminal
+displays and rotates it (expert → "Network"), no terminal
 involved. Each machine run gets its own monitor capability
 delivered to the emulator in `X86EMU_MONITOR_TOKEN` — never
 in argv, so it stays out of process lists and `argv.json` —

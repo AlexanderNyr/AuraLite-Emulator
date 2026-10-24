@@ -95,12 +95,14 @@ SCHEMA = {
     "sata2":          {"flag": "--sata2=",         "type": "path"},
     "sata2_port1":    {"flag": "--sata2-port1=",   "type": "path"},
     "sata_writethrough": {"flag": "--sata-writethrough", "type": "bool"},
+    "virtio_blk":     {"flag": "--virtio-blk=",     "type": "path"},   # VIRTIO V2
     # video
     "cdrom":          {"flag": "--cdrom=",         "type": "path"},   # STORE S6
     "vbe":            {"flag": "--vbe=",           "type": "str", "regex": r"^(\d{1,5}x\d{1,5}x(4|8|15|16|24|32)|off)$"},
     "no_fb":          {"flag": "--no-fb",          "type": "bool"},
     # network
     "tap":            {"flag": "--tap=",           "type": "str", "regex": r"^[A-Za-z0-9_.\-]{1,64}:\d{1,5}$"},
+    "virtio_net":     {"flag": "--virtio-net=",    "type": "str", "regex": r"^[A-Za-z0-9_.\-]{1,64}:\d{1,5}$"},   # VIRTIO V4
     # run
     "max_instr":      {"flag": "--max-instr=",     "type": "int", "min": 0, "max": 10 ** 15},
     "stats":          {"flag": "--stats",          "type": "bool"},
@@ -583,7 +585,7 @@ def make_auth(bind, state_dir):
 _LOGIN_PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AuraLite Emulator — доступ по токену</title>
+<title>AuraLite Emulator — token access</title>
 <style>body{background:#0b1020;color:#e7efff;font:15px/1.5 ui-monospace,Consolas,monospace;
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
 .box{background:#121a2d;border:1px solid #263451;border-radius:10px;padding:26px 30px;max-width:520px}
@@ -592,17 +594,17 @@ padding:9px;border:1px solid #263451;border-radius:6px;background:#0b1324;color:
 button{margin-top:12px;padding:9px 16px;border:1px solid #34758a;border-radius:7px;
 background:#15557a;color:#d9f3ff;font:inherit;cursor:pointer}
 .err{color:#ff8585}.dim{color:#8fa2c2}</style></head><body>
-<div class="box"><h1>AuraLite Emulator — удалённый доступ</h1>
-<p>Интерфейс запущен на сетевом адресе и требует токен доступа.</p>
-<p class="dim">Токен виден в настольном приложении AuraLite Emulator
-(режим «Эксперт» → вкладка «Сеть») и хранится в каталоге состояния GUI,
-файл <code>access-token</code>. Там же его можно заменить.</p>
+<div class="box"><h1>AuraLite Emulator — remote access</h1>
+<p>The interface is served on a network address and requires an access token.</p>
+<p class="dim">The token is shown in the AuraLite Emulator desktop app
+(Expert mode → "Network" tab) and stored in the GUI state directory,
+in the <code>access-token</code> file. It can also be replaced there.</p>
 %(error)s
 <form method="get" action="/">
-<label>Токен доступа<br><input name="token" type="password" autocomplete="off" autofocus></label>
-<br><button type="submit">Войти</button></form>
-<p class="dim">Внимание: соединение не шифруется (HTTP). Не используйте
-этот доступ в недоверенных сетях.</p>
+<label>Access token<br><input name="token" type="password" autocomplete="off" autofocus></label>
+<br><button type="submit">Sign in</button></form>
+<p class="dim">Warning: the connection is not encrypted (HTTP). Do not use
+this access on untrusted networks.</p>
 </div></body></html>
 """
 
@@ -824,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized:
             error = ""
             if any(k == "token" for k in parse_qs(urlparse(self.path).query)):
-                error = '<p class="err">Неверный токен. Попробуйте ещё раз.</p>'
+                error = '<p class="err">Wrong token. Please try again.</p>'
             body = (_LOGIN_PAGE % {"error": error}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

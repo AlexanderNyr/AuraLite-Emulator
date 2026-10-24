@@ -1021,3 +1021,31 @@ void xhci_snap(machine_t *m, snap_t *s) {
         xhci_set_base(&g_xhci, g_xhci.base);
     }
 }
+
+/* VIRTIO V3: snapshot load replays a firmware-relocated BAR0.
+ *
+ * The snapshot driver compares the live MMIO map before
+ * devices_snap runs -- but xhci_snap (which restores the
+ * serialized BAR0 base) lives inside devices_snap, so every
+ * snapshot taken after a SeaBIOS PCI enumeration moved BAR0
+ * refused to load ("MMIO map differs ... (XHCI BAR0)"):
+ * measured identically with plain --sata, no virtio involved.
+ * ahci_snap never had the problem because it both runs and
+ * rebinds before the comparison.  This replay takes the base
+ * from the config bytes pci_snap has just restored -- the
+ * enumeration's own assignment -- and rebinds the decode to
+ * it; xhci_snap later re-applies the same base from the
+ * serialized controller struct, so the two can never drift. */
+void xhci_rebind(machine_t *m) {
+    xhci_t *x = &g_xhci;
+    if (!x->m) x->m = m;
+    for (pci_dev_t *d = m->pci_devices; d; d = d->next) {
+        if (d->bus == 0 && d->dev == 20 && d->func == 0) {
+            uint64_t bar = 0;
+            for (int i = 0; i < 8; i++)
+                bar |= (uint64_t)d->cfg[0x10 + i] << (8 * i);
+            xhci_set_base(x, bar & ~(uint64_t)(XHCI_MMIO_SIZE - 1u) & ~0xFull);
+            return;
+        }
+    }
+}

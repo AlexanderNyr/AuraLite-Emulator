@@ -577,6 +577,7 @@ void devices_tick(machine_t *m) {
         ehci_walk(m, g_ehci.base);
     uhci_tick(m);
     e1000_tick();            /* NET N0: TAP datagrams -> RX ring */
+    virtio_net_tick();       /* VIRTIO V4: same cadence, other owner */
     pm_tick(m);              /* PM P1: TMR overflow -> TMR_STS -> SCI */
 }
 

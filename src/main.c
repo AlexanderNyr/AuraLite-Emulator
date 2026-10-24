@@ -156,6 +156,9 @@ int main(int argc, char **argv) {
     const char *text_out = NULL;    /* --dump-text=path: mode-3 console dump (VIDEO V1) */
     const char *vbe_arg = NULL;     /* --vbe=WxHxBPP|off: harness-side VBE mode-set (VIDEO V3) */
     const char *tap_arg = NULL;     /* --tap=host:port: e1000 + TAP socket (NET N0, opt-in) */
+    const char *vblk_arg = NULL;    /* --virtio-blk=path: modern virtio-blk (VIRTIO V2, opt-in) */
+    const char *vnet_arg = NULL;    /* --virtio-net[=host:port]: modern virtio-net (VIRTIO V4, opt-in) */
+    int vnet_on = 0;
     int sata_wt = 0;                /* --sata-writethrough (STORE S5): guest writes
                                      * land in the host image files too */
     int cfg_cpus = 0;               /* --cpus=N: K5 SMP-path metering; boot_info
@@ -193,6 +196,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--stats")) cfg_stats = 1;   /* PERF P0 */
         else if (!strncmp(argv[i], "--vbe=", 6)) vbe_arg = argv[i]+6;
         else if (!strncmp(argv[i], "--tap=", 6)) tap_arg = argv[i]+6;
+        else if (!strncmp(argv[i], "--virtio-blk=", 13)) vblk_arg = argv[i]+13;   /* VIRTIO V2 */
+        else if (!strcmp(argv[i], "--virtio-net")) { vnet_on = 1; vnet_arg = ""; }  /* VIRTIO V4 */
+        else if (!strncmp(argv[i], "--virtio-net=", 13)) { vnet_on = 1; vnet_arg = argv[i]+13; }
         else if (!strncmp(argv[i], "--log=", 6)) log_out = argv[i]+6;
         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
         else if (!strncmp(argv[i], "--keys-at=", 10)) {
@@ -255,6 +261,8 @@ int main(int argc, char **argv) {
                    "          [--no-fb] no linear framebuffer: VGA text mode 3 box (VIDEO V1)\n"
                   "          [--vbe=WxHxBPP|off] harness-side VBE mode-set through the dispi (VIDEO V3)\n"
                   "          [--tap=host:port] e1000 + TAP socket (NET N0; ground rule 127.0.0.1:8080)\n"
+                  "          [--virtio-net[=host:port]] modern virtio-net 1af4:1041 on the same TAP rule;\n"
+                  "                      mutually exclusive with --tap (VIRTIO V4)\n"
                    "          [--keys=1E,9E,...] scancode set-1 bytes queued to the KBC (H4)\n"
                    "          [--kernel=path] direct-load an AuraLite-OS kernel.elf (KERNEL-BOOT K1);\n"
                    "          [--initrd=path] USTAR rootfs published via boot_info (KERNEL-BOOT K4)\n"
@@ -262,6 +270,7 @@ int main(int argc, char **argv) {
                    "          [--smp=N] run N real vCPUs (max 8; use with --cpus=N for --kernel or --lpc=ich9 for BIOS SMP, K6/G6)\n"
                    "                      skips --rom entirely and starts at the ELF entry\n"
                    "          [--sata=img|--sata-portN=img] raw image on the onboard AHCI (STORE S1+)\n"
+                   "          [--virtio-blk=img] raw image on a modern virtio-blk 1af4:1042 at 0:05.0 (VIRTIO V2)\n"
                    "          [--cdrom=img] ISO on an ATAPI CD -- ctrl 0 port 1, El Torito boot (STORE S6)\n"
                    "          [--ahci2] second AHCI controller at 0:31:3 (STORE S4)\n"
                    "          [--no-usb-uhci] omit the UHCI companion (EHCI-only USB, USB U5)\n"
@@ -370,6 +379,25 @@ int main(int argc, char **argv) {
         mlog(&m->log, "[e1000] --tap attach failed (want host:port, default port 8080)");
         return 1;
     }
+    /* VIRTIO V2: --virtio-blk=path attaches the opt-in modern
+     * virtio-blk (1af4:1042 at 0:05.0) with a RAM copy of the image.
+     * Without the flag the function does not exist and every
+     * historical tape keeps its receipt (plan rule 2). */
+    if (vblk_arg && virtio_blk_attach(m, vblk_arg) != 0) {
+        mlog(&m->log, "[virtio-blk] --virtio-blk attach failed for %s", vblk_arg);
+        return 1;
+    }
+    /* VIRTIO V4 (D6): one TAP endpoint, one owner -- the e1000 and
+     * virtio-net would both drive 127.0.0.1:8080 datagrams, so the
+     * combination is refused instead of silently splitting frames. */
+    if (vnet_on && tap_arg) {
+        mlog(&m->log, "[virtio-net] --virtio-net and --tap are mutually exclusive (one TAP endpoint)");
+        return 1;
+    }
+    if (vnet_on && virtio_net_attach(m, vnet_arg) != 0) {
+        mlog(&m->log, "[virtio-net] --virtio-net attach failed (want host:port, default 127.0.0.1:8080)");
+        return 1;
+    }
     if (keys_list && !keys_at && !keys_at_prompt && kbc_queue_keys(m, keys_list) < 0) {
         mlog(&m->log, "[kbc] --keys parse error (want hex bytes like 1E,9E,39)");
         return 1;
@@ -476,7 +504,7 @@ int main(int argc, char **argv) {
 
     /* TOOLING T4: restore a saved machine before any tool attaches, so the
      * debugger, the trace and the run loop all start from it. */
-    snap_cfg_t snapcfg = { platform_by_name(platform_name)->name, tap_arg != NULL, sata_wt };
+    snap_cfg_t snapcfg = { platform_by_name(platform_name)->name, (tap_arg != NULL || vnet_on), sata_wt };
     g_snapcfg = snapcfg;
     dbg_snap_hook = repl_snapshot;
     if (snap_load_path && snap_load(m, snap_load_path, &snapcfg) != 0) {

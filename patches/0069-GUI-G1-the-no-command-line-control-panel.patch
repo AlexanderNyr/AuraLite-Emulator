@@ -82,7 +82,7 @@ index 1beea02..639ccbd 100644
 +  PPM artifacts), presets, the 502/404 refusals and path-traversal
 +  rejection (41 vectors).
 +- **T5 end-stop semantics kept.**  At the post-mortem stop the page shows
-+  the final state; «Остановить» sends the monitor's `quit` first so the
++  the final state; "Stop" sends the monitor's `quit` first so the
 +  emulator prints stats/receipts and writes artifacts (SIGTERM is only the
 +  fallback), then `api/stop`.
 +- Integration: `make gui`, `make test-gui` (in `make test` and
@@ -167,7 +167,7 @@ index 952cae6..8aaa5aa 100644
 +CLI would (`--monitor=127.0.0.1:<free port>` on loopback, spliced to the
 +page's `/ws`), and keeps its state (`~/.x86emu-gui` by default: presets,
 +per-run artifacts, snapshots) outside the repository. At the post-mortem
-+"end" stop the page keeps the final state visible; **Остановить** sends the
++"end" stop the page keeps the final state visible; **Stop** sends the
 +monitor's `quit` so the emulator prints its stats and writes the artifacts
 +before exiting. There is no authentication — same rules as the live
 +monitor: keep the launcher on loopback unless remote access is intentional.
@@ -1431,54 +1431,54 @@ index 0000000..c350078
 +<body>
 +<header>
 +  <h1>AuraLite x86 Emulator</h1>
-+  <span class="badge accent" id="stState">машина выключена</span>
++  <span class="badge accent" id="stState">machine is off</span>
 +  <span class="badge" id="stConn">GUI: …</span>
 +  <span class="badge" id="stStop">—</span>
 +  <div class="spacer"></div>
-+  <button class="primary" id="btnStart">▶ Запустить</button>
-+  <button id="btnRestart">↻ Перезапустить</button>
-+  <button class="danger" id="btnStop">■ Остановить</button>
++  <button class="primary" id="btnStart">▶ Start</button>
++  <button id="btnRestart">↻ Restart</button>
++  <button class="danger" id="btnStop">■ Stop</button>
 +</header>
 +
 +<main>
-+<!-- ============================ КОНФИГУРАЦИЯ ============================ -->
++<!-- ============================ CONFIGURATION ============================ -->
 +<section class="panel" id="cfgPanel">
-+  <h2>Конфигурация машины
++  <h2>Machine configuration
 +    <span class="flex">
-+      <button class="small" id="btnPresetSave">Сохранить как…</button>
-+      <select id="presetSel"><option value="">— пресеты —</option></select>
-+      <button class="small" id="btnPresetLoad">Открыть</button>
-+      <button class="small danger" id="btnPresetDel">Удалить</button>
++      <button class="small" id="btnPresetSave">Save as…</button>
++      <select id="presetSel"><option value="">— presets —</option></select>
++      <button class="small" id="btnPresetLoad">Open</button>
++      <button class="small danger" id="btnPresetDel">Delete</button>
 +    </span>
 +  </h2>
 +  <div class="body">
-+    <details open><summary>Загрузка</summary><div class="inner">
++    <details open><summary>Boot</summary><div class="inner">
 +      <div class="row">
-+        <label><input type="radio" name="bootPath" value="rom" checked> Прошивка (ROM)</label>
-+        <label><input type="radio" name="bootPath" value="kernel"> Ядро ELF</label>
++        <label><input type="radio" name="bootPath" value="rom" checked> Firmware (ROM)</label>
++        <label><input type="radio" name="bootPath" value="kernel"> ELF kernel</label>
 +      </div>
-+      <label class="stack"><span>Прошивка ROM (--rom)</span>
++      <label class="stack"><span>ROM firmware (--rom)</span>
 +        <div class="row"><input class="wide" type="text" id="fRom" value="firmware/firmware.bin">
-+        <button class="small" data-browse="fRom" data-ext=".bin,.rom">Обзор…</button></div></label>
-+      <label class="stack"><span>Загрузочный диск (--disk)</span>
++        <button class="small" data-browse="fRom" data-ext=".bin,.rom">Browse…</button></div></label>
++      <label class="stack"><span>Boot disk (--disk)</span>
 +        <div class="row"><input class="wide" type="text" id="fDisk" value="disk/disk.img">
-+        <button class="small" data-browse="fDisk" data-ext=".img,.raw,.qcow">Обзор…</button></div></label>
-+      <label class="stack"><span>Ядро ELF (--kernel)</span>
-+        <div class="row"><input class="wide" type="text" id="fKernel" placeholder="например /home/user/AuraLite-OS/build/kernel.elf">
-+        <button class="small" data-browse="fKernel" data-ext=".elf">Обзор…</button></div></label>
++        <button class="small" data-browse="fDisk" data-ext=".img,.raw,.qcow">Browse…</button></div></label>
++      <label class="stack"><span>ELF kernel (--kernel)</span>
++        <div class="row"><input class="wide" type="text" id="fKernel" placeholder="e.g. /home/user/AuraLite-OS/build/kernel.elf">
++        <button class="small" data-browse="fKernel" data-ext=".elf">Browse…</button></div></label>
 +      <label class="stack"><span>Initrd (--initrd)</span>
 +        <div class="row"><input class="wide" type="text" id="fInitrd" placeholder="initrd.tar">
-+        <button class="small" data-browse="fInitrd" data-ext=".tar,.img">Обзор…</button></div></label>
-+      <label class="stack"><span>Снапшот при старте (--snapshot-load)</span>
++        <button class="small" data-browse="fInitrd" data-ext=".tar,.img">Browse…</button></div></label>
++      <label class="stack"><span>Snapshot at start (--snapshot-load)</span>
 +        <div class="row"><input class="wide" type="text" id="fSnapLoad">
-+        <button class="small" data-browse="fSnapLoad" data-ext=".snap">Обзор…</button></div></label>
-+      <div class="hint">В режиме «Прошивка» загружается ROM-образ, диск отдаётся гостю как USB&nbsp;MSC / SATA.
-+      В режиме «Ядро ELF» ROM пропускается, ядро стартует напрямую из точки входа.</div>
++        <button class="small" data-browse="fSnapLoad" data-ext=".snap">Browse…</button></div></label>
++      <div class="hint">In "Firmware" mode a ROM image is loaded and the disk is handed to the guest as USB&nbsp;MSC / SATA.
++      In "ELF kernel" mode the ROM is skipped, the kernel starts straight from its entry point.</div>
 +    </div></details>
 +
-+    <details open><summary>Процессор и платформа</summary><div class="inner">
++    <details open><summary>CPU and platform</summary><div class="inner">
 +      <div class="grid2">
-+        <label class="stack"><span>Профиль (--platform)</span>
++        <label class="stack"><span>Profile (--platform)</span>
 +          <select id="fPlatform">
 +            <option value="sandybridge">Sandy Bridge (2011)</option>
 +            <option value="ivybridge">Ivy Bridge (2012)</option>
@@ -1486,169 +1486,169 @@ index 0000000..c350078
 +            <option value="broadwell">Broadwell (2015)</option>
 +            <option value="baytrail">Bay Trail (2013, Atom)</option>
 +          </select></label>
-+        <label class="stack"><span>Потоков vCPU (--smp), до 8</span>
++        <label class="stack"><span>vCPU threads (--smp), up to 8</span>
 +          <input type="number" id="fSmp" min="1" max="8" value="1"></label>
 +      </div>
 +      <div class="grid2">
-+        <label class="stack"><span>Публиковать CPU в boot_info/MADT (--cpus)</span>
-+          <input type="number" id="fCpus" min="1" max="64" placeholder="авто"></label>
++        <label class="stack"><span>Publish CPUs in boot_info/MADT (--cpus)</span>
++          <input type="number" id="fCpus" min="1" max="64" placeholder="auto"></label>
 +        <label><input type="checkbox" id="fSmpProbe"> --smp-probe (probe SMP)</label>
 +      </div>
 +    </div></details>
 +
-+    <details><summary>Чипсет и USB</summary><div class="inner">
-+      <label class="stack"><span>LPC-мост (--lpc)</span>
++    <details><summary>Chipset and USB</summary><div class="inner">
++      <label class="stack"><span>LPC bridge (--lpc)</span>
 +        <select id="fLpc">
-+          <option value="pantherpoint" selected>Panther Point 8086:1e55 (исторический)</option>
++          <option value="pantherpoint" selected>Panther Point 8086:1e55 (historical)</option>
 +          <option value="ich9">ICH9 8086:2918 (SeaBIOS + ACPI/SMP)</option>
 +        </select></label>
-+      <label><input type="checkbox" id="fNoUhci"> Только EHCI (без UHCI-компаньона)</label>
++      <label><input type="checkbox" id="fNoUhci"> EHCI only (no UHCI companion)</label>
 +    </div></details>
 +
-+    <details><summary>Диски SATA/AHCI</summary><div class="inner">
-+      <label class="stack"><span>Доп. диск, порт 1 (--sata-port1)</span>
-+        <div class="row"><input class="wide" type="text" id="fSata1"><button class="small" data-browse="fSata1" data-ext=".img,.raw">Обзор…</button></div></label>
++    <details><summary>SATA/AHCI disks</summary><div class="inner">
++      <label class="stack"><span>Extra disk, port 1 (--sata-port1)</span>
++        <div class="row"><input class="wide" type="text" id="fSata1"><button class="small" data-browse="fSata1" data-ext=".img,.raw">Browse…</button></div></label>
 +      <div class="grid2">
-+        <label class="stack"><span>Порт 2 (--sata-port2)</span>
-+          <div class="row"><input class="wide" type="text" id="fSata2p"><button class="small" data-browse="fSata2p" data-ext=".img,.raw">Обзор…</button></div></label>
-+        <label class="stack"><span>Порт 3 (--sata-port3)</span>
-+          <div class="row"><input class="wide" type="text" id="fSata3"><button class="small" data-browse="fSata3" data-ext=".img,.raw">Обзор…</button></div></label>
++        <label class="stack"><span>Port 2 (--sata-port2)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2p"><button class="small" data-browse="fSata2p" data-ext=".img,.raw">Browse…</button></div></label>
++        <label class="stack"><span>Port 3 (--sata-port3)</span>
++          <div class="row"><input class="wide" type="text" id="fSata3"><button class="small" data-browse="fSata3" data-ext=".img,.raw">Browse…</button></div></label>
 +      </div>
-+      <label><input type="checkbox" id="fAhci2"> Второй контроллер AHCI (--ahci2, 0:31:3)</label>
++      <label><input type="checkbox" id="fAhci2"> Second AHCI controller (--ahci2, 0:31:3)</label>
 +      <div class="grid2">
-+        <label class="stack"><span>Диск AHCI-2, порт 0 (--sata2)</span>
-+          <div class="row"><input class="wide" type="text" id="fSata2"><button class="small" data-browse="fSata2" data-ext=".img,.raw">Обзор…</button></div></label>
-+        <label class="stack"><span>Диск AHCI-2, порт 1 (--sata2-port1)</span>
-+          <div class="row"><input class="wide" type="text" id="fSata2p1"><button class="small" data-browse="fSata2p1" data-ext=".img,.raw">Обзор…</button></div></label>
++        <label class="stack"><span>AHCI-2 disk, port 0 (--sata2)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2"><button class="small" data-browse="fSata2" data-ext=".img,.raw">Browse…</button></div></label>
++        <label class="stack"><span>AHCI-2 disk, port 1 (--sata2-port1)</span>
++          <div class="row"><input class="wide" type="text" id="fSata2p1"><button class="small" data-browse="fSata2p1" data-ext=".img,.raw">Browse…</button></div></label>
 +      </div>
-+      <label><input type="checkbox" id="fWritethrough"> Запись гостя сразу в файлы образов (--sata-writethrough)</label>
++      <label><input type="checkbox" id="fWritethrough"> Guest writes go straight to the image files (--sata-writethrough)</label>
 +    </div></details>
 +
-+    <details><summary>Видео</summary><div class="inner">
-+      <label class="stack"><span>Режим VBE (--vbe)</span>
++    <details><summary>Video</summary><div class="inner">
++      <label class="stack"><span>VBE mode (--vbe)</span>
 +        <select id="fVbe">
-+          <option value="">не задавать (как есть)</option>
-+          <option value="off">off — только VGA text</option>
-+          <option value="800x600x32">800×600×32 (режим по умолчанию)</option>
++          <option value="">leave unset (as-is)</option>
++          <option value="off">off — VGA text only</option>
++          <option value="800x600x32">800×600×32 (default mode)</option>
 +          <option value="1024x768x32">1024×768×32</option>
 +          <option value="1280x800x32">1280×800×32</option>
-+          <option value="custom">свой WxHxBPP…</option>
++          <option value="custom">custom WxHxBPP…</option>
 +        </select></label>
-+      <label class="stack" id="vbeCustomWrap" style="display:none"><span>Свой режим</span>
-+        <input type="text" id="fVbeCustom" placeholder="например 1600x1200x32"></label>
-+      <label><input type="checkbox" id="fNoFb"> Без линейного фреймбуфера (--no-fb)</label>
++      <label class="stack" id="vbeCustomWrap" style="display:none"><span>Custom mode</span>
++        <input type="text" id="fVbeCustom" placeholder="e.g. 1600x1200x32"></label>
++      <label><input type="checkbox" id="fNoFb"> No linear framebuffer (--no-fb)</label>
 +    </div></details>
 +
-+    <details><summary>Сеть (e1000 + TAP)</summary><div class="inner">
-+      <label class="stack"><span>TAP-эндпоинт (--tap, UDP host:port)</span>
++    <details><summary>Network (e1000 + TAP)</summary><div class="inner">
++      <label class="stack"><span>TAP endpoint (--tap, UDP host:port)</span>
 +        <input type="text" id="fTap" placeholder="127.0.0.1:8080"></label>
 +      <div class="row">
-+        <label class="stack"><span>Порт респондера</span><input type="number" id="fRespPort" min="1" max="65535" value="8080"></label>
-+        <label class="stack"><span>Не отвечать (--drop)</span><input type="text" id="fRespDrop" placeholder="arp,icmp,dhcp,dns,tcp"></label>
++        <label class="stack"><span>Responder port</span><input type="number" id="fRespPort" min="1" max="65535" value="8080"></label>
++        <label class="stack"><span>Do not answer (--drop)</span><input type="text" id="fRespDrop" placeholder="arp,icmp,dhcp,dns,tcp"></label>
 +        <label><input type="checkbox" id="fRespNoTcp"> --no-tcp</label>
 +      </div>
 +      <div class="row">
-+        <button class="small primary" id="btnRespOn">Запустить респондер</button>
-+        <button class="small danger" id="btnRespOff">Остановить респондер</button>
-+        <span class="badge" id="respState">responder: выкл</span>
++        <button class="small primary" id="btnRespOn">Start responder</button>
++        <button class="small danger" id="btnRespOff">Stop responder</button>
++        <span class="badge" id="respState">responder: off</span>
 +      </div>
-+      <div class="hint">Хостовый респондер (tools/tap_responder.py) отвечает как slirp: DHCP, ARP, ICMP, DNS, TCP —
-+      гость получает адрес 10.0.2.15, шлюз 10.0.2.2, DNS 10.0.2.3.</div>
++      <div class="hint">The host responder (tools/tap_responder.py) answers like slirp: DHCP, ARP, ICMP, DNS, TCP —
++      the guest gets address 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3.</div>
 +    </div></details>
 +
-+    <details><summary>Параметры прогона</summary><div class="inner">
++    <details><summary>Run parameters</summary><div class="inner">
 +      <div class="grid2">
-+        <label class="stack"><span>Лимит инструкций (--max-instr, 0 — без лимита)</span>
++        <label class="stack"><span>Instruction limit (--max-instr, 0 — no limit)</span>
 +          <input type="number" id="fMaxInstr" min="0" value="200000000"></label>
-+        <label><input type="checkbox" id="fStats" checked> Печатать статистику (--stats)</label>
++        <label><input type="checkbox" id="fStats" checked> Print statistics (--stats)</label>
 +      </div>
 +    </div></details>
 +
-+    <details><summary>Сохранение результатов</summary><div class="inner">
++    <details><summary>Saving results</summary><div class="inner">
 +      <div class="grid2">
-+        <label><input type="checkbox" id="fLog" checked> Журнал (--log)</label>
-+        <label><input type="checkbox" id="fDumpFb" checked> Кадр фреймбуфера PPM (--dump-fb)</label>
-+        <label><input type="checkbox" id="fDumpText"> Текстовый экран (--dump-text)</label>
-+        <label><input type="checkbox" id="fTrace"> Трассировка (--trace-file)</label>
++        <label><input type="checkbox" id="fLog" checked> Log (--log)</label>
++        <label><input type="checkbox" id="fDumpFb" checked> Framebuffer frame PPM (--dump-fb)</label>
++        <label><input type="checkbox" id="fDumpText"> Text screen (--dump-text)</label>
++        <label><input type="checkbox" id="fTrace"> Tracing (--trace-file)</label>
 +      </div>
 +      <div class="grid2">
-+        <label class="stack"><span>Трасса с vtime (--trace-from)</span><input type="number" id="fTraceFrom" min="0" placeholder="с начала"></label>
-+        <label class="stack"><span>Сколько инструкций (--trace-count)</span><input type="number" id="fTraceCount" min="0" placeholder="все"></label>
++        <label class="stack"><span>Trace from vtime (--trace-from)</span><input type="number" id="fTraceFrom" min="0" placeholder="from start"></label>
++        <label class="stack"><span>How many instructions (--trace-count)</span><input type="number" id="fTraceCount" min="0" placeholder="all"></label>
 +      </div>
-+      <div class="hint">Файлы сохраняются в каталог прогона; скачать их можно во вкладке «Файлы» после (или во время) запуска.</div>
++      <div class="hint">Files are saved into the run directory; download them from the "Files" tab after (or during) the run.</div>
 +    </div></details>
 +
-+    <details><summary>Отладка</summary><div class="inner">
++    <details><summary>Debugging</summary><div class="inner">
 +      <div class="grid2">
-+        <label class="stack"><span>GDB-порт (--gdb, [host:]port)</span><input type="text" id="fGdb" placeholder="1234"></label>
-+        <label class="stack"><span>Физ. адрес внимания (--watch-phys)</span><input type="text" id="fWatchPhys" placeholder="0x100000"></label>
++        <label class="stack"><span>GDB port (--gdb, [host:]port)</span><input type="text" id="fGdb" placeholder="1234"></label>
++        <label class="stack"><span>Physical watch address (--watch-phys)</span><input type="text" id="fWatchPhys" placeholder="0x100000"></label>
 +      </div>
-+      <label class="stack"><span>Символы (--symbols, ELF)</span>
-+        <div class="row"><input class="wide" type="text" id="fSymbols"><button class="small" data-browse="fSymbols" data-ext=".elf">Обзор…</button></div></label>
-+      <label class="stack"><span>Скрипт отладчика (--debug-script)</span>
-+        <div class="row"><input class="wide" type="text" id="fDebugScript"><button class="small" data-browse="fDebugScript" data-ext=".txt,.dbg">Обзор…</button></div></label>
++      <label class="stack"><span>Symbols (--symbols, ELF)</span>
++        <div class="row"><input class="wide" type="text" id="fSymbols"><button class="small" data-browse="fSymbols" data-ext=".elf">Browse…</button></div></label>
++      <label class="stack"><span>Debugger script (--debug-script)</span>
++        <div class="row"><input class="wide" type="text" id="fDebugScript"><button class="small" data-browse="fDebugScript" data-ext=".txt,.dbg">Browse…</button></div></label>
 +      <div class="grid2">
-+        <label class="stack"><span>Сканкоды при старте (--keys, напр. 1E,9E)</span><input type="text" id="fKeys"></label>
-+        <label class="stack"><span>Момент ввода (--keys-at: vtime или prompt)</span><input type="text" id="fKeysAt"></label>
++        <label class="stack"><span>Scancodes at start (--keys, e.g. 1E,9E)</span><input type="text" id="fKeys"></label>
++        <label class="stack"><span>Input moment (--keys-at: vtime or prompt)</span><input type="text" id="fKeysAt"></label>
 +      </div>
-+      <div class="hint">Внутренние флаги: интерактивная отладка REPL доступна во вкладке «Регистры» (команда exec),
-+      gdb подключается к своему порту и перехватывает управление (монитор станет read-only).</div>
++      <div class="hint">Internal flags: the interactive REPL debugger is available in the "Registers" tab (exec command),
++      gdb attaches to its own port and takes over control (the monitor becomes read-only).</div>
 +    </div></details>
 +  </div>
 +</section>
 +
-+<!-- ============================ ГЛАВНАЯ ОБЛАСТЬ ============================ -->
++<!-- ============================ MAIN AREA ============================ -->
 +<section class="panel">
 +  <div class="runbar">
-+    <button class="primary" id="btnRun">▶ Продолжить</button>
-+    <button id="btnPause">⏸ Пауза</button>
-+    <button id="btnStep">⏭ Шаг</button>
-+    <button class="danger" id="btnQuit">Завершить прогон</button>
++    <button class="primary" id="btnRun">▶ Continue</button>
++    <button id="btnPause">⏸ Pause</button>
++    <button id="btnStep">⏭ Step</button>
++    <button class="danger" id="btnQuit">End the run</button>
 +    <span style="width:8px"></span>
-+    <label class="stack"><span>Точка останова (адрес / символ)</span>
++    <label class="stack"><span>Breakpoint (address / symbol)</span>
 +      <div class="row"><input type="text" id="fBreak" placeholder="0x100000" style="width:150px">
-+      <button class="small" id="btnBreak">Установить</button>
-+      <button class="small" id="btnBreaks">Список</button></div></label>
-+    <label><input type="checkbox" id="fAutoRun" checked> Стартовать сразу при запуске</label>
++      <button class="small" id="btnBreak">Set</button>
++      <button class="small" id="btnBreaks">List</button></div></label>
++    <label><input type="checkbox" id="fAutoRun" checked> Start immediately on launch</label>
 +    <div class="spacer"></div>
 +    <div class="row">
-+      <input type="text" id="fKeyCodes" placeholder="сканкоды: 1E,9E" style="width:130px">
-+      <button class="small" id="btnKeys">Клавиши</button>
-+      <input type="text" id="fTypeText" placeholder="текст (\\n — Enter)" style="width:170px">
-+      <button class="small" id="btnType">Ввод текста</button>
++      <input type="text" id="fKeyCodes" placeholder="scancodes: 1E,9E" style="width:130px">
++      <button class="small" id="btnKeys">Keys</button>
++      <input type="text" id="fTypeText" placeholder="text (\\n — Enter)" style="width:170px">
++      <button class="small" id="btnType">Type text</button>
 +    </div>
 +  </div>
 +
 +  <div class="tabs">
-+    <div class="tab active" data-tab="machine">Машина</div>
-+    <div class="tab" data-tab="regs">Регистры и REPL</div>
-+    <div class="tab" data-tab="log">Журнал</div>
-+    <div class="tab" data-tab="snap">Снапшоты</div>
-+    <div class="tab" data-tab="files">Файлы</div>
++    <div class="tab active" data-tab="machine">Machine</div>
++    <div class="tab" data-tab="regs">Registers and REPL</div>
++    <div class="tab" data-tab="log">Log</div>
++    <div class="tab" data-tab="snap">Snapshots</div>
++    <div class="tab" data-tab="files">Files</div>
 +  </div>
 +
 +  <div class="body">
-+    <!-- Машина -->
++    <!-- Machine -->
 +    <div class="page active" id="tab-machine">
 +      <div class="screenbox">
 +        <div>
 +          <canvas class="screen" id="screen" width="800" height="600"></canvas>
 +          <div class="row" style="margin-top:8px">
-+            <label>Масштаб
++            <label>Scale
 +              <select id="fbScale"><option value="1">1×</option><option value="1.5">1.5×</option>
-+              <option value="2">2×</option><option value="fit" selected>по ширине</option></select></label>
-+            <button class="small" id="btnFbPng">Сохранить PNG</button>
-+            <span class="badge" id="fbInfo">фреймбуфер: —</span>
++              <option value="2">2×</option><option value="fit" selected>fit width</option></select></label>
++            <button class="small" id="btnFbPng">Save PNG</button>
++            <span class="badge" id="fbInfo">framebuffer: —</span>
 +          </div>
 +        </div>
 +        <div style="flex:1;min-width:260px">
 +          <div class="kv">
-+            <div class="k">Платформа</div><div class="v" id="mPlatform">—</div>
-+            <div class="k">Режим CPU</div><div class="v" id="mMode">—</div>
-+            <div class="k">Останов</div><div class="v" id="mStop">—</div>
++            <div class="k">Platform</div><div class="v" id="mPlatform">—</div>
++            <div class="k">CPU mode</div><div class="v" id="mMode">—</div>
++            <div class="k">Stop</div><div class="v" id="mStop">—</div>
 +            <div class="k">vTime</div><div class="v" id="mVtime">—</div>
-+            <div class="k">Инструкций</div><div class="v" id="mExec">—</div>
-+            <div class="k">Команда</div><div class="v" id="mDisasm">—</div>
++            <div class="k">Instructions</div><div class="v" id="mExec">—</div>
++            <div class="k">Instruction</div><div class="v" id="mDisasm">—</div>
 +          </div>
 +          <h3 style="margin:14px 0 6px;font-size:12.5px;color:var(--muted)">vCPU</h3>
 +          <pre id="mVcpus">—</pre>
@@ -1656,82 +1656,82 @@ index 0000000..c350078
 +      </div>
 +    </div>
 +
-+    <!-- Регистры / REPL -->
++    <!-- Registers / REPL -->
 +    <div class="page" id="tab-regs">
-+      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Регистры выбранного vCPU</h3>
++      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Registers of the selected vCPU</h3>
 +      <div class="regs" id="rGrid">—</div>
-+      <h3 style="margin:16px 0 8px;font-size:12.5px;color:var(--muted)">REPL отладчика (команды x86dbg: regs, x/8i, info break, xlate …)</h3>
++      <h3 style="margin:16px 0 8px;font-size:12.5px;color:var(--muted)">Debugger REPL (x86dbg commands: regs, x/8i, info break, xlate …)</h3>
 +      <div class="row">
-+        <input class="wide" type="text" id="fExec" placeholder="например: x/8i $lin   |   info vcpu   |   p $rax+1">
-+        <button class="primary" id="btnExec">Выполнить</button>
++        <input class="wide" type="text" id="fExec" placeholder="e.g.: x/8i $lin   |   info vcpu   |   p $rax+1">
++        <button class="primary" id="btnExec">Run</button>
 +      </div>
 +      <pre id="execOut" style="margin-top:9px">—</pre>
 +    </div>
 +
-+    <!-- Журнал -->
++    <!-- Log -->
 +    <div class="page" id="tab-log">
 +      <div class="row" style="margin-bottom:8px">
-+        <label><input type="checkbox" id="logScroll" checked> автопрокрутка</label>
-+        <input class="wide" type="text" id="logFilter" placeholder="фистр по строке…">
-+        <button class="small" id="btnLogClear">Очистить</button>
-+        <button class="small" id="btnLogDownload">Скачать</button>
++        <label><input type="checkbox" id="logScroll" checked> autoscroll</label>
++        <input class="wide" type="text" id="logFilter" placeholder="filter by line…">
++        <button class="small" id="btnLogClear">Clear</button>
++        <button class="small" id="btnLogDownload">Download</button>
 +      </div>
-+      <pre id="logBox" style="max-height:520px">журнал машины появится здесь после подключения…</pre>
-+      <h3 style="margin:14px 0 8px;font-size:12.5px;color:var(--muted)">Вывод процесса (stdout / stderr прогона)</h3>
++      <pre id="logBox" style="max-height:520px">the machine log will appear here once connected…</pre>
++      <h3 style="margin:14px 0 8px;font-size:12.5px;color:var(--muted)">Process output (run stdout / stderr)</h3>
 +      <div class="row">
-+        <button class="small" id="btnOutRefresh">Обновить</button>
-+        <label>поток <select id="outWhich"><option value="stdout">stdout (рецепты)</option>
-+        <option value="stderr">stderr (лог кольца)</option></select></label>
++        <button class="small" id="btnOutRefresh">Refresh</button>
++        <label>stream <select id="outWhich"><option value="stdout">stdout (recipes)</option>
++        <option value="stderr">stderr (ring log)</option></select></label>
 +      </div>
 +      <pre id="outBox" style="margin-top:8px">—</pre>
 +    </div>
 +
-+    <!-- Снапшоты -->
++    <!-- Snapshots -->
 +    <div class="page" id="tab-snap">
 +      <div class="row">
-+        <input type="text" id="fSnapName" placeholder="имя снапшота (например boot-mid)">
-+        <button class="primary" id="btnSnapSave">Сохранить снапшот</button>
-+        <button class="small" id="btnSnapRefresh">Обновить список</button>
++        <input type="text" id="fSnapName" placeholder="snapshot name (e.g. boot-mid)">
++        <button class="primary" id="btnSnapSave">Save snapshot</button>
++        <button class="small" id="btnSnapRefresh">Refresh list</button>
 +      </div>
-+      <div class="hint" style="margin:8px 0">Снапшот сохраняется через debugger savevm в каталог snaps и загружается
-+      либо здесь (loadvm на остановленной машине), либо при следующем запуске через «Снапшот при старте».</div>
-+      <table class="list"><thead><tr><th>Имя</th><th>Размер</th><th>Изменён</th><th></th></tr></thead>
++      <div class="hint" style="margin:8px 0">A snapshot is saved via debugger savevm into the snaps directory and loaded
++      either here (loadvm on a stopped machine) or at the next launch via "Snapshot at start".</div>
++      <table class="list"><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
 +      <tbody id="snapRows"><tr><td colspan="4">—</td></tr></tbody></table>
 +    </div>
 +
-+    <!-- Файлы -->
++    <!-- Files -->
 +    <div class="page" id="tab-files">
-+      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Артефакты текущего/последнего прогона</h3>
-+      <div class="row"><button class="small" id="btnArtRefresh">Обновить</button>
-+      <span class="hint" id="runDirLabel">каталог: —</span></div>
-+      <table class="list" style="margin-top:8px"><thead><tr><th>Файл</th><th>Размер</th><th>Изменён</th><th></th></tr></thead>
++      <h3 style="margin:2px 0 8px;font-size:12.5px;color:var(--muted)">Artifacts of the current/last run</h3>
++      <div class="row"><button class="small" id="btnArtRefresh">Refresh</button>
++      <span class="hint" id="runDirLabel">directory: —</span></div>
++      <table class="list" style="margin-top:8px"><thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr></thead>
 +      <tbody id="artRows"><tr><td colspan="4">—</td></tr></tbody></table>
 +    </div>
 +  </div>
 +</section>
 +</main>
 +
-+<!-- модальное окно выбора файла -->
++<!-- file picker modal -->
 +<div class="modal" id="fileModal">
 +  <div class="box">
-+    <h3>Выбор файла</h3>
++    <h3>Choose a file</h3>
 +    <div class="row" style="padding:10px 16px 0">
 +      <input class="wide" type="text" id="fPath">
-+      <button class="small" id="btnPathGo">Перейти</button>
++      <button class="small" id="btnPathGo">Go</button>
 +    </div>
 +    <div class="list" id="fileList"></div>
 +    <div class="foot">
-+      <span class="hint" id="fileHint">двойной клик по каталогу — войти</span>
++      <span class="hint" id="fileHint">double-click a directory to enter it</span>
 +      <div class="spacer"></div>
-+      <button class="small" id="btnFileCancel">Отмена</button>
-+      <button class="small primary" id="btnFileOk">Выбрать</button>
++      <button class="small" id="btnFileCancel">Cancel</button>
++      <button class="small primary" id="btnFileOk">Select</button>
 +    </div>
 +  </div>
 +</div>
 +
 +<div class="toast" id="toast"></div>
-+<footer>AuraLite-Emulator · GUI G1 · всё управление — без командной строки ·
-+документация: README.md, docs/</footer>
++<footer>AuraLite-Emulator · GUI G1 · full control — no command line ·
++documentation: README.md, docs/</footer>
 +
 +<script>
 +'use strict';
@@ -1739,7 +1739,7 @@ index 0000000..c350078
 +const canvas=$('#screen'), ctx=canvas.getContext('2d');
 +let ws=null, lastLog=[], logSeq=0, machineState='off', autoRan=false;
 +
-+/* ---------------- уведомления ---------------- */
++/* ---------------- notifications ---------------- */
 +function toast(msg, err){const t=$('#toast');t.textContent=msg;t.className='toast show'+(err?' err':'');
 +  clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast', err?6500:3200);}
 +
@@ -1751,7 +1751,7 @@ index 0000000..c350078
 +  return j;
 +}
 +
-+/* ---------------- конфигурация ---------------- */
++/* ---------------- configuration ---------------- */
 +function cfgFromForm(){
 +  const c={};
 +  const put=(k,v)=>{if(v!==''&&v!==null&&v!==undefined&&v!==false)c[k]=v;};
@@ -1805,19 +1805,19 @@ index 0000000..c350078
 +  }
 +}
 +
-+/* ---------------- WebSocket (протокол монитора) ---------------- */
++/* ---------------- WebSocket (monitor protocol) ---------------- */
 +function wsURL(){
 +  const proto=location.protocol==='https:'?'wss://':'ws://';
 +  return proto+location.host+'/ws';
 +}
 +function connectWS(){
 +  if(ws){try{ws.close()}catch(_e){}}
-+  $('#stConn').textContent='GUI: подключение…';$('#stConn').className='badge warn';
++  $('#stConn').textContent='GUI: connecting…';$('#stConn').className='badge warn';
 +  ws=new WebSocket(wsURL());ws.binaryType='arraybuffer';
-+  ws.onopen=()=>{$('#stConn').textContent='GUI: на связи';$('#stConn').className='badge ok';
++  ws.onopen=()=>{$('#stConn').textContent='GUI: connected';$('#stConn').className='badge ok';
 +    if($('#fAutoRun').checked&&!autoRan){autoRan=true;sendCommand('continue');}};
-+  ws.onclose=()=>{$('#stConn').textContent='GUI: отключён';$('#stConn').className='badge bad';};
-+  ws.onerror=()=>{$('#stConn').textContent='GUI: ошибка WS';$('#stConn').className='badge bad';};
++  ws.onclose=()=>{$('#stConn').textContent='GUI: disconnected';$('#stConn').className='badge bad';};
++  ws.onerror=()=>{$('#stConn').textContent='GUI: WS error';$('#stConn').className='badge bad';};
 +  ws.onmessage=e=>{if(typeof e.data==='string'){
 +    try{const m=JSON.parse(e.data);
 +      if(m.kind==='state')renderState(m);else if(m.kind==='reply')renderReply(m);
@@ -1825,16 +1825,16 @@ index 0000000..c350078
 +  }else renderFramebuffer(e.data)};
 +}
 +function sendCommand(cmd,extra){
-+  if(!ws||ws.readyState!==WebSocket.OPEN){toast('нет соединения с машиной',true);return}
++  if(!ws||ws.readyState!==WebSocket.OPEN){toast('no connection to the machine',true);return}
 +  ws.send(JSON.stringify(Object.assign({cmd},extra||{})));
 +}
 +function renderReply(r){
-+  const txt=(r.ok?'OK':'ОШИБКА')+' '+(r.cmd||'')+': '+(r.message||'')+(r.output?('\n'+r.output):'');
++  const txt=(r.ok?'OK':'ERROR')+' '+(r.cmd||'')+': '+(r.message||'')+(r.output?('\\n'+r.output):'');
 +  $('#execOut').textContent=txt;
-+  if(!r.ok)toast(r.message||'ошибка команды',true);
++  if(!r.ok)toast(r.message||'command error',true);
 +}
 +
-+/* ---------------- отрисовка состояния ---------------- */
++/* ---------------- state rendering ---------------- */
 +function renderState(s){
 +  $('#mPlatform').textContent=s.platform||'—';
 +  $('#mMode').textContent=s.mode||'—';
@@ -1842,7 +1842,7 @@ index 0000000..c350078
 +  $('#stStop').textContent=s.stop_reason||'—';
 +  if(s.stop_reason==='end'){
 +    $('#stStop').className='badge ok';
-+    $('#stStop').textContent='прогон завершён (end) — «Остановить» сохранит результаты';
++    $('#stStop').textContent='run finished (end) — "Stop" keeps the results';
 +  }else{
 +    $('#stStop').className='badge';
 +    $('#stStop').textContent=s.stop_reason||'—';
@@ -1861,12 +1861,12 @@ index 0000000..c350078
 +    if(lastLog.length>2000)lastLog=lastLog.slice(-2000);
 +    paintLog();
 +  }
-+  if(s.framebuffer)$('#fbInfo').textContent=`фреймбуфер: ${s.framebuffer.width}×${s.framebuffer.height}`;
++  if(s.framebuffer)$('#fbInfo').textContent=`framebuffer: ${s.framebuffer.width}×${s.framebuffer.height}`;
 +}
 +function paintLog(){
 +  const f=($('#logFilter').value||'').toLowerCase();
 +  const txt=lastLog.filter(l=>!f||l.toLowerCase().includes(f)).join('\n');
-+  $('#logBox').textContent=txt||'(пусто)';
++  $('#logBox').textContent=txt||'(empty)';
 +  if($('#logScroll').checked)$('#logBox').scrollTop=$('#logBox').scrollHeight;
 +}
 +function renderFramebuffer(buffer){
@@ -1892,39 +1892,39 @@ index 0000000..c350078
 +  else canvas.style.width=(w*parseFloat(v))+'px';
 +}
 +
-+/* ---------------- жизненный цикл машины ---------------- */
++/* ---------------- machine lifecycle ---------------- */
 +async function refreshStatus(){
 +  try{
 +    const s=await api('/api/status');
 +    machineState=s.state;
-+    const map={off:['машина выключена',''],running:['машина работает','ok'],
-+      exited:['прогон завершён'+(s.exit_code!==null?` (код ${s.exit_code})`:''), s.exit_code===0?'ok':'bad']};
++    const map={off:['machine is off',''],running:['machine is running','ok'],
++      exited:['run finished'+(s.exit_code!==null?` (code ${s.exit_code})`:''), s.exit_code===0?'ok':'bad']};
 +    const [txt,cls]=map[s.state]||[s.state,''];
 +    $('#stState').textContent=txt;$('#stState').className='badge accent '+cls;
 +    $('#btnStart').disabled=(s.state==='running');
 +    $('#btnStop').disabled=(s.state!=='running');
 +    $('#btnRestart').disabled=false;
-+    if(s.run_dir)$('#runDirLabel').textContent='каталог: '+s.run_dir;
++    if(s.run_dir)$('#runDirLabel').textContent='directory: '+s.run_dir;
 +    const r=s.responder||{};
-+    $('#respState').textContent='responder: '+(r.running?'вкл (pid '+r.pid+')':'выкл');
++    $('#respState').textContent='responder: '+(r.running?'on (pid '+r.pid+')':'off');
 +    $('#respState').className='badge '+(r.running?'ok':'');
 +    return s;
-+  }catch(e){$('#stState').textContent='GUI: лаунчер недоступен';
++  }catch(e){$('#stState').textContent='GUI: launcher unavailable';
 +    $('#stState').className='badge bad';return null}
 +}
 +async function startMachine(){
 +  try{
 +    const cfg=cfgFromForm();
 +    const st=await refreshStatus();
-+    if(st&&st.state==='running'){if(!confirm('Машина уже работает. Перезапустить?'))return;
++    if(st&&st.state==='running'){if(!confirm('The machine is already running. Restart it?'))return;
 +      await api('/api/stop','POST',{});}
 +    await api('/api/start','POST',{config:cfg});
 +    autoRan=false;
-+    toast('машина запускается…');
++    toast('machine starting…');
 +    await refreshStatus();
 +    setTimeout(connectWS,250);
 +    setTimeout(()=>{refreshArtifacts()},1200);
-+  }catch(e){toast('запуск: '+e.message,true)}
++  }catch(e){toast('start: '+e.message,true)}
 +}
 +async function stopMachine(){
 +  try{
@@ -1935,31 +1935,31 @@ index 0000000..c350078
 +      for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,250));
 +        const s=await refreshStatus();if(s&&s.state!=='running')break;}}
 +    const r=await api('/api/stop','POST',{});
-+    toast('остановлено, код '+r.exit_code);
++    toast('stopped, code '+r.exit_code);
 +    await refreshStatus();refreshArtifacts();refreshOutput();
-+  }catch(e){toast('остановка: '+e.message,true)}
++  }catch(e){toast('stop: '+e.message,true)}
 +}
 +async function restartMachine(){
 +  try{await api('/api/stop','POST',{});autoRan=false;
 +    await api('/api/restart','POST',{config:cfgFromForm()});
-+    toast('перезапуск…');await refreshStatus();setTimeout(connectWS,250);}
-+  catch(e){toast('перезапуск: '+e.message,true)}
++    toast('restarting…');await refreshStatus();setTimeout(connectWS,250);}
++  catch(e){toast('restart: '+e.message,true)}
 +}
 +
-+/* ---------------- артефакты / вывод / снапшоты ---------------- */
++/* ---------------- artifacts / output / snapshots ---------------- */
 +async function refreshArtifacts(){
 +  try{
 +    const a=await api('/api/artifacts');
 +    $('#artRows').innerHTML=a.entries.map(e=>
 +      `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
-+      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Скачать</button></a></td></tr>`).join('')
-+      ||'<tr><td colspan="4">— нет файлов —</td></tr>';
++      <td><a href="/api/artifact/${encodeURIComponent(e.name)}"><button class="small">Download</button></a></td></tr>`).join('')
++      ||'<tr><td colspan="4">— no files —</td></tr>';
 +  }catch(e){}
 +}
 +async function refreshOutput(){
 +  try{
 +    const o=await api('/api/output?which='+$('#outWhich').value+'&tail=300');
-+    $('#outBox').textContent=o.output||'(пусто)';
++    $('#outBox').textContent=o.output||'(empty)';
 +  }catch(e){}
 +}
 +async function refreshSnaps(){
@@ -1967,14 +1967,14 @@ index 0000000..c350078
 +    const s=await api('/api/snapshots');
 +    $('#snapRows').innerHTML=s.entries.map(e=>
 +      `<tr><td>${e.name}</td><td>${e.size}</td><td>${new Date(e.mtime*1000).toLocaleString()}</td>
-+      <td class="flex"><button class="small" onclick="snapLoad('${e.name}')">Загрузить</button>
-+      <button class="small danger" onclick="snapDel('${e.name}')">Удалить</button></td></tr>`).join('')
-+      ||'<tr><td colspan="4">— нет снапшотов —</td></tr>';
++      <td class="flex"><button class="small" onclick="snapLoad('${e.name}')">Load</button>
++      <button class="small danger" onclick="snapDel('${e.name}')">Delete</button></td></tr>`).join('')
++      ||'<tr><td colspan="4">— no snapshots —</td></tr>';
 +  }catch(e){}
 +}
 +async function snapSave(){
 +  const name=($('#fSnapName').value||'').trim();
-+  if(!name){toast('введите имя снапшота',true);return}
++  if(!name){toast('enter a snapshot name',true);return}
 +  const st=await refreshStatus();
 +  const dir=(st&&st.snap_dir)||'';
 +  sendCommand('exec',{line:'savevm '+dir+'/'+name.replace(/[^\w.\-]/g,'_')+'.snap'});
@@ -1985,43 +1985,43 @@ index 0000000..c350078
 +  sendCommand('exec',{line:'loadvm '+dir+'/'+name});
 +};
 +window.snapDel=async name=>{
-+  if(!confirm('Удалить снапшот '+name+'?'))return;
++  if(!confirm('Delete snapshot '+name+'?'))return;
 +  try{await api('/api/snapshots?name='+encodeURIComponent(name),'DELETE');refreshSnaps();}
 +  catch(e){toast(e.message,true)}
 +};
 +
-+/* ---------------- пресеты ---------------- */
++/* ---------------- presets ---------------- */
 +async function refreshPresets(){
 +  try{
 +    const p=await api('/api/presets');
 +    const sel=$('#presetSel');
-+    sel.innerHTML='<option value="">— пресеты —</option>'+
++    sel.innerHTML='<option value="">— presets —</option>'+
 +      Object.keys(p.presets).sort().map(n=>`<option value="${n}">${n}</option>`).join('');
 +  }catch(e){}
 +}
 +async function presetSave(){
-+  const name=prompt('Название пресета:');
++  const name=prompt('Preset name:');
 +  if(!name)return;
 +  try{await api('/api/presets','POST',{name,config:cfgFromForm()});
-+    toast('пресет сохранён');refreshPresets();}
++    toast('preset saved');refreshPresets();}
 +  catch(e){toast(e.message,true)}
 +}
 +async function presetLoad(){
 +  const name=$('#presetSel').value;
-+  if(!name){toast('выберите пресет',true);return}
++  if(!name){toast('choose a preset',true);return}
 +  try{const p=await api('/api/presets');if(p.presets[name]){cfgToForm(p.presets[name]);
-+    toast('пресет «'+name+'» загружен');}}
++    toast('preset "'+name+'" loaded');}}
 +  catch(e){toast(e.message,true)}
 +}
 +async function presetDel(){
 +  const name=$('#presetSel').value;
 +  if(!name)return;
-+  if(!confirm('Удалить пресет «'+name+'»?'))return;
++  if(!confirm('Delete preset "'+name+'"?'))return;
 +  try{await api('/api/presets?name='+encodeURIComponent(name),'DELETE');refreshPresets();}
 +  catch(e){toast(e.message,true)}
 +}
 +
-+/* ---------------- выбор файла ---------------- */
++/* ---------------- file picker ---------------- */
 +let browseTarget=null, browseDir='';
 +function openBrowser(fieldId, exts){
 +  browseTarget=fieldId;
@@ -2042,11 +2042,11 @@ index 0000000..c350078
 +      r.entries.map(e=>e.dir
 +        ?`<div class="frow dir" data-dir="${r.path.replace(/\/$/,'')}/${e.name}">${e.name}/</div>`
 +        :`<div class="frow" data-file="${r.path.replace(/\/$/,'')}/${e.name}">${e.name}
-+           <span class="hint">${e.size}</span></div>`).join('')||'<div class="hint" style="padding:10px">пусто</div>';
++           <span class="hint">${e.size}</span></div>`).join('')||'<div class="hint" style="padding:10px">empty</div>';
 +  }catch(e){toast(e.message,true)}
 +}
 +
-+/* ---------------- события ---------------- */
++/* ---------------- events ---------------- */
 +$('#btnStart').onclick=startMachine;
 +$('#btnStop').onclick=stopMachine;
 +$('#btnRestart').onclick=restartMachine;
@@ -2083,11 +2083,11 @@ index 0000000..c350078
 +$('#btnRespOn').onclick=async()=>{
 +  try{await api('/api/responder','POST',{on:true,port:+$('#fRespPort').value||8080,
 +    drop:$('#fRespDrop').value,no_tcp:$('#fRespNoTcp').checked});
-+    toast('респондер запущен');refreshStatus();}
++    toast('responder started');refreshStatus();}
 +  catch(e){toast(e.message,true)}
 +};
 +$('#btnRespOff').onclick=async()=>{
-+  try{await api('/api/responder','POST',{on:false});toast('респондер остановлен');refreshStatus();}
++  try{await api('/api/responder','POST',{on:false});toast('responder stopped');refreshStatus();}
 +  catch(e){toast(e.message,true)}
 +};
 +$('#fVbe').onchange=()=>{$('#vbeCustomWrap').style.display=$('#fVbe').value==='custom'?'':'none'};
@@ -2123,7 +2123,7 @@ index 0000000..c350078
 +  if(t.dataset.tab==='snap')refreshSnaps();
 +});
 +
-+/* ---------------- старт ---------------- */
++/* ---------------- startup ---------------- */
 +(async function init(){
 +  applyScale();
 +  await refreshStatus();
