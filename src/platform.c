@@ -54,11 +54,20 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
         *a = p->cpuid1_eax;
         *b = 0x00040800; /* brand index / CLFLUSH / APIC ID stub */
         *c = (1u<<0)                 /* SSE3 */
+           | (1u<<17)                /* PCID (CPU_FEATURES CF3): the
+                                        * CR4.PCIDE/CR3[63] legality and the
+                                        * flush-always semantics exist now */
+           | (1u<<23)                /* POPCNT (CF4: F3 0F B8 decoded) */
            | (1u<<31);               /* hypervisor present -- we ARE one
                                         * (KERNEL-BOOT K3: the guest's vmdrv
                                         * probe prints the vendor string) */
-        *d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<9)|(1u<<15)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
-        /* FPU,TSC,MSR,CX8,APIC,CMOV,MMX,FXSR,SSE,SSE2 */
+        *d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<9)|(1u<<15)|(1u<<16)|(1u<<19)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
+        /* FPU,TSC,MSR,CX8,APIC,CMOV,PAT,CLFLUSH,MMX,FXSR,SSE,SSE2.
+         * PAT and CLFLUSH joined at CPU_FEATURES CF2: both were
+         * already true -- PAT as sparse storage with the SDM reset
+         * value (cpu_reset seeds it; no cache model makes the types
+         * functional no-ops), CLFLUSH as a correct no-op whose line
+         * size EBX had been advertising all along. */
         break;
     /* ---- hypervisor interface leaf (0x40000000) ---- */
     case 0x40000000:
@@ -70,7 +79,11 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
     case 0x80000000:
         *a = 0x80000008; break;
     case 0x80000001:
-        *d = (1u<<29); /* long mode supported */
+        *d = (1u<<29)              /* long mode supported */
+           | (1u<<11)              /* SYSCALL/SYSRET (CF2: exists since K4) */
+           | (1u<<20)              /* NX (CF2: walk enforces via EFER.NXE) */
+           | (1u<<26)              /* 1GiB pages (CF2: PDPTE.PS walked) */
+           | (1u<<27);             /* RDTSCP (CF4: 0F 01 F9 + TSC_AUX) */
         break;
 
     /* ---- C9 leaves ---- */
@@ -88,7 +101,10 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
         }
         break; }
     case 0x7: /* structured extended features */
-        if (subleaf == 0) { *a = 0; *b = (1u<<9); /* ERMS: we do fast REP MOVSB/STOSB */ }
+        if (subleaf == 0) { *a = 0; *b = (1u<<9)          /* ERMS: we do fast REP MOVSB/STOSB */
+                                       | (1u<<7)          /* SMEP (CPU_FEATURES CF1) */
+                                       | (1u<<10)         /* INVPCID (CF3: decoded, legality in cpu.c) */
+                                       | (1u<<20); }      /* SMAP (CF1) */
         break;
     case 0x80000002: case 0x80000003: case 0x80000004: { /* brand string, 48B */
         char brand[48];

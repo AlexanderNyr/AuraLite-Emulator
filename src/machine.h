@@ -17,7 +17,13 @@
 #define ROM_SIZE   (128u*1024)        /* 0x20000, matches firmware.bin size */
 
 #define ROM_ALIAS_LOW_BASE   0x000E0000ULL   /* 128K firmware flash alias; PAM selects RAM shadow */
-#define ROM_TOPOF4G_BASE     0xFFFE0000ULL   /* top-of-4GB reset window */
+#define ROM_TOPOF4G_BASE     0xFFE00000ULL   /* top-of-4GB firmware decode: the boot
+                                               * flash range covers the top 2 MiB with
+                                               * the 128K image tiled (ICH-style decode
+                                               * enables). 2 MiB, not 128 KiB, so the
+                                               * A20-masked image of the reset window
+                                               * (bit20 forced low) still lands in
+                                               * flash -- CF5 (the U5 A20 record). */
 
 /* ---- MMIO callback device model ---- */
 typedef uint64_t (*mmio_read_fn)(void *ctx, uint64_t addr, int size);

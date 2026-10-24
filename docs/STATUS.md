@@ -1302,14 +1302,39 @@ With `--lpc=ich9`, the ACPI tables are published (G4), the BIOS boot reaches
 vCPUs through the BIOS route and passes `irqapwake` + `smpstress` (G6, up to
 `EM_MAX_VCPU = 8`).  The default `8086:1e55` identity still
 publishes no RSDP and reports seven E820 entries; that lane is historical and
-deliberately unchanged.  The ACPI PM block models only the Timer register
-(PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
-so no power-management transition is claimed.  The x87 surface is
+deliberately unchanged.  The ACPI PM block models the Timer register
+(PMBASE+8) and, since PM_PLAN P0–P3, the PM1 status/enable/control
+registers with a level SCI on IRQ9, S5 power-off through the
+deterministic stop, GPE0 and zero-duration S1; the SMI path stays an
+honest no-SMM.  The x87 surface is
 complete for the plan's F0–F4 scope (data, control, arithmetic/compare,
 transcendentals, BCD and the integration gates); the fst slots' 6
 padding bytes are normalized at every write (`x87_w`) so the raw cpu_t
 dump in snapshot files is byte-stable, and the only remaining x87 #UD
 surface is the architecturally reserved register holes (D9 D1–D7,
-DD/DE/DF unmapped forms), pinned by the frozen table suite.  x87
-registers are not
-part of the gdbstub `g`-packet contract.
+DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+register and control state.
+The CPU feature contract is **closed**
+(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF5 shipped): the
+CR4.SMEP/SMAP walk guards are SDM-true and advertised (CF1 —
+the guards had been inverted since the original upstream code, and
+STAC/CLAC fell through into a stray SIDT store at linear 0; both
+were invisible while the features were unadvertised), CPUID no
+longer understates the already-implemented set (CF2 — NX, SYSCALL,
+1 GiB pages, CLFLUSH, and PAT with IA32_PAT leaving reset at the
+SDM default; INIT preserves it, RESET re-seeds it), PCID +
+INVPCID exist with their architectural legality on the
+flush-always TLB (CF3 — under full emulation QEMU/TCG has neither,
+which is what had the consumer's PCID runtime deferred), the
+control-register/EFER/MSR surface validates exactly as far as a
+full-suite census licensed (CF4 — advertise-derived CR4 mask,
+CR0/CR3/EFER reserved rules and the previously missing
+privilege gates are `#GP(0)`, the unknown-MSR lane stays
+documented permissive because the firmware's unhandled reset-stage
+MTRR probe would brick under a strict whitelist, and POPCNT +
+RDTSCP graduated from absent/host-halt and an accidental INVLPG
+alias respectively), and an INIT# under a closed A20 gate fetches
+its reset vector from flash again (CF5 — the U5 record, fixed on
+the decode side). Next material is the plan's §5 device backlog,
+modern virtio first.

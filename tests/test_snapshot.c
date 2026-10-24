@@ -173,6 +173,51 @@ static int u4_snapshot_cases(const char *ps, const char *ps2) {
     if (fails == f0) printf("ok U4 snapshot: relocated and disabled LAPIC save/load equivalently\n");
     return fails - f0;
 }
+/* CPU_FEATURES CF2 (D2): the cpu_reset-seeded IA32_PAT enters the
+ * v1 cpu section as plain sparse-table state -- no format change.
+ * Pin both values across save/load: the reset default (any boot
+ * that never touches PAT) and the consumer's guest-reprogrammed
+ * PA4=WC value, with the byte-exact fixed point. */
+/* "mov ecx,0x277; mov eax,lo; mov edx,hi; wrmsr; jmp $" at 0x5000 */
+static void guest_set_pat(machine_t *m, uint64_t v) {
+    uint8_t code[24]; int n = 0;
+    code[n++] = 0x66; code[n++] = 0xB9; code[n++] = 0x77;
+    code[n++] = 0x02; code[n++] = 0; code[n++] = 0;
+    code[n++] = 0x66; code[n++] = 0xB8;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i));
+    code[n++] = 0x66; code[n++] = 0xBA;
+    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i + 32));
+    code[n++] = 0x0F; code[n++] = 0x30; code[n++] = 0xEB; code[n++] = 0xFE;
+    memcpy(m->ram + 0x5000, code, (size_t)n);
+    m->cpu.rip = 0x5000;
+    for (int i = 0; i < 8; i++) (void)cpu_step(&m->cpu);
+}
+static int cf2_pat_cases(const char *ps, const char *ps2) {
+    int f0 = fails;
+    const uint64_t GUESTPAT = 0x0007040100070406ULL; /* PA4 := WC */
+    int found;
+    /* the plain reset default round-trips */
+    boot_lapic(&SC);
+    EXPECT(cpu_get_msr(&SC.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found,
+           "reset PAT default absent");
+    assert(snap_save(&SC, ps, &CFG) == 0);
+    boot_lapic(&SD);
+    assert(snap_load(&SD, ps, &CFG) == 0);
+    EXPECT(cpu_get_msr(&SD.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found,
+           "loaded PAT default lost");
+    assert(snap_save(&SD, ps2, &CFG) == 0);
+    EXPECT(same_file(ps, ps2), "PAT save -> load -> save not a fixed point");
+    /* and a value the guest reprogrammed at paging setup */
+    guest_set_pat(&SC, GUESTPAT);
+    assert(snap_save(&SC, ps, &CFG) == 0);
+    boot_lapic(&SD);
+    assert(snap_load(&SD, ps, &CFG) == 0);
+    EXPECT(cpu_get_msr(&SD.cpu, MSR_IA32_PAT, &found) == GUESTPAT && found,
+           "loaded guest PAT lost");
+    drop_mmio(&SC); drop_mmio(&SD);
+    if (fails == f0) printf("ok CF2 snapshot: IA32_PAT default and guest value save/load equivalently\n");
+    return fails - f0;
+}
 
 int main(void) {
     const char *p1 = "/tmp/test-snap-1.snap", *p2 = "/tmp/test-snap-2.snap", *p3 = "/tmp/test-snap-3.snap";
@@ -219,6 +264,7 @@ int main(void) {
 
     /* 3. sparse RAM */
     u4_snapshot_cases("/tmp/test-snap-u4a.snap", "/tmp/test-snap-u4b.snap");
+    cf2_pat_cases("/tmp/test-snap-cf2a.snap", "/tmp/test-snap-cf2b.snap");
     long sz = fsize(p1);
     EXPECT(sz > 0 && sz < 2 * 1024 * 1024, "snapshot of a tiny program is %ld bytes", sz);
     printf("ok sparse: %ld-byte file for a %u MiB machine\n", sz, RAM_SIZE >> 20);

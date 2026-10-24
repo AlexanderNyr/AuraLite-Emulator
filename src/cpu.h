@@ -33,6 +33,14 @@ typedef struct {
 
 #define MAX_MSR 64
 
+/* CPU_FEATURES CF2: IA32_PAT is sparse-table state with an
+ * architectural reset value (SDM Table 9-1): PA0..PA7 =
+ * WB WT UC- UC WB WT UC- UC. With no cache model the memory types
+ * are performance attributes, so storage + this reset value is the
+ * complete functional model (the ERMS precedent). */
+#define MSR_IA32_PAT        0x277u
+#define MSR_IA32_PAT_RESET  0x0007040600070406ULL
+
 typedef struct {
     uint32_t idx;
     uint64_t val;

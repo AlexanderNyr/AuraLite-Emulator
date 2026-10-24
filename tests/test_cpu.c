@@ -844,6 +844,13 @@ static void test_cpuid_leaves(void) {
         0x66, 0xB8, 0x08, 0x00, 0x00, 0x80,       /* mov eax,0x80000008 */
         0x0F, 0xA2,
         0x66, 0xA3, 0x20, 0x20,                   /* mov [0x2020],eax */
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,       /* mov eax,1 */
+        0x0F, 0xA2,
+        0x66, 0x89, 0x16, 0x24, 0x20,             /* mov [0x2024],edx */
+        0x66, 0x89, 0x0E, 0x2C, 0x20,             /* mov [0x202C],ecx */
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x80,       /* mov eax,0x80000001 */
+        0x0F, 0xA2,
+        0x66, 0x89, 0x16, 0x28, 0x20,             /* mov [0x2028],edx */
         0xF4 };
     run_program(&m, prog, sizeof prog, 0, 64);
     assert(!m.cpu.fault);
@@ -855,9 +862,23 @@ static void test_cpuid_leaves(void) {
     assert((mem_read(&m, 0x200C, 4) & 0xFFF) == 63);      /* 64B line - 1 */
     assert(mem_read(&m, 0x2010, 4) == 0);                 /* enum terminates */
     assert(mem_read(&m, 0x2014, 4) == 0);                 /* leaf 7: max subleaf */
-    assert(mem_read(&m, 0x2018, 4) == (1u << 9));         /* ERMS only */
+    assert(mem_read(&m, 0x2018, 4) == ((1u << 9) | (1u << 7) | (1u << 10) | (1u << 20))); /* ERMS + SMEP + INVPCID (CF3) + SMAP (CF1) */
     assert(mem_read(&m, 0x201C, 4) == 0x61727541u);       /* brand "Aura" */
     assert(mem_read(&m, 0x2020, 4) == 0x00003028u);       /* 48-bit VA, 40-bit PA */
+    /* CF2: leaf-1 EDX = FPU|TSC|MSR|CX8|APIC|CMOV|PAT|CLFLUSH|MMX|
+     * FXSR|SSE|SSE2 (PAT and CLFLUSH are the CF2 additions, both
+     * already true in the core) */
+    assert(mem_read(&m, 0x2024, 4) == 0x07898331u);
+    /* CF2+CF4: 80000001 EDX = LM|RDTSCP|1GBPAGES|NX|SYSCALL (the
+     * first three long-implemented when CF2 published them; RDTSCP
+     * was implemented at CF4 -- before that 0F 01 F9 was an
+     * accidental INVLPG) */
+    assert(mem_read(&m, 0x2028, 4) == 0x2C100800u);
+    /* CF3+CF4: leaf-1 ECX = SSE3|PCID|POPCNT|HYPERVISOR (the PCID
+     * bit arrived only with the CR4.PCIDE/CR3[63]/INVPCID legality
+     * surface; POPCNT's decode arrived at CF4 -- the semantics
+     * vectors live in tests/test_tlb.c + test_cf4_units below) */
+    assert(mem_read(&m, 0x202C, 4) == 0x80820001u);
 
     /* brand string is exactly 48 bytes of text padded with spaces */
     const platform_t *p = platform_by_name("haswell");
@@ -874,6 +895,144 @@ static void test_cpuid_leaves(void) {
     assert(strstr(brand, "AuraLite Virtual CPU") != NULL);
     assert(strstr(brand, "0x3C") != NULL);
     assert(strchr(brand, '\0') == brand + 48);
+}
+
+/* CPU_FEATURES CF2 (D2): IA32_PAT. The consumer's gate needs
+ * CPUID.1:EDX.PAT AND the architectural reset default before its
+ * read-modify-write (PA4 := WC). Both halves pinned: the bit lives
+ * in test_cpuid_leaves; here the reset value, the guest's exact
+ * RDMSR -> RMW -> WRMSR -> readback sequence, survival across an
+ * INIT# (silicon preserves the table), and re-default at RESET.
+ * Snapshot survival lives in tests/test_snapshot.c. */
+static void test_pat_msr(void) {
+    machine_t m;
+    setup_machine(&m);
+    int found = 0;
+    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found);
+    static const uint8_t prog[] = {
+        0x66, 0xB9, 0x77, 0x02, 0x00, 0x00,   /* mov ecx,0x277        */
+        0x0F, 0x32,                           /* rdmsr                */
+        0x66, 0xA3, 0x00, 0x24,               /* mov [0x2400],eax     */
+        0x66, 0x89, 0x16, 0x04, 0x24,         /* mov [0x2404],edx     */
+        0x66, 0x81, 0xE2, 0xF8, 0xFF, 0xFF, 0xFF, /* and edx,~7 (PA4) */
+        0x66, 0x83, 0xCA, 0x01,               /* or  edx,1  (WC)      */
+        0x0F, 0x30,                           /* wrmsr                */
+        0x0F, 0x32,                           /* rdmsr                */
+        0x66, 0xA3, 0x08, 0x24,               /* mov [0x2408],eax     */
+        0x66, 0x89, 0x16, 0x0C, 0x24,         /* mov [0x240C],edx     */
+        0xF4 };                               /* hlt                  */
+    run_program(&m, prog, sizeof prog, 0, 64);
+    assert(!m.cpu.fault);
+    assert(mem_read(&m, 0x2400, 4) == 0x00070406u);   /* defaults PA0..PA3 */
+    assert(mem_read(&m, 0x2404, 4) == 0x00070406u);   /* defaults PA4..PA7 */
+    assert(mem_read(&m, 0x2408, 4) == 0x00070406u);   /* low half untouched*/
+    assert(mem_read(&m, 0x240C, 4) == 0x00070401u);   /* PA4 := WC stuck   */
+    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == 0x0007040100070406ULL && found);
+    cpu_init_reset(&m.cpu);   /* INIT# preserves the MSR table (PAT too) */
+    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == 0x0007040100070406ULL && found);
+    cpu_reset(&m.cpu);        /* RESET re-seeds the SDM default */
+    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found);
+}
+
+/* CPU_FEATURES CF4 (D6 + the measured NO-GO): POPCNT and RDTSCP
+ * graduated from grep verdicts to implementations; the unknown-MSR
+ * lane stays permissive BY EVIDENCE -- the sample firmware RDMSRs
+ * 0x2FF unconditionally in reset-stage CAR code, so strictness
+ * would brick the primary workload -- and that permissiveness is
+ * pinned here, including the now-logged 64-slot drop. The CR/EFER
+ * #GP surface lives in tests/test_tlb.c::cf4_validate. */
+static void test_cf4_units(void) {
+    machine_t m;
+    setup_machine(&m);
+    /* POPCNT: count, flags defined (arith five cleared, ZF tracks
+     * a zero result) -- STC before each proves the clears bite. */
+    static const uint8_t popc[] = {
+        0x66, 0xB9, 0xF0, 0xF0, 0xF0, 0xF0,   /* mov ecx,0xF0F0F0F0 */
+        0xF9,                                 /* stc                */
+        0xF3, 0x66, 0x0F, 0xB8, 0xC1,         /* popcnt eax,ecx     */
+        0x66, 0xA3, 0x00, 0x25,               /* mov [0x2500],eax   */
+        0x9C, 0x58, 0xA3, 0x04, 0x25,         /* pushf; pop ax; mov [0x2504],ax */
+        0x66, 0x31, 0xC9,                     /* xor ecx,ecx        */
+        0xF9, 0xF3, 0x66, 0x0F, 0xB8, 0xC1,   /* stc; popcnt eax,ecx*/
+        0x66, 0xA3, 0x08, 0x25,               /* mov [0x2508],eax   */
+        0x9C, 0x58, 0xA3, 0x0C, 0x25,         /* flags -> [0x250C]  */
+        0xF4 };
+    run_program(&m, popc, sizeof popc, 0, 32);
+    assert(!m.cpu.fault);
+    assert(mem_read(&m, 0x2500, 4) == 16);
+    assert((mem_read(&m, 0x2504, 2) & 0x8D5) == 0);          /* CF PF AF ZF SF OF */
+    assert(mem_read(&m, 0x2508, 4) == 0);
+    assert((mem_read(&m, 0x250C, 2) & 0x8D5) == 0x40);      /* only ZF */
+    /* RDTSCP: RDTSC's twin + IA32_TSC_AUX in ECX. */
+    setup_machine(&m);   /* run_program leaves the HLT'd cpu halted */
+    static const uint8_t tcp[] = {
+        0x0F, 0x31,                           /* rdtsc              */
+        0x66, 0xA3, 0x10, 0x25,               /* [0x2510]=eax       */
+        0x66, 0x89, 0x16, 0x14, 0x25,         /* [0x2514]=edx       */
+        0x66, 0xB9, 0x03, 0x01, 0x00, 0xC0,   /* mov ecx,0xC0000103 */
+        0x66, 0xB8, 0x01, 0x00, 0xCD, 0xAB,   /* mov eax,0xABCD0001 */
+        0x66, 0x31, 0xD2,                     /* xor edx,edx        */
+        0x0F, 0x30,                           /* wrmsr (TSC_AUX)    */
+        0x0F, 0x01, 0xF9,                     /* rdtscp             */
+        0x66, 0xA3, 0x18, 0x25,               /* [0x2518]=eax       */
+        0x66, 0x89, 0x16, 0x1C, 0x25,         /* [0x251C]=edx       */
+        0x66, 0x89, 0x0E, 0x20, 0x25,         /* [0x2520]=ecx       */
+        0xF4 };
+    run_program(&m, tcp, sizeof tcp, 0, 32);
+    assert(!m.cpu.fault);
+    uint64_t t1 = ((uint64_t)mem_read(&m, 0x2514, 4) << 32) | mem_read(&m, 0x2510, 4);
+    uint64_t t2 = ((uint64_t)mem_read(&m, 0x251C, 4) << 32) | mem_read(&m, 0x2518, 4);
+    assert(mem_read(&m, 0x2520, 4) == 0xABCD0001u);
+    assert(t2 >= t1 && t2 - t1 < 1000000);
+    /* The NO-GO, pinned: an unstored index reads 0 fault-free (the
+     * firmware's reset-stage 0x2FF probe above all), and arbitrary
+     * indices are plain fatal-free storage. */
+    setup_machine(&m);
+    static const uint8_t msrperm[] = {
+        0x66, 0xB9, 0xFF, 0x02, 0x00, 0x00,   /* mov ecx,0x2FF      */
+        0x0F, 0x32,                           /* rdmsr              */
+        0x66, 0xA3, 0x28, 0x25,               /* [0x2528]=eax       */
+        0x66, 0x89, 0x16, 0x2C, 0x25,         /* [0x252C]=edx       */
+        0x66, 0xB9, 0x34, 0x12, 0x00, 0x00,   /* mov ecx,0x1234     */
+        0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE,   /* mov eax,0xDEADBEEF */
+        0x66, 0xBA, 0x78, 0x56, 0x34, 0x12,   /* mov edx,0x12345678 */
+        0x0F, 0x30,                           /* wrmsr              */
+        0x66, 0x31, 0xC0, 0x66, 0x31, 0xD2,   /* clobber eax/edx    */
+        0x0F, 0x32,                           /* rdmsr              */
+        0x66, 0xA3, 0x30, 0x25,
+        0x66, 0x89, 0x16, 0x34, 0x25,
+        0xF4 };
+    run_program(&m, msrperm, sizeof msrperm, 0, 32);
+    assert(!m.cpu.fault);
+    assert(mem_read(&m, 0x2528, 4) == 0 && mem_read(&m, 0x252C, 4) == 0);
+    assert(mem_read(&m, 0x2530, 4) == 0xDEADBEEFu);
+    assert(mem_read(&m, 0x2534, 4) == 0x12345678u);
+    /* The sparse table tops out at 64: first-written survives, the
+     * far side of the table reads back 0, and every loss is logged
+     * (it used to be silent). 80 fresh indices cross any seeding. */
+    setup_machine(&m);
+    static uint8_t big[8 * 80 + 64];
+    int n = 0;
+    big[n++] = 0x66; big[n++] = 0xB8; big[n++] = 1; big[n++] = 0; big[n++] = 0; big[n++] = 0; /* eax=1 */
+    big[n++] = 0x66; big[n++] = 0x31; big[n++] = 0xD2;                                       /* edx=0 */
+    for (int i = 0; i < 80; i++) {
+        unsigned idx = 0x9000 + (unsigned)i;
+        big[n++] = 0x66; big[n++] = 0xB9;
+        big[n++] = (uint8_t)idx; big[n++] = (uint8_t)(idx >> 8); big[n++] = 0; big[n++] = 0;
+        big[n++] = 0x0F; big[n++] = 0x30;
+    }
+    big[n++] = 0x66; big[n++] = 0xB9; big[n++] = 0x00; big[n++] = 0x90; big[n++] = 0; big[n++] = 0;
+    big[n++] = 0x0F; big[n++] = 0x32; big[n++] = 0x66; big[n++] = 0xA3; big[n++] = 0x38; big[n++] = 0x25;
+    big[n++] = 0x66; big[n++] = 0xB9; big[n++] = 0x4F; big[n++] = 0x90; big[n++] = 0; big[n++] = 0;
+    big[n++] = 0x0F; big[n++] = 0x32; big[n++] = 0x66; big[n++] = 0xA3; big[n++] = 0x3C; big[n++] = 0x25;
+    big[n++] = 0xF4;
+    run_program(&m, big, (size_t)n, 0, 512);
+    assert(!m.cpu.fault);
+    assert(mem_read(&m, 0x2538, 4) == 1);   /* 0x9000 stored  */
+    assert(mem_read(&m, 0x253C, 4) == 0);   /* 0x904F dropped */
+    int logged = 0;
+    for (int i = 0; i < m.log.count; i++) if (strstr(m.log.lines[i], "dropped")) logged = 1;
+    assert(logged);
 }
 
 /* SeaBIOS executes WBINVD before setting the PAM shadow read-only. With no
@@ -963,6 +1122,8 @@ int main(void) {
     test_bswap_xadd_cmpxchg();
 
     test_cpuid_leaves();
+    test_pat_msr();
+    test_cf4_units();
     test_wbinvd_no_cache();
     test_rdtsc_pause_fences();
 

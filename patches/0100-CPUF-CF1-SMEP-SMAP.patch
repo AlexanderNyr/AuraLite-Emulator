@@ -1,0 +1,490 @@
+From 438090b9262225c84d72617bba300a085d72f131 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Fri, 23 Oct 2026 11:56:45 +0000
+Subject: [PATCH] CPU-features CF1: SMEP/SMAP made true, then advertised
+
+The walk guards for CR4.SMEP/SMAP sat inside the supervisor-page
+branch of translate(): a kernel that set either bit faulted on its
+own text while user pages stayed open. Invisible since the
+original upstream code because CPUID advertised neither feature,
+so no consumer ever enabled them and no test ever vectored them.
+
+- Guards moved to supervisor-accesses-of-user-pages with the
+  architected error codes (SMEP P|I/D, SMAP P/P|W); user_cpl
+  already folds K4's desc_sv rule, so implicit descriptor
+  accesses take the same gate (QEMU's kernel-index shape). The
+  P2 TLB needed nothing: CR4/CPL/AC/desc_sv/mode were already
+  its key, proven by the warm STAC->CLAC toggle vector.
+- Gate delivery now clears EFLAGS.AC alongside IF (the frame
+  preserves the old bit for IRET); page_fault sets I/D for SMEP
+  regardless of NXE (the two nx_hit sites only).
+- Second latent defect in the same site: STAC/CLAC had no break
+  and fell through into decode_modrm + the SIDT store at linear
+  address 0, overwriting the guest's first bytes with the IDT
+  pseudo-descriptor on every execution. The cases now end, and
+  CPL>0 takes the delivered architected #UD.
+- CPUID leaf 7 advertises SMEP|SMAP|ERMS, pinned in
+  test_cpuid_leaves. AuraLite-OS now lights its SMEP/SMAP
+  receipts and STAC/CLAC copy paths up on this machine.
+
+Vectors: 9 in tests/test_tlb.c::smep_smap (own supervisor-mapped
+fixture; CF0 repro table in house form, linear-0 canary, CPL3
+#UD, AC across delivery). NC against 86539e4: 11 pre-existing P2
+vectors pass, the first CF1 case aborts in smstep on the inverted
+walk's bogus supervisor-fetch #PF; test-unit aborts on the leaf-7
+assertion. Gates: make test and make test-sanitize green with
+both live SeaBIOS ISO lanes; no firmware receipt delta.
+---
+ CHANGELOG.md                    |  32 +++++++
+ ROADMAP.md                      |  12 ++-
+ docs/STATUS.md                  |  13 +--
+ docs/plans/CPU_FEATURES_PLAN.md |  45 +++++++++-
+ src/cpu.c                       |  49 ++++++++--
+ src/platform.c                  |   4 +-
+ tests/test_cpu.c                |   2 +-
+ tests/test_tlb.c                | 152 ++++++++++++++++++++++++++++++++
+ 8 files changed, 290 insertions(+), 19 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 443d91f..1362e85 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,38 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0100 (CPU-features CF1: SMEP/SMAP made true)
++
++- **The page walk's SMEP/SMAP guards were inverted** (`src/cpu.c`)
++  and are now SDM-true: they lived inside the supervisor-page
++  branch of `translate()`, so with CR4.SMEP/SMAP set a kernel
++  faulted on its *own* pages while user pages stayed open. Nothing
++  had ever noticed — CPUID advertised neither feature, so no
++  consumer ever set the CR4 bits, and no test ever vectored them.
++  The guards now gate supervisor (incl. K4 `desc_sv` implicit)
++  fetches/data accesses to U/S=1 pages with the architected error
++  codes (SMEP `P|I/D`, SMAP `P`/`P|W`); gate delivery clears
++  EFLAGS.AC (the pushed frame keeps it for IRET), and CPUID leaf 7
++  advertises EBX.SMEP|EBX.SMAP next to ERMS (`src/platform.c`).
++  AuraLite-OS lights its `SMEP enabled`/`SMAP enabled` receipts and
++  STAC/CLAC copy paths up on this machine for the first time.
++- **STAC/CLAC no longer corrupt guest memory and are
++  privilege-gated.** Both ended without a `break` and fell through
++  into `decode_modrm` + the SIDT store at linear address 0 — every
++  STAC/CLAC would have overwritten the guest's first bytes with the
++  IDT pseudo-descriptor, latent for the same reason (guests gate
++  STAC on the CPUID bit). The case now ends; CPL>0 raises the
++  delivered architected #UD.
++- New vectors: 9 in `tests/test_tlb.c::smep_smap` (inversion cases
++  in house form, STAC→CLAC across a warm TLB, linear-0 canary,
++  CPL3 #UD, AC across delivery) + the leaf-7 word pinned in
++  `tests/test_cpu.c`. NC = the suites on the 0099 tree: 11 P2
++  vectors pass, the first CF1 case aborts (the inverted walk's
++  bogus #PF on a supervisor fetch); test-unit aborts on the
++  leaf-7 assertion. Gates: `make test` + `make test-sanitize`
++  (both live SeaBIOS ISO lanes), test-unit/test-tlb/test-ring3 —
++  green, with no firmware receipt delta.
++
+ ### Added — patch 0099 (CPU-features CF0: measured baseline, docs only)
+ 
+ - **Post-UPKEEP audit and the CPU_FEATURES_PLAN** (`docs/plans/
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 11ef8a4..9ad9336 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -40,7 +40,7 @@ maps to exactly one plan below.
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+-| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF1 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -153,9 +153,13 @@ harness reproduction.
+    making this the first emulator lane where the guest's
+    deferred PCID runtime can execute — CF4 decides CR/MSR
+    validation by census experiment, CF5 closes with the
+-   U5 A20 record. **CF0 (`0099`) shipped**: advertised-vs-
+-   implemented matrix, MSR census, defect ledger D1–D6,
+-   and a ranked device backlog (virtio first) in the plan §5.
++   U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) shipped**:
++   the advertised-vs-implemented matrix, MSR census and
++   defect ledger D1–D6, then the SMEP/SMAP guards made
++   true (with a second latent find in the same site: STAC/
++   CLAC fell through into a stray SIDT store at linear 0)
++   and advertised; the ranked device backlog (virtio
++   first) waits in the plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 0d0895e..0472b97 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1316,8 +1316,11 @@ DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+ UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+ register and control state.
+ The CPU feature contract is the current in-flight work
+-(`docs/plans/CPU_FEATURES_PLAN.md`): as measured there, CPUID
+-understates the machine (NX, SYSCALL, 1 GiB pages work but are not
+-advertised; IA32_PAT is sparse storage with a zero reset value; PCID
+-is absent), and the CR4.SMEP/SMAP walk guards — never advertised, so
+-never enabled by a consumer — are inverted relative to the SDM.
++(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF1 shipped): CPUID still
++understates the machine in the measured set (NX, SYSCALL, 1 GiB
++pages work but are not advertised; IA32_PAT is sparse storage with
++a zero reset value; PCID is absent), but the CR4.SMEP/SMAP walk
++guards are now SDM-true and advertised (CF1 — the guards had been
++inverted since the original upstream code, and STAC/CLAC fell
++through into a stray SIDT store at linear 0; both were invisible
++while the features were unadvertised).
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index accc608..6f56dcc 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -17,12 +17,12 @@
+ > pass (virtio, AC97, extra NICs, USB HID) are ranked in
+ > §5 for the next choice.
+ 
+-**Status: CF0 done ✅; CF1–CF5 queued**
++**Status: CF0–CF1 done ✅; CF2–CF5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | CF0 | Measured baseline: advertised-vs-implemented matrix, MSR census, defect ledger, decisions, phase split | ✅ done | this file (`patches/0099`) |
+-| CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ⬜ queued | `tests/test_tlb.c` vectors |
++| CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ✅ done | `tests/test_tlb.c` vectors (`patches/0100`) |
+ | CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ⬜ queued | CPUID/MSR vectors |
+ | CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ⬜ queued | `tests/test_tlb.c` vectors |
+ | CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ⬜ queued | vectors or an evidenced NO-GO |
+@@ -312,6 +312,47 @@ repro cases redden. Guest receipt change to record:
+ `cpu_smap_is_active` copy paths light up (frozen lane
+ runs where available).
+ 
++Closed. The guards moved to `eff_us && !user_cpl`
++(supervisor accessing a user page), where `user_cpl`
++already folds in K4's desc_sv rule — implicit descriptor
++accesses take the same SMAP gate as explicit kernel ones
++(the QEMU kernel-MMU-index shape; page-walk reads are
++physical and never reach the check). The P2 TLB needed no
++change: its key already contains whole CR4, CPL, AC,
++desc_sv and mode, so no warm success can outrank the new
++rules — vector 5 proves it across a STAC→CLAC toggle.
++Delivery now clears EFLAGS.AC alongside IF (the pushed
++frame preserves the old bit for IRET), and `page_fault`
++sets the I/D error bit for SMEP regardless of NXE (the
++only two nx_hit call sites are the NX-exec and SMEP
++branches, so nothing else moved). Reading the STAC site
++surfaced a second, worse latent defect that advertising
++SMAP would have armed: STAC/CLAC had no `break` and fell
++through into decode_modrm + the ext==1 SIDT store at
++linear address 0 (the register form decodes addr=0) —
++every STAC ever executed would have overwritten the
++guest's first bytes with the IDT pseudo-descriptor,
++invisible for the same reason as the inversion. Both
++sites now end the case; CPL>0 takes the delivered #UD
++(SDM; the WBINVD #GP(0) site is the local delivery
++idiom); the leaf-7 word reads SMEP|SMAP|ERMS, pinned in
++`test_cpuid_leaves`. Nine vectors in
++`tests/test_tlb.c::smep_smap` (own supervisor-mapped
++fixture) cover the CF0 repro table in house form plus
++the linear-0 fallthrough canary, the CPL3 #UD and AC
++across delivery. NC against `86539e4`: the 11 existing
++P2 vectors pass, then the first CF1 case aborts in
++`smstep` — the inverted walk delivers its bogus #PF on a
++supervisor fetch; test-unit's NC aborts on the leaf-7
++assertion. Gates: `make test` and `make test-sanitize`
++green with both live SeaBIOS ISO lanes; test-unit,
++test-tlb, test-ring3 green; no firmware receipt delta
++(family/model words untouched; SeaBIOS still reads
++EDX.12=0 and skips MTRR setup). Guest-side, when its
++lanes next run: the `SMEP enabled`/`SMAP enabled`
++receipts appear and the STAC/CLAC copy paths go live —
++the first consumers these guards have ever had.
++
+ ### CF2 — the advertised-truth bundle
+ 
+ Set, each with its pinning vector or an existing-lane
+diff --git a/src/cpu.c b/src/cpu.c
+index 6db1aa8..39c3708 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -96,7 +96,9 @@ static void page_fault(machine_t *m, uint64_t vaddr, int mode, int present_chain
+     if (present_chain) err |= 1u;             /* P: level-all-present */
+     if (mode == 1) err |= 2u;                 /* W/R */
+     if (cpl_now(c) == 3) err |= 4u;           /* U/S */
+-    if (nx_hit && (c->efer & (1ULL<<11))) err |= 16u; /* I/D (needs EFER.NXE) */
++    if (nx_hit) err |= 16u; /* I/D: fetch-protection fault -- NX
++                             * (call sites gate on EFER.NXE) or SMEP (CF1:
++                             * the SDM sets I/D for SMEP regardless) */
+     /* K4: page faults are rare in a healthy boot but their context rip is the
+      * entire delta between "mystery SIGSEGV" and a one-line verdict -- keep
+      * it always-on (measured: the init-shell null-deref chased below). */
+@@ -211,6 +213,18 @@ check:
+     /* whole chain was present from here on: P=1 */
+     if (!eff_us) {
+         if (user_cpl) { page_fault(m, vaddr, mode, 1, 0); return 0; }
++    } else if (!user_cpl) {
++        /* CPU_FEATURES CF1: SMEP/SMAP constrain a SUPERVISOR access to
++         * a USER page (eff U/S=1) -- a supervisor fetch (CR4.SMEP,
++         * err P|I/D) or a supervisor data access with EFLAGS.AC=0
++         * (CR4.SMAP). user_cpl already folds in K4's desc_sv rule, so
++         * implicit descriptor accesses are treated exactly like
++         * explicit kernel ones (the QEMU kernel-MMU-index shape);
++         * page-walk reads themselves are physical and never reach
++         * here. Pre-CF1 both guards sat inside the !eff_us branch --
++         * inverted since the original upstream code, invisible only
++         * because CPUID advertised neither feature, so no consumer
++         * ever set the CR4 bits (the CF0 harness table, plan 1.3). */
+         if ((c->cr4 & (1ULL<<20)) && mode == T_EXEC) { page_fault(m, vaddr, mode, 1, 1); return 0; } /* SMEP */
+         if ((c->cr4 & (1ULL<<21)) && mode != T_EXEC &&
+             !(c->rflags & (1ULL<<18)))          { page_fault(m, vaddr, mode, 1, 0); return 0; } /* SMAP, AC=0 */
+@@ -495,7 +509,11 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
+     far_load_cs(m, sel, handler);
+     if (!ring_change)         /* same-ring delivery: bring the RPL back */
+         c->seg[SEG_CS].sel = (uint16_t)(presuspend_cs | (sel & 3));
+-    c->rflags &= ~FLAG_IF;
++    /* CF1: gate delivery also clears EFLAGS.AC (the pushed image keeps
++     * the old bit for IRET to restore), so a handler always starts
++     * with SMAP shut -- a STAC window interrupted mid-copy must not
++     * leak open-door state into arbitrary handler code. */
++    c->rflags &= ~(FLAG_IF | (1ULL<<18));
+     c->exception_taken = 1;
+     /* IRQ vectors (32+) fire per timer tick in the idle loop and would drown
+      * the serial history in the logring -- exceptions stay always-on. (K4:
+@@ -3737,10 +3755,29 @@ really_slow:
+                      }
+                      break; }
+         case 0x01: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
+-                     if (modrm == 0xCB) { /* STAC (K4): SMAP door open */
+-                         c->rflags |= (1u<<18);
+-                     } else if (modrm == 0xCA) { /* CLAC (K4): door shut */
+-                         c->rflags &= ~(1u<<18);
++                     /* CPU_FEATURES CF1: STAC/CLAC are the SMAP door
++                      * (K4), made honest on both sides: (a) they now
++                      * END the case -- pre-CF1 execution fell through
++                      * into decode_modrm (register form: addr=0) and
++                      * the ext==1 SIDT store at linear address 0, so
++                      * every STAC/CLAC in history would have
++                      * overwritten the guest's first bytes with the
++                      * IDT pseudo-descriptor (never fired in a
++                      * measured lane: guests gate STAC on the SMAP
++                      * CPUID bit we had never advertised);
++                      * (b) CPL>0 takes the architected #UD, delivered
++                      * like the other core exceptions (the WBINVD
++                      * #GP(0) site is the local idiom). The CPUID
++                      * prong of the #UD is satisfied by construction:
++                      * the SMAP leaf-7 bit is unconditionally on. */
++                     if (modrm == 0xCB) { /* STAC: SMAP door open */
++                         if (cpl_now(c) != 0) raise_exception(m, 6, 0, 0);
++                         else c->rflags |= (1u<<18);
++                         break;
++                     } else if (modrm == 0xCA) { /* CLAC: door shut */
++                         if (cpl_now(c) != 0) raise_exception(m, 6, 0, 0);
++                         else c->rflags &= ~(1u<<18);
++                         break;
+                      } else if (modrm == 0xF8) { /* SWAPGS (0F 01 /7 mod=3 exact):
+                          exchanges GS base <-> IA32_KERNEL_GS_BASE. The
+                          AuraLite syscall/ISR stubs gate it by frame CS RPL,
+diff --git a/src/platform.c b/src/platform.c
+index afe28e2..7ebd9f2 100644
+--- a/src/platform.c
++++ b/src/platform.c
+@@ -88,7 +88,9 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+         }
+         break; }
+     case 0x7: /* structured extended features */
+-        if (subleaf == 0) { *a = 0; *b = (1u<<9); /* ERMS: we do fast REP MOVSB/STOSB */ }
++        if (subleaf == 0) { *a = 0; *b = (1u<<9)          /* ERMS: we do fast REP MOVSB/STOSB */
++                                       | (1u<<7)          /* SMEP (CPU_FEATURES CF1) */
++                                       | (1u<<20); }      /* SMAP (CF1) */
+         break;
+     case 0x80000002: case 0x80000003: case 0x80000004: { /* brand string, 48B */
+         char brand[48];
+diff --git a/tests/test_cpu.c b/tests/test_cpu.c
+index 13a8b94..02783ee 100644
+--- a/tests/test_cpu.c
++++ b/tests/test_cpu.c
+@@ -855,7 +855,7 @@ static void test_cpuid_leaves(void) {
+     assert((mem_read(&m, 0x200C, 4) & 0xFFF) == 63);      /* 64B line - 1 */
+     assert(mem_read(&m, 0x2010, 4) == 0);                 /* enum terminates */
+     assert(mem_read(&m, 0x2014, 4) == 0);                 /* leaf 7: max subleaf */
+-    assert(mem_read(&m, 0x2018, 4) == (1u << 9));         /* ERMS only */
++    assert(mem_read(&m, 0x2018, 4) == ((1u << 9) | (1u << 7) | (1u << 20))); /* ERMS + SMEP + SMAP (CF1) */
+     assert(mem_read(&m, 0x201C, 4) == 0x61727541u);       /* brand "Aura" */
+     assert(mem_read(&m, 0x2020, 4) == 0x00003028u);       /* 48-bit VA, 40-bit PA */
+ 
+diff --git a/tests/test_tlb.c b/tests/test_tlb.c
+index 385eeb7..2df74b5 100644
+--- a/tests/test_tlb.c
++++ b/tests/test_tlb.c
+@@ -339,6 +339,157 @@ static void smp_and_mode_key(void) {
+     assert(g_m.cpu.gpr[RAX] == NEW_VALUE);
+     puts("ok p2 direct CR3 key + SMP context separation");
+ }
++/* CPU_FEATURES CF1: the SMEP/SMAP contract, advertised only as of this
++ * phase. Own fixture: the identity 2MiB is SUPERVISOR-mapped (PD[0] has
++ * U/S=0) so CPL0 code at 0x1000 may execute with SMEP on; VA (4MiB)
++ * reaches a U/S=1 page (phys 5MiB; code at +0x0, data at +0x800).
++ * Case order matters for the NC: the first assertion is the one the
++ * pre-CF1 inverted walk fails. */
++#define SMEP (1ull << 20)
++#define SMAP (1ull << 21)
++#define ACF  (1ull << 18)
++#define UDATA (VA + 0x800ull)
++#define UVAL 0x2222222222222222ull
++#define KVAL 0x1111111111111111ull
++static void smfix(const uint8_t *code, size_t n) {
++    setup_machine(&g_m);
++    cpu_t *c = &g_m.cpu;
++    w64(0x10000, 0x11000 | P | W | US);   /* PML4[0] */
++    w64(0x11000, 0x12000 | P | W | US);   /* PDPT[0] */
++    w64(0x12000, P | W | PS);             /* PD[0]: identity 2MiB SUPERVISOR */
++    w64(0x12010, 0x13000 | P | W | US);   /* PD[2] -> PT */
++    w64(0x13000, 0x500000 | P | W | US);  /* PT[0] -> VA user page */
++    w64(0x500800, UVAL);                  /* user data at VA+0x800 */
++    w64(0x4000, KVAL);                    /* supervisor data at 0x4000 */
++    g_m.ram[0x500000] = 0x90; g_m.ram[0x500001] = 0x90;  /* user NOPs at VA */
++    static const uint8_t movusr[] = { 0x48, 0x8B, 0x03 }; /* MOV RAX,[RBX] */
++    memcpy(g_m.ram + 0x500010, movusr, sizeof movusr);    /* user code too */
++    static const uint8_t stac1[] = { 0x0F, 0x01, 0xCB };  /* STAC */
++    memcpy(g_m.ram + 0x500020, stac1, sizeof stac1);
++    c->cr3 = 0x10000;
++    c->cr4 = 0x20;                           /* PAE; SMEP/SMAP per case */
++    c->efer = (1ull<<8) | (1ull<<10) | (1ull<<11);
++    c->cr0 = 0x80010033ull;
++    c->idtr_base = 0x0C00; c->idtr_limit = 256 * 16 - 1;
++    w64(0x2000 + 4, 0x30000);
++    c->tr_base = 0x2000; c->tr_limit = 103;
++    for (int v = 0; v < 32; v++) gate(v, 8, 0x9000 + (uint64_t)v * 8);
++    memset(g_m.ram + 0x9000, 0xF4, 32 * 8);
++    c->seg[SEG_CS] = (segment_t){ .sel = 8, .base = 0, .limit = ~0u, .l = 1 };
++    c->seg[SEG_SS] = (segment_t){ .sel = 0x10, .base = 0, .limit = ~0u };
++    c->gpr[RSP] = 0x8000;
++    memcpy(g_m.ram + 0x1000, code, n);       /* supervisor code */
++}
++static void smstep(uint64_t rip) {
++    g_m.cpu.rip = rip;
++    assert(cpu_step(&g_m.cpu) == 0);
++    assert(!g_m.cpu.fault && !g_m.cpu.exception_taken);
++}
++static void smep_smap(void) {
++    static const uint8_t mov_r[] = { 0x48, 0x8B, 0x03 };        /* MOV RAX,[RBX] */
++    static const uint8_t mov_w[] = { 0x48, 0x89, 0x03 };        /* MOV [RBX],RAX */
++    static const uint8_t stac_r_clac_r[] = {
++        0x0F, 0x01, 0xCB, 0x48, 0x8B, 0x03,
++        0x48, 0x8B, 0x03, 0x0F, 0x01, 0xCA, 0x48, 0x8B, 0x03 }; /* STAC MOV MOV CLAC MOV */
++    static const uint8_t stac_mov[] = { 0x0F, 0x01, 0xCB, 0x48, 0x8B, 0x03 };
++    cpu_t *c;
++
++    /* 1: SMEP on: supervisor code runs, supervisor data reads (the
++     * CF0 inversion faulted on this very fetch). */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMEP; c->gpr[RBX] = 0x4000;
++    smstep(0x1000);
++    assert(c->gpr[RAX] == KVAL);
++    puts("ok cf1 SMEP: CPL0 executes + reads supervisor pages");
++
++    /* 2: SMEP on: CPL0 fetch from a user page -> #PF err=P|I/D. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMEP;
++    c->rip = VA; (void)cpu_step(c);
++    assert(c->cr2 == VA && c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0x11);
++    puts("ok cf1 SMEP: CPL0 exec of user page faults P|I/D");
++
++    /* 3: control: same fetch with SMEP off executes. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    smstep(VA);
++    puts("ok cf1 control: SMEP off executes the user page");
++
++    /* 4: SMAP on, AC=0: CPL0 read and write of user data fault. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMAP; c->rflags = 0; c->gpr[RBX] = UDATA;
++    c->rip = 0x1000; (void)cpu_step(c);
++    assert(c->cr2 == UDATA && c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0x1);            /* P */
++    smfix(mov_w, sizeof mov_w); c = &g_m.cpu;
++    c->cr4 |= SMAP; c->rflags = 0; c->gpr[RBX] = UDATA;
++    c->rip = 0x1000; (void)cpu_step(c);
++    assert(c->cr2 == UDATA && r64(c->gpr[RSP]) == 0x3); /* P|W */
++    puts("ok cf1 SMAP AC=0: CPL0 read P / write P|W faults on user data");
++
++    /* 5: the STAC/CLAC sandwich, twice-warmed so a stale TLB hit
++     * cannot smuggle the post-CLAC read through (AC is part of the
++     * P2 key). Also pins the pre-CF1 fallthrough twice over: the
++     * second read must return the USER value (not the IDT image the
++     * stray SIDT stored at linear 0 -- the canary) and linear 0 must
++     * survive STAC+CLAC byte-identical. */
++    smfix(stac_r_clac_r, sizeof stac_r_clac_r); c = &g_m.cpu;
++    w64(0, 0xC0FFEE00C0FFEE00ull);
++    c->cr4 |= SMAP; c->rflags = 0; c->gpr[RBX] = UDATA;
++    smstep(0x1000);                             /* STAC */
++    assert(c->rflags & ACF);
++    smstep(0x1003);                             /* MOV (warm once) */
++    assert(c->gpr[RAX] == UVAL);
++    smstep(0x1006);                             /* MOV (warm hit) */
++    assert(c->gpr[RAX] == UVAL);
++    smstep(0x1009);                             /* CLAC */
++    assert(!(c->rflags & ACF));
++    assert(r64(0) == 0xC0FFEE00C0FFEE00ull);    /* no stray SIDT store */
++    c->rip = 0x100C; (void)cpu_step(c);         /* MOV -> #PF */
++    assert(c->cr2 == UDATA && c->rip == 0x9000 + 14 * 8);
++    assert(r64(c->gpr[RSP]) == 0x1);
++    puts("ok cf1 SMAP: STAC opens, CLAC shuts (warm TLB), no SIDT fallthrough");
++
++    /* 6: SMAP on AC=0: supervisor data is unaffected. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMAP; c->rflags = 0; c->gpr[RBX] = 0x4000;
++    smstep(0x1000);
++    assert(c->gpr[RAX] == KVAL);
++    puts("ok cf1 SMAP AC=0: supervisor data reads normally");
++
++    /* 7: SMAP does not constrain CPL3 at all: user code reading a
++     * user page with AC=0 succeeds. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMAP; c->rflags = 0;
++    c->seg[SEG_CS].sel = 0x1B; c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x501F00; c->gpr[RBX] = UDATA;
++    smstep(VA + 0x10);
++    assert(c->gpr[RAX] == UVAL);
++    puts("ok cf1 SMAP: CPL3 data access is not the guard's business");
++
++    /* 8: STAC at CPL3 is the architected #UD, delivered. */
++    smfix(mov_r, sizeof mov_r); c = &g_m.cpu;
++    c->cr4 |= SMAP;
++    c->seg[SEG_CS].sel = 0x1B; c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x501F00;
++    c->rip = VA + 0x20; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 6 * 8);
++    assert(!(c->rflags & ACF));
++    puts("ok cf1 STAC at CPL3 delivers #UD");
++
++    /* 9: AC across delivery: open door, fault elsewhere; the pushed
++     * RFLAGS keeps AC=1 (IRET restores it), the handler starts shut. */
++    smfix(stac_mov, sizeof stac_mov); c = &g_m.cpu;
++    c->cr4 |= SMAP; c->rflags = 0; c->gpr[RBX] = 0x8000000000ull; /* unmapped */
++    smstep(0x1000);                             /* STAC */
++    assert(c->rflags & ACF);
++    c->rip = 0x1003; (void)cpu_step(c);         /* MOV -> #PF not-present */
++    assert(c->rip == 0x9000 + 14 * 8);
++    assert(!(c->rflags & ACF));                 /* handler starts shut */
++    assert(r64(c->gpr[RSP] + 24) & ACF);        /* frame: err,RIP,CS,RFLAGS */
++    puts("ok cf1 AC cleared on delivery, preserved in the frame");
++}
++
+ int main(void) {
+     pte_rewrite();
+     cr3_and_invlpg();
+@@ -348,6 +499,7 @@ int main(void) {
+     large_pages_and_a20();
+     mmio_table_uncacheable();
+     smp_and_mode_key();
++    smep_smap();
+     puts("test-tlb: all vectors passed");
+     return 0;
+ }
+-- 
+2.47.3
+

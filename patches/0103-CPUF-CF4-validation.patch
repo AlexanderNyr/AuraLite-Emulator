@@ -1,0 +1,788 @@
+From 49923ddc368805e7db42b234c5a2b83dbcb15795 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Fri, 23 Oct 2026 17:02:22 +0000
+Subject: [PATCH] CPUF-CF4: validation by measurement -- CR/EFER masks, CPL
+ gates, POPCNT/RDTSCP
+
+---
+ CHANGELOG.md                    |  47 ++++++++++
+ ROADMAP.md                      |  33 ++++---
+ docs/STATUS.md                  |  16 +++-
+ docs/plans/CPU_FEATURES_PLAN.md |  41 +++++++-
+ src/cpu.c                       | 160 ++++++++++++++++++++++++++------
+ src/platform.c                  |   4 +-
+ tests/test_cpu.c                | 119 ++++++++++++++++++++++--
+ tests/test_disasm.c             |   1 +
+ tests/test_tlb.c                | 143 ++++++++++++++++++++++++++++
+ 9 files changed, 507 insertions(+), 57 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5edb18c..2fe4c1c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,53 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0103 (CPU-features CF4: validation switched on by measurement)
++
++- **Every mask was censused to zero before it was allowed to
++  fault.** A scratch instrumented build logged would-be
++  violations across the five firmware profiles, both SeaBIOS ISO
++  lanes and the whole `make test` suite: no lane writes a
++  reserved CR4 bit (mask now enforced: structural bits 0–10 plus
++  exactly the advertised PCIDE/SMEP/SMAP — QEMU's rule with our
++  advertisement), a CR0 high bit or invalid combo (PG without
++  PE, NW without CD, PG-clear inside IA-32e — all `#GP(0)` now),
++  a CR3 bit above the 40-bit physical address, or an EFER bit
++  outside {SCE, LME, LMA, NXE} (strict since this patch, with
++  read-only LMA preserved across writes so an EFER RMW can
++  neither fault nor desync the mode). **And the census found a
++  hole the ledger didn't know about: MOV CRn, RDMSR and WRMSR
++  had no privilege check at all** — ring-3 code could rewrite
++  CR4 or any MSR. All four now deliver the architected `#GP(0)`
++  at CPL≠0 (census-clean: nothing legit runs them from ring 3).
++- **The unknown-MSR strict whitelist is an evidenced NO-GO** and
++  stays permissive by design, not by inertia: the firmware's
++  reset-stage CAR path reads `IA32_MTRR_DEF_TYPE` unconditionally
++  before an IDT exists and programs the variable MTRRs through
++  the sparse table, so silicon's `#GP` there would triple-fault
++  the primary workload on purpose-less principle. What changed:
++  the 65th distinct MSR write used to vanish silently — the
++  table keeps its 64 slots (census counted zero drops in every
++  lane, so no snapshot-layout risk was taken), but a lost write
++  is now logged by name.
++- **POPCNT and RDTSCP graduated from "absent" to
++  implemented-and-advertised** (D6 closed): leaf-1 ECX.23 and
++  80000001h EDX.27 respectively. Before this patch POPCNT was a
++  host-halt `#UD` and — worse — `0F 01 F9` silently executed as
++  an unrelated INVLPG flush. RDTSCP is RDTSC's exact twin (same
++  deterministic vtime) plus `IA32_TSC_AUX` in ECX; POPCNT has the
++  defined-flag semantics. 11 vectors in
++  `tests/test_tlb.c::cf4_validate` (every `#GP` family, the
++  two-sided CR4 mask, LMA-preservation, both CPL gates, 64-bit
++  POPCNT) plus `tests/test_cpu.c::test_cf4_units` (flag-exact
++  POPCNT, RDTSCP+TSC_AUX, the permissive-MSR pins and the logged
++  65th-slot drop). NC on the 0102 tree: 33 prior walk vectors
++  pass, CF4 aborts on its first legality assertion; the unit
++  suite aborts on the RDTSCP CPUID pin. `make test` (both
++  SeaBIOS lanes) + `make test-sanitize` green; a side
++  observation — compat-mode exceptions frame 32-bit on this core
++  where silicon frames 64-bit — is recorded in the plan, not
++  fixed in this phase.
++
+ ### Added — patch 0102 (CPU-features CF3: PCID + INVPCID)
+ 
+ - **PCID at last, with its legality surface** (`src/cpu.c`,
+diff --git a/ROADMAP.md b/ROADMAP.md
+index d36b610..f00c015 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -40,7 +40,7 @@ maps to exactly one plan below.
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+-| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF3 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF4 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -154,22 +154,27 @@ harness reproduction.
+    deferred PCID runtime can execute — CF4 decides CR/MSR
+    validation by census experiment, CF5 closes with the
+    U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) + CF2
+-   (`0101`) + CF3 (`0102`) shipped**: the advertised-vs-
+-   implemented matrix, MSR census and defect ledger
+-   D1–D6, then the SMEP/SMAP guards made true (with a
+-   second latent find in the same site: STAC/CLAC fell
+-   through into a stray SIDT store at linear 0) and
+-   advertised, then the already-true published (NX,
+-   SYSCALL, 1 GiB pages, CLFLUSH, PAT with its SDM reset
+-   value), then PCID + INVPCID with their legality (the
+-   first emulation lane where the guest's deferred PCID
+-   runtime can execute); the ranked device backlog
+-   (virtio first) waits in the plan §5.
++   (`0101`) + CF3 (`0102`) + CF4 (`0103`) shipped**: the
++   advertised-vs-implemented matrix, MSR census and
++   defect ledger D1–D6, then the SMEP/SMAP guards made
++   true (with a second latent find in the same site:
++   STAC/CLAC fell through into a stray SIDT store at
++   linear 0) and advertised, then the already-true
++   published (NX, SYSCALL, 1 GiB pages, CLFLUSH, PAT with
++   its SDM reset value), then PCID + INVPCID with their
++   legality (the first emulation lane where the guest's
++   deferred PCID runtime can execute), then validation
++   switched on strictly where a full-suite census counted
++   zero (and documented permissive where it didn't —
++   unknown MSRs: the firmware's unhandled reset-stage
++   MTRR probe), with POPCNT + RDTSCP implemented; the
++   ranked device backlog (virtio first) waits in the
++   plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above except CPU_FEATURES (CF0–CF3
+-shipped, CF4–CF5 queued) is **CLOSED**. Recent patches:
++Every plan in the ledger above except CPU_FEATURES (CF0–CF4
++shipped, CF5 queued) is **CLOSED**. Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index e898613..8b718c3 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1316,16 +1316,22 @@ DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+ UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+ register and control state.
+ The CPU feature contract is the current in-flight work
+-(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF3 shipped): the
++(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF4 shipped): the
+ CR4.SMEP/SMAP walk guards are now SDM-true and advertised (CF1 —
+ the guards had been inverted since the original upstream code, and
+ STAC/CLAC fell through into a stray SIDT store at linear 0; both
+ were invisible while the features were unadvertised), CPUID no
+ longer understates the already-implemented set (CF2 — NX, SYSCALL,
+ 1 GiB pages, CLFLUSH, and PAT with IA32_PAT leaving reset at the
+-SDM default; INIT preserves it, RESET re-seeds it), and PCID +
++SDM default; INIT preserves it, RESET re-seeds it), PCID +
+ INVPCID exist with their architectural legality on the
+ flush-always TLB (CF3 — under full emulation QEMU/TCG has neither,
+-which is what had the consumer's PCID runtime deferred). What
+-remains is CF4's measure-gated validation inventory and the CF5
+-A20 close-out record.
++which is what had the consumer's PCID runtime deferred), and the
++control-register/EFER/MSR surface validates exactly as far as a
++full-suite census licensed (CF4 — advertise-derived CR4 mask,
++CR0/CR3/EFER reserved rules and the previously missing
++privilege gates are `#GP(0)`, the unknown-MSR lane stays
++documented permissive because the firmware's unhandled reset-stage
++MTRR probe would brick under a strict whitelist, and POPCNT +
++RDTSCP graduated from absent/host-halt and an accidental INVLPG
++alias respectively). What remains is the CF5 A20 close-out record.
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index aa4eedb..c821985 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -17,7 +17,7 @@
+ > pass (virtio, AC97, extra NICs, USB HID) are ranked in
+ > §5 for the next choice.
+ 
+-**Status: CF0–CF3 done ✅; CF4–CF5 queued**
++**Status: CF0–CF4 done ✅; CF5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -25,7 +25,7 @@
+ | CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ✅ done | `tests/test_tlb.c` vectors (`patches/0100`) |
+ | CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ✅ done | CPUID/MSR vectors (`patches/0101`) |
+ | CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ✅ done | `tests/test_tlb.c` vectors (`patches/0102`) |
+-| CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ⬜ queued | vectors or an evidenced NO-GO |
++| CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ✅ done | vectors + the MSR NO-GO record (`patches/0103`) |
+ | CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ⬜ queued | close-out |
+ 
+ Each implementation phase ships one `.patch` under
+@@ -453,6 +453,43 @@ RDTSCP inventory is resolved one way or the other
+ (implement + advertise, or leave #UD/0 with the grep
+ verdict replaced by a vector).
+ 
++**Shipped (`0103`).** The experiment ran as a scratch
++log-only-instrumented build (reverted afterwards) counting
++would-fire events per candidate: full `make test` for the
++mask set, plus a second sweep (snapshot 5-profile + ring3)
++for the PG-clear/CPL clauses. Raw results:
++
++| Candidate policy | Census (violations in all lanes) | Verdict |
++|---|---|---|
++| CR4 mask 0x3207FF (base 0–10 + PCIDE/SMEP/SMAP) → #GP | 0 writes outside | **GO** |
++| CR0[63:32] / PG&!PE / NW&!CD → #GP | 0 | **GO** |
++| CR0 PG-clear in IA-32e (64-bit, or compat+PCIDE) → #GP | 0 | **GO** (closes the CF3 deferral) |
++| CR3[62:MAXPHYADDR=40] → #GP | 0 | **GO** |
++| EFER outside {SCE,LME,LMA,NXE} → #GP | writes: 0x100, 0xD00 only | **GO**, LMA write-preserved so RMW can neither fault nor desync |
++| MOV CRn / RDMSR / WRMSR at CPL≠0 → #GP | 0 — and the checks **did not exist at all** (census find) | **GO** (in-phase find; ring 3 could rewrite CR4/MSRs before) |
++| unknown-MSR whitelist → #GP | RDMSR miss: exactly {0x2FF}; WRMSR set {1B, 200, 201, 277, 2FF, EFER, FS_BASE} | **NO-GO** (a) keep permissive + document: firmware's reset-stage CAR code RDMSRs 0x2FF unconditionally before any IDT and programs variable MTRRs through sparse storage; a #GP there bricks the primary workload, and every other consumer probes via CPUID. Pinned permissive by vectors in `test_cf4_units` |
++| grow the 64-slot MSR table | drops: 0 in every lane | **NO-GO**, log only: the 65th distinct write is now `mlog`-ged by name; table stays 64, snapshot layout untouched |
++| PCIDE 1→0 in IA-32e | absent from the MOV-CR exception tables; 0 lane usage | permissive stands (not forbidden by the architected lists; no measurement argues otherwise) |
++| CR0 low reserved bits store-masking | silicon "ignores" them; nothing here consumes them | verbatim stands = functionally ignored |
++
++POPCNT (F3 0F B8; bare 0F B8 keeps the house #UD, JMPE is
++not x86) and RDTSCP (0F 01 F9 + IA32_TSC_AUX sparse storage;
++pre-CF4 it executed silently as an INVLPG flush — noted as
++the second "worse than absent" find of the phase) are
++implemented and advertised (leaf-1 ECX.23, 80000001h EDX.27;
++both pins deliberately moved). Neither new bit claims more
++than built: CR4.TSD gating of RDTSC/RDTSCP remains
++unimplemented on both, identically. 11 vectors in
++`cf4_validate` + `test_cf4_units`; NC on the 0102 tree: 33
++prior walk vectors pass, abort at CF4 case 1; unit suite
++aborts on the RDTSCP pin; full `make test` + sanitize green
++with enforcement live (the census prediction held — no lane
++trips a new #GP). One side observation for the backlog:
++compat-mode exceptions deliver **32-bit frames** in this
++core while silicon frames IA-32e exceptions 64-bit always —
++invisible to every measured lane (all ring-3 consumers run
++L=1), recorded here for whoever hardens the compat lane.
++
+ ### CF5 — close-out + the A20 record
+ 
+ UPKEEP §5 left one CPU-shaped open record: at U5 a
+diff --git a/src/cpu.c b/src/cpu.c
+index 62c7edf..6b8d64c 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -3692,45 +3692,105 @@ really_slow:
+                     c->xmm[i][1] = read_mem_v(m, addr + 160 + (uint64_t)i * 16 + 8, 8);
+                 }
+                 break; } }
+-        case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
++        case 0x30: { /* CF4: WRMSR is CPL0-only (#GP(0)), twin of the
++                      * MOV CRn gate; unchecked before, census-clean. */
++                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                     uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
+                      /* UPKEEP U4: IA32_APIC_BASE belongs to the LAPIC model
+                       * (validation -> BSP preservation -> window sync);
+                       * a rejected write stores nothing and raises no #GP
+-                      * -- the house MSR lane is permissive (RDMSR on an
+-                      * unknown index reads 0; CR writes keep no reserved-
+-                      * bit #GP), so the rejection is logged instead. */
++                      * -- unknown MSR *indices* stay permissive (the CF4
++                      * NO-GO record at the RDMSR case), so the rejection
++                      * is logged instead. */
+                      if (idx==LAPIC_MSR_APICBASE) lapic_apicbase_write(m, c, val);
+-                     else cpu_set_msr(c, idx, val);
+-                     if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
+-                     /* K3: GS-base MSRs are the architected long-mode
+-                      * segment base for GS addressing -- keep the decoder's
+-                      * seg[] shadow in sync (measured: AuraLite's
+-                      * cpu_local_init wires its per-CPU block through
+-                      * IA32_GS_BASE). */
+-                     /* K4: FS.base rides the same MSR lane (IA32_FS_BASE) --
+-                      * AuraLite's ARCH_SET_FS target write_fs_base() goes
+-                      * through write_msr, and the userspace-libc errno slot
+-                      * lives at %fs:0. Measured: init shell SIGSEGV'd on
+-                      * `mov %fs:0x0,%rdx` at 0x40008561 with FS.base stuck 0
+-                      * (null read, err=0x4) right after the banner. */
+-                     else if (idx==0xC0000100) c->seg[SEG_FS].base = val;
+-                     else if (idx==0xC0000101) c->seg[SEG_GS].base = val;
+-                     else if (idx==0xC0000102) c->kgs_base = val;
++                     else if (idx==0xC0000080) {
++                         /* CF4: EFER is the one MSR whose *bits* are
++                          * strict, because they steer the walk (LME/NXE)
++                          * and the mode itself. Defined write bits are
++                          * only those with advertised CPUID twins --
++                          * SCE(0), LME(8), NXE(11) -- plus LMA(10), a
++                          * read-only output: it is weighed for the
++                          * reserved check, then overridden by the live
++                          * value, so the canonical RDMSR->OR->WRMSR can
++                          * neither #GP nor desync the mode. Anything else
++                          * (SVME/FFXSR/TCE-class bits, high garbage) is
++                          * #GP(0). Census: every lane writes inside
++                          * {SCE,LME,LMA,NXE}. Table copy and c->efer get
++                          * the same value -- one EFER, never two. */
++                         if (val & ~0xD01ull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                         uint64_t nv = (val & ~(1ULL<<10)) | (c->efer & (1ULL<<10));
++                         cpu_set_msr(c, idx, nv); c->efer = nv; perf_tlb_flush(m);
++                     }
++                     else {
++                         cpu_set_msr(c, idx, val);
++                         /* CF4: the 65th distinct index used to vanish
++                          * without a trace. The table keeps its 64 slots
++                          * (snapshot layout; census counts zero drops in
++                          * every lane), but a lost write is now said out
++                          * loud. */
++                         int f2; (void)cpu_get_msr(c, idx, &f2);
++                         if (!f2) mlog(&m->log, "[cpu] WRMSR %08x dropped: sparse MSR table full (%d slots)", idx, MAX_MSR);
++                         /* K3/K4: FS/GS/KGS bases ride this lane -- keep
++                          * the decoder's seg[] shadows in sync (AuraLite
++                          * wires per-CPU through IA32_GS_BASE and TLS
++                          * through IA32_FS_BASE). */
++                         if (idx==0xC0000100) c->seg[SEG_FS].base = val;
++                         else if (idx==0xC0000101) c->seg[SEG_GS].base = val;
++                         else if (idx==0xC0000102) c->kgs_base = val;
++                     }
+                      break; }
+-        case 0x32: { uint32_t idx=(uint32_t)c->gpr[RCX]; int found; uint64_t val=cpu_get_msr(c, idx, &found);
++        case 0x32: { /* CF4: CPL0-only (#GP(0)), twin of the WRMSR gate.
++                      * Unknown indices keep reading 0 with no fault --
++                      * this phase's measured NO-GO: the whitelist+#GP
++                      * option was census-tested, and the sample
++                      * firmware's reset-stage CAR code RDMSRs
++                      * IA32_MTRR_DEF_TYPE (2FFh) unconditionally before
++                      * any IDT exists (then RMWs it and the variable
++                      * MTRRs through this very table); a #GP there is a
++                      * bricked primary workload, and every other
++                      * consumer probes by CPUID before touching an MSR.
++                      * Full record: CPU_FEATURES_PLAN CF4. */
++                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                     uint32_t idx=(uint32_t)c->gpr[RCX]; int found; uint64_t val=cpu_get_msr(c, idx, &found);
+                      if (idx==0xC0000080) val = c->efer;
+                      if (!found && idx!=0xC0000080) val = 0;
+                      c->gpr[RAX] = (uint32_t)val; c->gpr[RDX] = (uint32_t)(val>>32);
+                      break; }
+-        case 0x20: { rm_t rm=MODRM(); int crn=rm.reg_field&7; uint64_t v = crn==0?c->cr0:crn==2?c->cr2:crn==3?c->cr3:crn==4?c->cr4:0;
++        case 0x20: { /* CPU_FEATURES CF4: MOV to/from CRn is CPL0-only
++                      * on silicon (#GP(0)); neither direction had a CPL
++                      * check at all before this phase -- found while
++                      * censusing this site for the reserved-bit masks,
++                      * and census-clean in every lane. (The RDMSR/WRMSR
++                      * gate landed at their cases for the same reason.) */
++                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                     rm_t rm=MODRM(); int crn=rm.reg_field&7; uint64_t v = crn==0?c->cr0:crn==2?c->cr2:crn==3?c->cr3:crn==4?c->cr4:0;
+                      /* MOV r32/64, CRn is always register-to-register (mod==3 enforced by spec) */
+                      set_reg(c, rm.reg, (default_as==64)?8:4, 1, v); break; }
+-        case 0x22: { rm_t rm=MODRM(); int crn=rm.reg_field&7;
++        case 0x22: { if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                     rm_t rm=MODRM(); int crn=rm.reg_field&7;
+                      /* MOV CRn, reg reads the architected width: 64 bits in
+                       * long mode, 32 elsewhere (the baseline always read 8
+                       * bytes, C0 ledger #10). */
+                      uint64_t v = rm_read(&d,&rm,(default_as==64)?8:4) & ((default_as==64)?~0ull:0xFFFFFFFFull);
+-                     if (crn==0) { int entering_pg = ((v>>31)&1) && !((c->cr0>>31)&1); c->cr0=v;
++                     if (crn==0) {
++                                   /* CF4 (SDM MOV-CR; every clause was
++                                    * census-measured at zero across
++                                    * firmware/SeaBIOS/suites before being
++                                    * enforced): CR0[63:32] are reserved,
++                                    * PG requires PE, NW requires CD, and
++                                    * PG cannot be cleared while this
++                                    * sub-mode is 64-bit (64-bit list) or
++                                    * under PCIDE in compat mode (the CF3
++                                    * deferral). Low reserved bits stay
++                                    * store-verbatim: silicon "ignores"
++                                    * them and nothing here consumes them. */
++                                   if ((v >> 32) ||
++                                       (((v>>31)&1) && !(v&1)) ||
++                                       (((v>>29)&1) && !((v>>30)&1)) ||
++                                       (!((v>>31)&1) && ((c->cr0>>31)&1) &&
++                                        (default_as==64 || ((c->cr4>>17)&1))))
++                                       { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                                   int entering_pg = ((v>>31)&1) && !((c->cr0>>31)&1); c->cr0=v;
+                                    if (entering_pg && (c->efer & (1ULL<<8))) c->efer |= (1ULL<<10); /* set LMA */
+                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
+                      }
+@@ -3744,12 +3804,17 @@ really_slow:
+                           * reserved band -> #GP(0). The perf flush below
+                           * runs either way: this TLB is flush-always (P2)
+                           * and the architecture forbids demanding
+-                          * retention -- the hint only permits it. The
+-                          * 62:40 band stays permissive until CF4. */
++                          * retention -- the hint only permits it. */
+                          if ((v >> 63) & 1) {
+                              if (!((c->cr4 >> 17) & 1)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                              v &= ~(1ULL << 63);
+                          }
++                         /* CF4: the rest of the reserved band. This
++                          * machine advertises a 40-bit physical address
++                          * (80000008h), so CR3[62:40] set -> #GP(0),
++                          * completing the SDM CR3[63:MAXPHYADDR] rule
++                          * (bit 63 handled above). Census-zero. */
++                         if (v & 0x7FFFFF0000000000ull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                          c->cr3 = v; /* PCID rides [11:0]; the walk masks it */
+                      }
+                      else if (crn==4) {
+@@ -3758,8 +3823,20 @@ really_slow:
+                           * (EFER.LMA) -- outside it even writing 1 is
+                           * #GP(0) -- and the 0->1 edge additionally
+                           * requires CR3[11:0]==000H (those bits become
+-                          * the current PCID at the flip). Everything
+-                          * else about CR4 stays permissive until CF4. */
++                          * the current PCID at the flip). */
++                         /* CF4: the reserved mask -- QEMU's rule with
++                          * our advertisement: the structural base set
++                          * (VME..OSXMMEXCPT, bits 0-10, allowed whether
++                          * or not a feature bit names them) plus exactly
++                          * the gated bits whose CPUID twins we set:
++                          * PCIDE(17), SMEP(20), SMAP(21). LA57, OSXSAVE,
++                          * FSGSBASE, PKE, VMXE/SMXE, bits 15/19 and
++                          * everything from 22 up are reserved here
++                          * because we do not advertise them; storage
++                          * must not pretend otherwise. The CF3 PCIDE
++                          * edges above still apply within the mask.
++                          * Census: no lane writes outside it. */
++                         if (v & ~0x3207FFull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                          if (((v >> 17) & 1) && !(c->efer & (1ULL << 10))) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                          if (((v >> 17) & 1) && !((c->cr4 >> 17) & 1) && (c->cr3 & 0xFFF)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                          c->cr4 = v;
+@@ -3812,6 +3889,19 @@ really_slow:
+                          if (cpl_now(c) != 0) raise_exception(m, 6, 0, 0);
+                          else c->rflags &= ~(1u<<18);
+                          break;
++                     } else if (modrm == 0xF9) { /* RDTSCP (CF4, D6): before
++                         this phase 0F 01 F9 decoded into the ext==7 arm
++                         below and silently executed as an INVLPG flush --
++                         worse than absent. Semantics twin RDTSC's
++                         exactly (same deterministic vtime formula, and
++                         neither carries a CR4.TSD gate in this core);
++                         ECX takes IA32_TSC_AUX, plain sparse storage
++                         that reads 0 until a guest WRMSRs it. */
++                         uint64_t t = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
++                         int f9; uint64_t aux = cpu_get_msr(c, 0xC0000103, &f9); (void)f9;
++                         c->gpr[RAX] = (uint32_t)t; c->gpr[RDX] = (uint32_t)(t >> 32);
++                         c->gpr[RCX] = (uint32_t)aux;
++                         break;
+                      } else if (modrm == 0xF8) { /* SWAPGS (0F 01 /7 mod=3 exact):
+                          exchanges GS base <-> IA32_KERNEL_GS_BASE. The
+                          AuraLite syscall/ISR stubs gate it by frame CS RPL,
+@@ -3868,6 +3958,20 @@ really_slow:
+                      if (ext==2) { c->gdtr_limit=lim; c->gdtr_base=gbase; }
+                      else if (ext==3) { c->idtr_limit=lim; c->idtr_base=gbase; }
+                      break; }
++        case 0xB8: { /* POPCNT (F3 0F B8) -- CPU_FEATURES CF4 (D6):
++                      * advertised only as of this phase. Bare 0F B8 is
++                      * the Itanium JMPE relic, not an x86 instruction:
++                      * the house #UD. Flags: ZF by (count==0), the
++                      * arithmetic five all cleared (SDM definition,
++                      * not the BSF-style preserve). */
++            if (d.rep != 0xF3) { faultf(c, "#UD 0F B8 without F3 (JMPE is not x86)"); break; }
++            rm_t rm=MODRM(); FIXUP(rm);
++            uint64_t src = rm_read(&d,&rm,osz);
++            unsigned n = (unsigned)__builtin_popcountll(src);
++            set_reg(c, rm.reg_field, osz, d.has_rex, (uint64_t)n);
++            c->rflags &= ~(FLAG_CF | FLAG_PF | FLAG_AF | FLAG_SF | FLAG_OF);
++            if (n) c->rflags &= ~(uint64_t)FLAG_ZF; else c->rflags |= FLAG_ZF;
++            break; }
+         case 0xBC: case 0xBD: { /* BSF / BSR -- bit scans in either
+              * direction. src==0: ZF=1 and the destination is PRESERVED:
+              * the SDM calls it "undefined", but both host vendors keep the
+diff --git a/src/platform.c b/src/platform.c
+index c9e643b..0944d8b 100644
+--- a/src/platform.c
++++ b/src/platform.c
+@@ -57,6 +57,7 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+            | (1u<<17)                /* PCID (CPU_FEATURES CF3): the
+                                         * CR4.PCIDE/CR3[63] legality and the
+                                         * flush-always semantics exist now */
++           | (1u<<23)                /* POPCNT (CF4: F3 0F B8 decoded) */
+            | (1u<<31);               /* hypervisor present -- we ARE one
+                                         * (KERNEL-BOOT K3: the guest's vmdrv
+                                         * probe prints the vendor string) */
+@@ -81,7 +82,8 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+         *d = (1u<<29)              /* long mode supported */
+            | (1u<<11)              /* SYSCALL/SYSRET (CF2: exists since K4) */
+            | (1u<<20)              /* NX (CF2: walk enforces via EFER.NXE) */
+-           | (1u<<26);             /* 1GiB pages (CF2: PDPTE.PS walked) */
++           | (1u<<26)              /* 1GiB pages (CF2: PDPTE.PS walked) */
++           | (1u<<27);             /* RDTSCP (CF4: 0F 01 F9 + TSC_AUX) */
+         break;
+ 
+     /* ---- C9 leaves ---- */
+diff --git a/tests/test_cpu.c b/tests/test_cpu.c
+index 79494f4..6bafc1d 100644
+--- a/tests/test_cpu.c
++++ b/tests/test_cpu.c
+@@ -869,13 +869,16 @@ static void test_cpuid_leaves(void) {
+      * FXSR|SSE|SSE2 (PAT and CLFLUSH are the CF2 additions, both
+      * already true in the core) */
+     assert(mem_read(&m, 0x2024, 4) == 0x07898331u);
+-    /* CF2: 80000001 EDX = LM|1GBPAGES|NX|SYSCALL -- all three
+-     * additions long-implemented, previously read as absent */
+-    assert(mem_read(&m, 0x2028, 4) == 0x24100800u);
+-    /* CF3: leaf-1 ECX = SSE3|PCID|HYPERVISOR (the PCID bit arrived
+-     * only with the CR4.PCIDE/CR3[63]/INVPCID legality surface;
+-     * the semantics vectors live in tests/test_tlb.c::pcid) */
+-    assert(mem_read(&m, 0x202C, 4) == 0x80020001u);
++    /* CF2+CF4: 80000001 EDX = LM|RDTSCP|1GBPAGES|NX|SYSCALL (the
++     * first three long-implemented when CF2 published them; RDTSCP
++     * was implemented at CF4 -- before that 0F 01 F9 was an
++     * accidental INVLPG) */
++    assert(mem_read(&m, 0x2028, 4) == 0x2C100800u);
++    /* CF3+CF4: leaf-1 ECX = SSE3|PCID|POPCNT|HYPERVISOR (the PCID
++     * bit arrived only with the CR4.PCIDE/CR3[63]/INVPCID legality
++     * surface; POPCNT's decode arrived at CF4 -- the semantics
++     * vectors live in tests/test_tlb.c + test_cf4_units below) */
++    assert(mem_read(&m, 0x202C, 4) == 0x80820001u);
+ 
+     /* brand string is exactly 48 bytes of text padded with spaces */
+     const platform_t *p = platform_by_name("haswell");
+@@ -931,6 +934,107 @@ static void test_pat_msr(void) {
+     assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found);
+ }
+ 
++/* CPU_FEATURES CF4 (D6 + the measured NO-GO): POPCNT and RDTSCP
++ * graduated from grep verdicts to implementations; the unknown-MSR
++ * lane stays permissive BY EVIDENCE -- the sample firmware RDMSRs
++ * 0x2FF unconditionally in reset-stage CAR code, so strictness
++ * would brick the primary workload -- and that permissiveness is
++ * pinned here, including the now-logged 64-slot drop. The CR/EFER
++ * #GP surface lives in tests/test_tlb.c::cf4_validate. */
++static void test_cf4_units(void) {
++    machine_t m;
++    setup_machine(&m);
++    /* POPCNT: count, flags defined (arith five cleared, ZF tracks
++     * a zero result) -- STC before each proves the clears bite. */
++    static const uint8_t popc[] = {
++        0x66, 0xB9, 0xF0, 0xF0, 0xF0, 0xF0,   /* mov ecx,0xF0F0F0F0 */
++        0xF9,                                 /* stc                */
++        0xF3, 0x66, 0x0F, 0xB8, 0xC1,         /* popcnt eax,ecx     */
++        0x66, 0xA3, 0x00, 0x25,               /* mov [0x2500],eax   */
++        0x9C, 0x58, 0xA3, 0x04, 0x25,         /* pushf; pop ax; mov [0x2504],ax */
++        0x66, 0x31, 0xC9,                     /* xor ecx,ecx        */
++        0xF9, 0xF3, 0x66, 0x0F, 0xB8, 0xC1,   /* stc; popcnt eax,ecx*/
++        0x66, 0xA3, 0x08, 0x25,               /* mov [0x2508],eax   */
++        0x9C, 0x58, 0xA3, 0x0C, 0x25,         /* flags -> [0x250C]  */
++        0xF4 };
++    run_program(&m, popc, sizeof popc, 0, 32);
++    assert(!m.cpu.fault);
++    assert(mem_read(&m, 0x2500, 4) == 16);
++    assert((mem_read(&m, 0x2504, 2) & 0x8D5) == 0);          /* CF PF AF ZF SF OF */
++    assert(mem_read(&m, 0x2508, 4) == 0);
++    assert((mem_read(&m, 0x250C, 2) & 0x8D5) == 0x40);      /* only ZF */
++    /* RDTSCP: RDTSC's twin + IA32_TSC_AUX in ECX. */
++    setup_machine(&m);   /* run_program leaves the HLT'd cpu halted */
++    static const uint8_t tcp[] = {
++        0x0F, 0x31,                           /* rdtsc              */
++        0x66, 0xA3, 0x10, 0x25,               /* [0x2510]=eax       */
++        0x66, 0x89, 0x16, 0x14, 0x25,         /* [0x2514]=edx       */
++        0x66, 0xB9, 0x03, 0x01, 0x00, 0xC0,   /* mov ecx,0xC0000103 */
++        0x66, 0xB8, 0x01, 0x00, 0xCD, 0xAB,   /* mov eax,0xABCD0001 */
++        0x66, 0x31, 0xD2,                     /* xor edx,edx        */
++        0x0F, 0x30,                           /* wrmsr (TSC_AUX)    */
++        0x0F, 0x01, 0xF9,                     /* rdtscp             */
++        0x66, 0xA3, 0x18, 0x25,               /* [0x2518]=eax       */
++        0x66, 0x89, 0x16, 0x1C, 0x25,         /* [0x251C]=edx       */
++        0x66, 0x89, 0x0E, 0x20, 0x25,         /* [0x2520]=ecx       */
++        0xF4 };
++    run_program(&m, tcp, sizeof tcp, 0, 32);
++    assert(!m.cpu.fault);
++    uint64_t t1 = ((uint64_t)mem_read(&m, 0x2514, 4) << 32) | mem_read(&m, 0x2510, 4);
++    uint64_t t2 = ((uint64_t)mem_read(&m, 0x251C, 4) << 32) | mem_read(&m, 0x2518, 4);
++    assert(mem_read(&m, 0x2520, 4) == 0xABCD0001u);
++    assert(t2 >= t1 && t2 - t1 < 1000000);
++    /* The NO-GO, pinned: an unstored index reads 0 fault-free (the
++     * firmware's reset-stage 0x2FF probe above all), and arbitrary
++     * indices are plain fatal-free storage. */
++    setup_machine(&m);
++    static const uint8_t msrperm[] = {
++        0x66, 0xB9, 0xFF, 0x02, 0x00, 0x00,   /* mov ecx,0x2FF      */
++        0x0F, 0x32,                           /* rdmsr              */
++        0x66, 0xA3, 0x28, 0x25,               /* [0x2528]=eax       */
++        0x66, 0x89, 0x16, 0x2C, 0x25,         /* [0x252C]=edx       */
++        0x66, 0xB9, 0x34, 0x12, 0x00, 0x00,   /* mov ecx,0x1234     */
++        0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE,   /* mov eax,0xDEADBEEF */
++        0x66, 0xBA, 0x78, 0x56, 0x34, 0x12,   /* mov edx,0x12345678 */
++        0x0F, 0x30,                           /* wrmsr              */
++        0x66, 0x31, 0xC0, 0x66, 0x31, 0xD2,   /* clobber eax/edx    */
++        0x0F, 0x32,                           /* rdmsr              */
++        0x66, 0xA3, 0x30, 0x25,
++        0x66, 0x89, 0x16, 0x34, 0x25,
++        0xF4 };
++    run_program(&m, msrperm, sizeof msrperm, 0, 32);
++    assert(!m.cpu.fault);
++    assert(mem_read(&m, 0x2528, 4) == 0 && mem_read(&m, 0x252C, 4) == 0);
++    assert(mem_read(&m, 0x2530, 4) == 0xDEADBEEFu);
++    assert(mem_read(&m, 0x2534, 4) == 0x12345678u);
++    /* The sparse table tops out at 64: first-written survives, the
++     * far side of the table reads back 0, and every loss is logged
++     * (it used to be silent). 80 fresh indices cross any seeding. */
++    setup_machine(&m);
++    static uint8_t big[8 * 80 + 64];
++    int n = 0;
++    big[n++] = 0x66; big[n++] = 0xB8; big[n++] = 1; big[n++] = 0; big[n++] = 0; big[n++] = 0; /* eax=1 */
++    big[n++] = 0x66; big[n++] = 0x31; big[n++] = 0xD2;                                       /* edx=0 */
++    for (int i = 0; i < 80; i++) {
++        unsigned idx = 0x9000 + (unsigned)i;
++        big[n++] = 0x66; big[n++] = 0xB9;
++        big[n++] = (uint8_t)idx; big[n++] = (uint8_t)(idx >> 8); big[n++] = 0; big[n++] = 0;
++        big[n++] = 0x0F; big[n++] = 0x30;
++    }
++    big[n++] = 0x66; big[n++] = 0xB9; big[n++] = 0x00; big[n++] = 0x90; big[n++] = 0; big[n++] = 0;
++    big[n++] = 0x0F; big[n++] = 0x32; big[n++] = 0x66; big[n++] = 0xA3; big[n++] = 0x38; big[n++] = 0x25;
++    big[n++] = 0x66; big[n++] = 0xB9; big[n++] = 0x4F; big[n++] = 0x90; big[n++] = 0; big[n++] = 0;
++    big[n++] = 0x0F; big[n++] = 0x32; big[n++] = 0x66; big[n++] = 0xA3; big[n++] = 0x3C; big[n++] = 0x25;
++    big[n++] = 0xF4;
++    run_program(&m, big, (size_t)n, 0, 512);
++    assert(!m.cpu.fault);
++    assert(mem_read(&m, 0x2538, 4) == 1);   /* 0x9000 stored  */
++    assert(mem_read(&m, 0x253C, 4) == 0);   /* 0x904F dropped */
++    int logged = 0;
++    for (int i = 0; i < m.log.count; i++) if (strstr(m.log.lines[i], "dropped")) logged = 1;
++    assert(logged);
++}
++
+ /* SeaBIOS executes WBINVD before setting the PAM shadow read-only. With no
+  * modeled data cache, it must be a coherent no-op that still advances RIP. */
+ static void test_wbinvd_no_cache(void) {
+@@ -1019,6 +1123,7 @@ int main(void) {
+ 
+     test_cpuid_leaves();
+     test_pat_msr();
++    test_cf4_units();
+     test_wbinvd_no_cache();
+     test_rdtsc_pause_fences();
+ 
+diff --git a/tests/test_disasm.c b/tests/test_disasm.c
+index a40acdc..7b10c66 100644
+--- a/tests/test_disasm.c
++++ b/tests/test_disasm.c
+@@ -124,6 +124,7 @@ static const vec_t oracle[] = {
+     { 64, "660f1f840000000000", 0x0ULL, 9, "nop word [rax+rax+0x0]" },
+     { 64, "0f280500100000", 0x1000ULL, 7, "movaps xmm0,oword [rel 0x2007]" },
+     { 64, "660f388203", 0x0ULL, 5, "invpcid rax,oword [rbx]" }, /* CPU_FEATURES CF3 */
++    { 64, "0f01f9", 0x0ULL, 3, "rdtscp" }, /* CF4: CPU decode caught up with the table */
+     { 64, "660fefc0", 0x0ULL, 4, "pxor xmm0,xmm0" },
+     { 64, "f30f6f01", 0x0ULL, 4, "movdqu xmm0,oword [rcx]" },
+     { 64, "660fd60424", 0x0ULL, 5, "movq [rsp],xmm0" },
+diff --git a/tests/test_tlb.c b/tests/test_tlb.c
+index 541407c..aa3e2f0 100644
+--- a/tests/test_tlb.c
++++ b/tests/test_tlb.c
+@@ -671,6 +671,148 @@ static void pcid(void) {
+     puts("ok cf3 INVPCID at CPL3 delivers #GP(0)");
+ }
+ 
++/* CPU_FEATURES CF4: the validation surface, switched on only after
++ * a scratch census (instrumented sites, firmware 5 profiles, both
++ * SeaBIOS ISO lanes, the full suite) counted ZERO writes outside
++ * every mask below -- and one census find fell out of reading the
++ * sites: MOV CRn and RDMSR/WRMSR had no CPL check at all. The
++ * unknown-MSR whitelist is this phase's evidenced NO-GO (pinned
++ * permissive in tests/test_cpu.c::test_cf4_units). */
++static int mk_crimm(uint8_t *b, uint64_t imm, uint8_t modrm) {
++    b[0] = 0x48; b[1] = 0xB8;
++    for (int i = 0; i < 8; i++) b[2 + i] = (uint8_t)(imm >> (8 * i));
++    b[10] = 0x0F; b[11] = 0x22; b[12] = modrm;
++    return 13;
++}
++static void expect_gp0(cpu_t *c, uint64_t rip) {
++    c->rip = rip; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 13 * 8);
++    assert(r64(c->gpr[RSP]) == 0);
++}
++static void cf4_validate(void) {
++    uint8_t prog[16];
++    cpu_t *c;
++    int n;
++
++    /* 1: a reserved CR4 bit (LA57: unadvertised) -> #GP(0), CR4
++     * untouched. Lead case = the NC discriminator. */
++    n = mk_crimm(prog, 0x20 | (1ull << 12), 0xE0);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    assert(c->cr4 == 0x20);
++    puts("ok cf4 CR4 reserved bit delivers #GP(0)");
++
++    /* 2: the mask is exact, not approximate: every allowed bit at
++     * once (base 0-10 + PCIDE + SMEP + SMAP) lands clean. */
++    n = mk_crimm(prog, 0x3207FFull, 0xE0);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); smstep(0x100A);
++    assert(c->cr4 == 0x3207FFull);
++    puts("ok cf4 CR4 full advertised mask accepted verbatim");
++
++    /* 3-5: CR0's three #GP families; CD|NW together stay legal. */
++    n = mk_crimm(prog, 0x80010033ull | (1ull << 32), 0xC0);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    assert(c->cr0 == 0x80010033ull);
++    puts("ok cf4 CR0[63:32] delivers #GP(0)");
++
++    n = mk_crimm(prog, 0x80000032ull, 0xC0);            /* PG, no PE */
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    puts("ok cf4 CR0 PG-without-PE delivers #GP(0)");
++
++    n = mk_crimm(prog, 0x80010033ull | (1ull << 29), 0xC0); /* NW, no CD */
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    n = mk_crimm(prog, 0x80010033ull | (1ull << 29) | (1ull << 30), 0xC0);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); smstep(0x100A);
++    assert(c->cr0 == (0x80010033ull | (1ull << 29) | (1ull << 30)));
++    puts("ok cf4 CR0 NW-needs-CD (#GP) with CD|NW accepted");
++
++    /* 6: PG cannot be cleared in 64-bit mode; and the compat-mode
++     * twin from CF3's deferral list: with PCIDE it #GPs there too,
++     * without PCIDE it is the legal IA-32e exit. */
++    n = mk_crimm(prog, 0x00010033ull, 0xC0);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    assert(c->cr0 & (1ull << 31));
++    static const uint8_t pgclr32[] = { 0xB8, 0x33, 0x00, 0x01, 0x00,  /* MOV EAX,0x10033 */
++                                       0x0F, 0x22, 0xC0 };             /* MOV CR0,EAX @5 */
++    smfix(pgclr32, sizeof pgclr32); c = &g_m.cpu;
++    c->seg[SEG_CS].l = 0; c->seg[SEG_CS].d_b = 1;       /* compat sub-mode */
++    c->cr4 |= PCIDE;
++    smstep(0x1000);
++    c->rip = 0x1005; (void)cpu_step(c);   /* no expect_gp0: this core's
++        delivery picks the frame width from the current CS, so a compat
++        fault lands as a 32-bit frame (err is the low dword at [RSP]).
++        Silicon in IA-32e always frames 64-bit; the width rule is a
++        K4-era delivery property, recorded in the plan, not fixed here. */
++    assert(c->exception_taken && c->rip == 0x9000 + 13 * 8);
++    assert((uint32_t)r64(c->gpr[RSP]) == 0);
++    smfix(pgclr32, sizeof pgclr32); c = &g_m.cpu;
++    c->seg[SEG_CS].l = 0; c->seg[SEG_CS].d_b = 1;
++    smstep(0x1000); smstep(0x1005);                     /* the legal exit */
++    assert(!(c->cr0 & (1ull << 31)) && !(c->efer & (1ull << 10)));
++    puts("ok cf4 CR0 PG-clear: #GP in 64-bit + compat/PCIDE, legal exit without");
++
++    /* 7: CR3 above the 40-bit physical address -> #GP(0). */
++    n = mk_crimm(prog, 0x10000ull | (1ull << 40), 0xD8);
++    smfix(prog, (size_t)n); c = &g_m.cpu;
++    smstep(0x1000); expect_gp0(c, 0x100A);
++    assert(c->cr3 == 0x10000);
++    puts("ok cf4 CR3[62:40] delivers #GP(0)");
++
++    /* 8-9: EFER is the strict MSR: outside {SCE,LME,LMA,NXE} #GPs;
++     * LMA itself is a read-only output (source bit ignored, live
++     * value preserved, table and register congruent, RDMSR agrees). */
++    static const uint8_t wr_rd[] = { 0x0F, 0x30, 0x0F, 0x32 };       /* WRMSR; RDMSR */
++    smfix(wr_rd, sizeof wr_rd); c = &g_m.cpu;
++    c->gpr[RCX] = 0xC0000080; c->gpr[RAX] = 0x100; c->gpr[RDX] = 1;  /* bit32 garbage */
++    expect_gp0(c, 0x1000);
++    assert(c->efer == ((1ull << 8) | (1ull << 10) | (1ull << 11)));
++    puts("ok cf4 EFER reserved bit delivers #GP(0)");
++
++    smfix(wr_rd, sizeof wr_rd); c = &g_m.cpu;
++    c->gpr[RCX] = 0xC0000080; c->gpr[RAX] = 0x101; c->gpr[RDX] = 0;  /* SCE|LME, LMA=0 */
++    smstep(0x1000);
++    assert(c->efer == 0x501);                                        /* LMA preserved */
++    { int f; assert(cpu_get_msr(c, 0xC0000080, &f) == 0x501 && f); } /* one EFER only */
++    smstep(0x1002);
++    assert((uint32_t)c->gpr[RAX] == 0x501);
++    puts("ok cf4 EFER write: LMA preserved, readback congruent");
++
++    /* 10: the census find -- the privilege gates that were missing
++     * entirely. WRMSR and MOV CRn from ring 3 both deliver #GP(0). */
++    static const uint8_t uwr[] = { 0x0F, 0x30 };
++    smfix(uwr, sizeof uwr); c = &g_m.cpu;
++    memcpy(g_m.ram + 0x500040, uwr, sizeof uwr);
++    c->seg[SEG_CS].sel = 0x1B; c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x501F00; c->gpr[RCX] = 0x277; c->gpr[RAX] = 0; c->gpr[RDX] = 0;
++    expect_gp0(c, VA + 0x40);
++    static const uint8_t ucr[] = { 0x0F, 0x22, 0xE0 };                /* MOV CR4,RAX */
++    smfix(ucr, sizeof ucr); c = &g_m.cpu;
++    memcpy(g_m.ram + 0x500040, ucr, sizeof ucr);
++    c->seg[SEG_CS].sel = 0x1B; c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x501F00; c->gpr[RAX] = 0x20;
++    expect_gp0(c, VA + 0x40);
++    puts("ok cf4 CPL3 WRMSR and MOV CRn deliver #GP(0)");
++
++    /* 11: D6's other half at 64-bit: POPCNT across the full width;
++     * bare 0F B8 keeps the house #UD (host fault, not delivered). */
++    static const uint8_t pc64[] = { 0xF3, 0x48, 0x0F, 0xB8, 0xC3 };   /* POPCNT RAX,RBX */
++    smfix(pc64, sizeof pc64); c = &g_m.cpu;
++    c->gpr[RBX] = 0x8000000000000001ull; c->rflags = 0xCD5;
++    smstep(0x1000);
++    assert(c->gpr[RAX] == 2 && !(c->rflags & 0x8D5));
++    static const uint8_t jmpe[] = { 0x48, 0x0F, 0xB8, 0xC3 };         /* no F3 */
++    smfix(jmpe, sizeof jmpe); c = &g_m.cpu;
++    c->rip = 0x1000; (void)cpu_step(c);
++    assert(c->fault && !c->exception_taken);
++    puts("ok cf4 POPCNT 64-bit counts + flags; bare 0F B8 stays #UD");
++}
++
+ int main(void) {
+     pte_rewrite();
+     cr3_and_invlpg();
+@@ -682,6 +824,7 @@ int main(void) {
+     smp_and_mode_key();
+     smep_smap();
+     pcid();
++    cf4_validate();
+     puts("test-tlb: all vectors passed");
+     return 0;
+ }
+-- 
+2.47.3
+

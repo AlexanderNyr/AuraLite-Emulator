@@ -1,0 +1,635 @@
+From a21b478280e58fc9605f81653bdd754cd4626c0a Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Thu, 22 Oct 2026 20:15:36 +0000
+Subject: [PATCH] CPU-features CF0: measured baseline for the CPU feature
+ contract (docs)
+
+Post-UPKEEP audit with every prior plan closed and upstream main
+(957c12c) tree-identical to this branch. The next block is chosen by
+measurement, north-star first: the advertised-vs-implemented CPU
+matrix in docs/plans/CPU_FEATURES_PLAN.md finds the CR4.SMEP/SMAP
+walk guards inverted since the original upstream code (harness
+repro: with SMEP on, CPL0 faults fetching its own supervisor text
+and freely executes a user page; invisible today only because
+CPUID advertises neither feature and no test ever vectored them),
+four capabilities that work but read 0 in CPUID (NX, SYSCALL,
+1 GiB pages, CLFLUSH), IA32_PAT as sparse storage with a 0 reset
+value where the SDM default is 0x0007040600070406, and PCID absent
+while AuraLite-OS (74c2b9b, its HW_PLAN H4) carries a full PCID
+runtime that no QEMU configuration can execute -- this emulator
+can become its first lane. An MSR census over the firmware and
+both SeaBIOS ISO lanes bounds the validation question. Defect
+ledger D1-D6, five decisions (advertise-nothing-until-pinned at
+the front), phases CF1-CF5, and a ranked device backlog (modern
+virtio first) for the choice after this plan.
+
+Doc-sync in the same commit: STATUS "Current limits" no longer
+contradicts PM P0-P3 or UPKEEP U3; ROADMAP gains the missing
+PM/UPKEEP ledger rows, the CPU_FEATURES row, gap row 5 and the
+refreshed upstream (957c12c) inventory. Docs only; make test
+green with both live SeaBIOS ISO lanes on this tree.
+---
+ CHANGELOG.md                    |  31 +++
+ ROADMAP.md                      |  53 ++--
+ docs/STATUS.md                  |  20 +-
+ docs/plans/CPU_FEATURES_PLAN.md | 416 ++++++++++++++++++++++++++++++++
+ 4 files changed, 498 insertions(+), 22 deletions(-)
+ create mode 100644 docs/plans/CPU_FEATURES_PLAN.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0265a8a..443d91f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,37 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0099 (CPU-features CF0: measured baseline, docs only)
++
++- **Post-UPKEEP audit and the CPU_FEATURES_PLAN** (`docs/plans/
++  CPU_FEATURES_PLAN.md`). With all prior plans closed and upstream
++  `main` (`957c12c`) tree-identical to this branch, the next block
++  was re-measured from the tree, the tests and the consumers. The
++  advertised-vs-implemented CPU matrix found: CR4.SMEP/SMAP walk
++  guards exist since the original upstream code but are **inverted**
++  (harness repro in the plan §1.3: a CPL-0 fetch of a supervisor
++  page faults with SMEP on, a user page does not) — invisible until
++  now because CPUID advertises neither, so no consumer ever turned
++  them on; NX, SYSCALL, 1 GiB pages and CLFLUSH all work but read 0
++  in CPUID; IA32_PAT is sparse storage with a 0 reset value where
++  the SDM (and the guest's boot receipt) expect
++  `0x0007040600070406`; PCID/INVPCID are absent while the
++  north-star guest (AuraLite-OS `74c2b9b`, HW_PLAN H4) has a full
++  PCID runtime that QEMU/TCG structurally cannot execute. An MSR
++  census over the firmware and both SeaBIOS lanes bounds the
++  validation question (the firmware's MTRR writes ride the
++  permissive sparse store; SeaBIOS's MTRR path is gated off by our
++  own CPUID word). The plan splits the work CF1–CF5
++  (advertise-nothing-until-pinned) and records a ranked device
++  backlog (modern virtio first) in its §5.
++- Doc-sync in the same commit: `docs/STATUS.md` "Current limits"
++  no longer contradicts PM P0–P3 (PM1/SCI/S5 exist) or UPKEEP U3
++  (x87 is in the gdbstub packets); `ROADMAP.md` gains the missing
++  PM/UPKEEP ledger rows, the CF row and gap row 5, and refreshed
++  upstream/inventory facts. No code changed; `make test-unit
++  test-tlb test-ring3` re-run green, full gates green at U7 on
++  this same tree.
++
+ ### Fixed — patch 0098 (Upkeep U7: GUI/monitor authentication — **UPKEEP_PLAN COMPLETE**)
+ 
+ - **The web launcher, its WebSocket proxy and the direct monitor are
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 3d63a7b..11ef8a4 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -17,7 +17,7 @@ AuraLite OS is the companion from-scratch x86-64 OS. Its kernel requires from
+ the machine: long mode + higher-half paging, GDT/IDT/**TSS**, **PIC** IRQ
+ dispatch (later LAPIC for SMP), **SYSCALL/SYSRET** (Ring 3!), UART, a linear
+ framebuffer, **AHCI** storage, **e1000** networking, and USB MSC
+-(UHCI/EHCI/xHCI — it speaks all three; the emulator has EHCI). Each of those
++(UHCI/EHCI/xHCI — it speaks all three; the emulator has all three). Each of those
+ maps to exactly one plan below.
+ 
+ ## Plan ledger
+@@ -38,6 +38,9 @@ maps to exactly one plan below.
+ | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
+ | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
++| [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
++| [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -59,18 +62,20 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ 
+ ### Inventory (measured against the tree, not assumed)
+ 
+-- 37 patches under `patches/` (`0066`–`0081` verified with format-patch
+-  reverse-check + parent-check tree hash) on `feature/roadmap-next`. The
+-  deliverable diff `AuraLite-all-vs-github.patch` is generated as
++- 59 patches under `patches/` (`0034`–`0098` in-tree, each verified with
++  format-patch reverse-check + parent-check tree hash as it shipped) on
++  `feature/roadmap-next`. The deliverable diff
++  `AuraLite-all-vs-github.patch` is generated as
+   `git diff <current github main>..HEAD` and must be refreshed whenever
+-  upstream `main` moves; upstream `main` is now `1e7ff03`
+-  ("F0-F4 update" -- the squash of our `0072`–`0075` work on top of
+-  `a7e9799`, itself the squash of `0066`–`0069`; its tree matches our
+-  `391a6bb` except this very ledger file), so the patch carries the
+-  post-F4 work: the 2026-10-19 audit and the whole XHCI arc.
+-- Every plan in the ledger above is **CLOSED** (CORE, CHIPSET, KERNEL-BOOT,
+-  STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4, PERF P0–P5, TOOLING T0–T5,
+-  COMPAT G0–G6, FPU F0–F4, GUI G1–G2).
++  upstream `main` moves; upstream `main` is now `957c12c`
++  ("M, P, U update" — the squash of the whole `0066`–`0098` arc through
++  XHCI, MSI, PM and UPKEEP; its tree is byte-identical to this branch's
++  HEAD before CF0, so the deliverable diff at CF0 is exactly the CF0
++  content).
++- Every plan in the ledger above except CPU_FEATURES is **CLOSED**
++  (CORE, CHIPSET, KERNEL-BOOT, STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4,
++  PERF P0–P5, TOOLING T0–T5, COMPAT G0–G6, FPU F0–F4, GUI G1–G2,
++  XHCI X0–X5, MSI M0–M4, PM P0–P3, UPKEEP U0–U7).
+ - `src/` is 17,657 lines of C. Green at the audit: `make test` (unit +
+   integration, incl. the 13-lane t4 snapshot gate), `make test-sanitize`
+   (ASan/UBSan), diff-fuzz 512/12 288 all-match with 0 host crashes, the GUI
+@@ -86,10 +91,13 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+ | 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
+ | 3 | ~~**PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed~~ | ✅ **complete** (PM_PLAN P0–P3, patches 0087–0090: PM1 registers + SCI + S5, FADT/DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM) | `docs/plans/PM_PLAN.md` (P0–P3) |
+ | 4 | ~~Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice)~~ | ✅ **complete** (UPKEEP_PLAN U0–U7, patches `0091`–`0098`: all seven items closed with vectors + NCs; plan §5) | `docs/plans/UPKEEP_PLAN.md` (U0–U7, COMPLETE) |
++| 5 | **The CPU feature contract disagrees with the core** (post-UPKEEP audit 2026-10-22): CPUID advertises neither SMEP nor SMAP, and the walk guards for both (never enabled by a consumer, never vectored) are *inverted* — a kernel setting CR4.SMEP/SMAP #PFs on its own text; NX, SYSCALL, 1 GiB pages and CLFLUSH work but read 0 in CPUID; IA32_PAT is sparse storage whose reset value is 0, not the SDM default; PCID/INVPCID are absent while the north-star guest has a full PCID runtime that no QEMU lane can execute | `src/platform.c:43` (the whole CPUID surface), `src/cpu.c:210` (inverted guards, harness repro in the plan §1.3), `src/cpu.c:64` (sparse MSR file), AuraLite-OS `74c2b9b` `diagnostics.c`/`paging.c` | `docs/plans/CPU_FEATURES_PLAN.md` (CF0–CF5) |
+ 
+-No unmeasured defects are known: the F4 lanes closed the last flake class
+-(run-dependent snapshot bytes), and the defect ledgers in each plan are
+-either shipped or explicitly NO-GO (PERF P4).
++Defect state after the 2026-10-22 audit: the ledgers in the closed
++plans stand as shipped, and the next live ledger is CF D1–D6
++(`CPU_FEATURES_PLAN` §1.4), each item filed with code-site evidence and,
++for the one behavioural defect (the inverted SMEP/SMAP guards), a
++harness reproduction.
+ 
+ ### Next-block candidates (dependency-ordered)
+ 
+@@ -136,10 +144,23 @@ either shipped or explicitly NO-GO (PERF P4).
+    re-measured against current code and consumers, with
+    D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7; close-out in the
+    plan §5.
++5. **CPU_FEATURES_PLAN (CF0–CF5)** — advertise exactly what
++   the core does (post-UPKEEP audit, gap row 5): CF1 makes
++   CR4.SMEP/SMAP true and only then advertises them, CF2
++   publishes the already-true (NX, SYSCALL, 1 GiB pages,
++   CLFLUSH, IA32_PAT with its SDM reset value), CF3 adds
++   PCID + INVPCID legality on the flush-always TLB —
++   making this the first emulator lane where the guest's
++   deferred PCID runtime can execute — CF4 decides CR/MSR
++   validation by census experiment, CF5 closes with the
++   U5 A20 record. **CF0 (`0099`) shipped**: advertised-vs-
++   implemented matrix, MSR census, defect ledger D1–D6,
++   and a ranked device backlog (virtio first) in the plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-All twelve plans in the ledger above are **CLOSED**. Recent patches:
++Every plan in the ledger above except CPU_FEATURES (CF0 shipped,
++CF1–CF5 queued) is **CLOSED**. Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 82e84ba..0d0895e 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1302,14 +1302,22 @@ With `--lpc=ich9`, the ACPI tables are published (G4), the BIOS boot reaches
+ vCPUs through the BIOS route and passes `irqapwake` + `smpstress` (G6, up to
+ `EM_MAX_VCPU = 8`).  The default `8086:1e55` identity still
+ publishes no RSDP and reports seven E820 entries; that lane is historical and
+-deliberately unchanged.  The ACPI PM block models only the Timer register
+-(PMBASE+8): PM1_STS/EN/CNT, GPE and the SMI path read zero and swallow writes,
+-so no power-management transition is claimed.  The x87 surface is
++deliberately unchanged.  The ACPI PM block models the Timer register
++(PMBASE+8) and, since PM_PLAN P0–P3, the PM1 status/enable/control
++registers with a level SCI on IRQ9, S5 power-off through the
++deterministic stop, GPE0 and zero-duration S1; the SMI path stays an
++honest no-SMM.  The x87 surface is
+ complete for the plan's F0–F4 scope (data, control, arithmetic/compare,
+ transcendentals, BCD and the integration gates); the fst slots' 6
+ padding bytes are normalized at every write (`x87_w`) so the raw cpu_t
+ dump in snapshot files is byte-stable, and the only remaining x87 #UD
+ surface is the architecturally reserved register holes (D9 D1–D7,
+-DD/DE/DF unmapped forms), pinned by the frozen table suite.  x87
+-registers are not
+-part of the gdbstub `g`-packet contract.
++DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
++UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
++register and control state.
++The CPU feature contract is the current in-flight work
++(`docs/plans/CPU_FEATURES_PLAN.md`): as measured there, CPUID
++understates the machine (NX, SYSCALL, 1 GiB pages work but are not
++advertised; IA32_PAT is sparse storage with a zero reset value; PCID
++is absent), and the CR4.SMEP/SMAP walk guards — never advertised, so
++never enabled by a consumer — are inverted relative to the SDM.
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+new file mode 100644
+index 0000000..accc608
+--- /dev/null
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -0,0 +1,416 @@
++# CPU Features Plan — advertise exactly what the machine does
++
++> Post-UPKEEP audit (2026-10-22). All twelve prior plans are
++> closed and upstream `main` (`957c12c`, "M, P, U update") is
++> tree-identical to this branch's HEAD (`4db0e4b4…`), so the
++> next block was chosen the way the 2026-10-19 audit chose
++> XHCI/MSI/PM/UPKEEP: by measuring, in this order, the tree,
++> its test contracts, and its consumers (§0). The winner is
++> the CPU feature contract — the set of things CPUID and the
++> MSR file *say* about the processor versus what the core
++> actually *does* — because the measurement found, in one
++> small surface, two implemented-but-inverted security
++> features, four implemented-but-unadvertised capabilities,
++> and one architectural facility (PCID) whose only consumer
++> currently has **no emulator lane on earth that can execute
++> it** (§1.2). Device-shaped candidates measured in the same
++> pass (virtio, AC97, extra NICs, USB HID) are ranked in
++> §5 for the next choice.
++
++**Status: CF0 done ✅; CF1–CF5 queued**
++
++| Phase | Scope | Status | Deliverable |
++|---|---|---|---|
++| CF0 | Measured baseline: advertised-vs-implemented matrix, MSR census, defect ledger, decisions, phase split | ✅ done | this file (`patches/0099`) |
++| CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ⬜ queued | `tests/test_tlb.c` vectors |
++| CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ⬜ queued | CPUID/MSR vectors |
++| CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ⬜ queued | `tests/test_tlb.c` vectors |
++| CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ⬜ queued | vectors or an evidenced NO-GO |
++| CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ⬜ queued | close-out |
++
++Each implementation phase ships one `.patch` under
++`patches/` with measured receipts, a regression vector, one
++once-per-phase negative control, green gates and the docs
++update in the same commit (the standing house rules). CF0
++changes documentation only.
++
++## 0. Measurement method and current receipts
++
++Baseline taken at emulator `5f6df06` after UPKEEP U7
++(upstream `957c12c` is the same tree). The current code and
++its test contracts were inspected directly; the current
++AuraLite-OS source was inspected at `74c2b9b` for consumer
++use (it is a consumer clue, not a replacement for this
++repository's frozen lanes — the frozen guest build is absent
++from this sandbox, so its lanes skip here, as in prior
++phases). Two ad-hoc instruments were built for this audit
++and are **not** part of the tree:
++
++* an SMEP/SMAP harness (the `tests/test_tlb.c` fixture
++  pattern: hand-built 4-level tables, CPL 0, one user page
++  and one supervisor page) — §1.3's result table;
++* an MSR census build (`cpu_get_msr`/`cpu_set_msr` log the
++  first touch of each index to stderr) run over the sample
++  firmware (3 platform profiles) and both live SeaBIOS ISO
++  lanes — §1.2's footprint sets.
++
++Receipts at baseline: `make test` and `make test-sanitize`
++green with both live SeaBIOS ISO lanes (U7 close-out, tree
++unchanged since), and `make test-unit test-tlb test-ring3`
++re-run green for this audit. No production code changed in
++CF0; the two stale `docs/STATUS.md` "Current limits"
++statements found (§1.5) are corrected in this commit, as is
++`ROADMAP.md` ledger drift.
++
++## 1. Measured baseline (CF0)
++
++### 1.1 What CPUID says today
++
++`platform_cpuid` (`src/platform.c:43`) is the whole surface;
++`do_cpuid` (`src/cpu.c:846`) patches leaf-1 EBX[31:24] with
++the vCPU's initial APIC ID (G6) and masks EDX.9 when the
++LAPIC is globally disabled (U4). Per leaf:
++
++* **Leaf 0**: max basic leaf `0x16`, vendor `GenuineIntel`.
++* **Leaf 1**: EAX = the five platform signatures
++  (0x206A7…0x30678, the firmware's family/model contract);
++  EBX = `0x00040800` (CLFLUSH line size 8×8 B in [15:8],
++  APIC ID patched per vCPU); ECX = **SSE3 + hypervisor
++  only**; EDX = **FPU, TSC, MSR, CX8, APIC, CMOV, MMX,
++  FXSR, SSE, SSE2**. Absent among others: PSE (3), PAE (6),
++  MTRR (12), PGE (13), **PAT (16)**, CLFLUSH (19); ECX
++  PCID (17), x2APIC (21), POPCNT (23), TSC-deadline (24).
++* **Leaf 7.0**: EBX = **ERMS (9) only** ("we do fast REP
++  MOVSB/STOSB"). SMEP (7), INVPCID (10), SMAP (20) all 0.
++* **Leaf 0x80000001**: EDX = **long mode (29) only** —
++  SYSCALL (11), NX (20), 1GiB pages (26) all 0.
++* Leaves 2/4 (cache), brand string, 0x80000006/08
++  (40-bit phys / 48-bit virt), hypervisor leaf
++  `0x40000000` ("AuraLite HV"); every other leaf reads 0,
++  including 0x15/0x16 (TSC frequency = unknown, legal).
++
++### 1.2 What the consumers actually probe
++
++**AuraLite-OS `74c2b9b`** (the north star) makes exactly
++six CPUID feature decisions, all runtime-gated with a
++boot-log receipt (`kernel/arch/x86_64/diagnostics.c` prints
++`[cpu] features: pat=_ pcid=_ invpcid=_ erms=_` and the raw
++IA32_PAT every boot):
++
++* **PAT** — `paging.c` rewrites MSR `0x277` PA4=WC on every
++  CPU *iff* CPUID.1:EDX.16, and prints the readback;
++* **PCID** — sets CR4.PCIDE *iff* CPUID.1:ECX.17, with a
++  "hash-slot alloc, CR3-reload+generation fallback, no
++  invpcid" runtime; `tlb_shootdown.c` holds the INVPCID
++  path behind CPUID.7.0:EBX.10;
++* **SMEP/SMAP** — sets CR4 bits and `cpu_smap_is_active`
++  *iff* CPUID.7.0:EBX.7/.20 (`paging.c:33,120`);
++* **ERMS** — calibrates `string_fast.c` on EBX.9.
++
++Its own HW_PLAN measured the same four bits on every lane
++available to it: qemu64 says `pat=1 pcid=0 invpcid=0
++erms=0`; `-cpu max` (TCG) says `erms=1` and "STILL pcid=0
++invpcid=0 (`+pcid` is refused by TCG with a warning)"; the
++maintainer's WHPX machine says `pcid=1 invpcid=0`. HW H4
++was therefore re-scoped into a *deferral protocol* — its
++words: "no QEMU configuration here can execute PCID at
++all". On this emulator today the guest reads `pat=0 pcid=0
++invpcid=0 erms=1`, enables neither SMEP nor SMAP, and never
++touches MSR 0x277. The guest's complete MSR footprint
++(source census) is EFER, STAR/LSTAR/FMASK, FS/GS/KGS bases
++and the gated PAT write — no MTRRs, no TSC-deadline.
++
++**The sample firmware** branches on leaf-1 family/model
++(the five `platform_t` signatures are its measured
++contract, untouched by this plan) and — MSR census,
++firmware boot, three profiles — *programs MTRRs*:
++{ RD 0x1B, RD 0x2FF (MTRRdefType), RD EFER, WR 0x200,
++WR 0x201 } (Bay Trail skips the MTRR writes). Those writes
++land in the sparse MSR table (§1.3) and the reads get the
++stored value back: the forgiving MSR lane is load-bearing
++for the firmware lanes.
++
++**Stock SeaBIOS** (both ISO lanes, census build) touches
++exactly one MSR index per boot (0x1B, our own reset
++bookkeeping included): its MTRR programming is CPUID-gated
++off **by our own leaf-1 EDX.12 = 0**. Advertising MTRR
++would inherit a programming contract we have not measured;
++this plan does not propose it (§2).
++
++### 1.3 What the core actually does
++
++* **SMEP/SMAP enforcement exists and is inverted.** The
++  walk's `check:` block (`src/cpu.c:210`, upstream
++  `15166693`, untouched by every plan since) places both
++  guards inside `if (!eff_us)` — the supervisor-page
++  branch. SDM faults supervisor access to a **user** page
++  (`eff_us == 1`). Harness repro (CPL 0; U/S=0 identity
++  2 MiB + one U/S=1 page; this audit's instrument):
++
++  | case | SDM | today |
++  |---|---|---|
++  | SMEP: exec supervisor page, read supervisor data | OK | **#PF** (fetch, `err=0x11`) |
++  | SMEP: exec user page | #PF | **OK** |
++  | SMAP, AC=0: read user data | #PF | **OK** |
++  | SMAP, after STAC: read user data | OK | OK |
++  | SMAP, AC=0: read supervisor data | OK | **#PF** |
++
++  Nothing noticed for two compounding reasons: CPUID says
++  0, so no measured consumer ever sets the CR4 bits; and
++  no test in `tests/` mentions SMEP or SMAP (the K4-era
++  STAC/CLAC decode at `src/cpu.c:3740` executes at any CPL
++  with no CR4.SMAP gate — also unvectored). A kernel that
++  *did* trust CR4 would #PF on its own text in the first
++  instruction after enabling either feature.
++* **NX** is enforced by the walk with EFER.NXE
++  (`src/cpu.c:218` + `page_fault` I/D err bit) — works, is
++  used by every long-mode lane, and is not advertised.
++* **1 GiB pages** are walked (`pdpte & PS`,
++  `src/cpu.c:193`); SYSCALL/SYSRET are the guest's ring-3
++  backbone since K4; **CLFLUSH** decodes to a correct
++  no-op on a cache-free machine (`src/cpu.c:3588`) while
++  leaf-1 EBX already advertises its line size — an
++  inconsistent pair. None of the three bits is set.
++* **PAT**: the MSR file is a 64-entry sparse table in
++  `cpu_t` (`src/cpu.h:34`, `src/cpu.c:64`); any WRMSR
++  stores, any RDMSR returns the stored value or 0 — so
++  MSR 0x277 already "works" as storage, but its reset
++  value is 0 where SDM Table 9-1 (and the guest's H0
++  receipt) require `0x0007040600070406`. On a machine
++  with no cache model, memory types are performance
++  attributes only — the ERMS precedent: storage + reset
++  value + legality is the complete honest functional
++  model.
++* **PCID**: the walk masks CR3's low 12 bits
++  (`src/cpu.c:176`) and the P2 TLB is success-only with a
++  generation flush on *every* guest/DMA RAM store, so
++  PCID-tagged translations are semantically inert here by
++  construction. What's missing is purely the contract:
++  CPUID bits, CR4.PCIDE legality, CR3[63] and PCID-field
++  rules, and an INVPCID decode (today 0F 38 82 has no
++  case). INVLPG would need its "current PCID" scope
++  narrowed in text only — the flushes already cover it.
++* **Control-register writes are unvalidated** (MOV CRn,
++  `src/cpu.c:3705`): CR0/CR3/CR4 store any value verbatim;
++  reserved bits neither #GP nor mask. EFER via WRMSR is
++  likewise stored raw (`c->efer = val`). No measured
++  consumer writes garbage — the guest CPUID-gates every
++  bit it sets — but "CR4 accepts anything" is why the
++  inverted SMEP could never produce a canary failure
++  either.
++* **The unknown-MSR lane is permissive by recorded
++  decision** (U4: RDMSR unknown → 0, WRMSR → sparse store,
++  rejections logged not faulted). Its one sharp edge is
++  silent: the 65th distinct MSR index is *dropped without
++  a word* (`cpu_set_msr` count guard), after which reads
++  return 0 — a quiet correctness cliff no lane trips
++  today (census footprints above are ≤ 5 indices).
++
++### 1.4 The matrix
++
++| Feature | CPUID says | Core does | Verdict |
++|---|---|---|---|
++| ERMS (7.0:EBX.9) | 1 | REP string ops correct (speed is a hint) | honest |
++| SMEP (7.0:EBX.7) | 0 | guard present, **inverted**, unvectored | **D1 → CF1** |
++| SMAP (7.0:EBX.20) | 0 | guard present, **inverted**; STAC/CLAC ungated | **D1 → CF1** |
++| PAT (1:EDX.16) + MSR 277 | 0 | storage yes; **reset value 0 ≠ SDM** | **D2 → CF2** |
++| NX (8·1:EDX.20) | 0 | enforced | **D3 → CF2** |
++| SYSCALL (8·1:EDX.11) | 0 | implemented (K4) | **D3 → CF2** |
++| 1 GiB pages (8·1:EDX.26) | 0 | walked | **D3 → CF2** |
++| CLFLUSH (1:EDX.19) | 0 (but EBX line size = 64 B) | correct NOP | **D3 → CF2** |
++| PCID (1:ECX.17) | 0 | plumbing inert-ready; legality absent | **D4 → CF3** |
++| INVPCID (7.0:EBX.10) | 0 | not decoded | **D4 → CF3** |
++| CR0/CR4/EFER reserved bits | — | stored verbatim, no #GP | **D5 → CF4** |
++| unknown MSR | — | RD 0 / sparse WR; **silent 64-slot drop** | **D5 → CF4** |
++| POPCNT (1:ECX.23) | 0 | no execution case found (disasm knows it) | D6 → CF4 inventory |
++| RDTSCP (8·1:EDX.27) | 0 | unresolved by grep audit | D6 → CF4 inventory |
++| x2APIC, TSC-deadline, MTRR | 0 | absent (LAPIC header says so for x2APIC) | honest; §5 |
++
++### 1.5 Documentation debt found in the same pass
++
++`docs/STATUS.md` "Current limits" still claims the PM
++block "models only the Timer register… no power-management
++transition is claimed" (false since PM P0–P3, `0087–0090`)
++and that "x87 registers are not part of the gdbstub
++`g`-packet contract" (false since UPKEEP U3, `0094`).
++`ROADMAP.md`'s plan ledger lacks PM_PLAN and UPKEEP_PLAN
++rows, its audit inventory still names upstream `1e7ff03`
++and "the emulator has EHCI" for USB (all three controllers
++since XHCI X5). All corrected in this commit.
++
++## 2. Architecture decisions (CF0)
++
++1. **Advertise nothing until it is pinned.** Each CPUID
++   bit flips in the same phase that vectors the semantics
++   behind it. Flipping a bit is a guest-visible contract
++   change: the phase must name every pinned lane whose
++   receipts read CPUID and record any receipt delta
++   explicitly (expected: the guest's `[cpu] features:` line
++   and feature-enable logs *gain* content; the sample
++   firmware branches only on family/model, which this plan
++   never touches; SeaBIOS gates MTRR setup on EDX.12,
++   which stays 0 — §1.2's census is the evidence the flip
++   set in CF2/CF3 keeps SeaBIOS on its current path, and
++   both ISO lanes remain in the gate).
++2. **Memory types are storage here.** PAT (and the MTRR
++   sparse store the firmware already uses) have no
++   observable semantics on a cache-free in-order
++   interpreter beyond readback values and write legality.
++   Modeling exactly that, reset values included, is
++   honest in the same way ERMS-as-a-bit already is. We
++   still do **not** advertise MTRR: that bit changes
++   *SeaBIOS's* behavior (§1.2), a contract nobody has
++   measured a need for.
++3. **PCID collapses onto flush-always.** The P2 policy
++   (success-only TLB, generation bump on every RAM store)
++   makes per-PCID retention unobservable; CF3 implements
++   the *legal* surface (enabling rules, CR3[63] #GP,
++   INVPCID descriptor checks) and lets every invalidation
++   type flush — the no-flush load hint honored as a hint.
++   What the guest gains is real: its PCID allocator and
++   generation shootdown become executable somewhere other
++   than one WHPX machine.
++4. **Tighten nothing blind.** CF4's validation work is
++   gated on the census: the firmware's MTRR writes and the
++   U4 recorded permissive decision mean "#GP on unknown
++   MSR" ships only if firmware + SeaBIOS + guest source
++   footprints all survive it in a scratch experiment
++   first; an evidenced NO-GO (PERF P4 precedent) is an
++   acceptable CF4 outcome. The silent MSR-table drop,
++   however, gets at minimum a log line — silence is the
++   one indefensible part.
++5. **No snapshot-layout change is planned.** PAT seeds a
++   slot in the existing sparse MSR table; no `cpu_t` or
++   `machine_t` field is needed by any phase as scoped.
++   If a phase discovers otherwise it takes the U1
++   treatment (explicit incompatible-snapshot note) or
++   stops. Snapshot lanes are in every phase's gate
++   regardless — the CPUID words are not serialized, but
++   MSR contents are (`msr[]` rides the cpu dump), so the
++   CF2 reset seeding must be byte-stable across
++   save/load.
++
++## 3. Phase acceptance
++
++### CF1 — SMEP/SMAP made true
++
++Fix the walk guards to SDM (supervisor fetch of a U/S=1
++page faults under CR4.SMEP; supervisor data access to a
++U/S=1 page faults under CR4.SMAP with EFLAGS.AC=0), with
++the architected error codes; pin down the surrounding
++rules from SDM before coding (STAC/CLAC #UD conditions
++and CPL behavior, AC handling across interrupt/exception
++delivery and IRET, supervisor implicit accesses —
++descriptor/table reads under `desc_sv`, page-walk accesses
++themselves, which are supervisor-mode accesses to paging
++structures and not SMAP subjects). Vectors in
++`tests/test_tlb.c` covering this audit's five repro cases
++plus CPL3-unchanged and implicit-access cases; only then
++set EBX.7/EBX.20. NC: restore the inverted block — the
++repro cases redden. Guest receipt change to record:
++`SMEP enabled` / `SMAP enabled` lines and
++`cpu_smap_is_active` copy paths light up (frozen lane
++runs where available).
++
++### CF2 — the advertised-truth bundle
++
++Set, each with its pinning vector or an existing-lane
++citation re-measured in-phase: NX (80000001h EDX.20),
++SYSCALL (EDX.11), 1 GiB pages (EDX.26), CLFLUSH
++(1:EDX.19; the EBX line size stops being a contradiction).
++IA32_PAT: seed the SDM reset default `0x0007040600070406`
++per vCPU at INIT/reset seeding (U5's
++`cpu_init_reset` lane), set CPUID.1:EDX.16, and vector the
++guest's exact sequence (read, RMW PA4=WC, readback) plus
++snapshot byte-stability of the seeded slot. NC: unseed /
++unset → vector red. Family/model EAX untouched.
++
++### CF3 — PCID + INVPCID
++
++CPUID.1:ECX.17 and 7.0:EBX.10 after the legality surface
++exists: setting CR4.PCIDE only in IA-32e mode with
++CR3[11:0]==0 (else #GP(0)); MOV CR3 with bit 63 set #GPs
++while PCIDE=0 and is the no-invalidate hint while
++PCIDE=1; the PCID field is stored/echoed by MOV-from-CR3;
++INVLPG semantics under PCID restated (global flush still
++covers); INVPCID decoded with its four types, descriptor
++reserved/PCID-range checks raising #GP, each type
++flushing (types 1–3 global entries included per SDM).
++Vectors for every #GP case and for a two-PCID
++address-space switch driven the guest's way (CR3 reload
++with PCID tags). NC: PCIDE acceptance removed → vectors
++red; bit flips alone (without legality) must also redden
++a vector, which is the advertise-nothing-until-pinned
++rule made executable.
++
++### CF4 — validation, measure-gated
++
++CR4 (and CR0) reserved-bit masks derived from what the
++machine now advertises, #GP(0) on violation; EFER
++reserved bits likewise. The unknown-MSR question is
++decided by experiment, not taste: a scratch strict-mode
++run over firmware (5 profiles), both SeaBIOS ISO lanes
++and the unit suite decides between (a) keep permissive +
++document at the site, (b) whitelist the censused
++architectural set + #GP outside it. The 64-slot silent
++drop gains at least a one-line log; a table-growth
++decision needs snapshot-layout care per §2.5. POPCNT and
++RDTSCP inventory is resolved one way or the other
++(implement + advertise, or leave #UD/0 with the grep
++verdict replaced by a vector).
++
++### CF5 — close-out + the A20 record
++
++UPKEEP §5 left one CPU-shaped open record: at U5 a
++reset-vector fetch with the A20 gate closed did not
++follow the expected bus alias (`#UD group5 ext=7` in
++debug). CF5 reproduces it in a harness first; if real,
++it is fixed here with its vector (fetch-path A20 masking
++is this plan's home turf), if not reproducible the record
++is refuted with the attempt documented. Then the usual
++close-out: STATUS/ROADMAP sync, plan §close.
++
++## 4. Gates
++
++Per phase: its named suite (`test-tlb`, `test-unit`,
++`test-ring3`, `test-snapshot` lanes as applicable), one
++behavioural negative control, `make test`,
++`make test-sanitize`, and both SeaBIOS ISO lanes with the
++stock BIOS actually present. CPUID-touching phases
++additionally re-run the five-platform firmware smoke
++(inside `make test`) with receipt deltas recorded, never
++assumed away. CF0 is docs-only; its receipts are the
++baseline suites in §0 plus clean patch checks.
++
++## 5. Measured backlog beyond this plan (ranked)
++
++For the next "what's next", in the order this audit's
++evidence supports:
++
++1. **virtio-pci (modern) block**, then net: guest drivers
++   exist and are modern-1.0 (vendor caps, common config —
++   `drivers/virtio_blk/virtio_blk.c`, `drivers/virtio_net/`,
++   `drivers/virtio/`), probed *after* AHCI
++   (`kernel/kernel.c:449` vs `:462`), so AHCI stays
++   primary — a STORE/NET-shaped plan with a shared
++   virtqueue core.
++2. **Responder bare-SYN tuple restart** (UPKEEP §5):
++   RFC 9293 wants a challenge ACK; one `tools/` file plus
++   the U6 vectors' home.
++3. **AC97 audio** (`drivers/audio/ac97.c` + `pcspkr.c`):
++   the PC-speaker register plumbing (PIT ch2 + port 61)
++   exists since H2; AC97 needs a host-output design
++   decision (this project's GUI-first rule applies) before
++   any device model.
++4. **Alternate NICs** — guest ships `rtl8139`, `r8169`,
++   `vmxnet3`, `e1000e` drivers; our 82540EM e1000 is the
++   guest's measured primary (NET plan), so these are
++   interop breadth, not function.
++5. **USB HID** (keyboard/mouse): STATUS records "the
++   machine has no HID model on any bus"; guest input is
++   PS/2-first, so demand is unmeasured.
++6. **gdbstub breakpoints are linear** (STATUS U3 side
++   finding) — a tooling-truth item, small.
++7. **x2APIC**: consistently absent from both CPUID and
++   the LAPIC; no consumer pressure measured (guest uses
++   xAPIC MMIO throughout).
+-- 
+2.47.3
+

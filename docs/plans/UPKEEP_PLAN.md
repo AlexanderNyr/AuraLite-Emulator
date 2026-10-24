@@ -515,7 +515,11 @@ assertion (134). Adjacent finding, recorded not fixed:
 fetching the reset vector with the A20 gate closed does not
 follow the bus alias (only reachable by INIT# with the gate
 deliberately shut; every reset source on this board opens it,
-and guests are unaffected).
+and guests are unaffected). — *Resolved later by
+CPU_FEATURES CF5 (`0104`): reproduced in harness; the fix
+widened the top-of-4G firmware decode to the top 2 MiB so
+the A20-masked image of the reset window lands in flash;
+see `docs/plans/CPU_FEATURES_PLAN.md` §CF5.*
 
 ### U6 — responder TCP ✅
 
@@ -691,7 +695,8 @@ gaps" entry in `ROADMAP.md` is closed with them. The only
 snapshot-layout statement in the whole plan remains U1's
 (pre-U1 snapshots are rejected; U2–U7 changed no layout).
 Open, by deliberate record only: the reset-vector fetch
-under a closed A20 gate observed at U5, the responder's
+under a closed A20 gate observed at U5 (since resolved by
+CPU_FEATURES CF5, `0104`), the responder's
 bare-SYN tuple restart noted at U6, and the gdbstub's
 protocol-inherent lack of authentication (loopback by
 default, operator's choice) noted at U7. None of the three

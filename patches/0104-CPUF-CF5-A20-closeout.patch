@@ -1,0 +1,309 @@
+From 6a5cbf1d88380ae1a2485f63d466b62a8363f7aa Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Fri, 23 Oct 2026 20:34:55 +0000
+Subject: [PATCH] CPUF-CF5: close the U5 A20 record (reproduced, fixed
+ decode-side); plan closed
+
+---
+ CHANGELOG.md                    | 25 ++++++++++++++++
+ ROADMAP.md                      | 15 +++++-----
+ docs/STATUS.md                  | 13 +++++----
+ docs/plans/CPU_FEATURES_PLAN.md | 52 +++++++++++++++++++++++++++++++--
+ docs/plans/UPKEEP_PLAN.md       |  9 ++++--
+ src/machine.h                   |  8 ++++-
+ tests/test_chipset.c            | 28 ++++++++++++++++--
+ 7 files changed, 130 insertions(+), 20 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2fe4c1c..2f2d3fb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,31 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0104 (CPU-features CF5: the U5 A20 record, reproduced and closed)
++
++- **An INIT# with the A20 gate shut now fetches the reset vector
++  from flash, as the board's own aliases promise.** UPKEEP U5
++  left this as a recorded-not-fixed finding ("`#UD group5 ext=7`
++  in debug"); CF5 reproduces it in harness exactly: the bus
++  forces address bit 20 low, the reset fetch at `0xFFFFFFF0`
++  becomes `0xFFEFFFF0`, and the top-of-4G firmware decode used
++  to cover only the top 128 KiB — missing by one megabyte, so
++  the CPU ate open-bus `0xFF`. The H5 bus-global wrap itself is
++  pinned behaviour (every odd megabyte aliases down, like the
++  wired-AND it models) and stays; the fix is on the decode side:
++  the firmware range now spans the top 2 MiB with the 128 KiB
++  image tiled, the standard ICH-style boot-block decode, so the
++  window's A20 image lands in flash. One macro
++  (`ROM_TOPOF4G_BASE`), no snapshot change. New vector
++  `tests/test_chipset.c::test_a20_init_reset_fetch` (close the
++  gate by the guest's own port, INIT#, run the ROM stub); NC on
++  the 0103 tree aborts on its fetch assertion after the H5-era
++  vectors pass. With this, **CPU_FEATURES_PLAN is CLOSED
++  (CF0–CF5)**: every advertised CPUID bit is backed by the
++  behaviour it names, and every measured behaviour the contract
++  covers is advertised — the ranked device backlog (modern
++  virtio first) is the next plan's material.
++
+ ### Fixed — patch 0103 (CPU-features CF4: validation switched on by measurement)
+ 
+ - **Every mask was censused to zero before it was allowed to
+diff --git a/ROADMAP.md b/ROADMAP.md
+index f00c015..9d5733d 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -40,7 +40,7 @@ maps to exactly one plan below.
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+-| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF4 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -153,8 +153,7 @@ harness reproduction.
+    making this the first emulator lane where the guest's
+    deferred PCID runtime can execute — CF4 decides CR/MSR
+    validation by census experiment, CF5 closes with the
+-   U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) + CF2
+-   (`0101`) + CF3 (`0102`) + CF4 (`0103`) shipped**: the
++   U5 A20 record. **Closed (`0099`–`0104`)**: the
+    advertised-vs-implemented matrix, MSR census and
+    defect ledger D1–D6, then the SMEP/SMAP guards made
+    true (with a second latent find in the same site:
+@@ -167,14 +166,14 @@ harness reproduction.
+    switched on strictly where a full-suite census counted
+    zero (and documented permissive where it didn't —
+    unknown MSRs: the firmware's unhandled reset-stage
+-   MTRR probe), with POPCNT + RDTSCP implemented; the
+-   ranked device backlog (virtio first) waits in the
+-   plan §5.
++   MTRR probe), with POPCNT + RDTSCP implemented, and
++   finally the U5 A20 reset-fetch record reproduced and
++   fixed decode-side. The ranked device backlog (virtio
++   first) in the plan §5 is the next plan's material.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above except CPU_FEATURES (CF0–CF4
+-shipped, CF5 queued) is **CLOSED**. Recent patches:
++Every plan in the ledger above is **CLOSED**. Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 8b718c3..f70cb44 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1315,9 +1315,9 @@ surface is the architecturally reserved register holes (D9 D1–D7,
+ DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+ UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+ register and control state.
+-The CPU feature contract is the current in-flight work
+-(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF4 shipped): the
+-CR4.SMEP/SMAP walk guards are now SDM-true and advertised (CF1 —
++The CPU feature contract is **closed**
++(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF5 shipped): the
++CR4.SMEP/SMAP walk guards are SDM-true and advertised (CF1 —
+ the guards had been inverted since the original upstream code, and
+ STAC/CLAC fell through into a stray SIDT store at linear 0; both
+ were invisible while the features were unadvertised), CPUID no
+@@ -1326,7 +1326,7 @@ longer understates the already-implemented set (CF2 — NX, SYSCALL,
+ SDM default; INIT preserves it, RESET re-seeds it), PCID +
+ INVPCID exist with their architectural legality on the
+ flush-always TLB (CF3 — under full emulation QEMU/TCG has neither,
+-which is what had the consumer's PCID runtime deferred), and the
++which is what had the consumer's PCID runtime deferred), the
+ control-register/EFER/MSR surface validates exactly as far as a
+ full-suite census licensed (CF4 — advertise-derived CR4 mask,
+ CR0/CR3/EFER reserved rules and the previously missing
+@@ -1334,4 +1334,7 @@ privilege gates are `#GP(0)`, the unknown-MSR lane stays
+ documented permissive because the firmware's unhandled reset-stage
+ MTRR probe would brick under a strict whitelist, and POPCNT +
+ RDTSCP graduated from absent/host-halt and an accidental INVLPG
+-alias respectively). What remains is the CF5 A20 close-out record.
++alias respectively), and an INIT# under a closed A20 gate fetches
++its reset vector from flash again (CF5 — the U5 record, fixed on
++the decode side). Next material is the plan's §5 device backlog,
++modern virtio first.
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index c821985..a075440 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -17,7 +17,7 @@
+ > pass (virtio, AC97, extra NICs, USB HID) are ranked in
+ > §5 for the next choice.
+ 
+-**Status: CF0–CF4 done ✅; CF5 queued**
++**Status: CF0–CF5 done ✅ — PLAN CLOSED**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+@@ -26,7 +26,7 @@
+ | CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ✅ done | CPUID/MSR vectors (`patches/0101`) |
+ | CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ✅ done | `tests/test_tlb.c` vectors (`patches/0102`) |
+ | CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ✅ done | vectors + the MSR NO-GO record (`patches/0103`) |
+-| CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ⬜ queued | close-out |
++| CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ✅ done | close-out (`patches/0104`) |
+ 
+ Each implementation phase ships one `.patch` under
+ `patches/` with measured receipts, a regression vector, one
+@@ -501,6 +501,54 @@ is this plan's home turf), if not reproducible the record
+ is refuted with the attempt documented. Then the usual
+ close-out: STATUS/ROADMAP sync, plan §close.
+ 
++**Shipped (`0104`) — reproduced, real, fixed.** The harness
++repro is exact: close the gate at port 92h, read
++`0xFFFFFFF0` — the H5 bus rule forces bit20 low
++(`0xFFEFFFF0`), and the top-of-4G firmware decode covered
++only `0xFFFE0000..0xFFFFFFFF`, so the masked fetch fell
++one megabyte short of flash and read open bus (`0xFF` →
++`FF /7` → the recorded `#UD group5 ext=7`). The mask
++itself is not the defect: it is the pinned H5 contract
++(every odd megabyte aliases, the wired-AND behaviour, and
++its lanes assert it at 3 MiB too), so the fix landed on
++the decode side — `ROM_TOPOF4G_BASE` now starts the
++firmware range at the top **2 MiB** with the 128 KiB
++image tiled by the existing modulo indexing (the
++ICH-style boot-block decode span; both bases are
++128 KiB-aligned, so every previously-decoded byte keeps
++its slot). The window's A20 image now lands in flash,
++INIT# under a shut gate runs the ROM stub, and the
++write-side read-only guard widened with the same macro.
++One fixture line in `test_chipset.c` (the old base-value
++ternary) was flattened to the base-invariant `0x1FFF0`.
++NC on the 0103 tree: the three H5 A20 vectors pass, the
++new one aborts on its fetch assertion. The UPKEEP §5
++record is closed at its source; the UPKEEP plan's other
++two deliberate records (bare-SYN restart, gdbstub
++authentication) stay open for their own future plans, as
++does this plan's §5 backlog (virtio first) and the CF4
++compat-frame observation.
++
++**§close.** The contract the plan set out to write —
++advertise exactly what the machine does — now holds in
++both directions across the measured surface: the
++implemented-but-silent (CF2, CF4/D6), the
++inverted-then-made-true (CF1), the previously-absent
++(CF3), and the validation boundary (CF4, with the one
++measured NO-GO documented at its site instead of
++enforced into a bricked primary workload). The two
++recurring shapes of latent defect found on the way are
++worth the next plan's attention as a class: code that
++was unreachable while unadvertised (SMEP/SMAP inversion,
++the STAC fallthrough, the INVLPG-aliased RDTSCP, the
++missing CPL gates), and decode/state edges visible only
++from a deliberately-awkward state (closed-A20 INIT#).
++Still honestly zero and unbuilt, left for §5 or later
++plans: x2APIC, TSC-deadline, MTRRs (storage rides the
++permissive MSR lane; the CPUID bit stays 0 because no
++caching semantics exist), XSAVE/AVX state, and the rest
++of the ranked device backlog.
++
+ ## 4. Gates
+ 
+ Per phase: its named suite (`test-tlb`, `test-unit`,
+diff --git a/docs/plans/UPKEEP_PLAN.md b/docs/plans/UPKEEP_PLAN.md
+index 53ef05f..df0cb35 100644
+--- a/docs/plans/UPKEEP_PLAN.md
++++ b/docs/plans/UPKEEP_PLAN.md
+@@ -515,7 +515,11 @@ assertion (134). Adjacent finding, recorded not fixed:
+ fetching the reset vector with the A20 gate closed does not
+ follow the bus alias (only reachable by INIT# with the gate
+ deliberately shut; every reset source on this board opens it,
+-and guests are unaffected).
++and guests are unaffected). — *Resolved later by
++CPU_FEATURES CF5 (`0104`): reproduced in harness; the fix
++widened the top-of-4G firmware decode to the top 2 MiB so
++the A20-masked image of the reset window lands in flash;
++see `docs/plans/CPU_FEATURES_PLAN.md` §CF5.*
+ 
+ ### U6 — responder TCP ✅
+ 
+@@ -691,7 +695,8 @@ gaps" entry in `ROADMAP.md` is closed with them. The only
+ snapshot-layout statement in the whole plan remains U1's
+ (pre-U1 snapshots are rejected; U2–U7 changed no layout).
+ Open, by deliberate record only: the reset-vector fetch
+-under a closed A20 gate observed at U5, the responder's
++under a closed A20 gate observed at U5 (since resolved by
++CPU_FEATURES CF5, `0104`), the responder's
+ bare-SYN tuple restart noted at U6, and the gdbstub's
+ protocol-inherent lack of authentication (loopback by
+ default, operator's choice) noted at U7. None of the three
+diff --git a/src/machine.h b/src/machine.h
+index 5675c7e..f13270b 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -17,7 +17,13 @@
+ #define ROM_SIZE   (128u*1024)        /* 0x20000, matches firmware.bin size */
+ 
+ #define ROM_ALIAS_LOW_BASE   0x000E0000ULL   /* 128K firmware flash alias; PAM selects RAM shadow */
+-#define ROM_TOPOF4G_BASE     0xFFFE0000ULL   /* top-of-4GB reset window */
++#define ROM_TOPOF4G_BASE     0xFFE00000ULL   /* top-of-4GB firmware decode: the boot
++                                               * flash range covers the top 2 MiB with
++                                               * the 128K image tiled (ICH-style decode
++                                               * enables). 2 MiB, not 128 KiB, so the
++                                               * A20-masked image of the reset window
++                                               * (bit20 forced low) still lands in
++                                               * flash -- CF5 (the U5 A20 record). */
+ 
+ /* ---- MMIO callback device model ---- */
+ typedef uint64_t (*mmio_read_fn)(void *ctx, uint64_t addr, int size);
+diff --git a/tests/test_chipset.c b/tests/test_chipset.c
+index 17e70a3..d20b1ef 100644
+--- a/tests/test_chipset.c
++++ b/tests/test_chipset.c
+@@ -105,6 +105,28 @@ static void test_a20_kbc_or_semantics(void) {
+     printf("ok: a20_kbc_or_semantics\n");
+ }
+ 
++/* CPU_FEATURES CF5: the U5 open record, in harness. With the gate
++ * deliberately shut, INIT# re-aims the fetch at 0xFFFFFFF0; the bus
++ * forces bit20 low (0xFFEFFFF0 -- the H5 mask is bus-global and
++ * pinned above), and the top-of-4G firmware decode must still
++ * serve the image there. Pre-CF5 decode covered only the top
++ * 128 KiB, the masked fetch missed it by one megabyte, and the CPU
++ * ate open-bus 0xFF ("#UD group5 ext=7" in U5's debug). */
++static void test_a20_init_reset_fetch(void) {
++    fx_t f; fx_init(&f);
++    f.m.rom[0x1FFF0] = 0x90;                      /* NOP at the reset vector */
++    f.m.rom[0x1FFF1] = 0xF4;                      /* HLT */
++    assert(mem_read(&f.m, 0xFFFFFFF0ULL, 1) == 0x90);   /* gate open */
++    io_write(&f.m, 0x92, 1, 0x00);                /* both sources now low */
++    assert(f.m.chipset.a20 == 0);
++    assert(mem_read(&f.m, 0xFFFFFFF0ULL, 1) == 0x90);   /* through the A20 image */
++    cpu_init_reset(&f.m.cpu);                     /* INIT#: chipset state rides through */
++    assert(f.m.chipset.a20 == 0);
++    assert(cpu_step(&f.m.cpu) == 0 && !f.m.cpu.fault);                 /* NOP runs */
++    assert(cpu_step(&f.m.cpu) != 0 && !f.m.cpu.fault && f.m.cpu.halted); /* HLT (stops) */
++    printf("ok: a20_init_reset_fetch\n");
++}
++
+ /* ------------------------------------------------------- reset vectors */
+ 
+ /* reset-vector stub (fetched at 0xFFFFFFF0, top-of-4G ROM window):
+@@ -114,8 +136,9 @@ static const uint8_t RESET_STUB[] = { 0xEA, 0x00, 0x05, 0x00, 0x00 };
+ static const uint8_t REENTRY[] = { 0xFE, 0x06, 0x07, 0x20, 0xEB, 0xFE };
+ 
+ static void install_reset_path(fx_t *f) {
+-    memcpy(f->m.rom + (ROM_TOPOF4G_BASE == 0xFFFE0000ULL ? 0x1FFF0 : 0), RESET_STUB,
+-           sizeof RESET_STUB);   /* offset of 0xFFFFFFF0 within the 128K image */
++    memcpy(f->m.rom + 0x1FFF0, RESET_STUB,
++           sizeof RESET_STUB);   /* offset of 0xFFFFFFF0 within the 128K image
++                                   * (any 128K-aligned decode base keeps it) */
+     memcpy(f->m.ram + 0x500, REENTRY, sizeof REENTRY);
+ }
+ 
+@@ -446,6 +469,7 @@ int main(void) {
+     test_a20_default_open();
+     test_a20_wrap_via_p92();
+     test_a20_kbc_or_semantics();
++    test_a20_init_reset_fetch();
+     test_reset_via_p92();
+     test_reset_via_cf9_predicates();
+     test_reset_via_cf9();
+-- 
+2.47.3
+

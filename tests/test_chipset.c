@@ -105,6 +105,28 @@ static void test_a20_kbc_or_semantics(void) {
     printf("ok: a20_kbc_or_semantics\n");
 }
 
+/* CPU_FEATURES CF5: the U5 open record, in harness. With the gate
+ * deliberately shut, INIT# re-aims the fetch at 0xFFFFFFF0; the bus
+ * forces bit20 low (0xFFEFFFF0 -- the H5 mask is bus-global and
+ * pinned above), and the top-of-4G firmware decode must still
+ * serve the image there. Pre-CF5 decode covered only the top
+ * 128 KiB, the masked fetch missed it by one megabyte, and the CPU
+ * ate open-bus 0xFF ("#UD group5 ext=7" in U5's debug). */
+static void test_a20_init_reset_fetch(void) {
+    fx_t f; fx_init(&f);
+    f.m.rom[0x1FFF0] = 0x90;                      /* NOP at the reset vector */
+    f.m.rom[0x1FFF1] = 0xF4;                      /* HLT */
+    assert(mem_read(&f.m, 0xFFFFFFF0ULL, 1) == 0x90);   /* gate open */
+    io_write(&f.m, 0x92, 1, 0x00);                /* both sources now low */
+    assert(f.m.chipset.a20 == 0);
+    assert(mem_read(&f.m, 0xFFFFFFF0ULL, 1) == 0x90);   /* through the A20 image */
+    cpu_init_reset(&f.m.cpu);                     /* INIT#: chipset state rides through */
+    assert(f.m.chipset.a20 == 0);
+    assert(cpu_step(&f.m.cpu) == 0 && !f.m.cpu.fault);                 /* NOP runs */
+    assert(cpu_step(&f.m.cpu) != 0 && !f.m.cpu.fault && f.m.cpu.halted); /* HLT (stops) */
+    printf("ok: a20_init_reset_fetch\n");
+}
+
 /* ------------------------------------------------------- reset vectors */
 
 /* reset-vector stub (fetched at 0xFFFFFFF0, top-of-4G ROM window):
@@ -114,8 +136,9 @@ static const uint8_t RESET_STUB[] = { 0xEA, 0x00, 0x05, 0x00, 0x00 };
 static const uint8_t REENTRY[] = { 0xFE, 0x06, 0x07, 0x20, 0xEB, 0xFE };
 
 static void install_reset_path(fx_t *f) {
-    memcpy(f->m.rom + (ROM_TOPOF4G_BASE == 0xFFFE0000ULL ? 0x1FFF0 : 0), RESET_STUB,
-           sizeof RESET_STUB);   /* offset of 0xFFFFFFF0 within the 128K image */
+    memcpy(f->m.rom + 0x1FFF0, RESET_STUB,
+           sizeof RESET_STUB);   /* offset of 0xFFFFFFF0 within the 128K image
+                                   * (any 128K-aligned decode base keeps it) */
     memcpy(f->m.ram + 0x500, REENTRY, sizeof REENTRY);
 }
 
@@ -446,6 +469,7 @@ int main(void) {
     test_a20_default_open();
     test_a20_wrap_via_p92();
     test_a20_kbc_or_semantics();
+    test_a20_init_reset_fetch();
     test_reset_via_p92();
     test_reset_via_cf9_predicates();
     test_reset_via_cf9();

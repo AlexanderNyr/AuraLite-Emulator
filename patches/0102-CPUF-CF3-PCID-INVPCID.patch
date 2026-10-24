@@ -1,0 +1,575 @@
+From 6c9bc15854c9589f30a830c2abd8b3b4e655bcd2 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Fri, 23 Oct 2026 14:35:41 +0000
+Subject: [PATCH] CPUF-CF3: PCID + INVPCID -- legality first, then the CPUID
+ bits
+
+---
+ CHANGELOG.md                    |  37 +++++++
+ ROADMAP.md                      |  25 +++--
+ docs/STATUS.md                  |  12 ++-
+ docs/plans/CPU_FEATURES_PLAN.md |  35 +++++-
+ src/cpu.c                       |  72 ++++++++++++-
+ src/disasm.c                    |   1 +
+ src/platform.c                  |   4 +
+ tests/test_cpu.c                |   7 +-
+ tests/test_disasm.c             |   1 +
+ tests/test_tlb.c                | 182 ++++++++++++++++++++++++++++++++
+ 10 files changed, 356 insertions(+), 20 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 83cef6e..5edb18c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,43 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Added — patch 0102 (CPU-features CF3: PCID + INVPCID)
++
++- **PCID at last, with its legality surface** (`src/cpu.c`,
++  `src/platform.c`). CPUID leaf 1 ECX.PCID and leaf 7.0
++  EBX.INVPCID are set only now that the contract exists:
++  CR4.PCIDE=1 is accepted only in IA-32e mode, and the 0→1 edge
++  additionally requires CR3[11:0]=0 (violations deliver #GP(0));
++  MOV CR3 bit 63 is the no-invalidate *hint* under PCIDE=1
++  (weighed, never stored — MOV-from-CR3 reads back the PCID field
++  and 0 above it) and reserved-band #GP(0) under PCIDE=0;
++  `INVPCID` (66 0F 38 82) is decoded with its four types and full
++  architected fault surface (type>3, descriptor [63:12], PCIDE=0
++  narrowing, type-0 canonical address, CPL0, 66-required,
++  memory-only operand). On this flush-always TLB every
++  invalidation is the conservative full flush, which the SDM
++  explicitly permits — PCID tagging is semantically inert here,
++  only its *observability* is new. Measured on the reference:
++  QEMU/TCG cannot do any of this at all (`+pcid` is refused;
++  INVPCID is listed missing in its decoder), which is why
++  AuraLite-OS has its PCID runtime deferred. That guest's
++  CR4.PCIDE enable, CR3-reload-with-tags allocator and INVPCID
++  shootdown path can now execute end-to-end on an emulation lane
++  for the first time. The disassembler learned the mnemonic too.
++- 13 new vectors in `tests/test_tlb.c::pcid` (both #GP edges of
++  PCIDE, a real-mode/IVT legality drive, bit-63 hint-vs-reserved,
++  a two-root/two-PCID switch driven the guest's way, INVPCID
++  types 0–3 plus five fault cases) with the CPUID words pinned in
++  `tests/test_cpu.c` (the leaf-7 EBX pin deliberately gains
++  INVPCID; leaf-1 ECX is a new pin). Two-form NC on the 0101 tree:
++  (a) tests only — 20 prior vectors pass, CF3 aborts on its first
++  legality assertion; (b) tests + the CPUID bits alone — the
++  semantics vectors abort identically, so advertising without the
++  legality can never go green. Gates: `make test` (both live
++  SeaBIOS ISO lanes; firmware CR-traffic receipts unchanged) +
++  `make test-sanitize` green, no snapshot format change (PCID
++  rides the existing CR3 field).
++
+ ### Fixed — patch 0101 (CPU-features CF2: the advertised-truth bundle)
+ 
+ - **CPUID now advertises what the core already did** (`src/platform.c`):
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 2ceadef..d36b610 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -40,7 +40,7 @@ maps to exactly one plan below.
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+-| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF2 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF3 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -154,19 +154,22 @@ harness reproduction.
+    deferred PCID runtime can execute — CF4 decides CR/MSR
+    validation by census experiment, CF5 closes with the
+    U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) + CF2
+-   (`0101`) shipped**: the advertised-vs-implemented
+-   matrix, MSR census and defect ledger D1–D6, then the
+-   SMEP/SMAP guards made true (with a second latent find
+-   in the same site: STAC/CLAC fell through into a stray
+-   SIDT store at linear 0) and advertised, then the
+-   already-true published (NX, SYSCALL, 1 GiB pages,
+-   CLFLUSH, PAT with its SDM reset value); the ranked
+-   device backlog (virtio first) waits in the plan §5.
++   (`0101`) + CF3 (`0102`) shipped**: the advertised-vs-
++   implemented matrix, MSR census and defect ledger
++   D1–D6, then the SMEP/SMAP guards made true (with a
++   second latent find in the same site: STAC/CLAC fell
++   through into a stray SIDT store at linear 0) and
++   advertised, then the already-true published (NX,
++   SYSCALL, 1 GiB pages, CLFLUSH, PAT with its SDM reset
++   value), then PCID + INVPCID with their legality (the
++   first emulation lane where the guest's deferred PCID
++   runtime can execute); the ranked device backlog
++   (virtio first) waits in the plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above except CPU_FEATURES (CF0–CF2
+-shipped, CF3–CF5 queued) is **CLOSED**. Recent patches:
++Every plan in the ledger above except CPU_FEATURES (CF0–CF3
++shipped, CF4–CF5 queued) is **CLOSED**. Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index fd93011..e898613 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1316,12 +1316,16 @@ DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+ UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+ register and control state.
+ The CPU feature contract is the current in-flight work
+-(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF2 shipped): the
++(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF3 shipped): the
+ CR4.SMEP/SMAP walk guards are now SDM-true and advertised (CF1 —
+ the guards had been inverted since the original upstream code, and
+ STAC/CLAC fell through into a stray SIDT store at linear 0; both
+-were invisible while the features were unadvertised), and CPUID no
++were invisible while the features were unadvertised), CPUID no
+ longer understates the already-implemented set (CF2 — NX, SYSCALL,
+ 1 GiB pages, CLFLUSH, and PAT with IA32_PAT leaving reset at the
+-SDM default; INIT preserves it, RESET re-seeds it). PCID is the
+-remaining measured absence (CF3).
++SDM default; INIT preserves it, RESET re-seeds it), and PCID +
++INVPCID exist with their architectural legality on the
++flush-always TLB (CF3 — under full emulation QEMU/TCG has neither,
++which is what had the consumer's PCID runtime deferred). What
++remains is CF4's measure-gated validation inventory and the CF5
++A20 close-out record.
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index 02447d3..aa4eedb 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -17,14 +17,14 @@
+ > pass (virtio, AC97, extra NICs, USB HID) are ranked in
+ > §5 for the next choice.
+ 
+-**Status: CF0–CF2 done ✅; CF3–CF5 queued**
++**Status: CF0–CF3 done ✅; CF4–CF5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | CF0 | Measured baseline: advertised-vs-implemented matrix, MSR census, defect ledger, decisions, phase split | ✅ done | this file (`patches/0099`) |
+ | CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ✅ done | `tests/test_tlb.c` vectors (`patches/0100`) |
+ | CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ✅ done | CPUID/MSR vectors (`patches/0101`) |
+-| CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ⬜ queued | `tests/test_tlb.c` vectors |
++| CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ✅ done | `tests/test_tlb.c` vectors (`patches/0102`) |
+ | CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ⬜ queued | vectors or an evidenced NO-GO |
+ | CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ⬜ queued | close-out |
+ 
+@@ -406,6 +406,37 @@ red; bit flips alone (without legality) must also redden
+ a vector, which is the advertise-nothing-until-pinned
+ rule made executable.
+ 
++**Shipped (`0102`).** As built: leaf-1 ECX = `0x80020001`,
++leaf-7 EBX gains INVPCID (deliberate pin change); MOV-CR
++gains exactly the two PCIDE rules above plus the bit-63
++hint/reserved split; `66 0F 38 82` decodes with the checks
++in KVM's order (66 → memory-form → CPL → type → descriptor
++→ reserved/PCID/canonical), every type landing on the one
++conservative flush. Three measured corrections to the CF0-era
++text above. (1) "types 1–3 global entries included" was
++imprecise: only type 2 *must* invalidate globals; types 0/1/3
++exclude them but carry explicit "may invalidate more"
++clauses — the flush-always landing rides on those clauses,
++recorded at the site. (2) PCIDE=0 does **not** #UD INVPCID:
++the SDM narrows it (types 0/1 must name PCID 000H, types 2/3
++run) — implemented and vectored as narrowed. (3) The
++reference implementation is absent, not lax: QEMU refuses
++`+pcid` under TCG and lists INVPCID as missing in its
++decoder, so the SDM text was the sole authority (verified by
++source clone in-phase). LOCK-prefixed INVPCID inherits the
++decoder-wide LOCK swallow (the STAC precedent). Deferred to
++CF4's inventory, all MOV-CR family and measure-gated there:
++the CR3[62:MAXPHYADDR] band, compat-mode clear-CR0.PG-while-
++PCIDE, and the PCIDE 1→0-in-IA-32e edge (absent from the
++instruction's exception tables — neither permitted nor
++forbidden there, so permissive stands until measured).
++13 vectors in `tests/test_tlb.c::pcid`; two-form NC on the
++0101 tree: tests-only aborts at CF3 case 1 after 20 prior
++oks (disasm oracle red alone), and tests+bits-only aborts
++identically — advertise-without-legality cannot pass. Gates
++green incl. both SeaBIOS ISO lanes; no snapshot change
++(PCID rides CR3).
++
+ ### CF4 — validation, measure-gated
+ 
+ CR4 (and CR0) reserved-bit masks derived from what the
+diff --git a/src/cpu.c b/src/cpu.c
+index 5998dd7..62c7edf 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -3734,7 +3734,36 @@ really_slow:
+                                    if (entering_pg && (c->efer & (1ULL<<8))) c->efer |= (1ULL<<10); /* set LMA */
+                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
+                      }
+-                     else if (crn==2) c->cr2=v; else if (crn==3) c->cr3=v; else if (crn==4) c->cr4=v;
++                     else if (crn==2) c->cr2=v;
++                     else if (crn==3) {
++                         /* CPU_FEATURES CF3 (SDM MOV-CR description): with
++                          * CR4.PCIDE=1, bit 63 of the source is the
++                          * no-invalidate hint -- weighed, never stored
++                          * (MOV-from-CR3 reads it back 0). With PCIDE=0
++                          * the same bit sits in the CR3[63:MAXPHYADDR]
++                          * reserved band -> #GP(0). The perf flush below
++                          * runs either way: this TLB is flush-always (P2)
++                          * and the architecture forbids demanding
++                          * retention -- the hint only permits it. The
++                          * 62:40 band stays permissive until CF4. */
++                         if ((v >> 63) & 1) {
++                             if (!((c->cr4 >> 17) & 1)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                             v &= ~(1ULL << 63);
++                         }
++                         c->cr3 = v; /* PCID rides [11:0]; the walk masks it */
++                     }
++                     else if (crn==4) {
++                         /* CPU_FEATURES CF3 (SDM MOV-CR exceptions):
++                          * CR4.PCIDE may hold 1 only in IA-32e mode
++                          * (EFER.LMA) -- outside it even writing 1 is
++                          * #GP(0) -- and the 0->1 edge additionally
++                          * requires CR3[11:0]==000H (those bits become
++                          * the current PCID at the flip). Everything
++                          * else about CR4 stays permissive until CF4. */
++                         if (((v >> 17) & 1) && !(c->efer & (1ULL << 10))) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                         if (((v >> 17) & 1) && !((c->cr4 >> 17) & 1) && (c->cr3 & 0xFFF)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++                         c->cr4 = v;
++                     }
+                      if (crn==0 || crn==3 || crn==4) perf_tlb_flush(m);
+                      break; }
+         case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
+@@ -3812,7 +3841,10 @@ really_slow:
+                                       O(1); a full flush is conservative but
+                                       avoids mis-keying large-page aliases.
+                                       K2 measured an eager read causing a
+-                                      recursive fault in paging_unmap(). */
++                                      recursive fault in paging_unmap().
++                                      CF3: PCID narrows its architected
++                                      scope to the current PCID -- the same
++                                      full flush covers that too. */
+                          perf_tlb_flush(m);
+                          break; }
+                      if (ext==5) { faultf(c, "#UD 0F 01 /5 reserved"); break; }
+@@ -3861,6 +3893,42 @@ really_slow:
+             int32_t rel = (osz==2) ? (int16_t)fetch16(&d) : fetch32s(&d);
+             if (eval_cc(op2 & 0xF, c->rflags)) d.pc = (uint64_t)((int64_t)d.pc + rel);
+             break; }
++        case 0x38: { /* three-byte escape. Only 66 0F 38 82 (INVPCID)
++                      * is decoded; the rest of the map keeps the house
++                      * unsupported-opcode halt. */
++            uint8_t op3 = fetch8(&d);
++            if (c->fault || c->exception_taken) goto done;   /* K4 fetch abort */
++            if (op3 != 0x82) { faultf(c, "#UD unsupported 0F 38 opcode 0x%02x at rip=%08llx", op3, (unsigned long long)d.start_pc); break; }
++            /* CPU_FEATURES CF3: INVPCID r64/r32, m128. The P2 TLB is
++             * flush-always and RAM-store-generation-keyed, so no type
++             * can retain anything a narrower invalidation would --
++             * and the SDM text for every type explicitly permits
++             * invalidating more. The complete honest model here is
++             * therefore the legality surface + one conservative
++             * flush (the INVLPG one). 66 is opcode-defining and is
++             * sensed exactly as at the MOVDQA site (d.opsize==2; in
++             * a 16-bit-default mode 66 lands on 4) -- REX.W would
++             * clobber opsize to 8 and is rejected by the same test,
++             * matching the SSE family's treatment; real encoders
++             * never emit it (the operand width comes from the mode:
++             * 64-bit in 64-bit mode, 32 otherwise regardless of
++             * CS.D). LOCK, swallowed decoder-wide since forever,
++             * stays swallowed (the STAC precedent). */
++            if (!(d.opsize == 2 || (default_as == 16 && d.opsize == 4))) { c->rip = d.start_pc; raise_exception(m, 6, 0, 0); break; }
++            rm_t rm = MODRM(); FIXUP(rm);
++            if (!rm.is_mem) { c->rip = d.start_pc; raise_exception(m, 6, 0, 0); break; } /* m128 operand only */
++            if (cpl_now(c) != 0) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* CPL0 only */
++            uint64_t itype = get_reg(c, rm.reg_field, (default_as == 64) ? 8 : 4, d.has_rex);
++            if (itype > 3) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
++            uint64_t ea = (rm.seg >= 0 ? c->seg[rm.seg].base : 0) + rm_ea(&d, &rm);
++            uint64_t dlo = read_mem_v(m, ea, 8);        /* a faulting descriptor read is the architected #PF */
++            uint64_t dhi = read_mem_v(m, ea + 8, 8);
++            if (dlo & ~0xFFFull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* DESC[63:12] reserved */
++            if (!((c->cr4 >> 17) & 1) && itype < 2 && (dlo & 0xFFF)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* PCIDE=0: types 0/1 name PCID 000H only */
++            if (itype == 0 && (c->efer & (1ULL << 10)) &&
++                (uint64_t)((int64_t)(dhi << 16) >> 16) != dhi) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* type 0 address must be canonical (48-bit VA) */
++            perf_tlb_flush(m);
++            break; }
+         default:
+             faultf(c, "#UD unsupported 0F opcode 0x0F 0x%02x at rip=%08llx", op2, (unsigned long long)d.start_pc);
+             break;
+diff --git a/src/disasm.c b/src/disasm.c
+index 7602c26..287dc26 100644
+--- a/src/disasm.c
++++ b/src/disasm.c
+@@ -304,6 +304,7 @@ static const ent_t t0f38[256][4] = {
+     [0x3B] = X66("pminud","Vx,Wx"), [0x3C] = X66("pmaxsb","Vx,Wx"), [0x3D] = X66("pmaxsd","Vx,Wx"),
+     [0x3E] = X66("pmaxuw","Vx,Wx"), [0x3F] = X66("pmaxud","Vx,Wx"),
+     [0x40] = X66("pmulld","Vx,Wx"), [0x41] = X66("phminposuw","Vx,Wx"),
++    [0x82] = X66("invpcid","Gc,Mx!"),
+     [0xDB] = X66("aesimc","Vx,Wx"), [0xDC] = X66("aesenc","Vx,Wx"), [0xDD] = X66("aesenclast","Vx,Wx"),
+     [0xDE] = X66("aesdec","Vx,Wx"), [0xDF] = X66("aesdeclast","Vx,Wx"),
+     [0xF0] = Q4(I("movbe","Gv,Mv!"), N, N, I("crc32","Gy,Eb!")),
+diff --git a/src/platform.c b/src/platform.c
+index ec3096d..c9e643b 100644
+--- a/src/platform.c
++++ b/src/platform.c
+@@ -54,6 +54,9 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+         *a = p->cpuid1_eax;
+         *b = 0x00040800; /* brand index / CLFLUSH / APIC ID stub */
+         *c = (1u<<0)                 /* SSE3 */
++           | (1u<<17)                /* PCID (CPU_FEATURES CF3): the
++                                        * CR4.PCIDE/CR3[63] legality and the
++                                        * flush-always semantics exist now */
+            | (1u<<31);               /* hypervisor present -- we ARE one
+                                         * (KERNEL-BOOT K3: the guest's vmdrv
+                                         * probe prints the vendor string) */
+@@ -98,6 +101,7 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+     case 0x7: /* structured extended features */
+         if (subleaf == 0) { *a = 0; *b = (1u<<9)          /* ERMS: we do fast REP MOVSB/STOSB */
+                                        | (1u<<7)          /* SMEP (CPU_FEATURES CF1) */
++                                       | (1u<<10)         /* INVPCID (CF3: decoded, legality in cpu.c) */
+                                        | (1u<<20); }      /* SMAP (CF1) */
+         break;
+     case 0x80000002: case 0x80000003: case 0x80000004: { /* brand string, 48B */
+diff --git a/tests/test_cpu.c b/tests/test_cpu.c
+index 53762db..79494f4 100644
+--- a/tests/test_cpu.c
++++ b/tests/test_cpu.c
+@@ -847,6 +847,7 @@ static void test_cpuid_leaves(void) {
+         0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,       /* mov eax,1 */
+         0x0F, 0xA2,
+         0x66, 0x89, 0x16, 0x24, 0x20,             /* mov [0x2024],edx */
++        0x66, 0x89, 0x0E, 0x2C, 0x20,             /* mov [0x202C],ecx */
+         0x66, 0xB8, 0x01, 0x00, 0x00, 0x80,       /* mov eax,0x80000001 */
+         0x0F, 0xA2,
+         0x66, 0x89, 0x16, 0x28, 0x20,             /* mov [0x2028],edx */
+@@ -861,7 +862,7 @@ static void test_cpuid_leaves(void) {
+     assert((mem_read(&m, 0x200C, 4) & 0xFFF) == 63);      /* 64B line - 1 */
+     assert(mem_read(&m, 0x2010, 4) == 0);                 /* enum terminates */
+     assert(mem_read(&m, 0x2014, 4) == 0);                 /* leaf 7: max subleaf */
+-    assert(mem_read(&m, 0x2018, 4) == ((1u << 9) | (1u << 7) | (1u << 20))); /* ERMS + SMEP + SMAP (CF1) */
++    assert(mem_read(&m, 0x2018, 4) == ((1u << 9) | (1u << 7) | (1u << 10) | (1u << 20))); /* ERMS + SMEP + INVPCID (CF3) + SMAP (CF1) */
+     assert(mem_read(&m, 0x201C, 4) == 0x61727541u);       /* brand "Aura" */
+     assert(mem_read(&m, 0x2020, 4) == 0x00003028u);       /* 48-bit VA, 40-bit PA */
+     /* CF2: leaf-1 EDX = FPU|TSC|MSR|CX8|APIC|CMOV|PAT|CLFLUSH|MMX|
+@@ -871,6 +872,10 @@ static void test_cpuid_leaves(void) {
+     /* CF2: 80000001 EDX = LM|1GBPAGES|NX|SYSCALL -- all three
+      * additions long-implemented, previously read as absent */
+     assert(mem_read(&m, 0x2028, 4) == 0x24100800u);
++    /* CF3: leaf-1 ECX = SSE3|PCID|HYPERVISOR (the PCID bit arrived
++     * only with the CR4.PCIDE/CR3[63]/INVPCID legality surface;
++     * the semantics vectors live in tests/test_tlb.c::pcid) */
++    assert(mem_read(&m, 0x202C, 4) == 0x80020001u);
+ 
+     /* brand string is exactly 48 bytes of text padded with spaces */
+     const platform_t *p = platform_by_name("haswell");
+diff --git a/tests/test_disasm.c b/tests/test_disasm.c
+index 773d40c..a40acdc 100644
+--- a/tests/test_disasm.c
++++ b/tests/test_disasm.c
+@@ -123,6 +123,7 @@ static const vec_t oracle[] = {
+     { 64, "0f1f440000", 0x0ULL, 5, "nop dword [rax+rax+0x0]" },
+     { 64, "660f1f840000000000", 0x0ULL, 9, "nop word [rax+rax+0x0]" },
+     { 64, "0f280500100000", 0x1000ULL, 7, "movaps xmm0,oword [rel 0x2007]" },
++    { 64, "660f388203", 0x0ULL, 5, "invpcid rax,oword [rbx]" }, /* CPU_FEATURES CF3 */
+     { 64, "660fefc0", 0x0ULL, 4, "pxor xmm0,xmm0" },
+     { 64, "f30f6f01", 0x0ULL, 4, "movdqu xmm0,oword [rcx]" },
+     { 64, "660fd60424", 0x0ULL, 5, "movq [rsp],xmm0" },
+diff --git a/tests/test_tlb.c b/tests/test_tlb.c
+index 2df74b5..541407c 100644
+--- a/tests/test_tlb.c
++++ b/tests/test_tlb.c
+@@ -490,6 +490,187 @@ static void smep_smap(void) {
+     puts("ok cf1 AC cleared on delivery, preserved in the frame");
+ }
+ 
++/* CPU_FEATURES CF3: the PCID + INVPCID contract. The TLB is
++ * flush-always by design (P2), so tagging is semantically inert
++ * here; what these vectors pin is everything a guest can
++ * *observe*: CR4.PCIDE legality edges, CR3[63] as hint-not-state,
++ * the PCID field store/echo, correct translations across the
++ * guest's CR3-reload-with-tags switch (AuraLite-OS's deferred PCID
++ * runtime, whose "no invpcid" fallback is exactly that reload),
++ * and INVPCID's full decode + #GP surface. Case 1 leads with a
++ * legality reject so the NC isolation starts at the first assert. */
++#define PCIDE (1ull << 17)
++#define PV2 0x3333333333333333ull
++/* smfix's T1 root (VA -> phys 0x500000, UDATA == UVAL) plus a
++ * second root T2 at 0x14000 mapping the same VA to 0x600000. */
++static void pcfix2(const uint8_t *code, size_t n) {
++    smfix(code, n);
++    w64(0x14000, 0x15000 | P | W | US);   /* T2 PML4[0] */
++    w64(0x15000, 0x16000 | P | W | US);   /* T2 PDPT[0] */
++    w64(0x16000, P | W | PS);             /* T2 PD[0]: identity 2MiB */
++    w64(0x16010, 0x17000 | P | W | US);   /* T2 PD[2] -> PT */
++    w64(0x17000, 0x600000 | P | W | US);  /* T2 PT[0] -> VA, alt page */
++    w64(0x600800, PV2);                   /* UDATA under T2 */
++}
++/* one INVPCID (rax=type, desc at [0x3000]) in a fresh smfix;
++ * returns the delivered vector, or -1 when it executed clean. */
++static int inv_run(uint64_t type, uint64_t dlo, uint64_t dhi, int pcide) {
++    static const uint8_t prog[] = { 0x66, 0x0F, 0x38, 0x82, 0x03,   /* INVPCID RAX,[RBX] */
++                                     0x48, 0x8B, 0x01 };             /* MOV RAX,[RCX] */
++    smfix(prog, sizeof prog);
++    cpu_t *c = &g_m.cpu;
++    if (pcide) c->cr4 |= PCIDE;
++    w64(0x3000, dlo); w64(0x3008, dhi);
++    c->gpr[RAX] = type; c->gpr[RBX] = 0x3000; c->gpr[RCX] = UDATA;
++    c->rip = 0x1000; (void)cpu_step(c);
++    return c->exception_taken ? (int)((c->rip - 0x9000) / 8) : -1;
++}
++static void pcid(void) {
++    static const uint8_t setpcide[] = {
++        0x48, 0xB8, 0x20, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, /* MOV RAX,PAE|PCIDE */
++        0x0F, 0x22, 0xE0 };                                         /* MOV CR4,RAX @10 */
++    static const uint8_t cr3b63[] = {
++        0x48, 0xB8, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80, /* MOV RAX,B63|T1|7 */
++        0x0F, 0x22, 0xD8,                                           /* MOV CR3,RAX @10 */
++        0x0F, 0x20, 0xD8 };                                         /* MOV RAX,CR3 @13 */
++    cpu_t *c;
++
++    /* 1: the 0->1 PCIDE edge with CR3[11:0]!=0 -> delivered #GP(0),
++     * CR4 untouched. */
++    smfix(setpcide, sizeof setpcide); c = &g_m.cpu;
++    c->cr3 |= 5;                          /* stale low bits (ignored while PCIDE=0) */
++    smstep(0x1000);
++    c->rip = 0x100A; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 13 * 8);
++    assert(r64(c->gpr[RSP]) == 0);
++    assert(!(c->cr4 & PCIDE));
++    puts("ok cf3 PCIDE 0->1 with CR3[11:0]!=0 delivers #GP(0)");
++
++    /* 2: writing PCIDE=1 outside IA-32e -> #GP(0), here in real
++     * mode through the IVT (the !LMA branch covers legacy too). */
++    setup_machine(&g_m); c = &g_m.cpu;
++    g_m.ram[0x8000] = 0xF4;
++    mem_write(&g_m, 13 * 4, 2, 0x8000); mem_write(&g_m, 13 * 4 + 2, 2, 0x0000);
++    static const uint8_t rm_prog[] = { 0x66, 0xB8, 0x20, 0x00, 0x02, 0x00, /* MOV EAX,PAE|PCIDE */
++                                       0x0F, 0x22, 0xE0 };                 /* MOV CR4,EAX @6 */
++    memcpy(g_m.ram + 0x1000, rm_prog, sizeof rm_prog);
++    c->gpr[RSP] = 0x7000;
++    c->rip = 0x1000; assert(cpu_step(c) == 0 && !c->fault && !c->exception_taken);
++    c->rip = 0x1006; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x8000 && c->seg[SEG_CS].sel == 0);
++    assert(!(c->cr4 & PCIDE));
++    puts("ok cf3 PCIDE=1 outside IA-32e delivers #GP (real mode/IVT)");
++
++    /* 3: the legal edge: CR3[11:0]==0 -> PCIDE sticks; writing it
++     * again while already 1 is not an edge (low CR3 bits may now be
++     * a live PCID) and must not fault. */
++    smfix(setpcide, sizeof setpcide); c = &g_m.cpu;
++    smstep(0x1000); smstep(0x100A);
++    assert(c->cr4 & PCIDE);
++    c->cr3 |= 9;
++    smstep(0x1000); smstep(0x100A);
++    assert(c->cr4 & PCIDE);
++    puts("ok cf3 PCIDE legal edge sticks; re-write while 1 is no edge");
++
++    /* 4: MOV CR3 bit 63 with PCIDE=0 -> #GP(0), CR3 unchanged. */
++    smfix(cr3b63, sizeof cr3b63); c = &g_m.cpu;
++    smstep(0x1000);
++    c->rip = 0x100A; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 13 * 8);
++    assert(r64(c->gpr[RSP]) == 0 && c->cr3 == 0x10000);
++    puts("ok cf3 CR3 bit63 with PCIDE=0 delivers #GP(0)");
++
++    /* 5: with PCIDE=1 bit 63 is the no-invalidate hint: accepted,
++     * never stored; PCID [11:0] stores and MOV-from-CR3 echoes it. */
++    smfix(cr3b63, sizeof cr3b63); c = &g_m.cpu;
++    c->cr4 |= PCIDE;
++    smstep(0x1000); smstep(0x100A); smstep(0x100D);
++    assert(c->gpr[RAX] == 0x10007 && c->cr3 == 0x10007);
++    puts("ok cf3 CR3 bit63 hint unstored; PCID stored + echoed");
++
++    /* 6: the guest's way -- address-space switches as CR3 reloads
++     * with PCID tags and the bit-63 no-flush hint. Every read must
++     * see the CURRENT root's mapping (flush-always + cr3-keyed TLB
++     * make stale survival impossible, hint or not). */
++    static const uint8_t swprog[] = {
++        0x48, 0xB8, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80, /*  0: B63|T1|1 */
++        0x0F, 0x22, 0xD8,                                           /* 10: MOV CR3,RAX */
++        0x48, 0x8B, 0x03,                                           /* 13: MOV RAX,[RBX] */
++        0x48, 0xB8, 0x02, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80, /* 16: B63|T2|2 */
++        0x0F, 0x22, 0xD8,                                           /* 26 */
++        0x48, 0x8B, 0x03,                                           /* 29 */
++        0x48, 0xB8, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80, /* 32: back to T1|1 */
++        0x0F, 0x22, 0xD8,                                           /* 42 */
++        0x48, 0x8B, 0x03 };                                         /* 45 */
++    pcfix2(swprog, sizeof swprog); c = &g_m.cpu;
++    c->cr4 |= PCIDE; c->gpr[RBX] = UDATA;
++    smstep(0x1000); smstep(0x100A); smstep(0x100D);
++    assert(c->gpr[RAX] == UVAL);
++    smstep(0x1010); smstep(0x101A); smstep(0x101D);
++    assert(c->gpr[RAX] == PV2);
++    smstep(0x1020); smstep(0x102A); smstep(0x102D);
++    assert(c->gpr[RAX] == UVAL);
++    puts("ok cf3 two-PCID CR3-reload switch reads the current root only");
++
++    /* 7: all four INVPCID types execute at CPL0/PCIDE=1 and leave
++     * translation correct. */
++    for (uint64_t t = 0; t < 4; t++) {
++        assert(inv_run(t, 2, VA, 1) == -1);
++        smstep(0x1005);
++        assert(g_m.cpu.gpr[RAX] == UVAL);
++    }
++    puts("ok cf3 INVPCID types 0..3 execute; translations survive");
++
++    /* 8: type > 3 -> #GP(0). */
++    assert(inv_run(4, 0, 0, 1) == 13);
++    assert(r64(g_m.cpu.gpr[RSP]) == 0);
++    puts("ok cf3 INVPCID type 4 delivers #GP(0)");
++
++    /* 9: descriptor reserved band [63:12] -> #GP(0). */
++    assert(inv_run(0, 1ull << 12, VA, 1) == 13);
++    assert(r64(g_m.cpu.gpr[RSP]) == 0);
++    puts("ok cf3 INVPCID descriptor [63:12] set delivers #GP(0)");
++
++    /* 10: type-0 address must be canonical (48-bit VA). */
++    assert(inv_run(0, 0, 0x0000800000000000ull, 1) == 13);
++    assert(inv_run(0, 0, 0xFFFF800000000000ull, 1) == -1);
++    puts("ok cf3 INVPCID type-0: non-canonical #GP(0), high-canonical ok");
++
++    /* 11: PCIDE=0 does not #UD the instruction -- it narrows it:
++     * types 0/1 must name PCID 000H, types 2/3 run (SDM text). */
++    assert(inv_run(1, 1, 0, 0) == 13);
++    assert(inv_run(0, 0, VA, 0) == -1);
++    assert(inv_run(2, 0, 0, 0) == -1);
++    assert(inv_run(3, 0, 0, 0) == -1);
++    puts("ok cf3 INVPCID with PCIDE=0: narrowed, not #UD");
++
++    /* 12: encoding law: 66 is opcode-defining, m128 is memory-only. */
++    static const uint8_t no66[] = { 0x0F, 0x38, 0x82, 0x03 };
++    smfix(no66, sizeof no66); c = &g_m.cpu;
++    c->cr4 |= PCIDE;
++    c->rip = 0x1000; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 6 * 8);
++    static const uint8_t regform[] = { 0x66, 0x0F, 0x38, 0x82, 0xC3 }; /* mod=3 */
++    smfix(regform, sizeof regform); c = &g_m.cpu;
++    c->cr4 |= PCIDE;
++    c->rip = 0x1000; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 6 * 8);
++    puts("ok cf3 INVPCID without 66 / with mod=3 delivers #UD");
++
++    /* 13: CPL3 -> #GP(0) (privilege is checked before the descriptor
++     * is ever touched). */
++    static const uint8_t invb[] = { 0x66, 0x0F, 0x38, 0x82, 0x03 };
++    smfix(invb, sizeof invb); c = &g_m.cpu;
++    memcpy(g_m.ram + 0x500030, invb, sizeof invb);   /* user copy at VA+0x30 */
++    c->cr4 |= PCIDE;
++    c->seg[SEG_CS].sel = 0x1B; c->seg[SEG_SS].sel = 0x23;
++    c->gpr[RSP] = 0x501F00; c->gpr[RAX] = 2; c->gpr[RBX] = UDATA;
++    c->rip = VA + 0x30; (void)cpu_step(c);
++    assert(c->exception_taken && c->rip == 0x9000 + 13 * 8);
++    assert(r64(c->gpr[RSP]) == 0);
++    puts("ok cf3 INVPCID at CPL3 delivers #GP(0)");
++}
++
+ int main(void) {
+     pte_rewrite();
+     cr3_and_invlpg();
+@@ -500,6 +681,7 @@ int main(void) {
+     mmio_table_uncacheable();
+     smp_and_mode_key();
+     smep_smap();
++    pcid();
+     puts("test-tlb: all vectors passed");
+     return 0;
+ }
+-- 
+2.47.3
+

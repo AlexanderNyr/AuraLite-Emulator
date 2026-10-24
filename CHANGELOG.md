@@ -7,6 +7,210 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Fixed — patch 0104 (CPU-features CF5: the U5 A20 record, reproduced and closed)
+
+- **An INIT# with the A20 gate shut now fetches the reset vector
+  from flash, as the board's own aliases promise.** UPKEEP U5
+  left this as a recorded-not-fixed finding ("`#UD group5 ext=7`
+  in debug"); CF5 reproduces it in harness exactly: the bus
+  forces address bit 20 low, the reset fetch at `0xFFFFFFF0`
+  becomes `0xFFEFFFF0`, and the top-of-4G firmware decode used
+  to cover only the top 128 KiB — missing by one megabyte, so
+  the CPU ate open-bus `0xFF`. The H5 bus-global wrap itself is
+  pinned behaviour (every odd megabyte aliases down, like the
+  wired-AND it models) and stays; the fix is on the decode side:
+  the firmware range now spans the top 2 MiB with the 128 KiB
+  image tiled, the standard ICH-style boot-block decode, so the
+  window's A20 image lands in flash. One macro
+  (`ROM_TOPOF4G_BASE`), no snapshot change. New vector
+  `tests/test_chipset.c::test_a20_init_reset_fetch` (close the
+  gate by the guest's own port, INIT#, run the ROM stub); NC on
+  the 0103 tree aborts on its fetch assertion after the H5-era
+  vectors pass. With this, **CPU_FEATURES_PLAN is CLOSED
+  (CF0–CF5)**: every advertised CPUID bit is backed by the
+  behaviour it names, and every measured behaviour the contract
+  covers is advertised — the ranked device backlog (modern
+  virtio first) is the next plan's material.
+
+### Fixed — patch 0103 (CPU-features CF4: validation switched on by measurement)
+
+- **Every mask was censused to zero before it was allowed to
+  fault.** A scratch instrumented build logged would-be
+  violations across the five firmware profiles, both SeaBIOS ISO
+  lanes and the whole `make test` suite: no lane writes a
+  reserved CR4 bit (mask now enforced: structural bits 0–10 plus
+  exactly the advertised PCIDE/SMEP/SMAP — QEMU's rule with our
+  advertisement), a CR0 high bit or invalid combo (PG without
+  PE, NW without CD, PG-clear inside IA-32e — all `#GP(0)` now),
+  a CR3 bit above the 40-bit physical address, or an EFER bit
+  outside {SCE, LME, LMA, NXE} (strict since this patch, with
+  read-only LMA preserved across writes so an EFER RMW can
+  neither fault nor desync the mode). **And the census found a
+  hole the ledger didn't know about: MOV CRn, RDMSR and WRMSR
+  had no privilege check at all** — ring-3 code could rewrite
+  CR4 or any MSR. All four now deliver the architected `#GP(0)`
+  at CPL≠0 (census-clean: nothing legit runs them from ring 3).
+- **The unknown-MSR strict whitelist is an evidenced NO-GO** and
+  stays permissive by design, not by inertia: the firmware's
+  reset-stage CAR path reads `IA32_MTRR_DEF_TYPE` unconditionally
+  before an IDT exists and programs the variable MTRRs through
+  the sparse table, so silicon's `#GP` there would triple-fault
+  the primary workload on purpose-less principle. What changed:
+  the 65th distinct MSR write used to vanish silently — the
+  table keeps its 64 slots (census counted zero drops in every
+  lane, so no snapshot-layout risk was taken), but a lost write
+  is now logged by name.
+- **POPCNT and RDTSCP graduated from "absent" to
+  implemented-and-advertised** (D6 closed): leaf-1 ECX.23 and
+  80000001h EDX.27 respectively. Before this patch POPCNT was a
+  host-halt `#UD` and — worse — `0F 01 F9` silently executed as
+  an unrelated INVLPG flush. RDTSCP is RDTSC's exact twin (same
+  deterministic vtime) plus `IA32_TSC_AUX` in ECX; POPCNT has the
+  defined-flag semantics. 11 vectors in
+  `tests/test_tlb.c::cf4_validate` (every `#GP` family, the
+  two-sided CR4 mask, LMA-preservation, both CPL gates, 64-bit
+  POPCNT) plus `tests/test_cpu.c::test_cf4_units` (flag-exact
+  POPCNT, RDTSCP+TSC_AUX, the permissive-MSR pins and the logged
+  65th-slot drop). NC on the 0102 tree: 33 prior walk vectors
+  pass, CF4 aborts on its first legality assertion; the unit
+  suite aborts on the RDTSCP CPUID pin. `make test` (both
+  SeaBIOS lanes) + `make test-sanitize` green; a side
+  observation — compat-mode exceptions frame 32-bit on this core
+  where silicon frames 64-bit — is recorded in the plan, not
+  fixed in this phase.
+
+### Added — patch 0102 (CPU-features CF3: PCID + INVPCID)
+
+- **PCID at last, with its legality surface** (`src/cpu.c`,
+  `src/platform.c`). CPUID leaf 1 ECX.PCID and leaf 7.0
+  EBX.INVPCID are set only now that the contract exists:
+  CR4.PCIDE=1 is accepted only in IA-32e mode, and the 0→1 edge
+  additionally requires CR3[11:0]=0 (violations deliver #GP(0));
+  MOV CR3 bit 63 is the no-invalidate *hint* under PCIDE=1
+  (weighed, never stored — MOV-from-CR3 reads back the PCID field
+  and 0 above it) and reserved-band #GP(0) under PCIDE=0;
+  `INVPCID` (66 0F 38 82) is decoded with its four types and full
+  architected fault surface (type>3, descriptor [63:12], PCIDE=0
+  narrowing, type-0 canonical address, CPL0, 66-required,
+  memory-only operand). On this flush-always TLB every
+  invalidation is the conservative full flush, which the SDM
+  explicitly permits — PCID tagging is semantically inert here,
+  only its *observability* is new. Measured on the reference:
+  QEMU/TCG cannot do any of this at all (`+pcid` is refused;
+  INVPCID is listed missing in its decoder), which is why
+  AuraLite-OS has its PCID runtime deferred. That guest's
+  CR4.PCIDE enable, CR3-reload-with-tags allocator and INVPCID
+  shootdown path can now execute end-to-end on an emulation lane
+  for the first time. The disassembler learned the mnemonic too.
+- 13 new vectors in `tests/test_tlb.c::pcid` (both #GP edges of
+  PCIDE, a real-mode/IVT legality drive, bit-63 hint-vs-reserved,
+  a two-root/two-PCID switch driven the guest's way, INVPCID
+  types 0–3 plus five fault cases) with the CPUID words pinned in
+  `tests/test_cpu.c` (the leaf-7 EBX pin deliberately gains
+  INVPCID; leaf-1 ECX is a new pin). Two-form NC on the 0101 tree:
+  (a) tests only — 20 prior vectors pass, CF3 aborts on its first
+  legality assertion; (b) tests + the CPUID bits alone — the
+  semantics vectors abort identically, so advertising without the
+  legality can never go green. Gates: `make test` (both live
+  SeaBIOS ISO lanes; firmware CR-traffic receipts unchanged) +
+  `make test-sanitize` green, no snapshot format change (PCID
+  rides the existing CR3 field).
+
+### Fixed — patch 0101 (CPU-features CF2: the advertised-truth bundle)
+
+- **CPUID now advertises what the core already did** (`src/platform.c`):
+  leaf 1 EDX gains PAT (bit 16) and CLFLUSH (bit 19 — EBX had been
+  reporting its 64-byte line size all along); leaf 80000001h EDX
+  gains SYSCALL (bit 11, implemented since K4), NX (bit 20, the walk
+  enforces under EFER.NXE) and 1 GiB pages (bit 26, PDPTE.PS walked).
+  A guest OS probing for hardware NX, a fast syscall entry or huge
+  pages now finds them instead of quietly falling back to weaker
+  paths.
+- **IA32_PAT leaves reset at the SDM default** `0x0007040600070406`
+  (`src/cpu.c`, seeded in `cpu_reset` next to APICBASE; the INIT#
+  lane already preserves the whole sparse table across INIT exactly
+  as silicon does). Before, a pre-write `RDMSR 0x277` read zeros —
+  all-UC — while real hardware says WB/WT/UC-/UC. No cache model
+  makes the types performance attributes here, so storage + the
+  reset value is the complete functional model (the ERMS
+  precedent). AuraLite-OS's own paging setup now meets both halves
+  of its PAT gate: the CPUID bit and the values its
+  read-modify-write expects.
+- Vectors: `tests/test_cpu.c` pins the two EDX words and runs the
+  guest's exact RDMSR → RMW (PA4 := WC) → WRMSR → readback sequence
+  plus INIT-preserves / RESET-re-seeds; `tests/test_snapshot.c`
+  pins the seeded default and a guest-reprogrammed PAT across
+  save → load → save with the byte-exact fixed point (no snapshot
+  format change). NC on the 0100 tree (+ header constants only):
+  test-unit aborts on the leaf-1 EDX assertion; test-snap fails
+  exactly the two default-value checks while the U4 cases stay
+  green. Gates: `make test` + `make test-sanitize` (both live
+  SeaBIOS ISO lanes) green; SeaBIOS's MSR census is unchanged (the
+  MTRR path stays closed — EDX.12 is still 0).
+
+### Fixed — patch 0100 (CPU-features CF1: SMEP/SMAP made true)
+
+- **The page walk's SMEP/SMAP guards were inverted** (`src/cpu.c`)
+  and are now SDM-true: they lived inside the supervisor-page
+  branch of `translate()`, so with CR4.SMEP/SMAP set a kernel
+  faulted on its *own* pages while user pages stayed open. Nothing
+  had ever noticed — CPUID advertised neither feature, so no
+  consumer ever set the CR4 bits, and no test ever vectored them.
+  The guards now gate supervisor (incl. K4 `desc_sv` implicit)
+  fetches/data accesses to U/S=1 pages with the architected error
+  codes (SMEP `P|I/D`, SMAP `P`/`P|W`); gate delivery clears
+  EFLAGS.AC (the pushed frame keeps it for IRET), and CPUID leaf 7
+  advertises EBX.SMEP|EBX.SMAP next to ERMS (`src/platform.c`).
+  AuraLite-OS lights its `SMEP enabled`/`SMAP enabled` receipts and
+  STAC/CLAC copy paths up on this machine for the first time.
+- **STAC/CLAC no longer corrupt guest memory and are
+  privilege-gated.** Both ended without a `break` and fell through
+  into `decode_modrm` + the SIDT store at linear address 0 — every
+  STAC/CLAC would have overwritten the guest's first bytes with the
+  IDT pseudo-descriptor, latent for the same reason (guests gate
+  STAC on the CPUID bit). The case now ends; CPL>0 raises the
+  delivered architected #UD.
+- New vectors: 9 in `tests/test_tlb.c::smep_smap` (inversion cases
+  in house form, STAC→CLAC across a warm TLB, linear-0 canary,
+  CPL3 #UD, AC across delivery) + the leaf-7 word pinned in
+  `tests/test_cpu.c`. NC = the suites on the 0099 tree: 11 P2
+  vectors pass, the first CF1 case aborts (the inverted walk's
+  bogus #PF on a supervisor fetch); test-unit aborts on the
+  leaf-7 assertion. Gates: `make test` + `make test-sanitize`
+  (both live SeaBIOS ISO lanes), test-unit/test-tlb/test-ring3 —
+  green, with no firmware receipt delta.
+
+### Added — patch 0099 (CPU-features CF0: measured baseline, docs only)
+
+- **Post-UPKEEP audit and the CPU_FEATURES_PLAN** (`docs/plans/
+  CPU_FEATURES_PLAN.md`). With all prior plans closed and upstream
+  `main` (`957c12c`) tree-identical to this branch, the next block
+  was re-measured from the tree, the tests and the consumers. The
+  advertised-vs-implemented CPU matrix found: CR4.SMEP/SMAP walk
+  guards exist since the original upstream code but are **inverted**
+  (harness repro in the plan §1.3: a CPL-0 fetch of a supervisor
+  page faults with SMEP on, a user page does not) — invisible until
+  now because CPUID advertises neither, so no consumer ever turned
+  them on; NX, SYSCALL, 1 GiB pages and CLFLUSH all work but read 0
+  in CPUID; IA32_PAT is sparse storage with a 0 reset value where
+  the SDM (and the guest's boot receipt) expect
+  `0x0007040600070406`; PCID/INVPCID are absent while the
+  north-star guest (AuraLite-OS `74c2b9b`, HW_PLAN H4) has a full
+  PCID runtime that QEMU/TCG structurally cannot execute. An MSR
+  census over the firmware and both SeaBIOS lanes bounds the
+  validation question (the firmware's MTRR writes ride the
+  permissive sparse store; SeaBIOS's MTRR path is gated off by our
+  own CPUID word). The plan splits the work CF1–CF5
+  (advertise-nothing-until-pinned) and records a ranked device
+  backlog (modern virtio first) in its §5.
+- Doc-sync in the same commit: `docs/STATUS.md` "Current limits"
+  no longer contradicts PM P0–P3 (PM1/SCI/S5 exist) or UPKEEP U3
+  (x87 is in the gdbstub packets); `ROADMAP.md` gains the missing
+  PM/UPKEEP ledger rows, the CF row and gap row 5, and refreshed
+  upstream/inventory facts. No code changed; `make test-unit
+  test-tlb test-ring3` re-run green, full gates green at U7 on
+  this same tree.
+
 ### Fixed — patch 0098 (Upkeep U7: GUI/monitor authentication — **UPKEEP_PLAN COMPLETE**)
 
 - **The web launcher, its WebSocket proxy and the direct monitor are

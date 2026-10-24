@@ -1,0 +1,395 @@
+From b613cf3f19f50af76ea80a9265a877edd2992dd8 Mon Sep 17 00:00:00 2001
+From: AuraLite <auralite@example.invalid>
+Date: Fri, 23 Oct 2026 12:33:26 +0000
+Subject: [PATCH] CPUF-CF2: advertise the already-true
+ (NX/SYSCALL/1GiB/CLFLUSH/PAT), seed IA32_PAT
+
+---
+ CHANGELOG.md                    | 32 +++++++++++++++++++++
+ ROADMAP.md                      | 22 +++++++-------
+ docs/STATUS.md                  | 17 +++++------
+ docs/plans/CPU_FEATURES_PLAN.md | 26 +++++++++++++++--
+ src/cpu.c                       |  5 ++++
+ src/cpu.h                       |  8 ++++++
+ src/platform.c                  | 14 +++++++--
+ tests/test_cpu.c                | 51 +++++++++++++++++++++++++++++++++
+ tests/test_snapshot.c           | 46 +++++++++++++++++++++++++++++
+ 9 files changed, 198 insertions(+), 23 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1362e85..83cef6e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,38 @@ patch has its own immediate parent; entries name measured defects and gates.
+ 
+ ## [Unreleased]
+ 
++### Fixed — patch 0101 (CPU-features CF2: the advertised-truth bundle)
++
++- **CPUID now advertises what the core already did** (`src/platform.c`):
++  leaf 1 EDX gains PAT (bit 16) and CLFLUSH (bit 19 — EBX had been
++  reporting its 64-byte line size all along); leaf 80000001h EDX
++  gains SYSCALL (bit 11, implemented since K4), NX (bit 20, the walk
++  enforces under EFER.NXE) and 1 GiB pages (bit 26, PDPTE.PS walked).
++  A guest OS probing for hardware NX, a fast syscall entry or huge
++  pages now finds them instead of quietly falling back to weaker
++  paths.
++- **IA32_PAT leaves reset at the SDM default** `0x0007040600070406`
++  (`src/cpu.c`, seeded in `cpu_reset` next to APICBASE; the INIT#
++  lane already preserves the whole sparse table across INIT exactly
++  as silicon does). Before, a pre-write `RDMSR 0x277` read zeros —
++  all-UC — while real hardware says WB/WT/UC-/UC. No cache model
++  makes the types performance attributes here, so storage + the
++  reset value is the complete functional model (the ERMS
++  precedent). AuraLite-OS's own paging setup now meets both halves
++  of its PAT gate: the CPUID bit and the values its
++  read-modify-write expects.
++- Vectors: `tests/test_cpu.c` pins the two EDX words and runs the
++  guest's exact RDMSR → RMW (PA4 := WC) → WRMSR → readback sequence
++  plus INIT-preserves / RESET-re-seeds; `tests/test_snapshot.c`
++  pins the seeded default and a guest-reprogrammed PAT across
++  save → load → save with the byte-exact fixed point (no snapshot
++  format change). NC on the 0100 tree (+ header constants only):
++  test-unit aborts on the leaf-1 EDX assertion; test-snap fails
++  exactly the two default-value checks while the U4 cases stay
++  green. Gates: `make test` + `make test-sanitize` (both live
++  SeaBIOS ISO lanes) green; SeaBIOS's MSR census is unchanged (the
++  MTRR path stays closed — EDX.12 is still 0).
++
+ ### Fixed — patch 0100 (CPU-features CF1: SMEP/SMAP made true)
+ 
+ - **The page walk's SMEP/SMAP guards were inverted** (`src/cpu.c`)
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 9ad9336..2ceadef 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -40,7 +40,7 @@ maps to exactly one plan below.
+ | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+ | [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+ | [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+-| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF1 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
++| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | 🚧 **CF0–CF2 done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
+ 
+ Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
+ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
+@@ -153,18 +153,20 @@ harness reproduction.
+    making this the first emulator lane where the guest's
+    deferred PCID runtime can execute — CF4 decides CR/MSR
+    validation by census experiment, CF5 closes with the
+-   U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) shipped**:
+-   the advertised-vs-implemented matrix, MSR census and
+-   defect ledger D1–D6, then the SMEP/SMAP guards made
+-   true (with a second latent find in the same site: STAC/
+-   CLAC fell through into a stray SIDT store at linear 0)
+-   and advertised; the ranked device backlog (virtio
+-   first) waits in the plan §5.
++   U5 A20 record. **CF0 (`0099`) + CF1 (`0100`) + CF2
++   (`0101`) shipped**: the advertised-vs-implemented
++   matrix, MSR census and defect ledger D1–D6, then the
++   SMEP/SMAP guards made true (with a second latent find
++   in the same site: STAC/CLAC fell through into a stray
++   SIDT store at linear 0) and advertised, then the
++   already-true published (NX, SYSCALL, 1 GiB pages,
++   CLFLUSH, PAT with its SDM reset value); the ranked
++   device backlog (virtio first) waits in the plan §5.
+ 
+ ## Immediate queue (recent shipped patches)
+ 
+-Every plan in the ledger above except CPU_FEATURES (CF0 shipped,
+-CF1–CF5 queued) is **CLOSED**. Recent patches:
++Every plan in the ledger above except CPU_FEATURES (CF0–CF2
++shipped, CF3–CF5 queued) is **CLOSED**. Recent patches:
+ 
+ - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
+   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 0472b97..fd93011 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -1316,11 +1316,12 @@ DD/DE/DF unmapped forms), pinned by the frozen table suite.  Since
+ UPKEEP U3 the gdbstub `g`/`G`/`p`/`P` packets carry the real x87
+ register and control state.
+ The CPU feature contract is the current in-flight work
+-(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF1 shipped): CPUID still
+-understates the machine in the measured set (NX, SYSCALL, 1 GiB
+-pages work but are not advertised; IA32_PAT is sparse storage with
+-a zero reset value; PCID is absent), but the CR4.SMEP/SMAP walk
+-guards are now SDM-true and advertised (CF1 — the guards had been
+-inverted since the original upstream code, and STAC/CLAC fell
+-through into a stray SIDT store at linear 0; both were invisible
+-while the features were unadvertised).
++(`docs/plans/CPU_FEATURES_PLAN.md`, CF0–CF2 shipped): the
++CR4.SMEP/SMAP walk guards are now SDM-true and advertised (CF1 —
++the guards had been inverted since the original upstream code, and
++STAC/CLAC fell through into a stray SIDT store at linear 0; both
++were invisible while the features were unadvertised), and CPUID no
++longer understates the already-implemented set (CF2 — NX, SYSCALL,
++1 GiB pages, CLFLUSH, and PAT with IA32_PAT leaving reset at the
++SDM default; INIT preserves it, RESET re-seeds it). PCID is the
++remaining measured absence (CF3).
+diff --git a/docs/plans/CPU_FEATURES_PLAN.md b/docs/plans/CPU_FEATURES_PLAN.md
+index 6f56dcc..02447d3 100644
+--- a/docs/plans/CPU_FEATURES_PLAN.md
++++ b/docs/plans/CPU_FEATURES_PLAN.md
+@@ -17,13 +17,13 @@
+ > pass (virtio, AC97, extra NICs, USB HID) are ranked in
+ > §5 for the next choice.
+ 
+-**Status: CF0–CF1 done ✅; CF2–CF5 queued**
++**Status: CF0–CF2 done ✅; CF3–CF5 queued**
+ 
+ | Phase | Scope | Status | Deliverable |
+ |---|---|---|---|
+ | CF0 | Measured baseline: advertised-vs-implemented matrix, MSR census, defect ledger, decisions, phase split | ✅ done | this file (`patches/0099`) |
+ | CF1 | CR4.SMEP/SMAP: fix the inverted walk guards, gate STAC/CLAC, vector, advertise | ✅ done | `tests/test_tlb.c` vectors (`patches/0100`) |
+-| CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ⬜ queued | CPUID/MSR vectors |
++| CF2 | Advertised-truth bundle: NX, SYSCALL, 1GiB pages, CLFLUSH bits; IA32_PAT reset default + CPUID.PAT | ✅ done | CPUID/MSR vectors (`patches/0101`) |
+ | CF3 | PCID + INVPCID: CPUID bits, CR4.PCIDE/CR3 legality, INVPCID decode onto the flush-always TLB | ⬜ queued | `tests/test_tlb.c` vectors |
+ | CF4 | Validation hardening, measure-gated: CR0/CR4/EFER reserved bits, unknown-MSR policy, MSR-table overflow honesty; POPCNT/RDTSCP inventory resolution | ⬜ queued | vectors or an evidenced NO-GO |
+ | CF5 | Close-out: the U5 A20-closed reset-fetch record reproduced or refuted; docs sync | ⬜ queued | close-out |
+@@ -366,6 +366,28 @@ guest's exact sequence (read, RMW PA4=WC, readback) plus
+ snapshot byte-stability of the seeded slot. NC: unseed /
+ unset → vector red. Family/model EAX untouched.
+ 
++**Shipped (`0101`).** As built: leaf-1 EDX = `0x07898331`
++(+PAT+CLFLUSH), 80000001h EDX = `0x24100800` (LM|1GiB|NX|
++SYSCALL), both pinned in `test_cpuid_leaves`. One measured
++correction to the plan above: the seed lives in `cpu_reset`
++(RESET semantics, deterministic slot 1 after APICBASE), not
++`cpu_init_reset` — the INIT lane already preserves the sparse
++table across INIT wholesale, which matches silicon (PAT is a
++RESET-reset MSR; INIT# leaves MSRs alone), so no INIT-side
++logic was needed and the vector pins INIT-preserves /
++RESET-re-seeds. `test_pat_msr` runs the guest's exact
++RDMSR→RMW→WRMSR→readback; `cf2_pat_cases` pins default and
++guest values across the snapshot fixed point — no format
++change (the seed enters the v1 cpu section as plain sparse
++state). NC on the 0100 tree (+ header constants so the tests
++compile, no logic): test-unit aborts on the leaf-1 EDX
++assertion; test-snap U4 cases stay green and exactly the two
++default-value checks fail — the guest-reprogrammed case passed
++on the parent too, because storage already worked; only the
++reset default was the defect. Gates: `make test` + sanitize
++green incl. both SeaBIOS ISO lanes; firmware/SeaBIOS MSR
++census unchanged (EDX.12 still 0, the MTRR path stays closed).
++
+ ### CF3 — PCID + INVPCID
+ 
+ CPUID.1:ECX.17 and 7.0:EBX.10 after the legality surface
+diff --git a/src/cpu.c b/src/cpu.c
+index 39c3708..5998dd7 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -941,6 +941,11 @@ void cpu_reset(cpu_t *c) {
+         /* a reset of the live pair re-bases the MMIO window too */
+         if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
+     }
++    /* CPU_FEATURES CF2: IA32_PAT leaves reset at the SDM default
++     * (cpu.h). Seeded here -- the RESET path -- only; cpu_init_reset
++     * below preserves the whole sparse table across INIT# exactly as
++     * silicon does, so an INIT keeps whatever PAT the guest set. */
++    cpu_set_msr(c, MSR_IA32_PAT, MSR_IA32_PAT_RESET);
+ }
+ 
+ /* UPKEEP U5: the INIT# processor state (Intel SDM Vol.3A Table 9-1,
+diff --git a/src/cpu.h b/src/cpu.h
+index 7c14359..9b5bae0 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -33,6 +33,14 @@ typedef struct {
+ 
+ #define MAX_MSR 64
+ 
++/* CPU_FEATURES CF2: IA32_PAT is sparse-table state with an
++ * architectural reset value (SDM Table 9-1): PA0..PA7 =
++ * WB WT UC- UC WB WT UC- UC. With no cache model the memory types
++ * are performance attributes, so storage + this reset value is the
++ * complete functional model (the ERMS precedent). */
++#define MSR_IA32_PAT        0x277u
++#define MSR_IA32_PAT_RESET  0x0007040600070406ULL
++
+ typedef struct {
+     uint32_t idx;
+     uint64_t val;
+diff --git a/src/platform.c b/src/platform.c
+index 7ebd9f2..ec3096d 100644
+--- a/src/platform.c
++++ b/src/platform.c
+@@ -57,8 +57,13 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+            | (1u<<31);               /* hypervisor present -- we ARE one
+                                         * (KERNEL-BOOT K3: the guest's vmdrv
+                                         * probe prints the vendor string) */
+-        *d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<9)|(1u<<15)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
+-        /* FPU,TSC,MSR,CX8,APIC,CMOV,MMX,FXSR,SSE,SSE2 */
++        *d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<9)|(1u<<15)|(1u<<16)|(1u<<19)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
++        /* FPU,TSC,MSR,CX8,APIC,CMOV,PAT,CLFLUSH,MMX,FXSR,SSE,SSE2.
++         * PAT and CLFLUSH joined at CPU_FEATURES CF2: both were
++         * already true -- PAT as sparse storage with the SDM reset
++         * value (cpu_reset seeds it; no cache model makes the types
++         * functional no-ops), CLFLUSH as a correct no-op whose line
++         * size EBX had been advertising all along. */
+         break;
+     /* ---- hypervisor interface leaf (0x40000000) ---- */
+     case 0x40000000:
+@@ -70,7 +75,10 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
+     case 0x80000000:
+         *a = 0x80000008; break;
+     case 0x80000001:
+-        *d = (1u<<29); /* long mode supported */
++        *d = (1u<<29)              /* long mode supported */
++           | (1u<<11)              /* SYSCALL/SYSRET (CF2: exists since K4) */
++           | (1u<<20)              /* NX (CF2: walk enforces via EFER.NXE) */
++           | (1u<<26);             /* 1GiB pages (CF2: PDPTE.PS walked) */
+         break;
+ 
+     /* ---- C9 leaves ---- */
+diff --git a/tests/test_cpu.c b/tests/test_cpu.c
+index 02783ee..53762db 100644
+--- a/tests/test_cpu.c
++++ b/tests/test_cpu.c
+@@ -844,6 +844,12 @@ static void test_cpuid_leaves(void) {
+         0x66, 0xB8, 0x08, 0x00, 0x00, 0x80,       /* mov eax,0x80000008 */
+         0x0F, 0xA2,
+         0x66, 0xA3, 0x20, 0x20,                   /* mov [0x2020],eax */
++        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,       /* mov eax,1 */
++        0x0F, 0xA2,
++        0x66, 0x89, 0x16, 0x24, 0x20,             /* mov [0x2024],edx */
++        0x66, 0xB8, 0x01, 0x00, 0x00, 0x80,       /* mov eax,0x80000001 */
++        0x0F, 0xA2,
++        0x66, 0x89, 0x16, 0x28, 0x20,             /* mov [0x2028],edx */
+         0xF4 };
+     run_program(&m, prog, sizeof prog, 0, 64);
+     assert(!m.cpu.fault);
+@@ -858,6 +864,13 @@ static void test_cpuid_leaves(void) {
+     assert(mem_read(&m, 0x2018, 4) == ((1u << 9) | (1u << 7) | (1u << 20))); /* ERMS + SMEP + SMAP (CF1) */
+     assert(mem_read(&m, 0x201C, 4) == 0x61727541u);       /* brand "Aura" */
+     assert(mem_read(&m, 0x2020, 4) == 0x00003028u);       /* 48-bit VA, 40-bit PA */
++    /* CF2: leaf-1 EDX = FPU|TSC|MSR|CX8|APIC|CMOV|PAT|CLFLUSH|MMX|
++     * FXSR|SSE|SSE2 (PAT and CLFLUSH are the CF2 additions, both
++     * already true in the core) */
++    assert(mem_read(&m, 0x2024, 4) == 0x07898331u);
++    /* CF2: 80000001 EDX = LM|1GBPAGES|NX|SYSCALL -- all three
++     * additions long-implemented, previously read as absent */
++    assert(mem_read(&m, 0x2028, 4) == 0x24100800u);
+ 
+     /* brand string is exactly 48 bytes of text padded with spaces */
+     const platform_t *p = platform_by_name("haswell");
+@@ -876,6 +889,43 @@ static void test_cpuid_leaves(void) {
+     assert(strchr(brand, '\0') == brand + 48);
+ }
+ 
++/* CPU_FEATURES CF2 (D2): IA32_PAT. The consumer's gate needs
++ * CPUID.1:EDX.PAT AND the architectural reset default before its
++ * read-modify-write (PA4 := WC). Both halves pinned: the bit lives
++ * in test_cpuid_leaves; here the reset value, the guest's exact
++ * RDMSR -> RMW -> WRMSR -> readback sequence, survival across an
++ * INIT# (silicon preserves the table), and re-default at RESET.
++ * Snapshot survival lives in tests/test_snapshot.c. */
++static void test_pat_msr(void) {
++    machine_t m;
++    setup_machine(&m);
++    int found = 0;
++    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found);
++    static const uint8_t prog[] = {
++        0x66, 0xB9, 0x77, 0x02, 0x00, 0x00,   /* mov ecx,0x277        */
++        0x0F, 0x32,                           /* rdmsr                */
++        0x66, 0xA3, 0x00, 0x24,               /* mov [0x2400],eax     */
++        0x66, 0x89, 0x16, 0x04, 0x24,         /* mov [0x2404],edx     */
++        0x66, 0x81, 0xE2, 0xF8, 0xFF, 0xFF, 0xFF, /* and edx,~7 (PA4) */
++        0x66, 0x83, 0xCA, 0x01,               /* or  edx,1  (WC)      */
++        0x0F, 0x30,                           /* wrmsr                */
++        0x0F, 0x32,                           /* rdmsr                */
++        0x66, 0xA3, 0x08, 0x24,               /* mov [0x2408],eax     */
++        0x66, 0x89, 0x16, 0x0C, 0x24,         /* mov [0x240C],edx     */
++        0xF4 };                               /* hlt                  */
++    run_program(&m, prog, sizeof prog, 0, 64);
++    assert(!m.cpu.fault);
++    assert(mem_read(&m, 0x2400, 4) == 0x00070406u);   /* defaults PA0..PA3 */
++    assert(mem_read(&m, 0x2404, 4) == 0x00070406u);   /* defaults PA4..PA7 */
++    assert(mem_read(&m, 0x2408, 4) == 0x00070406u);   /* low half untouched*/
++    assert(mem_read(&m, 0x240C, 4) == 0x00070401u);   /* PA4 := WC stuck   */
++    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == 0x0007040100070406ULL && found);
++    cpu_init_reset(&m.cpu);   /* INIT# preserves the MSR table (PAT too) */
++    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == 0x0007040100070406ULL && found);
++    cpu_reset(&m.cpu);        /* RESET re-seeds the SDM default */
++    assert(cpu_get_msr(&m.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found);
++}
++
+ /* SeaBIOS executes WBINVD before setting the PAM shadow read-only. With no
+  * modeled data cache, it must be a coherent no-op that still advances RIP. */
+ static void test_wbinvd_no_cache(void) {
+@@ -963,6 +1013,7 @@ int main(void) {
+     test_bswap_xadd_cmpxchg();
+ 
+     test_cpuid_leaves();
++    test_pat_msr();
+     test_wbinvd_no_cache();
+     test_rdtsc_pause_fences();
+ 
+diff --git a/tests/test_snapshot.c b/tests/test_snapshot.c
+index fe92f27..b3e1494 100644
+--- a/tests/test_snapshot.c
++++ b/tests/test_snapshot.c
+@@ -173,6 +173,51 @@ static int u4_snapshot_cases(const char *ps, const char *ps2) {
+     if (fails == f0) printf("ok U4 snapshot: relocated and disabled LAPIC save/load equivalently\n");
+     return fails - f0;
+ }
++/* CPU_FEATURES CF2 (D2): the cpu_reset-seeded IA32_PAT enters the
++ * v1 cpu section as plain sparse-table state -- no format change.
++ * Pin both values across save/load: the reset default (any boot
++ * that never touches PAT) and the consumer's guest-reprogrammed
++ * PA4=WC value, with the byte-exact fixed point. */
++/* "mov ecx,0x277; mov eax,lo; mov edx,hi; wrmsr; jmp $" at 0x5000 */
++static void guest_set_pat(machine_t *m, uint64_t v) {
++    uint8_t code[24]; int n = 0;
++    code[n++] = 0x66; code[n++] = 0xB9; code[n++] = 0x77;
++    code[n++] = 0x02; code[n++] = 0; code[n++] = 0;
++    code[n++] = 0x66; code[n++] = 0xB8;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i));
++    code[n++] = 0x66; code[n++] = 0xBA;
++    for (int i = 0; i < 4; i++) code[n++] = (uint8_t)(v >> (8 * i + 32));
++    code[n++] = 0x0F; code[n++] = 0x30; code[n++] = 0xEB; code[n++] = 0xFE;
++    memcpy(m->ram + 0x5000, code, (size_t)n);
++    m->cpu.rip = 0x5000;
++    for (int i = 0; i < 8; i++) (void)cpu_step(&m->cpu);
++}
++static int cf2_pat_cases(const char *ps, const char *ps2) {
++    int f0 = fails;
++    const uint64_t GUESTPAT = 0x0007040100070406ULL; /* PA4 := WC */
++    int found;
++    /* the plain reset default round-trips */
++    boot_lapic(&SC);
++    EXPECT(cpu_get_msr(&SC.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found,
++           "reset PAT default absent");
++    assert(snap_save(&SC, ps, &CFG) == 0);
++    boot_lapic(&SD);
++    assert(snap_load(&SD, ps, &CFG) == 0);
++    EXPECT(cpu_get_msr(&SD.cpu, MSR_IA32_PAT, &found) == MSR_IA32_PAT_RESET && found,
++           "loaded PAT default lost");
++    assert(snap_save(&SD, ps2, &CFG) == 0);
++    EXPECT(same_file(ps, ps2), "PAT save -> load -> save not a fixed point");
++    /* and a value the guest reprogrammed at paging setup */
++    guest_set_pat(&SC, GUESTPAT);
++    assert(snap_save(&SC, ps, &CFG) == 0);
++    boot_lapic(&SD);
++    assert(snap_load(&SD, ps, &CFG) == 0);
++    EXPECT(cpu_get_msr(&SD.cpu, MSR_IA32_PAT, &found) == GUESTPAT && found,
++           "loaded guest PAT lost");
++    drop_mmio(&SC); drop_mmio(&SD);
++    if (fails == f0) printf("ok CF2 snapshot: IA32_PAT default and guest value save/load equivalently\n");
++    return fails - f0;
++}
+ 
+ int main(void) {
+     const char *p1 = "/tmp/test-snap-1.snap", *p2 = "/tmp/test-snap-2.snap", *p3 = "/tmp/test-snap-3.snap";
+@@ -219,6 +264,7 @@ int main(void) {
+ 
+     /* 3. sparse RAM */
+     u4_snapshot_cases("/tmp/test-snap-u4a.snap", "/tmp/test-snap-u4b.snap");
++    cf2_pat_cases("/tmp/test-snap-cf2a.snap", "/tmp/test-snap-cf2b.snap");
+     long sz = fsize(p1);
+     EXPECT(sz > 0 && sz < 2 * 1024 * 1024, "snapshot of a tiny program is %ld bytes", sz);
+     printf("ok sparse: %ld-byte file for a %u MiB machine\n", sz, RAM_SIZE >> 20);
+-- 
+2.47.3
+

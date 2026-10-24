@@ -17,7 +17,7 @@ AuraLite OS is the companion from-scratch x86-64 OS. Its kernel requires from
 the machine: long mode + higher-half paging, GDT/IDT/**TSS**, **PIC** IRQ
 dispatch (later LAPIC for SMP), **SYSCALL/SYSRET** (Ring 3!), UART, a linear
 framebuffer, **AHCI** storage, **e1000** networking, and USB MSC
-(UHCI/EHCI/xHCI — it speaks all three; the emulator has EHCI). Each of those
+(UHCI/EHCI/xHCI — it speaks all three; the emulator has all three). Each of those
 maps to exactly one plan below.
 
 ## Plan ledger
@@ -38,6 +38,9 @@ maps to exactly one plan below.
 | GUI (native tkinter + launcher) | ✅ **CLOSED** (G1–G2 done ✅; `0069`–`0070`) | the whole machine surface is reachable without a command line: `tools/launcher.py` + `web/gui.html` (G1) and the native tkinter desktop `tools/gui_app.py` (G2, «Обычный»/«Экспертный», wizard, «выбери ISO -> Пуск»); both ISO boot paths accepted (MBR-as-disk + ATAPI/El Torito) | G1–G2 |
 | [`docs/plans/XHCI_PLAN.md`](docs/plans/XHCI_PLAN.md) | ✅ **COMPLETE** (X0–X5 done) | the north-star USB 3.0 host controller (audit candidate #1): a real xHCI that runs the guest's 90 KB `drivers/usb/xhci.c` -- register file, command/event/transfer rings, slot/endpoint contexts, root ports + hotplug over INTx | X0–X5 |
 | [`docs/plans/MSI_PLAN.md`](docs/plans/MSI_PLAN.md) | ✅ **COMPLETE** (M0–M4 done) | message-signalled interrupts (audit candidate #2): QEMU-parity MSI-X on the xHCI (cap @0x90, 16 entries), a LAPIC message-delivery core on the proven IOAPIC sink, per-device MSI-vs-INTx routing with byte-identical INTx fallback | M0–M4 |
+| [`docs/plans/PM_PLAN.md`](docs/plans/PM_PLAN.md) | ✅ **COMPLETE** (P0–P3 done) | ACPI power management (audit candidate #3): PM1 registers + level SCI on IRQ9 + S5, revision-4 FADT and \_S5/\_S1 DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM | P0–P3 |
+| [`docs/plans/UPKEEP_PLAN.md`](docs/plans/UPKEEP_PLAN.md) | ✅ **COMPLETE** (U0–U7 done) | the seven documented small gaps, one phase each (audit candidate #4): settable RTC, e1000 EERD/MDIC, gdbstub x87, IA32_APIC_BASE, CF9 CPU INIT, responder TCP sequencing/SACK, GUI/monitor capability authentication | U0–U7 |
+| [`docs/plans/CPU_FEATURES_PLAN.md`](docs/plans/CPU_FEATURES_PLAN.md) | ✅ **done** | the CPU feature contract (post-UPKEEP audit 2026-10-22): advertise exactly what the core does — fix the inverted SMEP/SMAP guards, advertise the already-true (NX/SYSCALL/1GiB/CLFLUSH, IA32_PAT with its architectural reset value), PCID + INVPCID, measure-gated CR/MSR validation | CF0–CF5 |
 
 Ordering is dependency-driven: CORE → (CHIPSET, STORE, USB) → VIDEO/NET →
 COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
@@ -59,18 +62,20 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 
 ### Inventory (measured against the tree, not assumed)
 
-- 37 patches under `patches/` (`0066`–`0081` verified with format-patch
-  reverse-check + parent-check tree hash) on `feature/roadmap-next`. The
-  deliverable diff `AuraLite-all-vs-github.patch` is generated as
+- 59 patches under `patches/` (`0034`–`0098` in-tree, each verified with
+  format-patch reverse-check + parent-check tree hash as it shipped) on
+  `feature/roadmap-next`. The deliverable diff
+  `AuraLite-all-vs-github.patch` is generated as
   `git diff <current github main>..HEAD` and must be refreshed whenever
-  upstream `main` moves; upstream `main` is now `1e7ff03`
-  ("F0-F4 update" -- the squash of our `0072`–`0075` work on top of
-  `a7e9799`, itself the squash of `0066`–`0069`; its tree matches our
-  `391a6bb` except this very ledger file), so the patch carries the
-  post-F4 work: the 2026-10-19 audit and the whole XHCI arc.
-- Every plan in the ledger above is **CLOSED** (CORE, CHIPSET, KERNEL-BOOT,
-  STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4, PERF P0–P5, TOOLING T0–T5,
-  COMPAT G0–G6, FPU F0–F4, GUI G1–G2).
+  upstream `main` moves; upstream `main` is now `957c12c`
+  ("M, P, U update" — the squash of the whole `0066`–`0098` arc through
+  XHCI, MSI, PM and UPKEEP; its tree is byte-identical to this branch's
+  HEAD before CF0, so the deliverable diff at CF0 is exactly the CF0
+  content).
+- Every plan in the ledger above except CPU_FEATURES is **CLOSED**
+  (CORE, CHIPSET, KERNEL-BOOT, STORE S0–S6, USB, VIDEO V0–V5, NET N0–N4,
+  PERF P0–P5, TOOLING T0–T5, COMPAT G0–G6, FPU F0–F4, GUI G1–G2,
+  XHCI X0–X5, MSI M0–M4, PM P0–P3, UPKEEP U0–U7).
 - `src/` is 17,657 lines of C. Green at the audit: `make test` (unit +
   integration, incl. the 13-lane t4 snapshot gate), `make test-sanitize`
   (ASan/UBSan), diff-fuzz 512/12 288 all-match with 0 host crashes, the GUI
@@ -86,10 +91,13 @@ COMPAT; PERF and TOOLING run in parallel once CORE's differential rig exists.
 | 2 | **MSI/MSI-X.** Every device interrupts through INTx lines (PIC/IOAPIC pins); no PCI MSI capability, no LAPIC message write delivery | no MSI in `src/pci.c`/`src/lapic.c`; AHCI/e1000 INTx paths are the S5/N4 pattern | `docs/plans/MSI_PLAN.md` (M0–M4) |
 | 3 | ~~**PM/ACPI power.** The PM block models only PMBASE+8 (the 24-bit TMR); PM1_STS/PM1_EN/PM1_CNT, GPE0 and the SMI path read zero and swallow writes; no sleep-state transition is claimed~~ | ✅ **complete** (PM_PLAN P0–P3, patches 0087–0090: PM1 registers + SCI + S5, FADT/DSDT on the kernel lane, GPE0, zero-duration S1; SMI stays an honest no-SMM) | `docs/plans/PM_PLAN.md` (P0–P3) |
 | 4 | ~~Small honest gaps, each documented at its site: LAPIC MSR-based relocation/disable not modeled (`src/lapic.h`); CPU INIT from CF9 `0x02` not modeled (`src/chipset.c`); RTC epoch writes ignored (`src/rtc.h`); e1000 EERD/MDIC are PHY/EEPROM stubs (`NET_PLAN` register table); TCP has no SACK sending and incomplete close-state handling (`docs/STATUS.md`); x87 registers are outside the gdbstub `g`-packet; the GUI binds loopback with no authentication (operator choice)~~ | ✅ **complete** (UPKEEP_PLAN U0–U7, patches `0091`–`0098`: all seven items closed with vectors + NCs; plan §5) | `docs/plans/UPKEEP_PLAN.md` (U0–U7, COMPLETE) |
+| 5 | **The CPU feature contract disagrees with the core** (post-UPKEEP audit 2026-10-22): CPUID advertises neither SMEP nor SMAP, and the walk guards for both (never enabled by a consumer, never vectored) are *inverted* — a kernel setting CR4.SMEP/SMAP #PFs on its own text; NX, SYSCALL, 1 GiB pages and CLFLUSH work but read 0 in CPUID; IA32_PAT is sparse storage whose reset value is 0, not the SDM default; PCID/INVPCID are absent while the north-star guest has a full PCID runtime that no QEMU lane can execute | `src/platform.c:43` (the whole CPUID surface), `src/cpu.c:210` (inverted guards, harness repro in the plan §1.3), `src/cpu.c:64` (sparse MSR file), AuraLite-OS `74c2b9b` `diagnostics.c`/`paging.c` | `docs/plans/CPU_FEATURES_PLAN.md` (CF0–CF5) |
 
-No unmeasured defects are known: the F4 lanes closed the last flake class
-(run-dependent snapshot bytes), and the defect ledgers in each plan are
-either shipped or explicitly NO-GO (PERF P4).
+Defect state after the 2026-10-22 audit: the ledgers in the closed
+plans stand as shipped, and the next live ledger is CF D1–D6
+(`CPU_FEATURES_PLAN` §1.4), each item filed with code-site evidence and,
+for the one behavioural defect (the inverted SMEP/SMAP guards), a
+harness reproduction.
 
 ### Next-block candidates (dependency-ordered)
 
@@ -136,10 +144,36 @@ either shipped or explicitly NO-GO (PERF P4).
    re-measured against current code and consumers, with
    D1–D7 mapped to U4/U5/U1/U2/U6/U3/U7; close-out in the
    plan §5.
+5. **CPU_FEATURES_PLAN (CF0–CF5)** — advertise exactly what
+   the core does (post-UPKEEP audit, gap row 5): CF1 makes
+   CR4.SMEP/SMAP true and only then advertises them, CF2
+   publishes the already-true (NX, SYSCALL, 1 GiB pages,
+   CLFLUSH, IA32_PAT with its SDM reset value), CF3 adds
+   PCID + INVPCID legality on the flush-always TLB —
+   making this the first emulator lane where the guest's
+   deferred PCID runtime can execute — CF4 decides CR/MSR
+   validation by census experiment, CF5 closes with the
+   U5 A20 record. **Closed (`0099`–`0104`)**: the
+   advertised-vs-implemented matrix, MSR census and
+   defect ledger D1–D6, then the SMEP/SMAP guards made
+   true (with a second latent find in the same site:
+   STAC/CLAC fell through into a stray SIDT store at
+   linear 0) and advertised, then the already-true
+   published (NX, SYSCALL, 1 GiB pages, CLFLUSH, PAT with
+   its SDM reset value), then PCID + INVPCID with their
+   legality (the first emulation lane where the guest's
+   deferred PCID runtime can execute), then validation
+   switched on strictly where a full-suite census counted
+   zero (and documented permissive where it didn't —
+   unknown MSRs: the firmware's unhandled reset-stage
+   MTRR probe), with POPCNT + RDTSCP implemented, and
+   finally the U5 A20 reset-fetch record reproduced and
+   fixed decode-side. The ranked device backlog (virtio
+   first) in the plan §5 is the next plan's material.
 
 ## Immediate queue (recent shipped patches)
 
-All twelve plans in the ledger above are **CLOSED**. Recent patches:
+Every plan in the ledger above is **CLOSED**. Recent patches:
 
 - ~~`0071` — STORE S6: **ATAPI + El Torito** so any ISO boots like
   VirtualBox/VMware.  `--cdrom=` (ctrl 0 port 1; conflicts with

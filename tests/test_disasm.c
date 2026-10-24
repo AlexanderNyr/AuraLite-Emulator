@@ -123,6 +123,8 @@ static const vec_t oracle[] = {
     { 64, "0f1f440000", 0x0ULL, 5, "nop dword [rax+rax+0x0]" },
     { 64, "660f1f840000000000", 0x0ULL, 9, "nop word [rax+rax+0x0]" },
     { 64, "0f280500100000", 0x1000ULL, 7, "movaps xmm0,oword [rel 0x2007]" },
+    { 64, "660f388203", 0x0ULL, 5, "invpcid rax,oword [rbx]" }, /* CPU_FEATURES CF3 */
+    { 64, "0f01f9", 0x0ULL, 3, "rdtscp" }, /* CF4: CPU decode caught up with the table */
     { 64, "660fefc0", 0x0ULL, 4, "pxor xmm0,xmm0" },
     { 64, "f30f6f01", 0x0ULL, 4, "movdqu xmm0,oword [rcx]" },
     { 64, "660fd60424", 0x0ULL, 5, "movq [rsp],xmm0" },

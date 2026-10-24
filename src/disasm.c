@@ -304,6 +304,7 @@ static const ent_t t0f38[256][4] = {
     [0x3B] = X66("pminud","Vx,Wx"), [0x3C] = X66("pmaxsb","Vx,Wx"), [0x3D] = X66("pmaxsd","Vx,Wx"),
     [0x3E] = X66("pmaxuw","Vx,Wx"), [0x3F] = X66("pmaxud","Vx,Wx"),
     [0x40] = X66("pmulld","Vx,Wx"), [0x41] = X66("phminposuw","Vx,Wx"),
+    [0x82] = X66("invpcid","Gc,Mx!"),
     [0xDB] = X66("aesimc","Vx,Wx"), [0xDC] = X66("aesenc","Vx,Wx"), [0xDD] = X66("aesenclast","Vx,Wx"),
     [0xDE] = X66("aesdec","Vx,Wx"), [0xDF] = X66("aesdeclast","Vx,Wx"),
     [0xF0] = Q4(I("movbe","Gv,Mv!"), N, N, I("crc32","Gy,Eb!")),

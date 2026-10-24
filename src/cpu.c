@@ -96,7 +96,9 @@ static void page_fault(machine_t *m, uint64_t vaddr, int mode, int present_chain
     if (present_chain) err |= 1u;             /* P: level-all-present */
     if (mode == 1) err |= 2u;                 /* W/R */
     if (cpl_now(c) == 3) err |= 4u;           /* U/S */
-    if (nx_hit && (c->efer & (1ULL<<11))) err |= 16u; /* I/D (needs EFER.NXE) */
+    if (nx_hit) err |= 16u; /* I/D: fetch-protection fault -- NX
+                             * (call sites gate on EFER.NXE) or SMEP (CF1:
+                             * the SDM sets I/D for SMEP regardless) */
     /* K4: page faults are rare in a healthy boot but their context rip is the
      * entire delta between "mystery SIGSEGV" and a one-line verdict -- keep
      * it always-on (measured: the init-shell null-deref chased below). */
@@ -211,6 +213,18 @@ check:
     /* whole chain was present from here on: P=1 */
     if (!eff_us) {
         if (user_cpl) { page_fault(m, vaddr, mode, 1, 0); return 0; }
+    } else if (!user_cpl) {
+        /* CPU_FEATURES CF1: SMEP/SMAP constrain a SUPERVISOR access to
+         * a USER page (eff U/S=1) -- a supervisor fetch (CR4.SMEP,
+         * err P|I/D) or a supervisor data access with EFLAGS.AC=0
+         * (CR4.SMAP). user_cpl already folds in K4's desc_sv rule, so
+         * implicit descriptor accesses are treated exactly like
+         * explicit kernel ones (the QEMU kernel-MMU-index shape);
+         * page-walk reads themselves are physical and never reach
+         * here. Pre-CF1 both guards sat inside the !eff_us branch --
+         * inverted since the original upstream code, invisible only
+         * because CPUID advertised neither feature, so no consumer
+         * ever set the CR4 bits (the CF0 harness table, plan 1.3). */
         if ((c->cr4 & (1ULL<<20)) && mode == T_EXEC) { page_fault(m, vaddr, mode, 1, 1); return 0; } /* SMEP */
         if ((c->cr4 & (1ULL<<21)) && mode != T_EXEC &&
             !(c->rflags & (1ULL<<18)))          { page_fault(m, vaddr, mode, 1, 0); return 0; } /* SMAP, AC=0 */
@@ -495,7 +509,11 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
     far_load_cs(m, sel, handler);
     if (!ring_change)         /* same-ring delivery: bring the RPL back */
         c->seg[SEG_CS].sel = (uint16_t)(presuspend_cs | (sel & 3));
-    c->rflags &= ~FLAG_IF;
+    /* CF1: gate delivery also clears EFLAGS.AC (the pushed image keeps
+     * the old bit for IRET to restore), so a handler always starts
+     * with SMAP shut -- a STAC window interrupted mid-copy must not
+     * leak open-door state into arbitrary handler code. */
+    c->rflags &= ~(FLAG_IF | (1ULL<<18));
     c->exception_taken = 1;
     /* IRQ vectors (32+) fire per timer tick in the idle loop and would drown
      * the serial history in the logring -- exceptions stay always-on. (K4:
@@ -923,6 +941,11 @@ void cpu_reset(cpu_t *c) {
         /* a reset of the live pair re-bases the MMIO window too */
         if (mach && c == &mach->cpu) lapic_sync_mmio(mach);
     }
+    /* CPU_FEATURES CF2: IA32_PAT leaves reset at the SDM default
+     * (cpu.h). Seeded here -- the RESET path -- only; cpu_init_reset
+     * below preserves the whole sparse table across INIT# exactly as
+     * silicon does, so an INIT keeps whatever PAT the guest set. */
+    cpu_set_msr(c, MSR_IA32_PAT, MSR_IA32_PAT_RESET);
 }
 
 /* UPKEEP U5: the INIT# processor state (Intel SDM Vol.3A Table 9-1,
@@ -3669,49 +3692,155 @@ really_slow:
                     c->xmm[i][1] = read_mem_v(m, addr + 160 + (uint64_t)i * 16 + 8, 8);
                 }
                 break; } }
-        case 0x30: { uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
+        case 0x30: { /* CF4: WRMSR is CPL0-only (#GP(0)), twin of the
+                      * MOV CRn gate; unchecked before, census-clean. */
+                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                     uint32_t idx=(uint32_t)c->gpr[RCX]; uint64_t val=((uint64_t)(uint32_t)c->gpr[RDX]<<32)|(uint32_t)c->gpr[RAX];
                      /* UPKEEP U4: IA32_APIC_BASE belongs to the LAPIC model
                       * (validation -> BSP preservation -> window sync);
                       * a rejected write stores nothing and raises no #GP
-                      * -- the house MSR lane is permissive (RDMSR on an
-                      * unknown index reads 0; CR writes keep no reserved-
-                      * bit #GP), so the rejection is logged instead. */
+                      * -- unknown MSR *indices* stay permissive (the CF4
+                      * NO-GO record at the RDMSR case), so the rejection
+                      * is logged instead. */
                      if (idx==LAPIC_MSR_APICBASE) lapic_apicbase_write(m, c, val);
-                     else cpu_set_msr(c, idx, val);
-                     if (idx==0xC0000080) { c->efer = val; perf_tlb_flush(m); }
-                     /* K3: GS-base MSRs are the architected long-mode
-                      * segment base for GS addressing -- keep the decoder's
-                      * seg[] shadow in sync (measured: AuraLite's
-                      * cpu_local_init wires its per-CPU block through
-                      * IA32_GS_BASE). */
-                     /* K4: FS.base rides the same MSR lane (IA32_FS_BASE) --
-                      * AuraLite's ARCH_SET_FS target write_fs_base() goes
-                      * through write_msr, and the userspace-libc errno slot
-                      * lives at %fs:0. Measured: init shell SIGSEGV'd on
-                      * `mov %fs:0x0,%rdx` at 0x40008561 with FS.base stuck 0
-                      * (null read, err=0x4) right after the banner. */
-                     else if (idx==0xC0000100) c->seg[SEG_FS].base = val;
-                     else if (idx==0xC0000101) c->seg[SEG_GS].base = val;
-                     else if (idx==0xC0000102) c->kgs_base = val;
+                     else if (idx==0xC0000080) {
+                         /* CF4: EFER is the one MSR whose *bits* are
+                          * strict, because they steer the walk (LME/NXE)
+                          * and the mode itself. Defined write bits are
+                          * only those with advertised CPUID twins --
+                          * SCE(0), LME(8), NXE(11) -- plus LMA(10), a
+                          * read-only output: it is weighed for the
+                          * reserved check, then overridden by the live
+                          * value, so the canonical RDMSR->OR->WRMSR can
+                          * neither #GP nor desync the mode. Anything else
+                          * (SVME/FFXSR/TCE-class bits, high garbage) is
+                          * #GP(0). Census: every lane writes inside
+                          * {SCE,LME,LMA,NXE}. Table copy and c->efer get
+                          * the same value -- one EFER, never two. */
+                         if (val & ~0xD01ull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         uint64_t nv = (val & ~(1ULL<<10)) | (c->efer & (1ULL<<10));
+                         cpu_set_msr(c, idx, nv); c->efer = nv; perf_tlb_flush(m);
+                     }
+                     else {
+                         cpu_set_msr(c, idx, val);
+                         /* CF4: the 65th distinct index used to vanish
+                          * without a trace. The table keeps its 64 slots
+                          * (snapshot layout; census counts zero drops in
+                          * every lane), but a lost write is now said out
+                          * loud. */
+                         int f2; (void)cpu_get_msr(c, idx, &f2);
+                         if (!f2) mlog(&m->log, "[cpu] WRMSR %08x dropped: sparse MSR table full (%d slots)", idx, MAX_MSR);
+                         /* K3/K4: FS/GS/KGS bases ride this lane -- keep
+                          * the decoder's seg[] shadows in sync (AuraLite
+                          * wires per-CPU through IA32_GS_BASE and TLS
+                          * through IA32_FS_BASE). */
+                         if (idx==0xC0000100) c->seg[SEG_FS].base = val;
+                         else if (idx==0xC0000101) c->seg[SEG_GS].base = val;
+                         else if (idx==0xC0000102) c->kgs_base = val;
+                     }
                      break; }
-        case 0x32: { uint32_t idx=(uint32_t)c->gpr[RCX]; int found; uint64_t val=cpu_get_msr(c, idx, &found);
+        case 0x32: { /* CF4: CPL0-only (#GP(0)), twin of the WRMSR gate.
+                      * Unknown indices keep reading 0 with no fault --
+                      * this phase's measured NO-GO: the whitelist+#GP
+                      * option was census-tested, and the sample
+                      * firmware's reset-stage CAR code RDMSRs
+                      * IA32_MTRR_DEF_TYPE (2FFh) unconditionally before
+                      * any IDT exists (then RMWs it and the variable
+                      * MTRRs through this very table); a #GP there is a
+                      * bricked primary workload, and every other
+                      * consumer probes by CPUID before touching an MSR.
+                      * Full record: CPU_FEATURES_PLAN CF4. */
+                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                     uint32_t idx=(uint32_t)c->gpr[RCX]; int found; uint64_t val=cpu_get_msr(c, idx, &found);
                      if (idx==0xC0000080) val = c->efer;
                      if (!found && idx!=0xC0000080) val = 0;
                      c->gpr[RAX] = (uint32_t)val; c->gpr[RDX] = (uint32_t)(val>>32);
                      break; }
-        case 0x20: { rm_t rm=MODRM(); int crn=rm.reg_field&7; uint64_t v = crn==0?c->cr0:crn==2?c->cr2:crn==3?c->cr3:crn==4?c->cr4:0;
+        case 0x20: { /* CPU_FEATURES CF4: MOV to/from CRn is CPL0-only
+                      * on silicon (#GP(0)); neither direction had a CPL
+                      * check at all before this phase -- found while
+                      * censusing this site for the reserved-bit masks,
+                      * and census-clean in every lane. (The RDMSR/WRMSR
+                      * gate landed at their cases for the same reason.) */
+                     if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                     rm_t rm=MODRM(); int crn=rm.reg_field&7; uint64_t v = crn==0?c->cr0:crn==2?c->cr2:crn==3?c->cr3:crn==4?c->cr4:0;
                      /* MOV r32/64, CRn is always register-to-register (mod==3 enforced by spec) */
                      set_reg(c, rm.reg, (default_as==64)?8:4, 1, v); break; }
-        case 0x22: { rm_t rm=MODRM(); int crn=rm.reg_field&7;
+        case 0x22: { if (cpl_now(c)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                     rm_t rm=MODRM(); int crn=rm.reg_field&7;
                      /* MOV CRn, reg reads the architected width: 64 bits in
                       * long mode, 32 elsewhere (the baseline always read 8
                       * bytes, C0 ledger #10). */
                      uint64_t v = rm_read(&d,&rm,(default_as==64)?8:4) & ((default_as==64)?~0ull:0xFFFFFFFFull);
-                     if (crn==0) { int entering_pg = ((v>>31)&1) && !((c->cr0>>31)&1); c->cr0=v;
+                     if (crn==0) {
+                                   /* CF4 (SDM MOV-CR; every clause was
+                                    * census-measured at zero across
+                                    * firmware/SeaBIOS/suites before being
+                                    * enforced): CR0[63:32] are reserved,
+                                    * PG requires PE, NW requires CD, and
+                                    * PG cannot be cleared while this
+                                    * sub-mode is 64-bit (64-bit list) or
+                                    * under PCIDE in compat mode (the CF3
+                                    * deferral). Low reserved bits stay
+                                    * store-verbatim: silicon "ignores"
+                                    * them and nothing here consumes them. */
+                                   if ((v >> 32) ||
+                                       (((v>>31)&1) && !(v&1)) ||
+                                       (((v>>29)&1) && !((v>>30)&1)) ||
+                                       (!((v>>31)&1) && ((c->cr0>>31)&1) &&
+                                        (default_as==64 || ((c->cr4>>17)&1))))
+                                       { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                                   int entering_pg = ((v>>31)&1) && !((c->cr0>>31)&1); c->cr0=v;
                                    if (entering_pg && (c->efer & (1ULL<<8))) c->efer |= (1ULL<<10); /* set LMA */
                                    if (!((v>>31)&1)) c->efer &= ~(1ULL<<10);
                      }
-                     else if (crn==2) c->cr2=v; else if (crn==3) c->cr3=v; else if (crn==4) c->cr4=v;
+                     else if (crn==2) c->cr2=v;
+                     else if (crn==3) {
+                         /* CPU_FEATURES CF3 (SDM MOV-CR description): with
+                          * CR4.PCIDE=1, bit 63 of the source is the
+                          * no-invalidate hint -- weighed, never stored
+                          * (MOV-from-CR3 reads it back 0). With PCIDE=0
+                          * the same bit sits in the CR3[63:MAXPHYADDR]
+                          * reserved band -> #GP(0). The perf flush below
+                          * runs either way: this TLB is flush-always (P2)
+                          * and the architecture forbids demanding
+                          * retention -- the hint only permits it. */
+                         if ((v >> 63) & 1) {
+                             if (!((c->cr4 >> 17) & 1)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                             v &= ~(1ULL << 63);
+                         }
+                         /* CF4: the rest of the reserved band. This
+                          * machine advertises a 40-bit physical address
+                          * (80000008h), so CR3[62:40] set -> #GP(0),
+                          * completing the SDM CR3[63:MAXPHYADDR] rule
+                          * (bit 63 handled above). Census-zero. */
+                         if (v & 0x7FFFFF0000000000ull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         c->cr3 = v; /* PCID rides [11:0]; the walk masks it */
+                     }
+                     else if (crn==4) {
+                         /* CPU_FEATURES CF3 (SDM MOV-CR exceptions):
+                          * CR4.PCIDE may hold 1 only in IA-32e mode
+                          * (EFER.LMA) -- outside it even writing 1 is
+                          * #GP(0) -- and the 0->1 edge additionally
+                          * requires CR3[11:0]==000H (those bits become
+                          * the current PCID at the flip). */
+                         /* CF4: the reserved mask -- QEMU's rule with
+                          * our advertisement: the structural base set
+                          * (VME..OSXMMEXCPT, bits 0-10, allowed whether
+                          * or not a feature bit names them) plus exactly
+                          * the gated bits whose CPUID twins we set:
+                          * PCIDE(17), SMEP(20), SMAP(21). LA57, OSXSAVE,
+                          * FSGSBASE, PKE, VMXE/SMXE, bits 15/19 and
+                          * everything from 22 up are reserved here
+                          * because we do not advertise them; storage
+                          * must not pretend otherwise. The CF3 PCIDE
+                          * edges above still apply within the mask.
+                          * Census: no lane writes outside it. */
+                         if (v & ~0x3207FFull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         if (((v >> 17) & 1) && !(c->efer & (1ULL << 10))) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         if (((v >> 17) & 1) && !((c->cr4 >> 17) & 1) && (c->cr3 & 0xFFF)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         c->cr4 = v;
+                     }
                      if (crn==0 || crn==3 || crn==4) perf_tlb_flush(m);
                      break; }
         case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
@@ -3737,10 +3866,42 @@ really_slow:
                      }
                      break; }
         case 0x01: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
-                     if (modrm == 0xCB) { /* STAC (K4): SMAP door open */
-                         c->rflags |= (1u<<18);
-                     } else if (modrm == 0xCA) { /* CLAC (K4): door shut */
-                         c->rflags &= ~(1u<<18);
+                     /* CPU_FEATURES CF1: STAC/CLAC are the SMAP door
+                      * (K4), made honest on both sides: (a) they now
+                      * END the case -- pre-CF1 execution fell through
+                      * into decode_modrm (register form: addr=0) and
+                      * the ext==1 SIDT store at linear address 0, so
+                      * every STAC/CLAC in history would have
+                      * overwritten the guest's first bytes with the
+                      * IDT pseudo-descriptor (never fired in a
+                      * measured lane: guests gate STAC on the SMAP
+                      * CPUID bit we had never advertised);
+                      * (b) CPL>0 takes the architected #UD, delivered
+                      * like the other core exceptions (the WBINVD
+                      * #GP(0) site is the local idiom). The CPUID
+                      * prong of the #UD is satisfied by construction:
+                      * the SMAP leaf-7 bit is unconditionally on. */
+                     if (modrm == 0xCB) { /* STAC: SMAP door open */
+                         if (cpl_now(c) != 0) raise_exception(m, 6, 0, 0);
+                         else c->rflags |= (1u<<18);
+                         break;
+                     } else if (modrm == 0xCA) { /* CLAC: door shut */
+                         if (cpl_now(c) != 0) raise_exception(m, 6, 0, 0);
+                         else c->rflags &= ~(1u<<18);
+                         break;
+                     } else if (modrm == 0xF9) { /* RDTSCP (CF4, D6): before
+                         this phase 0F 01 F9 decoded into the ext==7 arm
+                         below and silently executed as an INVLPG flush --
+                         worse than absent. Semantics twin RDTSC's
+                         exactly (same deterministic vtime formula, and
+                         neither carries a CR4.TSD gate in this core);
+                         ECX takes IA32_TSC_AUX, plain sparse storage
+                         that reads 0 until a guest WRMSRs it. */
+                         uint64_t t = m->vtime_instr * (uint64_t)m->plat->tsc_per_instr;
+                         int f9; uint64_t aux = cpu_get_msr(c, 0xC0000103, &f9); (void)f9;
+                         c->gpr[RAX] = (uint32_t)t; c->gpr[RDX] = (uint32_t)(t >> 32);
+                         c->gpr[RCX] = (uint32_t)aux;
+                         break;
                      } else if (modrm == 0xF8) { /* SWAPGS (0F 01 /7 mod=3 exact):
                          exchanges GS base <-> IA32_KERNEL_GS_BASE. The
                          AuraLite syscall/ISR stubs gate it by frame CS RPL,
@@ -3770,7 +3931,10 @@ really_slow:
                                       O(1); a full flush is conservative but
                                       avoids mis-keying large-page aliases.
                                       K2 measured an eager read causing a
-                                      recursive fault in paging_unmap(). */
+                                      recursive fault in paging_unmap().
+                                      CF3: PCID narrows its architected
+                                      scope to the current PCID -- the same
+                                      full flush covers that too. */
                          perf_tlb_flush(m);
                          break; }
                      if (ext==5) { faultf(c, "#UD 0F 01 /5 reserved"); break; }
@@ -3794,6 +3958,20 @@ really_slow:
                      if (ext==2) { c->gdtr_limit=lim; c->gdtr_base=gbase; }
                      else if (ext==3) { c->idtr_limit=lim; c->idtr_base=gbase; }
                      break; }
+        case 0xB8: { /* POPCNT (F3 0F B8) -- CPU_FEATURES CF4 (D6):
+                      * advertised only as of this phase. Bare 0F B8 is
+                      * the Itanium JMPE relic, not an x86 instruction:
+                      * the house #UD. Flags: ZF by (count==0), the
+                      * arithmetic five all cleared (SDM definition,
+                      * not the BSF-style preserve). */
+            if (d.rep != 0xF3) { faultf(c, "#UD 0F B8 without F3 (JMPE is not x86)"); break; }
+            rm_t rm=MODRM(); FIXUP(rm);
+            uint64_t src = rm_read(&d,&rm,osz);
+            unsigned n = (unsigned)__builtin_popcountll(src);
+            set_reg(c, rm.reg_field, osz, d.has_rex, (uint64_t)n);
+            c->rflags &= ~(FLAG_CF | FLAG_PF | FLAG_AF | FLAG_SF | FLAG_OF);
+            if (n) c->rflags &= ~(uint64_t)FLAG_ZF; else c->rflags |= FLAG_ZF;
+            break; }
         case 0xBC: case 0xBD: { /* BSF / BSR -- bit scans in either
              * direction. src==0: ZF=1 and the destination is PRESERVED:
              * the SDM calls it "undefined", but both host vendors keep the
@@ -3818,6 +3996,42 @@ really_slow:
              * 16-bit mode, rel32 otherwise. */
             int32_t rel = (osz==2) ? (int16_t)fetch16(&d) : fetch32s(&d);
             if (eval_cc(op2 & 0xF, c->rflags)) d.pc = (uint64_t)((int64_t)d.pc + rel);
+            break; }
+        case 0x38: { /* three-byte escape. Only 66 0F 38 82 (INVPCID)
+                      * is decoded; the rest of the map keeps the house
+                      * unsupported-opcode halt. */
+            uint8_t op3 = fetch8(&d);
+            if (c->fault || c->exception_taken) goto done;   /* K4 fetch abort */
+            if (op3 != 0x82) { faultf(c, "#UD unsupported 0F 38 opcode 0x%02x at rip=%08llx", op3, (unsigned long long)d.start_pc); break; }
+            /* CPU_FEATURES CF3: INVPCID r64/r32, m128. The P2 TLB is
+             * flush-always and RAM-store-generation-keyed, so no type
+             * can retain anything a narrower invalidation would --
+             * and the SDM text for every type explicitly permits
+             * invalidating more. The complete honest model here is
+             * therefore the legality surface + one conservative
+             * flush (the INVLPG one). 66 is opcode-defining and is
+             * sensed exactly as at the MOVDQA site (d.opsize==2; in
+             * a 16-bit-default mode 66 lands on 4) -- REX.W would
+             * clobber opsize to 8 and is rejected by the same test,
+             * matching the SSE family's treatment; real encoders
+             * never emit it (the operand width comes from the mode:
+             * 64-bit in 64-bit mode, 32 otherwise regardless of
+             * CS.D). LOCK, swallowed decoder-wide since forever,
+             * stays swallowed (the STAC precedent). */
+            if (!(d.opsize == 2 || (default_as == 16 && d.opsize == 4))) { c->rip = d.start_pc; raise_exception(m, 6, 0, 0); break; }
+            rm_t rm = MODRM(); FIXUP(rm);
+            if (!rm.is_mem) { c->rip = d.start_pc; raise_exception(m, 6, 0, 0); break; } /* m128 operand only */
+            if (cpl_now(c) != 0) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* CPL0 only */
+            uint64_t itype = get_reg(c, rm.reg_field, (default_as == 64) ? 8 : 4, d.has_rex);
+            if (itype > 3) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+            uint64_t ea = (rm.seg >= 0 ? c->seg[rm.seg].base : 0) + rm_ea(&d, &rm);
+            uint64_t dlo = read_mem_v(m, ea, 8);        /* a faulting descriptor read is the architected #PF */
+            uint64_t dhi = read_mem_v(m, ea + 8, 8);
+            if (dlo & ~0xFFFull) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* DESC[63:12] reserved */
+            if (!((c->cr4 >> 17) & 1) && itype < 2 && (dlo & 0xFFF)) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* PCIDE=0: types 0/1 name PCID 000H only */
+            if (itype == 0 && (c->efer & (1ULL << 10)) &&
+                (uint64_t)((int64_t)(dhi << 16) >> 16) != dhi) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; } /* type 0 address must be canonical (48-bit VA) */
+            perf_tlb_flush(m);
             break; }
         default:
             faultf(c, "#UD unsupported 0F opcode 0x0F 0x%02x at rip=%08llx", op2, (unsigned long long)d.start_pc);
