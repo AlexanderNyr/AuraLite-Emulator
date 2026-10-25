@@ -74,18 +74,139 @@ void cpu_set_msr(cpu_t *c, uint32_t idx, uint64_t val) {
 /* ======================= paging (4-level, long mode) ===================== */
 static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err);
 static int cpl_now(const cpu_t *c) { return c->seg[SEG_CS].sel & 3; }
+
+/* ==================== guest-bring-up diagnostics (A6) =====================
+ *
+ * A6 (audit fix): this core is documented as "firmware-agnostic -- it contains
+ * no hacks tied to a specific ROM" (docs/architecture.md, "What this is").
+ * The K4
+ * bring-up probes below broke that promise in a way that shipped in every
+ * release build:
+ *
+ *   * cpu_step() compared RIP against three literal AuraLite-OS kernel
+ *     addresses (0xffffffff801907be / ...7d3 / 0xffffffff80106f85) once per
+ *     instruction;
+ *   * write_mem_v(), i.e. EVERY guest store, range-compared the linear
+ *     address against 0x7fffefffa000..0x7fffefffc000 and against a GS window,
+ *     and formatted log lines;
+ *   * the SYSCALL/SYSRET arms opened and wrote "/tmp/k4-probe.txt" -- a fixed
+ *     host path, from inside the interpreter, with the FILE* never closed
+ *     (an fd leak per machine), on an assumption (a writable /tmp) the
+ *     emulator has no right to make;
+ *   * raise_exception() and fetch8()/translate() consulted getenv().
+ *
+ * None of it was reachable unless EMU_DBG_U=1, but the constants, the
+ * comparisons and the /tmp string were in the shipped binary -- and the three
+ * RIPs are stale the moment that kernel is rebuilt.
+ *
+ * The facility is kept, because it is genuinely useful while bringing up a new
+ * guest, but it is now a COMPILE-TIME option:
+ *
+ *     make DEBUG_HOOKS=1        (adds -DAURA_DEBUG_HOOKS=1)
+ *
+ * With AURA_DEBUG_HOOKS=0 (the default) dbg_u_on can never become 1, so every
+ * `if (dbg_u_on > 0)` site below folds away and the release binary carries
+ * neither the guest addresses nor the /tmp path; `strings x86emu |
+ * grep k4-probe` is the regression vector (tests/test_cli_inputs.py).
+ *
+ * The lazy getenv() resolution itself is deliberately NOT gated: dbg_u_on
+ * flips -1 -> 0 on the first fetch, and that transition is what gates the P3
+ * predecode (PERF P3) and is carried in snapshots.  Pinning it at compile time
+ * would change decode_hits by one on the first instruction and move every
+ * recorded --stats receipt.
+ */
+#ifndef AURA_DEBUG_HOOKS
+#define AURA_DEBUG_HOOKS 0
+#endif
+
 static int dbg_u_on = -1;  /* K4: EMU_DBG_U=1 knob, resolved lazily (fetch8) */
 /* TOOLING T4: whether that lazy lookup has run is internal path state --
  * while it is -1 the P3 predecode is bypassed -- so a snapshot carries it
  * (measured: without this, a restored run lost one decode hit). */
+#if AURA_DEBUG_HOOKS
+static void dbg_u_rips_load(void);
+#endif
 int  cpu_dbg_knob_resolved(void) { return dbg_u_on >= 0; }
 void cpu_dbg_knob_resolve(void) {
     if (dbg_u_on < 0) { const char *e = getenv("EMU_DBG_U"); dbg_u_on = (e && e[0] == '1'); }
+#if AURA_DEBUG_HOOKS
+    if (dbg_u_on > 0) dbg_u_rips_load();   /* A6: guest watch list, once */
+#endif
 }
+
+#if AURA_DEBUG_HOOKS
+/* A6: the guest-specific watch list, named and in one place instead of three
+ * literals buried in cpu_step().  These are AuraLite-OS kernel addresses and
+ * are meaningful only for that build -- override with EMU_DBG_U_RIPS
+ * (comma-separated hex) when the kernel moves. */
+static const uint64_t dbg_u_rips_default[] = {
+    0xffffffff801907beull,   /* syscall-entry stub stores (syscall path A)   */
+    0xffffffff801907d3ull,   /* syscall-entry stub stores (syscall path B)   */
+    0xffffffff80106f85ull,   /* the ring-3 trampoline's cpu_local write      */
+};
+#define DBG_U_RIPS_MAX 16
+static uint64_t dbg_u_rips[DBG_U_RIPS_MAX];
+static int dbg_u_nrips;
+
+static void dbg_u_rips_load(void) {
+    dbg_u_nrips = (int)(sizeof dbg_u_rips_default / sizeof dbg_u_rips_default[0]);
+    if (dbg_u_nrips > DBG_U_RIPS_MAX) dbg_u_nrips = DBG_U_RIPS_MAX;
+    for (int i = 0; i < dbg_u_nrips; i++) dbg_u_rips[i] = dbg_u_rips_default[i];
+    const char *e = getenv("EMU_DBG_U_RIPS");
+    if (!e || !*e) return;
+    int n = 0;
+    const char *p = e;
+    while (*p && n < DBG_U_RIPS_MAX) {
+        char *end = NULL;
+        unsigned long long v = strtoull(p, &end, 0);
+        if (end == p) break;                  /* not a number: stop at it */
+        dbg_u_rips[n++] = (uint64_t)v;
+        p = end;
+        if (*p == ',') p++;
+        else break;
+    }
+    if (n) dbg_u_nrips = n;                   /* an explicit list replaces the default */
+}
+
+/* The per-instruction hook cpu_step() calls.  False in the default build.
+ * Both the lazily-resolved knob and the watch list are settled here, because
+ * cpu_step() runs BEFORE fetch8() resolves EMU_DBG_U for the first
+ * instruction -- without this the first match of a run could not be seen. */
+static inline int dbg_u_watch_rip(const cpu_t *c) {
+    if (dbg_u_on < 0) cpu_dbg_knob_resolve();
+    if (dbg_u_on <= 0) return 0;
+    if (!dbg_u_nrips) dbg_u_rips_load();
+    for (int i = 0; i < dbg_u_nrips; i++)
+        if (c->rip == dbg_u_rips[i]) return 1;
+    return 0;
+}
+
 static int dbg_u_events;
 static int dbg_read_probe = 0;      /* K4: first-N read/write syscall probe */
 static int syscall_ret_probe = -1;  /* id of the in-flight probed syscall */
-static FILE *probe_fp;              /* /tmp/k4-probe.txt, unbuffered -- survives kills */
+static FILE *probe_fp;              /* $EMU_DBG_U_FILE, unbuffered -- survives kills */
+
+/* A6: the probe file is a diagnostic sink, so it must be (a) named by the
+ * operator, (b) opened only when the probe fires, and (c) closable.  The
+ * default keeps the historical /tmp path when EMU_DBG_U=1 is asked for. */
+static FILE *dbg_u_probe_file(void) {
+    if (!probe_fp) {
+        const char *path = getenv("EMU_DBG_U_FILE");
+        if (!path || !*path) path = "/tmp/k4-probe.txt";
+        probe_fp = fopen(path, "w");
+        if (probe_fp) setvbuf(probe_fp, NULL, _IONBF, 0);
+    }
+    return probe_fp;
+}
+
+void cpu_dbg_hooks_close(void) {
+    if (probe_fp) { fclose(probe_fp); probe_fp = NULL; }
+}
+#else
+#define dbg_u_events 0
+#define dbg_u_watch_rip(c) 0
+void cpu_dbg_hooks_close(void) { }
+#endif
 
 /* K4: raise a page fault with the architected error code.
  * mode: 0 = data read, 1 = data write, 2 = instruction fetch. */
@@ -275,6 +396,9 @@ static void write_mem_v(machine_t *m, uint64_t vaddr, int size, uint64_t val) {
     uint64_t phys;
     if (!translate(m, vaddr, &phys, T_WRITE))  /* fault already raised (K4) */
         return;
+#if AURA_DEBUG_HOOKS
+    /* A6: guest-specific store probes -- compile-time optional, so the
+     * release path carries neither the literal windows nor the formatting. */
     if (dbg_u_on > 0 && vaddr >= 0x7fffefffa000ull && vaddr < 0x7fffefffc000ull)
         mlog(&m->log, "[dbg-u] ustack W va=%llx sz=%d val=%llx cpl=%d rip=%llx",
              (unsigned long long)vaddr, size, (unsigned long long)val,
@@ -287,6 +411,7 @@ static void write_mem_v(machine_t *m, uint64_t vaddr, int size, uint64_t val) {
         mlog(&m->log, "[dbg-u] cpulocal W va=GS+%llx val=%llx rip=%llx",
              (unsigned long long)(vaddr - m->cpu.seg[SEG_GS].base),
              (unsigned long long)val, (unsigned long long)m->cpu.rip);
+#endif
     DBG_ACCESS(m, vaddr, size, 1);   /* TOOLING T2 watch */
     mem_write(m, phys, size, val);
 }
@@ -409,10 +534,12 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
         c->exception_taken = 1;
         /* IVT dispatch receipts: measured 9381 INT16 lines during a stock
          * SeaBIOS keyboard spin-up alone -- opt-in via AURALITE_IVT_LOG=1. */
+#if AURA_DEBUG_HOOKS
         { static int ivt_log = -1;
           if (ivt_log < 0) { const char *e = getenv("AURALITE_IVT_LOG"); ivt_log = (e && e[0] == '1'); }
           if (ivt_log)
               mlog(&m->log, "[cpu] real-mode vector %d (%s) -> %04x:%04x via IVT", vector, vecname(vector), cs, off); }
+#endif
         c->in_exception = 0;
         return;
     }
@@ -477,10 +604,12 @@ static void raise_exception(machine_t *m, int vector, int has_err, uint32_t err)
             ns = tss ? read_mem_v(m, tss + 0x24 + (uint64_t)(ist - 1) * 8, 8) : 0; /* linear (K2) */
         else if (ring_change)
             ns = tss ? read_mem_v(m, tss + 4, 8) : 0;                          /* TSS.RSP0 */
+#if AURA_DEBUG_HOOKS
         if (dbg_u_on > 0 && ring_change)
             mlog(&m->log, "[dbg-u] ringchg vec=%d from_cpl=%d ist=%d tss=%llx ns=%llx old_rsp=%llx cr3=%llx",
                  vector, from_cpl, ist, (unsigned long long)tss, (unsigned long long)ns,
                  (unsigned long long)c->gpr[RSP], (unsigned long long)c->cr3);
+#endif
         if (ns) rsp = ns;
     }
     if (ring_change) {
@@ -677,8 +806,10 @@ static uint64_t read_code_v(machine_t *m, uint64_t vaddr, int size) {
 static uint8_t fetch8(dctx_t *d){
     if (dbg_u_on < 0) { const char *e = getenv("EMU_DBG_U"); dbg_u_on = (e && e[0] == '1'); }
     uint64_t la = d->c->seg[SEG_CS].base + d->pc;
+#if AURA_DEBUG_HOOKS
     if (dbg_u_on && dbg_u_events < 200 && (d->c->seg[SEG_CS].sel & 3) == 3)
         { dbg_u_events++; mlog(&d->m->log, "[dbg-u] %03d uf la=%llx", dbg_u_events, (unsigned long long)la); }
+#endif
     uint8_t v=(uint8_t)read_code_v(d->m, la, 1); d->pc+=1; return v; }
 static uint16_t fetch16(dctx_t *d){ uint16_t v=(uint16_t)read_code_v(d->m, d->c->seg[SEG_CS].base+d->pc,2); d->pc+=2; return v; }
 static uint32_t fetch32(dctx_t *d){ uint32_t v=(uint32_t)read_code_v(d->m, d->c->seg[SEG_CS].base+d->pc,4); d->pc+=4; return v; }
@@ -2283,10 +2414,10 @@ static void x87_exec(machine_t *m, cpu_t *c, dctx_t *d, uint8_t op) {
 /* ============================== main stepper ============================== */
 int cpu_step(cpu_t *c) {
     machine_t *m = c->mach;
-    /* K4 dbg-u: point watches on the syscall-entry stub stores */
-    if (dbg_u_on > 0 && (c->rip == 0xffffffff801907beull ||
-                         c->rip == 0xffffffff801907d3ull ||
-                         c->rip == 0xffffffff80106f85ull))
+    /* A6: the per-instruction probe is a compile-time option now; in the
+     * default build this folds to nothing (measured: the release binary no
+     * longer contains the three guest RIP literals). */
+    if (AURA_DEBUG_HOOKS && dbg_u_watch_rip(c))
         mlog(&m->log, "[dbg-u] watch rip=%llx rsp=%llx rcx=%llx gs=%llx kgs=%llx",
              (unsigned long long)c->rip, (unsigned long long)c->gpr[RSP],
              (unsigned long long)c->gpr[RCX], (unsigned long long)c->seg[SEG_GS].base,
@@ -2643,6 +2774,7 @@ really_slow:
                        (int)(c->efer & 1), default_as);
                 break;
             }
+#if AURA_DEBUG_HOOKS
             if (dbg_u_on > 0)
                 mlog(&m->log, "[dbg-u] SYSCALL entry rip=%llx rsp=%llx [rsp]=%llx [rsp+8]=%llx rcx=%llx r11=%llx rax=%llx rdi=%llx",
                      (unsigned long long)c->rip, (unsigned long long)c->gpr[RSP],
@@ -2656,15 +2788,17 @@ really_slow:
             if (dbg_u_on > 0 && c->gpr[RAX] == 0 && c->gpr[RDI] == 0 &&
                 dbg_read_probe < 30) {
                 syscall_ret_probe = dbg_read_probe++;
-                /* unbuffered FILE, not the ring or a pipe: storm wraps wrap
-                 * the ring, pipe buffers never flush before a kill (both
-                 * measured). Live-readable mid-run. */
-                if (!probe_fp) { probe_fp = fopen("/tmp/k4-probe.txt", "w"); setvbuf(probe_fp, NULL, _IONBF, 0); }
-                fprintf(probe_fp, "sysread0#%d buf=%llx n=%lld rip=%llx cr3=%llx\n",
-                        syscall_ret_probe, (unsigned long long)c->gpr[RSI],
-                        (long long)c->gpr[RDX], (unsigned long long)c->rip,
-                        (unsigned long long)c->cr3);
+                /* unbuffered FILE, not the ring or a pipe: a storm wraps the
+                 * ring and pipe buffers never flush before a kill (both
+                 * measured).  A6: the sink is operator-named and closable. */
+                FILE *pf = dbg_u_probe_file();
+                if (pf)
+                    fprintf(pf, "sysread0#%d buf=%llx n=%lld rip=%llx cr3=%llx\n",
+                            syscall_ret_probe, (unsigned long long)c->gpr[RSI],
+                            (long long)c->gpr[RDX], (unsigned long long)c->rip,
+                            (unsigned long long)c->cr3);
             }
+#endif
             int f1, f2, f3;
             uint64_t star   = cpu_get_msr(c, 0xC0000081, &f1);
             uint64_t lstar  = cpu_get_msr(c, 0xC0000082, &f2);
@@ -2676,13 +2810,17 @@ really_slow:
             uint16_t kcs = (uint16_t)((star >> 32) & 0xFFFC);
             c->seg[SEG_SS].sel = (uint16_t)(kcs + 8);
             c->seg[SEG_SS].base = 0;
+#if AURA_DEBUG_HOOKS
             if (dbg_u_on > 0)
                 mlog(&m->log, "[dbg-u] SYSCALL pre-farload rsp=%llx kcs=%x lstar=%llx",
                      (unsigned long long)c->gpr[RSP], kcs, (unsigned long long)lstar);
+#endif
             far_load_cs(m, kcs, lstar);
+#if AURA_DEBUG_HOOKS
             if (dbg_u_on > 0)
                 mlog(&m->log, "[dbg-u] SYSCALL post-farload rsp=%llx rip=%llx",
                      (unsigned long long)c->gpr[RSP], (unsigned long long)c->rip);
+#endif
             d.pc = c->rip;
             break; }
         case 0x07: { /* SYSRET (K4): CS=STAR[63:48]+16|3, SS=+8|3,
@@ -2695,13 +2833,17 @@ really_slow:
             uint64_t star = cpu_get_msr(c, 0xC0000081, &f1);
             (void)f3;
             uint16_t ubase = (uint16_t)(star >> 48);
+#if AURA_DEBUG_HOOKS
             if (dbg_u_on > 0 && syscall_ret_probe >= 0) {
-                fprintf(probe_fp, "sysret0#%d rax=%lld rip=%llx bytes=",
-                        syscall_ret_probe, (long long)c->gpr[RAX],
-                        (unsigned long long)c->gpr[RCX]);
-                for (int i = 0; i < 16 && (long long)c->gpr[RAX] > 0; i++)
-                    fprintf(probe_fp, "%02llx", (unsigned long long)read_mem_v(m, c->gpr[RSI] + i, 1));
-                fputc('\n', probe_fp);
+                FILE *pf = dbg_u_probe_file();
+                if (pf) {
+                    fprintf(pf, "sysret0#%d rax=%lld rip=%llx bytes=",
+                            syscall_ret_probe, (long long)c->gpr[RAX],
+                            (unsigned long long)c->gpr[RCX]);
+                    for (int i = 0; i < 16 && (long long)c->gpr[RAX] > 0; i++)
+                        fprintf(pf, "%02llx", (unsigned long long)read_mem_v(m, c->gpr[RSI] + i, 1));
+                    fputc('\n', pf);
+                }
                 syscall_ret_probe = -1;
             }
             if (dbg_u_on)
@@ -2709,6 +2851,7 @@ really_slow:
                      (unsigned long long)c->gpr[RCX], (unsigned long long)c->gpr[R11],
                      (unsigned long long)c->gpr[RSP],
                      (unsigned long long)read_mem_v(m, c->gpr[RSP], 8));
+#endif
             c->seg[SEG_SS].sel = (uint16_t)((ubase + 8) | 3);
             c->seg[SEG_SS].base = 0;
             c->rflags = (c->gpr[R11] & RFLAGS_WRITABLE) | 0x2;

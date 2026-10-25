@@ -1,5 +1,7 @@
 # Build outputs
 /x86emu
+/x86emu-dbg
+/test-*
 /x86emu-bench
 /x86dis
 /firmware/*.bin
@@ -7,6 +9,7 @@
 /disk/*.img
 /tests/kload_fixture.elf
 /tests/nic_net.elf
+/tests/fpu_payload.elf
 
 # Emulator output
 *.ppm

@@ -2,11 +2,18 @@
 // machine for a chosen chipset-generation profile, runs the CPU, and
 // reports what happened (registers, mode, PCI/log trail, optional
 // framebuffer dump) -- a debugging tool for the firmware as much as a demo.
+/* A1: read_file() classifies its input with fstat()/S_ISREG, so the POSIX
+ * declarations must be visible under the Makefile's plain `-std=c11`
+ * (the same idiom as src/platform.c and src/snapshot.c). */
+#define _POSIX_C_SOURCE 200809L
 #include <signal.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include "machine.h"
 #include "devices.h"
 #include "pci.h"
@@ -18,16 +25,173 @@
 #include "snapshot.h" /* TOOLING T4 */
 #include "monitor.h" /* TOOLING T5 */
 
+/* A1 (audit fix): one strict reader for every media file the CLI accepts.
+ *
+ * The previous body was fopen + fseek/ftell + malloc(n) + fread(n).  That
+ * silently turned four different input errors into a "successfully loaded"
+ * zero-byte image, because ftell() on a directory or a character device
+ * reports 0 (measured, this tree, before the fix):
+ *
+ *   ./x86emu --rom=<directory>  -> "[boot] ... rom=<dir> (0 bytes)", then the
+ *                                  machine executed whatever the empty flash
+ *                                  contained and died with a #UD at 0x10000
+ *   ./x86emu --rom=<empty file> -> the same #UD at 0x10000
+ *   ./x86emu --disk=<directory> -> "[boot] ... disk=<dir> (0 bytes)": a disk
+ *                                  the guest can never read, reported as attached
+ *   ./x86emu --disk=/dev/zero   -> the same 0-byte attachment
+ *
+ * while README s"Run" promises exit code 1 for input-file errors.  malloc was
+ * unchecked and a short read only printed a warning while returning the
+ * partially filled buffer.
+ *
+ * Every rejection names the file and the reason in `file_err`, so the caller
+ * can either refuse the run (REQUIRED media) or fall back with an honest log
+ * line (the optional --disk attachment, whose historic no-disk lane works). */
+static char file_err[320];
+
 static uint8_t *read_file(const char *path, size_t *len) {
+    file_err[0] = '\0';
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); return NULL; }
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (!f) {
+        snprintf(file_err, sizeof file_err, "%s: %s", path, strerror(errno));
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0) {
+        snprintf(file_err, sizeof file_err, "%s: fstat: %s", path, strerror(errno));
+        fclose(f);
+        return NULL;
+    }
+    /* A directory or a pipe/character device has no image to load.  Reading
+     * it "successfully" with a zero length is the defect this guards. */
+    if (!S_ISREG(st.st_mode)) {
+        snprintf(file_err, sizeof file_err, "%s: not a regular file", path);
+        fclose(f);
+        return NULL;
+    }
+    if (st.st_size <= 0) {
+        snprintf(file_err, sizeof file_err, "%s: empty file (0 bytes)", path);
+        fclose(f);
+        return NULL;
+    }
+    size_t n = (size_t)st.st_size;
     uint8_t *buf = malloc(n);
-    if (fread(buf, 1, n, f) != (size_t)n) { fprintf(stderr, "short read %s\n", path); }
+    if (!buf) {
+        snprintf(file_err, sizeof file_err, "%s: out of memory for %zu bytes", path, n);
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, n, f);
+    if (got != n) {
+        snprintf(file_err, sizeof file_err, "%s: short read (%zu of %zu bytes)", path, got, n);
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
-    if (len) *len = (size_t)n;
+    if (len) *len = n;
     return buf;
 }
+
+/* A2 (audit fix): strict numeric option parsing.
+ *
+ * Every numeric option used to be strtoull/atoi with a NULL endptr and no
+ * errno check, so a typo became a silently different machine (measured, this
+ * tree, before the fix):
+ *
+ *   --max-instr=abc  -> 0: the run executed ZERO instructions and exited 0
+ *   --smp=-5         -> 0: a negative "CPU count" silently meant one vCPU
+ *   --cpus=abc       -> 0: boot_info advertised one CPU
+ *   --keys-at=abc    -> 0: keystrokes injected immediately instead of late
+ *   --watch-phys=zzz -> 0: the store probe watched address 0
+ *   --trace-from/count=abc -> 0
+ *   --sata-portfoo=img -> atoi("foo") == 0: the image was attached to PORT 0,
+ *                         silently changing the machine shape (and the
+ *                         snapshot shape fingerprint) instead of failing
+ *   --sata-port99=img  -> dropped on the floor, exit 0
+ *
+ * `parse_u64` accepts exactly one number (base 0, so 0x.. and 0.. work), an
+ * optional explicit range, and refuses everything else with the option name. */
+static int parse_u64(const char *opt, const char *s, uint64_t lo, uint64_t hi, uint64_t *out) {
+    if (!s || !*s) {
+        fprintf(stderr, "%s: missing value (usage: --help)\n", opt);
+        return -1;
+    }
+    if (*s == '-') {   /* strtoull would wrap it into a huge positive number */
+        fprintf(stderr, "%s: a negative value is not accepted, got '%s'\n", opt, s);
+        return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (end == s || (end && *end) || errno == ERANGE) {
+        fprintf(stderr, "%s: expected a number, got '%s' (usage: --help)\n", opt, s);
+        return -1;
+    }
+    if (v < lo || v > hi) {
+        fprintf(stderr, "%s: %llu is outside the accepted range [%llu..%llu]\n",
+                opt, v, (unsigned long long)lo, (unsigned long long)hi);
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_i32(const char *opt, const char *s, int lo, int hi, int *out) {
+    if (!s || !*s) {
+        fprintf(stderr, "%s: missing value (usage: --help)\n", opt);
+        return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 0);
+    if (end == s || (end && *end) || errno == ERANGE || v < lo || v > hi) {
+        fprintf(stderr, "%s: expected an integer in [%d..%d], got '%s'\n", opt, lo, hi, s);
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+/* A5 (audit fix): `--gdb=` is validated up front, exactly like `--monitor=`.
+ *
+ * Before the fix a malformed spec only produced a message from inside
+ * gdb_attach() and then "[gdb] not attached; the run continues without gdb"
+ * with exit code 0 (measured: `--gdb=abc` and `--gdb=99999`).  A scripted
+ * lane that asked for a debugger therefore lost it silently and still
+ * reported success -- the opposite of the README's "input errors exit 1".
+ * Runtime failures (bind/accept) still degrade to the documented message,
+ * because those are environment problems, not user input errors. */
+static int validate_host_port(const char *opt, const char *spec,
+                              char *host, size_t hostsz) {
+    if (!spec || !*spec) {
+        fprintf(stderr, "%s: missing [host:]port\n", opt);
+        return -1;
+    }
+    const char *colon = strrchr(spec, ':');
+    const char *num = spec;
+    if (colon) {
+        size_t hl = (size_t)(colon - spec);
+        if (!hl) {
+            fprintf(stderr, "%s: empty host in '%s'\n", opt, spec);
+            return -1;
+        }
+        if (hl >= hostsz) {
+            fprintf(stderr, "%s: host name too long in '%s'\n", opt, spec);
+            return -1;
+        }
+        memcpy(host, spec, hl);
+        host[hl] = '\0';
+        num = colon + 1;
+    }
+    int port = 0;
+    if (parse_i32(opt, num, 1, 65535, &port) != 0) {
+        fprintf(stderr, "%s: expected [host:]port with port in 1..65535, got '%s'\n", opt, spec);
+        return -1;
+    }
+    return 0;
+}
+
 
 static void write_ppm(machine_t *m, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -131,6 +295,7 @@ int run_up_step(machine_t *m, uint64_t *n, int *step_result, keys_trigger_t *k, 
 int main(int argc, char **argv) {
     const char *rom_path = "firmware/firmware.bin";
     const char *disk_path = "disk/disk.img";
+    int disk_explicit = 0;          /* A1: --disk= was named by the user */
     const char *platform_name = "haswell";
     const char *fb_out = NULL;
     const char *log_out = NULL;
@@ -187,9 +352,12 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--rom=", 6)) rom_path = argv[i]+6;
-        else if (!strncmp(argv[i], "--disk=", 7)) disk_path = argv[i]+7;
+        else if (!strncmp(argv[i], "--disk=", 7)) { disk_path = argv[i]+7; disk_explicit = 1; }
         else if (!strncmp(argv[i], "--platform=", 11)) platform_name = argv[i]+11;
-        else if (!strncmp(argv[i], "--max-instr=", 12)) max_instr = strtoull(argv[i]+12, NULL, 0);
+        else if (!strncmp(argv[i], "--max-instr=", 12)) {
+            if (parse_u64("--max-instr", argv[i]+12, 0, 1000000000000000ULL, &max_instr) != 0)
+                return EXIT_INPUT_ERROR;
+        }
         else if (!strncmp(argv[i], "--dump-fb=", 10)) fb_out = argv[i]+10;
         else if (!strncmp(argv[i], "--dump-text=", 12)) text_out = argv[i]+12;
         else if (!strcmp(argv[i], "--no-fb")) cfg_no_fb = 1;
@@ -203,7 +371,8 @@ int main(int argc, char **argv) {
         else if (!strncmp(argv[i], "--keys=", 7)) keys_list = argv[i]+7;
         else if (!strncmp(argv[i], "--keys-at=", 10)) {
             if (!strcmp(argv[i]+10, "prompt")) keys_at_prompt = 1;
-            else keys_at = strtoull(argv[i]+10, NULL, 0);
+            else if (parse_u64("--keys-at", argv[i]+10, 0, UINT64_MAX, &keys_at) != 0)
+                return EXIT_INPUT_ERROR;
         }
         else if (!strncmp(argv[i], "--kernel=", 9)) kernel_path = argv[i]+9;
         else if (!strncmp(argv[i], "--initrd=", 9)) initrd_path = argv[i]+9;
@@ -215,10 +384,24 @@ int main(int argc, char **argv) {
          * prefixes first so --sata2-portN cannot fall into --sata2= or
          * --sata=). */
         else if (!strncmp(argv[i], "--sata2-port", 12)) {
+            /* A2: the port digit is parsed strictly.  `atoi("foo") == 0` used
+             * to attach the image to port 0 (silently changing the machine
+             * shape) and an out-of-range port was dropped with exit 0. */
             const char *eq = strchr(argv[i] + 12, '=');
-            int port = atoi(argv[i] + 12);
-            if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
-                sata_cfg[1][port] = eq + 1;
+            char num[16];
+            size_t nl = eq ? (size_t)(eq - (argv[i] + 12)) : strlen(argv[i] + 12);
+            if (!eq || nl == 0 || nl >= sizeof num) {
+                fprintf(stderr, "--sata2-port: expected --sata2-portN=PATH, got '%s'\n", argv[i]);
+                return EXIT_INPUT_ERROR;
+            }
+            memcpy(num, argv[i] + 12, nl); num[nl] = '\0';
+            int port = -1;
+            if (parse_i32("--sata2-portN", num, 0, AHCI_MAX_ATTACH - 1, &port) != 0) {
+                fprintf(stderr, "--sata2-portN: N must be 0..%d (AHCI_MAX_ATTACH-1)\n",
+                        AHCI_MAX_ATTACH - 1);
+                return EXIT_INPUT_ERROR;
+            }
+            sata_cfg[1][port] = eq + 1;
         }
         else if (!strncmp(argv[i], "--sata2=", 8)) sata_cfg[1][0] = argv[i]+8;
         else if (!strcmp(argv[i], "--ahci2")) cfg_ahci2 = 1;
@@ -226,14 +409,33 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--sata-writethrough")) sata_wt = 1;   /* S5 */
         else if (!strncmp(argv[i], "--sata-port", 11)) {
             const char *eq = strchr(argv[i] + 11, '=');
-            int port = atoi(argv[i] + 11);
-            if (eq && port >= 0 && port < AHCI_MAX_ATTACH && port < 64)
-                sata_cfg[0][port] = eq + 1;
+            char num[16];
+            size_t nl = eq ? (size_t)(eq - (argv[i] + 11)) : strlen(argv[i] + 11);
+            if (!eq || nl == 0 || nl >= sizeof num) {
+                fprintf(stderr, "--sata-port: expected --sata-portN=PATH, got '%s'\n", argv[i]);
+                return EXIT_INPUT_ERROR;
+            }
+            memcpy(num, argv[i] + 11, nl); num[nl] = '\0';
+            int port = -1;
+            if (parse_i32("--sata-portN", num, 0, AHCI_MAX_ATTACH - 1, &port) != 0) {
+                fprintf(stderr, "--sata-portN: N must be 0..%d (AHCI_MAX_ATTACH-1)\n",
+                        AHCI_MAX_ATTACH - 1);
+                return EXIT_INPUT_ERROR;
+            }
+            sata_cfg[0][port] = eq + 1;
         }
         else if (!strncmp(argv[i], "--sata=", 7)) sata_cfg[0][0] = argv[i]+7;
         else if (!strncmp(argv[i], "--cdrom=", 8)) cdrom_path = argv[i]+8;   /* S6 */
-        else if (!strncmp(argv[i], "--cpus=", 7)) cfg_cpus = atoi(argv[i]+7);
-        else if (!strncmp(argv[i], "--smp=", 6)) cfg_smp = atoi(argv[i]+6);
+        else if (!strncmp(argv[i], "--cpus=", 7)) {
+            /* A2: was atoi() -- "--cpus=abc" published one CPU silently. */
+            if (parse_i32("--cpus", argv[i]+7, 0, 64, &cfg_cpus) != 0)
+                return EXIT_INPUT_ERROR;
+        }
+        else if (!strncmp(argv[i], "--smp=", 6)) {
+            /* A2: was atoi() -- "--smp=-5" silently meant one vCPU. */
+            if (parse_i32("--smp", argv[i]+6, 0, EM_MAX_VCPU, &cfg_smp) != 0)
+                return EXIT_INPUT_ERROR;
+        }
         else if (!strncmp(argv[i], "--lpc=", 6)) {   /* COMPAT G4 */
             const char *v = argv[i]+6;
             if (!strcmp(v, "ich9")) cfg_lpc_ich9 = 1;
@@ -241,12 +443,20 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "--lpc: expected ich9|pantherpoint, got '%s'\n", v); return EXIT_INPUT_ERROR; }
         }
         else if (!strcmp(argv[i], "--smp-probe")) smp_probe = 1;
-        else if (!strncmp(argv[i], "--watch-phys=", 13))
-            watch_phys = strtoull(argv[i]+13, NULL, 0);
+        else if (!strncmp(argv[i], "--watch-phys=", 13)) {
+            if (parse_u64("--watch-phys", argv[i]+13, 0, UINT64_MAX, &watch_phys) != 0)
+                return EXIT_INPUT_ERROR;
+        }
         else if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strncmp(argv[i], "--trace-file=", 13)) trace_file = argv[i]+13;   /* TOOLING T1 */
-        else if (!strncmp(argv[i], "--trace-from=", 13)) trace_from = strtoull(argv[i]+13, NULL, 0);
-        else if (!strncmp(argv[i], "--trace-count=", 14)) trace_count = strtoull(argv[i]+14, NULL, 0);
+        else if (!strncmp(argv[i], "--trace-from=", 13)) {
+            if (parse_u64("--trace-from", argv[i]+13, 0, UINT64_MAX, &trace_from) != 0)
+                return EXIT_INPUT_ERROR;
+        }
+        else if (!strncmp(argv[i], "--trace-count=", 14)) {
+            if (parse_u64("--trace-count", argv[i]+14, 0, UINT64_MAX, &trace_count) != 0)
+                return EXIT_INPUT_ERROR;
+        }
         else if (!strcmp(argv[i], "--debug")) debug_repl = 1;                         /* TOOLING T2 */
         else if (!strncmp(argv[i], "--debug-script=", 15)) debug_script = argv[i]+15;
         else if (!strncmp(argv[i], "--symbols=", 10)) symbols_path = argv[i]+10;
@@ -333,11 +543,80 @@ int main(int argc, char **argv) {
         fclose(tf);
     }
 
+    /* A3 (audit fix): --vbe is validated HERE, before any machine state
+     * exists.  The old in-place check sat after devices_init_common() and
+     * used a bare sscanf("%dx%dx%d"), which accepts trailing garbage
+     * (measured: `--vbe=800x600x32junk` booted normally). */
+    int vbe_off = 0, vbe_w = 0, vbe_h = 0, vbe_bpp = 0;
+    if (vbe_arg) {
+        if (!strcmp(vbe_arg, "off")) {
+            vbe_off = 1;
+        } else {
+            int consumed = 0;
+            if (sscanf(vbe_arg, "%dx%dx%d%n", &vbe_w, &vbe_h, &vbe_bpp, &consumed) != 3 ||
+                vbe_arg[consumed] != '\0' || vbe_w <= 0 || vbe_h <= 0 || vbe_bpp <= 0) {
+                fprintf(stderr, "--vbe: expected WxHxBPP or off, got '%s'\n", vbe_arg);
+                return EXIT_INPUT_ERROR;
+            }
+            /* the dispi clamps a mode to VRAM (VIDEO V4); an absurd request is
+             * still a user error, not a silently different display. */
+            if (vbe_w > 16384 || vbe_h > 16384 || vbe_bpp > 32) {
+                fprintf(stderr, "--vbe: %dx%dx%d is out of the supported range "
+                                "(W,H <= 16384, BPP <= 32)\n", vbe_w, vbe_h, vbe_bpp);
+                return EXIT_INPUT_ERROR;
+            }
+        }
+    }
+
+    /* A5: --gdb= is a user-input contract, checked before any machine state
+     * exists (see validate_host_port). */
+    if (gdb_spec) {
+        char ghost[128];
+        snprintf(ghost, sizeof ghost, "127.0.0.1");
+        if (validate_host_port("--gdb", gdb_spec, ghost, sizeof ghost) != 0)
+            return EXIT_INPUT_ERROR;
+    }
+
     size_t rom_len = 0;
     uint8_t *rom = NULL;
     if (!kernel_path) {
         rom = read_file(rom_path, &rom_len);
-        if (!rom) return 1;
+        if (!rom) {   /* A1: the reason is in file_err (directory, empty, ...) */
+            fprintf(stderr, "--rom: %s\n", file_err);
+            return EXIT_INPUT_ERROR;
+        }
+        /* A4 (audit fix): the ROM window is ROM_SIZE (128 KiB) and mem_init
+         * right-aligns an image so its LAST byte sits at the reset vector.
+         * An image larger than the window used to be truncated to its FIRST
+         * 128 KiB (mem_init's `n = min(len, ROM_SIZE)`), i.e. the lost half
+         * was the half holding the reset vector.  Measured before the fix:
+         * `--rom=/usr/share/seabios/bios-256k.bin` (262144 bytes) ran into
+         * "#UD group5 ext=7" and exit code 2, while the 128 KiB image of the
+         * same firmware booted (exit 0).  Refuse loudly instead. */
+        if (rom_len > ROM_SIZE) {
+            fprintf(stderr, "--rom: %s is %zu bytes and does not fit the %u-byte "
+                            "ROM window (use a firmware image of at most %u bytes)\n",
+                    rom_path, rom_len, (unsigned)ROM_SIZE, (unsigned)ROM_SIZE);
+            free(rom);
+            return EXIT_INPUT_ERROR;
+        }
+    }
+
+    /* A1: the optional USB-stick image is read here, before the machine is
+     * built.  It is read AFTER the ROM because the ROM checks return early --
+     * keeping the order makes every early return allocation-free (measured:
+     * the first cut leaked this 1 MiB buffer on the --rom error paths, which
+     * the ASan lane reported as `LeakSanitizer: Direct leak of 1048576
+     * byte(s) ... read_file src/main.c`).
+     * An explicitly given `--disk=` that cannot be read is an input error;
+     * the built-in default stays optional, because a tree without
+     * disk/disk.img still boots the firmware (the historical no-media lane). */
+    size_t disk_len = 0;
+    uint8_t *disk = read_file(disk_path, &disk_len);
+    if (!disk && disk_explicit) {
+        fprintf(stderr, "--disk: %s\n", file_err);
+        free(rom);
+        return EXIT_INPUT_ERROR;
     }
 
     int rc = EXIT_OK;
@@ -361,16 +640,9 @@ int main(int argc, char **argv) {
      * through the real dispi io path before the CPU starts; --vbe=off is the
      * client's mode-3-forcing disable.  The display source follows the same
      * documented mode state a guest client's writes produce. */
-    if (vbe_arg) {
-        int vw, vh, vb;
-        if (!strcmp(vbe_arg, "off")) {
-            vbe_mode_disable(m);
-        } else if (sscanf(vbe_arg, "%dx%dx%d", &vw, &vh, &vb) == 3 && vw > 0 && vh > 0) {
-            vbe_mode_set(m, vw, vh, vb);
-        } else {
-            mlog(&m->log, "[vbe] --vbe parse error (want WxHxBPP or off)");
-            return 1;
-        }
+    if (vbe_arg) {   /* A3: the string was validated before the machine existed */
+        if (vbe_off) vbe_mode_disable(m);
+        else         vbe_mode_set(m, vbe_w, vbe_h, vbe_bpp);
     }
     /* NET N0: --tap=host:port attaches the opt-in e1000 with its TAP socket
      * (ground rule 127.0.0.1:8080).  Without the flag no PCI function is
@@ -403,10 +675,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    size_t disk_len = 0;
-    uint8_t *disk = read_file(disk_path, &disk_len);
+    /* A1: the disk image was already read (and validated) before the machine
+     * was built -- see the media block above. */
     if (disk) { m->disk = disk; m->disk_len = disk_len; }
-    else if (!kernel_path) { mlog(&m->log, "[boot] no disk image loaded -- USB mass-storage reads will return nothing"); }
+    else if (!kernel_path) {
+        mlog(&m->log, "[boot] no disk image loaded (%s) -- USB mass-storage reads will return nothing",
+             file_err[0] ? file_err : disk_path);
+    }
 
     /* STORE S1+: attach SATA port images the same way the USB stick gets its
      * backing.  S4: row 1 feeds the --ahci2 controller; bring the second
@@ -424,9 +699,14 @@ int main(int argc, char **argv) {
             size_t len = 0;
             uint8_t *img = read_file(sata_cfg[c][i], &len);
             if (!img) {
-                mlog(&m->log, "[ahci%s] port %d: cannot read %s -- port stays dark",
-                     c ? "2" : "", i, sata_cfg[c][i]);
-                continue;
+                /* A1: an attachment the user named must not become a silently
+                 * dark port -- the guest then boots a machine shape nobody
+                 * asked for (and a snapshot shape check would refuse it much
+                 * later, with a far worse message). */
+                fprintf(stderr, "--sata%s-port%d: %s\n", c ? "2" : "", i, file_err);
+                rc = EXIT_INPUT_ERROR;
+                if (debug_in) { fclose(debug_in); debug_in = NULL; }
+                goto teardown;
             }
             m->sata_img[c][i] = img; m->sata_len[c][i] = len;
             m->sata_kind[c][i] = (uint8_t)sata_kind_cfg[c][i];
@@ -719,6 +999,7 @@ teardown:
 
     /* C10: orderly teardown keeps the ASan/UBSan lane leak-clean. */
     dbg_detach(m);                                  /* TOOLING */
+    cpu_dbg_hooks_close();                          /* A6: close the probe sink */
     devices_done(m);
     pci_done(m);
     mem_done(m);

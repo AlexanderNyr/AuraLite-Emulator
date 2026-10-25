@@ -4,10 +4,20 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror
 CPPFLAGS ?= -Isrc
 
+# A6: the guest-bring-up diagnostics (EMU_DBG_U, AURALITE_IVT_LOG) are a
+# COMPILE-TIME option.  `make DEBUG_HOOKS=1` puts them back; the default
+# release build carries none of their guest-specific constants, no getenv in
+# the interpreter and no /tmp probe path (see src/cpu.c).  The regression
+# vector is tests/test_cli_inputs.py, which greps the shipped binary.
+DEBUG_HOOKS ?= 0
+ifeq ($(DEBUG_HOOKS),1)
+CPPFLAGS += -DAURA_DEBUG_HOOKS=1
+endif
+
 SRC := $(wildcard src/*.c)
 
 .DELETE_ON_ERROR:
-.PHONY: all clean firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
+.PHONY: all clean test-cli test-docs firmware demo test test-unit test-compat test-g3 test-g3-nc test-g5 test-g5-nc test-g5-live test-g6 test-g6-nc test-g6-live test-boot test-table test-fpu test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-virtio-seabios test-msi test-sanitize fuzz test-video-modes test-net-tx test-net-rx test-net-e2e test-tap-responder test-perf bench bench-nc bench-binary test-perf-mem test-perf-mem-nc test-tlb test-tlb-nc test-decode test-decode-nc test-perf-compare test-perf-compare-nc bench-compare test-perf-history test-disasm test-disasm-diff test-trace test-disasm-nc test-dbg test-debug test-dbg-nc test-gdbstub test-gdb test-gdbstub-nc test-snap test-snapshot test-snapshot-nc test-monitor-codec test-monitor test-monitor-nc
 all: x86emu
 
 # PERF P0 bench knobs.  Repetitions must be odd so the median is an actual
@@ -34,6 +44,18 @@ disk/disk.img: disk/test_kernel.bin
 
 demo: x86emu firmware/firmware.bin disk/disk.img
 	./x86emu --platform=haswell --max-instr=200000 --dump-fb=framebuffer.ppm
+
+# A1/A2/A5/A6: the CLI input contract and the "no guest-specific constants in
+# the shipped interpreter" invariant.  Runs against the built binary, so it
+# needs no SeaBIOS and no frozen guest; NASM is only used for the two sample
+# build fixtures the control checks boot (firmware + guest kernel, below).
+test-docs:
+	python3 tests/test_docs.py
+
+test-cli: x86emu firmware/firmware.bin disk/disk.img tests/test_cli_inputs.py
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DAURA_DEBUG_HOOKS=1 $(SRC) -o x86emu-dbg -lm
+	python3 tests/test_cli_inputs.py
+	rm -f x86emu-dbg
 
 test-unit: tests/test_fpu.c tests/test_cpu.c tests/test_usb.c tests/test_video.c tests/test_net.c tests/test_pam.c tests/test_pic.c tests/test_pit.c tests/test_pm.c tests/test_rtc.c tests/test_kbc.c tests/test_serial.c tests/test_chipset.c tests/test_lapic.c tests/test_ioapic.c src/cpu.c src/mem.c src/io.c src/platform.c src/pci.c src/xhci.c src/devices.c src/vga_font.h src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c tests/test_acpi.c src/acpi.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cpu.c src/cpu.c src/mem.c src/io.c src/platform.c src/pic.c src/pit.c src/pm.c src/rtc.c src/kbc.c src/chipset.c src/lapic.c src/ioapic.c -o test-cpu -lm
@@ -401,7 +423,7 @@ test-net-e2e: x86emu tests/nic_net.elf tools/tap_responder.py \
               tests/test_tap_responder.py tests/integration/n3_net_e2e.sh
 	sh tests/integration/n3_net_e2e.sh
 
-test: test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
+test: test-docs test-cli test-unit test-compat test-g3 test-g5 test-g6 test-table test-kload test-fpu-gate test-xhci test-virtio test-virtio-blk test-virtio-net test-msi test-ring3 test-perf test-perf-mem test-tlb test-decode test-perf-compare test-boot test-net-tx test-tap-responder test-net-rx test-net-e2e test-disasm test-disasm-diff test-trace test-dbg test-debug test-gdb test-snap test-snapshot test-monitor-codec test-monitor test-gui test-iso test-virtio-seabios
 
 # VIDEO V3: mode-switch (dispi) + V1 guest lanes, each twice, byte-identical
 test-video-modes: x86emu

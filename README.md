@@ -29,6 +29,20 @@ make
 make firmware/firmware.bin disk/disk.img
 ```
 
+The default build carries no guest-specific diagnostics.  The `K4`-era
+bring-up probes (`EMU_DBG_U=1`: per-instruction RIP watches, the /tmp probe
+sink, the IVT log) are a compile-time option, because their constants and
+comparisons otherwise live in the shipped interpreter:
+
+```sh
+make DEBUG_HOOKS=1        # -DAURA_DEBUG_HOOKS=1: EMU_DBG_U / AURALITE_IVT_LOG work again
+```
+
+With `DEBUG_HOOKS=1`, `EMU_DBG_U_RIPS=<hex[,hex...]>` replaces the built-in
+AuraLite-OS watch list and `EMU_DBG_U_FILE=<path>` replaces the probe sink
+(default `/tmp/k4-probe.txt`).  `make test-cli` greps the release binary to
+keep those strings out of it.
+
 ### Windows 10 / 11 (`build.bat`)
 
 On Windows 10/11 you can build native `x86emu.exe` and `x86dis.exe` binaries with **MinGW-w64 GCC** (MSYS2 / WinLibs) using the POSIX/Winsock2/ELF compatibility layer in `win32/`, or delegate to **WSL2** (see [`docs/WINDOWS.md`](docs/WINDOWS.md) for the full Windows guide):
@@ -97,6 +111,16 @@ unless remote access is intentional.
 ## Run
 
 The emulator returns exit code `0` for a normal stop or instruction-limit stop and exit code `2` when the CPU enters a fault state. Input-file errors return exit code `1`.
+
+That `1` is enforced (audit A1-A5, `tests/test_cli_inputs.py`): every media
+path the CLI is given must be a non-empty regular file and every numeric
+option must parse exactly, so these are all refused before a machine exists
+instead of booting something else -- `--rom=<directory>`, `--rom=<empty
+file>`, `--rom=<image larger than the 128 KiB ROM window>`, an unreadable
+`--disk=`/`--sata*=`/`--cdrom=`, `--max-instr=abc`, `--smp=-5`,
+`--sata-portfoo=img` (which used to attach to port 0), `--vbe=800x600x32junk`
+and a malformed `--gdb=`.  The built-in default `disk/disk.img` stays
+optional, so a tree without it still boots.
 
 The unmodified firmware is useful for observing its actual behaviour and faults:
 
@@ -207,6 +231,8 @@ The focused CPU tests can be run independently:
 
 ```sh
 make test-unit
+make test-cli     # the CLI input contract + the shipped-binary invariant (audit A1-A6)
+make test-docs    # no Cyrillic, architecture docs present, links resolve (audit A7)
 ```
 
 `make test` includes `make test-gui` (both GUI layers: the web launcher
@@ -274,6 +300,13 @@ overrides the gateway MAC, `--dns-ip` / `--dns-ttl` the A record
 published convention but could not be measured here).
 
 ## Architecture
+
+The full architecture — layers, the `machine_t` contract, the CPU core and its
+step pipeline, the chipset and device models, the three boot paths, the
+timebase, the tooling, the invariants that must not move, and an extension
+guide — is in **[`docs/architecture.md`](docs/architecture.md)**, with the
+address layout in **[`docs/memory_map.md`](docs/memory_map.md)**. The short
+version, file by file:
 
 - `src/cpu.c` / `src/cpu.h` — x86/x86-64 interpreter, paging, exceptions/interrupts, P2 translation TLB and P3 prefix/opcode predecode cache.
 - `src/mem.c` / `src/io.c` — physical RAM/ROM/MMIO address space (with Q35 PAM and A20) and 64K I/O port space.

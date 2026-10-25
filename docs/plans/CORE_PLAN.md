@@ -260,7 +260,7 @@ Landing a phase means, in the same patch where applicable:
 
 | Commit | Phase | Adds |
 |---|---|---|
-| `0001` | C0 | this plan, ROADMAP (index), PROJECT_ANALYSIS (audit) |
+| `0001` | C0 | this plan, ROADMAP (index), PROJECT_ANALYSIS (audit; since `0112` that note is `docs/architecture.md`) |
 | `0002` | C1 | `eval_cc`, near-Jcc opcodes 0F 80–8F, rel16, short-Jcc rewire |
 | `0003` | C2 | group2 complete (C0/C1/D0–D3, ROL/ROR/RCL/RCR, flags) |
 | `0004` | C3 | group3 MUL/IMUL/DIV/IDIV, `#DE` |

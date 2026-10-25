@@ -198,5 +198,10 @@ uint32_t cpu_devtick_get(void);
 void     cpu_devtick_set(uint32_t v);
 int      cpu_dbg_knob_resolved(void);   /* lazy EMU_DBG_U lookup done?   */
 void     cpu_dbg_knob_resolve(void);
+/* A6: release the guest-bring-up diagnostic sink (the EMU_DBG_U probe file).
+ * A no-op unless the tree was built with -DAURA_DEBUG_HOOKS=1
+ * (make DEBUG_HOOKS=1).  Called from the harness teardown so the FILE* is
+ * never leaked -- the pre-A6 code opened it lazily and never closed it. */
+void     cpu_dbg_hooks_close(void);
 
 #endif

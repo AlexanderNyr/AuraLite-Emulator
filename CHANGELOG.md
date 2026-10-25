@@ -7,6 +7,151 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Fixed — patch 0112 (AUDIT 2026-10-25: the CLI input contract, and guest diagnostics out of the shipped interpreter)
+
+> One audit pass, one patch: the six defects below share a theme (the harness
+> silently booting a machine nobody asked for) and one regression lane,
+> `tests/test_cli_inputs.py`.  Every entry names the measurement that was
+> taken on the built binary BEFORE the fix.
+
+#### Docs — `PROJECT_ANALYSIS.md` is gone; `docs/architecture.md` replaces it
+
+- **The audit note under the repository root was removed** (patch `0112`). It
+  described the tree at `39f83f9` (2026-10-16) and quoted counts — 16,065 lines
+  of `src/`, `cpu.c` at 2,971 lines, 50 source files — that had been wrong since
+  the VIRTIO/XHCI/CPU_FEATURES phases; the real tree at `f0fc4e7` is 30 `.c` +
+  28 `.h` and 22,177 lines, with `cpu.c` at 4,731. A document that is
+  hand-copied from the code decays silently, and this one had already been
+  contradicted by three separate phases.
+- **`docs/architecture.md` takes its place**, written the way the companion
+  repository documents its own kernel (`AuraLite-OS/docs/architecture.md`):
+  a layers diagram, one section per subsystem with ASCII flow diagrams and
+  tables, explicit invariants, an extension guide ("change this -> gate that"),
+  and a source map whose numbers say which commit they were measured at. It
+  cross-links `STATUS.md` for status and `ROADMAP.md` for plans instead of
+  duplicating them.
+- **`docs/memory_map.md` and `docs/README.md` are new.** The address map
+  (physical regions, I/O ports, the PCI tree with IDs, interrupt routing, and
+  the direct-kernel lane's low-memory layout) was previously scattered across
+  `machine.h`, `kload.h` and the README; `docs/README.md` is the reading-order
+  index plus the documentation conventions (`Closed`, `Receipt`, `SKIP`).
+- **The Cyrillic sweep came back empty.** A UTF-8/byte scan over every tracked
+  file (`.git` excluded) reports **0 of 465 files containing Cyrillic**, which is
+  the post-`0111` state holding: the whole tree is English. Because "nothing to
+  translate" is a claim that can quietly stop being true (one pasted comment is
+  enough), the sweep is now a gate rather than a one-off measurement --
+  `tests/test_docs.py`, lane `make test-docs`, part of `make test`.
+- **`tests/test_docs.py` pins all three documentation claims**: no Cyrillic in
+  any tracked file; `docs/architecture.md` / `docs/memory_map.md` /
+  `docs/README.md` exist and still carry their required sections; every
+  relative link in the four reading-path documents resolves; and no live file
+  references the removed audit note (a mention is allowed only on a line that
+  says it was removed or names its replacement -- `patches/` and the
+  chronological record are exempt, because they record history).
+- References were redirected, not left dangling: `src/cpu.c`'s firmware-agnostic
+  comment now cites `docs/architecture.md`, the CORE_PLAN C0 deliverable row
+  names the replacement, and README's Architecture section opens with the link.
+  The two historical CHANGELOG entries that mention the old file stay as they
+  are — they record what shipped at the time.
+
+#### A6 — the guest-bring-up diagnostics are a compile-time option
+
+- **The shipped interpreter no longer carries AuraLite-OS-specific constants.**
+  `docs/architecture.md` s"What this is" promises a firmware-agnostic core, and three
+  diagnostics from the K4 bring-up broke that promise in every release build:
+  `cpu_step()` compared RIP against three literal kernel addresses
+  (`0xffffffff801907be`, `...7d3`, `0xffffffff80106f85`) once per instruction;
+  `write_mem_v()` -- i.e. every guest store -- range-compared the linear
+  address against `0x7fffefffa000..0x7fffefffc000` and a GS window; the
+  SYSCALL/SYSRET arms wrote a probe file into a **fixed host path**
+  (`/tmp/k4-probe.txt`) from inside the interpreter, with the `FILE*` never
+  closed (one leaked descriptor per machine, on an assumption about /tmp a
+  CPU core has no right to make); and `raise_exception()`/`fetch8()` called
+  `getenv()` on the guest path. None of it was reachable without
+  `EMU_DBG_U=1`, but the constants, the comparisons and the /tmp string
+  shipped -- and the three RIPs are stale the moment that kernel is rebuilt.
+- **The facility is kept, gated at compile time**: `make DEBUG_HOOKS=1`
+  (adds `-DAURA_DEBUG_HOOKS=1`). With the default `DEBUG_HOOKS=0` every
+  `if (dbg_u_on > 0)` site folds away, and the guest watch list moved from
+  three buried literals into one named table (`dbg_u_rips_default`) that
+  `EMU_DBG_U_RIPS` can override with a comma-separated hex list -- so a
+  rebuilt kernel no longer silently stops matching. The probe sink is named
+  by `EMU_DBG_U_FILE` (default unchanged) and `cpu_dbg_hooks_close()` releases
+  it from the harness teardown.
+- **The lazy `getenv("EMU_DBG_U")` resolution is deliberately NOT gated.**
+  `dbg_u_on` flips `-1 -> 0` on the first fetch; that transition is what
+  gates the P3 predecode (`PERF P3`) and is carried in snapshots (TOOLING
+  T4). Pinning it at compile time would change `decode_hits` by one on the
+  first instruction and move every recorded `--stats` receipt, so the
+  compile-time option is a byte-exact no-op for the release path: measured on
+  the reference tape, `executed=4837677 tlb_hits=6738321 tlb_misses=4667
+  decode_hits=4802386` before and after the change.
+- **Regression vector**: `tests/test_cli_inputs.py` (lane `make test-cli`,
+  part of `make test`) greps the shipped binary for `k4-probe`, `[dbg-u]`,
+  `AURALITE_IVT_LOG` and `801907be` and requires all four to be absent, with
+  the `-DAURA_DEBUG_HOOKS=1` build as the positive control that the grep can
+  see them at all. The lane also fails if the release binary stops booting.
+
+#### A1-A5 — the CLI input contract is enforced
+
+- **README s"Run" promises exit code 1 for input-file errors; four measured
+  paths returned 0 or 2 instead.** `read_file()` was
+  `fopen + fseek/ftell + malloc(n) + fread(n)`, and `ftell()` reports 0 for a
+  directory or a character device, so:
+  `--rom=<directory>` and `--rom=<empty file>` produced a 0-byte "ROM", the
+  machine executed the empty flash and reported `[cpu] FAULT: #UD group5
+  ext=7` with **exit 2** (an input error presented as a CPU fault);
+  `--disk=<directory>` and `--disk=/dev/zero` logged a 0-byte disk as
+  attached and ran. `malloc` was unchecked and a short read only warned while
+  returning the partially filled buffer. One strict reader now requires a
+  non-empty regular file, names the reason in `file_err`, and the callers
+  decide: an **explicitly named** `--disk=` / `--sata*=` / `--cdrom=` that
+  cannot be read is an input error (exit 1), while the built-in default
+  `disk/disk.img` stays optional so the historical no-media lane still boots.
+  The ASan/UBSan lane paid for itself here: the first cut read the disk before
+  the ROM checks and leaked that 1 MiB buffer on the new `--rom` error paths
+  (`LeakSanitizer: Direct leak of 1048576 byte(s) ... read_file src/main.c`);
+  the media are read in dependency order now and every early return is
+  allocation-free -- all thirteen new failure paths plus a full boot report
+  zero sanitizer findings, leaks included.
+- **Every numeric option was `strtoull`/`atoi` with a NULL endptr.** Measured:
+  `--max-instr=abc` parsed to 0 and the run **executed zero instructions and
+  exited 0**; `--smp=-5` silently meant one vCPU; `--cpus=abc` published one
+  CPU; `--keys-at=abc` injected keystrokes immediately; `--watch-phys=zzz`
+  watched address 0; `--trace-from/count=abc` became 0. Worst of the set,
+  `--sata-portfoo=img` used `atoi("foo") == 0` and attached the image **to
+  port 0** -- a silent change of machine shape that a snapshot shape check
+  would only refuse much later -- while `--sata-port99=img` was dropped on the
+  floor with exit 0. `parse_u64`/`parse_i32` now accept exactly one number in
+  an explicit range and reject a leading `-` (which `strtoull` wrapped into a
+  huge positive value, producing the nonsense message "18446744073709551615 is
+  outside the accepted range").
+- **`--vbe=`** was validated after the whole machine had been built and with a
+  bare `sscanf("%dx%dx%d")`, so `--vbe=800x600x32junk` booted normally. It is
+  now parsed before any machine state exists, with `%n` requiring the whole
+  string, positive dimensions and the documented bounds (W,H <= 16384,
+  BPP <= 32 -- the dispi still clamps to VRAM per VIDEO V4).
+- **A ROM larger than the ROM window was truncated from the wrong end.**
+  `mem_init()` right-aligns an image so its LAST byte lands on the reset
+  vector, but it copies `min(len, ROM_SIZE)` bytes from the image's START --
+  so an oversized image lost the half that holds the reset vector. Measured:
+  `--rom=/usr/share/seabios/bios-256k.bin` (262144 bytes) ran into
+  `#UD group5 ext=7` and exit 2, while the 128 KiB build of the same SeaBIOS
+  booted (exit 0). The harness now refuses an oversized image with the limit
+  in the message instead of booting a machine nobody asked for.
+- **`--gdb=` degraded silently.** A malformed spec printed a message from
+  inside `gdb_attach()` and then `[gdb] not attached; the run continues
+  without gdb` with exit 0 (`--gdb=abc`, `--gdb=99999`): a scripted lane that
+  asked for a debugger lost it and still reported success. It is now
+  validated up front like `--monitor=` (strict `[host:]port`, port 1..65535,
+  non-empty host); runtime bind/accept failures keep the documented degrade,
+  because those are environment problems rather than input errors.
+- **Regression vector**: `tests/test_cli_inputs.py` -- 64 checks, every
+  rejection paired with a control that must keep working (`--rom=<real>`
+  boots to `GUEST_OK`, `--smp=8`, `--vbe=800x600x32`, `--sata-port5=`,
+  `--keys-at=prompt`, and a tree without `disk/disk.img` still boots), so a
+  "reject everything" implementation cannot pass.
+
 ### Changed — patch 0111 (EN: the whole tree in English, no Cyrillic anywhere)
 
 - **Every line of human text in the repository is now English.**
