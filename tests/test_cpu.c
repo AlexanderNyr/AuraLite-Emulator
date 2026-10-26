@@ -851,6 +851,7 @@ static void test_cpuid_leaves(void) {
         0x66, 0xB8, 0x01, 0x00, 0x00, 0x80,       /* mov eax,0x80000001 */
         0x0F, 0xA2,
         0x66, 0x89, 0x16, 0x28, 0x20,             /* mov [0x2028],edx */
+        0x66, 0x89, 0x0E, 0x30, 0x20,             /* mov [0x2030],ecx */
         0xF4 };
     run_program(&m, prog, sizeof prog, 0, 64);
     assert(!m.cpu.fault);
@@ -874,11 +875,17 @@ static void test_cpuid_leaves(void) {
      * was implemented at CF4 -- before that 0F 01 F9 was an
      * accidental INVLPG) */
     assert(mem_read(&m, 0x2028, 4) == 0x2C100800u);
-    /* CF3+CF4: leaf-1 ECX = SSE3|PCID|POPCNT|HYPERVISOR (the PCID
+    /* CF3+CF4: leaf-1 ECX = SSE3|PCID|CMPXCHG16B|POPCNT|HYPERVISOR (the PCID
      * bit arrived only with the CR4.PCIDE/CR3[63]/INVPCID legality
      * surface; POPCNT's decode arrived at CF4 -- the semantics
-     * vectors live in tests/test_tlb.c + test_cf4_units below) */
-    assert(mem_read(&m, 0x202C, 4) == 0x80820001u);
+     * vectors live in tests/test_tlb.c + test_cf4_units below;
+     * CMPXCHG16B is the D1 bit -- 0F C7 /1 with REX.W is decoded
+     * now, so advertising it is no longer a lie) */
+    assert(mem_read(&m, 0x202C, 4) == 0x80822001u);
+    /* D1: 80000001 ECX bit 0 = LAHF/SAHF in 64-bit mode.  Both opcodes
+     * are decoded now, which is what lets the guest's frame-pointer
+     * probes (and gcc's -fno-omit-frame-pointer epilogues) run. */
+    assert(mem_read(&m, 0x2030, 4) == 0x00000001u);
 
     /* brand string is exactly 48 bytes of text padded with spaces */
     const platform_t *p = platform_by_name("haswell");

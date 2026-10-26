@@ -924,9 +924,16 @@ static void cmd_sregs(machine_t *m, FILE *o, int v) {
         fprintf(o, "%s sel=%04x base=%016llx limit=%08x type=%02x d_b=%d l=%d p=%d\n", segn[i],
                 c->seg[i].sel, (unsigned long long)c->seg[i].base, c->seg[i].limit, c->seg[i].type,
                 c->seg[i].d_b, c->seg[i].l, c->seg[i].present);
-    fprintf(o, "gdtr base=%016llx limit=%04x\nidtr base=%016llx limit=%04x\ntr   base=%016llx limit=%04x\n",
+    /* D1: TR/LDTR now carry the selectors the loads recorded (STR/SLDT
+     * report them, and VERR/VERW/LAR/LSL with TI=1 read through LDTR), so
+     * the state dump has to show them or the debugger is lying about what
+     * the guest's next descriptor access will use. */
+    fprintf(o, "gdtr base=%016llx limit=%04x\nidtr base=%016llx limit=%04x\n"
+               "tr   sel=%04x base=%016llx limit=%04x\n"
+               "ldtr sel=%04x base=%016llx limit=%04x\n",
             (unsigned long long)c->gdtr_base, c->gdtr_limit, (unsigned long long)c->idtr_base, c->idtr_limit,
-            (unsigned long long)c->tr_base, c->tr_limit);
+            c->tr_sel, (unsigned long long)c->tr_base, c->tr_limit,
+            c->ldtr_sel, (unsigned long long)c->ldtr_base, c->ldtr_limit);
     fprintf(o, "kernel_gs_base=%016llx\n", (unsigned long long)c->kgs_base);
 }
 

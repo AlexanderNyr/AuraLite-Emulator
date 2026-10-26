@@ -442,8 +442,28 @@ static void read_descriptor(machine_t *m, uint64_t table_base, uint16_t sel, des
     if (d->g) d->limit = (uint32_t)((d->limit << 12) | 0xFFF);
 }
 
-static void load_seg_from_desc(cpu_t *c, int segidx, uint16_t sel, desc_t *d) {
-    c->seg[segidx].sel = sel;
+/* D1: descriptor fetch with the architectural limit check.  Every selector a
+ * system instruction takes (LLDT/LTR/VERR/VERW/LAR/LSL/pop FS/pop GS) must be
+ * validated against its table limit BEFORE the read: a descriptor past the
+ * limit of a supervisor table is #GP(0) (SDM vol.3A s.3.4.2/s.5.5), while an
+ * unchecked fetch from CPL3 would take the #PF of the table's own page
+ * instead -- the wrong vector, with the wrong error code.  `raw_hi` (may be
+ * NULL) hands back the descriptor's second dword so LAR can rebuild the
+ * access-rights/flags image without a second read.  Returns 0 when the
+ * selector lies outside the table; the caller raises #GP(sel). */
+static int read_descriptor_ck(machine_t *m, uint64_t table_base, uint16_t limit,
+                              uint16_t sel, desc_t *d, uint32_t *raw_hi) {
+    if ((uint64_t)(sel & ~7u) + 7u > (uint64_t)limit) return 0;
+    read_descriptor(m, table_base, sel, d);
+    if (raw_hi) {
+        m->cpu.desc_sv++;
+        *raw_hi = (uint32_t)read_mem_v(m, table_base + (uint64_t)(sel & ~7u) + 4, 4);
+        m->cpu.desc_sv--;
+    }
+    return 1;
+}
+
+static void load_seg_from_desc(cpu_t *c, int segidx, uint16_t sel, desc_t *d) {    c->seg[segidx].sel = sel;
     c->seg[segidx].base = d->base;
     c->seg[segidx].limit = d->limit;
     c->seg[segidx].present = d->present;
@@ -2766,6 +2786,37 @@ really_slow:
         uint8_t op2 = fetch8(&d);
         if (c->fault || c->exception_taken) goto done;   /* K4 fetch abort */
         switch (op2) {
+        /* ---- LAR / LSL (D1): the descriptor-query pair.  Unlike every other
+         * descriptor access in this core, a null selector or a descriptor
+         * outside its table limit is NOT a fault here: the SDM makes the
+         * instruction report failure in ZF and leave the destination
+         * untouched.  Before D1 both opcodes were #UD, so a guest probing its
+         * own GDT (a very common ring-0 diagnostic) faulted instead of
+         * reading it.  TI=1 reads the LDT LLDT cached (D1). ---- */
+        case 0x02: case 0x03: {
+            rm_t rm=MODRM(); FIXUP(rm);
+            uint16_t sel = (uint16_t)rm_read(&d,&rm,2);
+            if (c->fault || c->exception_taken) break;
+            int ok = 0; uint64_t res = 0;
+            if ((sel & ~7u) != 0 && !((sel & 4u) && !c->ldtr_sel)) {
+                uint64_t tbase = (sel & 4u) ? c->ldtr_base  : c->gdtr_base;
+                uint16_t tlim  = (sel & 4u) ? c->ldtr_limit : c->gdtr_limit;
+                desc_t ds; uint32_t raw_hi = 0;
+                if (read_descriptor_ck(m, tbase, tlim, sel, &ds, &raw_hi)) {
+                    ok = 1;
+                    if (op2 == 0x02) {   /* LAR: access rights (7:0) + flags
+                                          * (15:8) = AVL/L/D-B/G and limit[19:16] */
+                        res = ((((raw_hi >> 20) & 0xFu) << 4) | ((raw_hi >> 16) & 0xFu)) << 8;
+                        res |= (raw_hi >> 8) & 0xFFu;
+                    } else {             /* LSL: the granularity-expanded limit */
+                        res = ds.limit;
+                    }
+                }
+            }
+            if (ok) { set_reg(c, rm.reg_field, osz==2?2:4, d.has_rex, res);
+                      c->rflags |= FLAG_ZF; }
+            else    { c->rflags &= ~FLAG_ZF; }
+            break; }
         case 0x05: { /* SYSCALL (K4): ring-3 -> kernel fast call. RCX/R11 take
                       * the return RIP/RFLAGS, CS:EIP load from STAR/LSTAR,
                       * SFMASK masks RFLAGS. Requires EFER.SCE. */
@@ -3658,6 +3709,63 @@ really_slow:
             set_reg(c,rm.reg_field,size,d.has_rex,dst);
             rm_write(&d,&rm,size,sum);
             break; }
+        /* ---- group 9 (D1): 0F C7 /1 = CMPXCHG8B, or CMPXCHG16B under
+         * REX.W.  Both halves of the guest's lock-free 128-bit atomics (and
+         * every compiler's __int128/atomic 16) ride this; before D1 the
+         * whole opcode was #UD.  The compare operand is EDX:EAX (RDX:RAX)
+         * and the replacement ECX:EBX (RCX:RBX); ZF reports success.  The
+         * memory operand is architecturally 16-byte aligned for the wide
+         * form and 8-byte for the narrow one, and a misaligned one is
+         * #GP(0), not #AC (CR0.AM/AC do not gate this instruction).  Every
+         * other /ext stays #UD: /6 and /7 (RDRAND/RDSEED) are not
+         * advertised in CPUID, and /0,/2..5 are reserved here. ---- */
+        case 0xC7: {
+            rm_t rm = MODRM(); FIXUP(rm);
+            int ext = rm.reg_field & 7;
+            int wide = (default_as == 64) && d.rex_w;
+            if (ext != 1 || !rm.is_mem) {
+                faultf(c, "#UD 0F C7 /%d is not an implemented group-9 form",
+                       ext);
+                break;
+            }
+            uint64_t ea = rm_ea(&d, &rm);
+            if (ea & (wide ? 15u : 7u)) {          /* #GP(0): alignment */
+                c->rip = d.start_pc;
+                raise_exception(m, 13, 1, 0);
+                break;
+            }
+            rm_t rm2 = rm; rm2.is_mem = 1; rm2.addr = ea;
+            if (!wide) {
+                uint64_t cmp  = ((uint64_t)(uint32_t)c->gpr[RDX] << 32) | (uint32_t)c->gpr[RAX];
+                uint64_t repl = ((uint64_t)(uint32_t)c->gpr[RCX] << 32) | (uint32_t)c->gpr[RBX];
+                uint64_t mem  = rm_read(&d, &rm2, 8);
+                if (c->fault || c->exception_taken) break;
+                if (mem == cmp) {
+                    rm_write(&d, &rm2, 8, repl);
+                    c->rflags |= FLAG_ZF;
+                } else {
+                    set_reg(c, RAX, 4, 0, (uint32_t)mem);
+                    set_reg(c, RDX, 4, 0, (uint32_t)(mem >> 32));
+                    c->rflags &= ~FLAG_ZF;
+                }
+            } else {
+                rm_t rm_hi = rm2; rm_hi.addr = ea + 8;
+                uint64_t mlo = rm_read(&d, &rm2, 8);
+                if (c->fault || c->exception_taken) break;
+                uint64_t mhi = rm_read(&d, &rm_hi, 8);
+                if (c->fault || c->exception_taken) break;
+                if (mlo == c->gpr[RAX] && mhi == c->gpr[RDX]) {
+                    rm_write(&d, &rm2, 8, c->gpr[RBX]);
+                    if (c->fault || c->exception_taken) break;
+                    rm_write(&d, &rm_hi, 8, c->gpr[RCX]);
+                    c->rflags |= FLAG_ZF;
+                } else {
+                    c->gpr[RAX] = mlo;
+                    c->gpr[RDX] = mhi;
+                    c->rflags &= ~FLAG_ZF;
+                }
+            }
+            break; }
         /* ---- BSWAP r32/r64 (16-bit operand size is per-CPU undefined; we swap 32) ---- */
         case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF: {
             int r = (op2-0xC8) | (d.has_rex ? (d.rex_b<<3) : 0);
@@ -3687,6 +3795,40 @@ really_slow:
          *      tests/toggles) and group 0F BA /4..7 imm8 forms. CF := old
          *      bit; other arithmetic flags are architecturally undefined and
          *      deliberately left untouched (fuzz masks them per class). ---- */
+        /* ---- PUSH/POP FS and GS (D1): the last two segment-register
+         * transfers the core was missing (ES/CS/SS/DS are the one-byte
+         * 06/0E/16/1E/07/17/1F opcodes).  POP loads through the same
+         * descriptor path the one-byte forms use; in 64-bit mode a null
+         * selector clears the segment instead of faulting, which is the
+         * only place those two differ. ---- */
+        case 0xA0: case 0xA8: {   /* PUSH FS / PUSH GS */
+            int sg = (op2 == 0xA0) ? SEG_FS : SEG_GS;
+            do_push(&d, stack_unit(&d), c->seg[sg].sel);
+            break; }
+        case 0xA1: case 0xA9: {   /* POP FS / POP GS */
+            int sg = (op2 == 0xA1) ? SEG_FS : SEG_GS;
+            int ssz = stack_unit(&d);
+            uint16_t sel = (uint16_t)do_pop(&d, ssz);
+            if (c->fault || c->exception_taken) break;
+            if (!(c->cr0 & 1)) {              /* real mode */
+                c->seg[sg].sel = sel; c->seg[sg].base = (uint64_t)sel << 4;
+                c->seg[sg].limit = 0xFFFF;
+            } else if (default_as == 64 && (sel & ~7u) == 0) {
+                c->seg[sg].sel = sel; c->seg[sg].base = 0; c->seg[sg].limit = 0;
+            } else {
+                desc_t ds;
+                if (((sel & 4u) && !c->ldtr_sel) ||
+                    !read_descriptor_ck(m, (sel & 4u) ? c->ldtr_base : c->gdtr_base,
+                                        (sel & 4u) ? c->ldtr_limit : c->gdtr_limit,
+                                        sel, &ds, NULL) ||
+                    !ds.present || !ds.s || (ds.type & 8u)) {
+                    c->rip = d.start_pc;
+                    raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+                    break;
+                }
+                load_seg_from_desc(c, sg, sel, &ds);
+            }
+            break; }
         case 0xA3: case 0xAB: case 0xB3: case 0xBB: {
             int opid = (op2==0xAB)?1 : (op2==0xB3)?2 : (op2==0xBB)?3 : 0; /* 0 BT 1 TS 2 TR 3 TC */
             int bits = osz*8;
@@ -3732,6 +3874,9 @@ really_slow:
             if (ext==7) elem ^=  (1ULL << ib);
             if (ext!=4) rm_write(&d,&rm,osz,elem);
             break; }
+        case 0x08:  /* INVD (D1): invalidate without writeback.  With no
+                     * cache model it is the same coherent no-op as WBINVD,
+                     * and the same privilege gate applies. */
         case 0x09: { /* WBINVD: no data-cache model, so coherent no-op. */
             if ((c->cr0 & 1) && cpl_now(c) != 0) {
                 raise_exception(m, 13, 1, 0); /* #GP(0): privileged instruction */
@@ -3986,26 +4131,107 @@ really_slow:
                      }
                      if (crn==0 || crn==3 || crn==4) perf_tlb_flush(m);
                      break; }
+        /* ---- group 6: SLDT/STR/LLDT/LTR/VERR/VERW (D1).  Before D1 only
+         * LTR and STR existed, SLDT/LLDT/VERR/VERW took a #UD that
+         * docs/architecture.md and the README did not mention (the ISA table
+         * listed "LLDT/LTR/SLDT/STR" as implemented), and STR reported a
+         * hardcoded 0 -- the null selector, indistinguishable from "no task
+         * register".  Only the two *loads* are privileged (SLDT/STR read
+         * state and are legal at any CPL), and every selector they take is
+         * checked against its table limit before the read
+         * (read_descriptor_ck), so a CPL3 attempt on a supervisor GDT takes
+         * #GP(0) rather than the #PF of the table's page.  Segment LIMITS
+         * are still not a protection unit here (documented non-claim), so
+         * LTR validates the descriptor TYPE and presence but does not
+         * enforce the TSS IL. ---- */
         case 0x00: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
                      rm_t rm = decode_modrm(&d, modrm); fixup_riprel(&d,&rm);
-                     if (ext==3) {          /* LTR r/m16 (H6): cache TR, set busy */
-                         uint16_t sel = (uint16_t)rm_read(&d,&rm,2) & ~7u;
-                         /* K2: GDT reads/writes are linear-addressed */
-                         /* K4: descriptor fetch + the busy-bit store are
-                          * CPU-internal supervisor accesses (desc_sv) */
+                     if (ext==0) {          /* SLDT r/m16 */
+                         rm_write(&d,&rm,2, c->ldtr_sel);
+                     } else if (ext==1) {   /* STR r/m16: the selector LTR loaded */
+                         rm_write(&d,&rm,2, c->tr_sel);
+                     } else if (ext==2) {   /* LLDT Ew: cache the LDT descriptor */
+                         if (cpl_now(c) != 0) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         uint16_t sel = (uint16_t)rm_read(&d,&rm,2);
+                         if (c->fault || c->exception_taken) break;
+                         if ((sel & ~7u) == 0) {   /* null selector: LDTR := invalid */
+                             c->ldtr_sel = 0; c->ldtr_base = 0; c->ldtr_limit = 0;
+                             break;
+                         }
+                         desc_t ds;
+                         if ((sel & 4u) ||
+                             !read_descriptor_ck(m, c->gdtr_base, c->gdtr_limit, sel, &ds, NULL) ||
+                             !ds.present || ds.s || ds.type != 2u) {
+                             /* TI must be 0, the descriptor must be a present
+                              * LDT (system, type 2) inside the GDT limit. */
+                             c->rip = d.start_pc;
+                             raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+                             break;
+                         }
+                         c->ldtr_sel = (uint16_t)(sel & ~7u);
+                         c->ldtr_base = ds.base; c->ldtr_limit = ds.limit;
+                     } else if (ext==3) {   /* LTR r/m16 (H6): cache TR, set busy */
+                         if (cpl_now(c) != 0) { c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break; }
+                         uint16_t sel = (uint16_t)rm_read(&d,&rm,2);
+                         if (c->fault || c->exception_taken) break;
+                         if ((sel & ~7u) == 0) {   /* null selector: #GP(0) */
+                             c->rip = d.start_pc; raise_exception(m, 13, 1, 0); break;
+                         }
+                         /* K2: GDT reads/writes are linear-addressed
+                          * K4: descriptor fetch + the busy-bit store are
+                          * CPU-internal supervisor accesses (desc_sv), which
+                          * read_descriptor_ck and the store below keep. */
+                         desc_t ds;
+                         if ((sel & 4u) ||
+                             !read_descriptor_ck(m, c->gdtr_base, c->gdtr_limit, sel, &ds, NULL) ||
+                             !ds.present || ds.s ||
+                             !(ds.type == 1u || ds.type == 3u || ds.type == 9u || ds.type == 11u)) {
+                             /* a present available/busy TSS (types 1/3 for
+                              * 16- and 32-bit, 9/11 for 64-bit).  Busy is
+                              * accepted so a re-load of the live TR (which
+                              * this very instruction marked busy) stays
+                              * legal, as it always was here. */
+                             c->rip = d.start_pc;
+                             raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+                             break;
+                         }
+                         c->tr_sel = (uint16_t)(sel & ~7u);
+                         c->tr_base = ds.base;
+                         c->tr_limit = (uint16_t)ds.limit;
                          m->cpu.desc_sv++;
-                         uint64_t lo = read_mem_v(m, c->gdtr_base + sel, 8);
-                         uint64_t hi32 = read_mem_v(m, c->gdtr_base + sel + 8, 4);
-                         c->tr_base = ((lo >> 16) & 0xFFFFFFULL) |
-                                      (((lo >> 56) & 0xFFULL) << 24) | (hi32 << 32);
-                         c->tr_limit = (uint16_t)(lo & 0xFFFF);
-                         write_mem_v(m, c->gdtr_base + sel + 5, 1,
-                                   (uint8_t)((((lo >> 40) & 0xFFu)) | 0x2)); /* busy */
+                         write_mem_v(m, c->gdtr_base + (sel & ~7u) + 5, 1,
+                                     (uint8_t)(ds.type | 0x2));         /* busy */
                          m->cpu.desc_sv--;
-                     } else if (ext==1) {   /* STR: single fixed TSS, raw selector stored as 0 */
-                         rm_write(&d,&rm,2,0);
+                     } else if (ext==4 || ext==5) {   /* VERR / VERW Ew */
+                         uint16_t sel = (uint16_t)rm_read(&d,&rm,2);
+                         if (c->fault || c->exception_taken) break;
+                         if ((sel & ~7u) == 0) {   /* null: ZF=0, no fault */
+                             c->rflags &= ~FLAG_ZF;
+                             break;
+                         }
+                         uint64_t tbase = (sel & 4u) ? c->ldtr_base  : c->gdtr_base;
+                         uint16_t tlim  = (sel & 4u) ? c->ldtr_limit : c->gdtr_limit;
+                         desc_t ds;
+                         if (((sel & 4u) && !c->ldtr_sel) ||
+                             !read_descriptor_ck(m, tbase, tlim, sel, &ds, NULL)) {
+                             c->rip = d.start_pc;
+                             raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+                             break;
+                         }
+                         int ok = 0;
+                         if (ds.s) {                  /* code or data, not system */
+                             int cpl = cpl_now(c), rpl = sel & 3;
+                             int lim = cpl > rpl ? cpl : rpl;   /* max(CPL,RPL) */
+                             if (ds.type & 8u) {                /* code */
+                                 if (ds.type & 4u) ok = (ds.dpl <= cpl);          /* conforming */
+                                 else ok = (ds.type & 2u) && (ds.dpl >= lim);     /* readable + DPL */
+                             } else {                           /* data */
+                                 ok = (ds.dpl >= lim) && (ext == 4 || (ds.type & 2u));
+                             }
+                         }
+                         if (ok) c->rflags |= FLAG_ZF; else c->rflags &= ~FLAG_ZF;
                      } else {
-                         faultf(c, "#UD unsupported 0F opcode 0x0F 0x00 /%d", ext);
+                         faultf(c, "#UD 0F 00 /%d reserved", ext);
                      }
                      break; }
         case 0x01: { uint8_t modrm = fetch8(&d); int ext=(modrm>>3)&7;
@@ -4483,6 +4709,75 @@ really_slow:
     case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F: {
         int8_t rel = fetch8s(&d);
         if (eval_cc(op & 0xF, c->rflags)) d.pc = (uint64_t)((int64_t)d.pc + rel);
+        break; }
+
+    /* ---- LAHF / SAHF (D1): legal in EVERY mode, 64-bit included (the
+     * CPUID.80000001H:ECX.LAHF-SAHF bit is advertised with them in
+     * platform.c).  SAHF loads SF:ZF:0:AF:0:PF:1:CF from AH; LAHF rebuilds
+     * that byte from RFLAGS with bit 1 set and bits 3/5 clear.  OF, DF, IF,
+     * TF and everything above bit 7 are untouched in both directions.
+     * Before D1 both opcodes were #UD, which is why gcc's frame-pointer
+     * probe (`lahf`/`sahf` pairs and the cpuid-preserving stubs) and the
+     * legacy BIOS `AH`-flag idioms could not run on this core at all. ---- */
+    case 0x9E: {   /* SAHF: AH -> SF ZF AF PF CF */
+        c->rflags = (c->rflags & ~(FLAG_SF|FLAG_ZF|FLAG_AF|FLAG_PF|FLAG_CF))
+                  | ((c->gpr[RAX] >> 8) & (FLAG_SF|FLAG_ZF|FLAG_AF|FLAG_PF|FLAG_CF));
+        break; }
+    case 0x9F: {   /* LAHF: SF ZF AF PF CF -> AH (bit1=1, bits 3/5=0) */
+        uint64_t f = ((c->rflags & 0x00D5u) | 0x02u) << 8;
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFF00ull) | f;
+        break; }
+
+    /* ---- ENTER / LEAVE (D1): legal in every mode, 64-bit included.
+     * ENTER imm16,imm8 pushes RBP, copies `level-1` display pointers when
+     * level > 1 and pushes the frame pointer once more whenever level > 0
+     * (level = imm8 & 0x1F), then makes RBP the new frame and drops RSP by
+     * the frame size.  LEAVE
+     * is its epilogue twin: RSP := RBP, then pop RBP.  gcc emits `leave`
+     * in every frame-pointer epilogue, so its absence was the second half
+     * of why compiled guest code could not run (LAHF/SAHF being the
+     * first). ---- */
+    case 0xC8: {   /* ENTER */
+        int ssz = stack_unit(&d);
+        uint16_t frame = fetch16(&d);
+        int level = fetch8(&d) & 0x1F;
+        if (c->fault || c->exception_taken) break;
+        do_push(&d, ssz, c->gpr[RBP]);
+        if (c->fault || c->exception_taken) break;
+        uint64_t fp = c->gpr[RSP];              /* frame_temp */
+        /* SDM pseudocode: level = 0 skips the display area entirely; for
+         * level >= 1 the processor copies level-1 display pointers and then
+         * ALWAYS pushes frame_temp once more -- at level 1 too, in 16/32-bit
+         * as well as in 64-bit mode (the "only for level > 1" reading is
+         * wrong; measured on hardware, see the D1 differential notes). */
+        for (int i = 1; i < level; i++) {
+            c->gpr[RBP] -= (uint64_t)ssz;
+            do_push(&d, ssz, read_mem_v(m, c->seg[SEG_SS].base + c->gpr[RBP], ssz));
+            if (c->fault || c->exception_taken) goto enter_done;
+        }
+        if (level > 0) do_push(&d, ssz, fp);
+        set_reg(c, RBP, ssz, 0, fp);
+        c->gpr[RSP] -= frame;
+    enter_done:
+        break; }
+    case 0xC9: {   /* LEAVE */
+        int ssz = stack_unit(&d);
+        c->gpr[RSP] = c->gpr[RBP];
+        set_reg(c, RBP, ssz, 0, do_pop(&d, ssz));
+        break; }
+
+    /* ---- XLATB (D1): AL := [DS:BX+AL] (DS overridable, offset masked to
+     * the address size).  The one-byte table-lookup opcode BIOS and
+     * scan-code translation tables use; it was #UD here. ---- */
+    case 0xD7: {
+        int as = d.addrsize;
+        uint64_t off = c->gpr[RBX] + (c->gpr[RAX] & 0xFFu);
+        if (as == 16) off &= 0xFFFFu;
+        else if (as == 32) off &= 0xFFFFFFFFu;
+        int sg = (d.seg_override >= 0) ? d.seg_override : SEG_DS;
+        uint8_t v = (uint8_t)read_mem_v(m, c->seg[sg].base + off, 1);
+        if (c->fault || c->exception_taken) break;
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFull) | v;
         break; }
 
     /* ---- PUSHF / POPF ---- */

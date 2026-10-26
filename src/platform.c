@@ -57,6 +57,9 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
            | (1u<<17)                /* PCID (CPU_FEATURES CF3): the
                                         * CR4.PCIDE/CR3[63] legality and the
                                         * flush-always semantics exist now */
+           | (1u<<13)                /* CMPXCHG16B (D1: 0F C7 /1 with
+                                        * REX.W compares/replaces 16 bytes
+                                        * with its alignment #GP) */
            | (1u<<23)                /* POPCNT (CF4: F3 0F B8 decoded) */
            | (1u<<31);               /* hypervisor present -- we ARE one
                                         * (KERNEL-BOOT K3: the guest's vmdrv
@@ -79,6 +82,10 @@ void platform_cpuid(const platform_t *p, uint32_t leaf, uint32_t subleaf, uint32
     case 0x80000000:
         *a = 0x80000008; break;
     case 0x80000001:
+        *c = (1u<<0);              /* LAHF/SAHF in 64-bit mode (D1: both
+                                    * opcodes are decoded now; before them
+                                    * this bit was 0 and gcc's frame-pointer
+                                    * probe could not run on the core) */
         *d = (1u<<29)              /* long mode supported */
            | (1u<<11)              /* SYSCALL/SYSRET (CF2: exists since K4) */
            | (1u<<20)              /* NX (CF2: walk enforces via EFER.NXE) */

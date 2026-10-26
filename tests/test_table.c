@@ -40,6 +40,7 @@ static const struct { const char *n; uint64_t bit; } FLAGS[] = {
 };
 static const struct { const char *n; int seg; } SEGS[] = {
     {"cs",SEG_CS},{"ds",SEG_DS},{"es",SEG_ES},{"ss",SEG_SS},
+    {"fs",SEG_FS},{"gs",SEG_GS},
 };
 
 static uint64_t rmask(int w) { return w==8 ? ~0ull : ((1ull << (8*w)) - 1); }
@@ -617,6 +618,54 @@ static const vec_t VECTORS[] = {
     V("mov eax,ebx",     "66 89 D8", "ebx=0x00CAFE00", "eax=0x00CAFE00"),
     V("imul eax,ebx ovf","66 0F AF C3", "eax=0x10000,ebx=0x10000", "eax=0,cf=1,of=1"),
     V("cmp eax,0",       "66 83 F8 00", "eax=0", "zf=1"),
+
+    /* -- R: D1 decode-completeness -- LAHF/SAHF/XLAT/ENTER/LEAVE ---------------
+     * Expected values are host-measured (not assumed): see the values the same
+     * instructions produce on real hardware in the D1 differential harness. */
+    V("lahf d5 -> c7",   "9F", "rax=0x1122334455660000,cf=1,pf=1,zf=1,sf=1,af=0", "ah=0xC7"),
+    V("lahf bare",       "9F", "rax=0x112233445566FF00,cf=0,pf=0,zf=0,sf=0,af=0", "ah=0x02"),
+    V("sahf d5",         "9E", "rax=0x112233445566D500,cf=0,pf=0,af=0,zf=0,sf=0,of=1",
+                              "cf=1,pf=1,af=1,zf=1,sf=1,of=1,rax=0x112233445566D500"),
+    V("sahf 00 keeps of", "9E", "rax=0x1122334455660000,cf=1,pf=1,af=1,zf=1,sf=1,of=1",
+                               "cf=0,pf=0,af=0,zf=0,sf=0,of=1"),
+    V("xlatb",           "D7", "bx=0x2100,al=0x05,mb[0x2105]=0x9A", "al=0x9A"),
+    V("xlatb high idx",  "D7", "bx=0x2100,al=0xFF,mb[0x21FF]=0x5A", "al=0x5A"),
+    V("enter level0",    "C8 20 00 00", "sp=0x8000,bp=0x1234", "sp=0x7FDE,bp=0x7FFE"),
+    V("enter level1",    "C8 20 00 01", "sp=0x8000,bp=0x1234", "sp=0x7FDC,bp=0x7FFE"),
+    V("enter level2",    "C8 20 00 02", "sp=0x8000,bp=0x8000", "sp=0x7FDA,bp=0x7FFE"),
+    V("leave",           "C9", "sp=0x8000,bp=0x8000,mw[0x8000]=0x1234", "sp=0x8002,bp=0x1234"),
+
+    /* -- S: D1 system instructions -- SLDT/STR/LLDT/LTR/VERR/LAR/LSL ---------- */
+    V("sldt ax",         "0F 00 C0", "ax=0xFFFF", "ax=0"),
+    V("str ax",          "0F 00 C8", "ax=0xFFFF", "ax=0"),
+    V("lldt null ok",    "0F 00 D0", "ax=0", "ax=0"),
+    /* #GP is delivered through the real-mode IVT, so these vectors point
+     * vector 13 (0x34) at a lone HLT and observe the three-word frame the
+     * delivery pushes (FLAGS,CS,IP) plus the #GP(0) restart semantics. */
+    V("ltr null #gp",    "0F 00 D8",
+      "ax=0,mw[0x34]=0x2000,mw[0x36]=0,mb[0x2000]=0xF4", "sp=0x7FFA,cs=0"),
+    V("verr null zf0",   "0F 00 E0", "ax=0", "zf=0"),
+    V("verw null zf0",   "0F 00 E8", "ax=0", "zf=0"),
+    V("lar null zf0",    "0F 02 CA", "dx=0,cx=0xFFFF", "zf=0,cx=0xFFFF"),
+    V("lsl null zf0",    "0F 03 CA", "dx=0,cx=0xFFFF", "zf=0,cx=0xFFFF"),
+    V("0f00 /6 #ud",     "0F 00 F0", "", "fault=1"),
+    V("0f00 /7 #ud",     "0F 00 F8", "", "fault=1"),
+    V("invd decodes",    "0F 08", "", ""),
+
+    /* -- T: D1 segment-register push/pop and CMPXCHG8B ------------------------- */
+    V("push fs",         "0F A0 58", "fs=0x2E", "ax=0x2E"),
+    V("push gs",         "0F A8 58", "gs=0x33", "ax=0x33"),
+    V("cmpxchg8b hit",   "0F C7 0E 00 21",
+      "edx=0x22222222,eax=0x11111111,ebx=0x33333333,ecx=0x44444444,"
+      "mq[0x2100]=0x2222222211111111",
+      "zf=1,mq[0x2100]=0x4444444433333333"),
+    V("cmpxchg8b miss",  "0F C7 0E 00 21",
+      "edx=0x22222222,eax=0x11111111,ebx=0x33333333,ecx=0x44444444,"
+      "mq[0x2100]=0xFEEDFACEDEADBEEF",
+      "zf=0,eax=0xDEADBEEF,edx=0xFEEDFACE,mq[0x2100]=0xFEEDFACEDEADBEEF"),
+    V("cmpxchg8b misalign #gp", "0F C7 0E 01 21",
+      "mw[0x34]=0x2000,mw[0x36]=0,mb[0x2000]=0xF4", "sp=0x7FFA,cs=0"),
+    V("cmpxchg8b reg #ud",      "0F C7 C1", "", "fault=1"),
 };
 
 /* --------------------------------------------------------------- runner -- */
@@ -643,6 +692,6 @@ int main(void) {
         apply_list(&m, v->expect, 0, v->name, NULL);
     }
     printf("table vectors: %zu/%zu ok\n", n, n);
-    assert(n >= 300);
+    assert(n >= 390);
     return 0;
 }

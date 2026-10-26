@@ -158,10 +158,21 @@ reused.
 Implemented: the full firmware/OS integer set (ALU incl. ADC/SBB with carry,
 MOV family, Jcc/CMOVcc/SETcc, shifts/rotates with count masking, MUL/IMUL/
 DIV/IDIV with `#DE`, BT/BTS/BTR/BTC, BSF/BSR/BSWAP, XADD, CMPXCHG, LOOP/JCXZ,
-MOVS/CMPS/SCAS/LODS/STOS + INS/OUTS with REP/REPE/REPNE, IN/OUT), the system
-instructions (MOV CRn/DRn, LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR, LMSW/SMSW,
-CLTS, INVLPG/INVPCID, WBINVD/CLFLUSH, HLT/WAIT, STAC/CLAC), CPUID, RDTSC/
+MOVS/CMPS/SCAS/LODS/STOS + INS/OUTS with REP/REPE/REPNE, IN/OUT, LAHF/SAHF,
+XLATB, ENTER/LEAVE, CMPXCHG8B/CMPXCHG16B), the system instructions (MOV CRn/DRn,
+LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR, LAR/LSL/VERR/VERW, LMSW/SMSW, CLTS,
+INVLPG/INVPCID, WBINVD/INVD/CLFLUSH, HLT/WAIT, STAC/CLAC), the segment-register
+pushes/pops (06/07/0E/16/17/1E/1F and `0F A0/A1/A8/A9` for FS/GS), CPUID, RDTSC/
 RDTSCP, RDMSR/WRMSR, SYSCALL/SYSRET, SWAPGS, POPCNT.
+
+The D1 lane closed the last decode holes that kept compiled guest code from
+running: `LAHF`/`SAHF` (with `CPUID.80000001H.ECX[0]` now advertised) and
+`ENTER`/`LEAVE`, plus `XLATB`, the full `0F 00` group (`SLDT`/`STR` with a real
+task-register selector, `LLDT` caching `LDTR`, `LTR`, `VERR`/`VERW`), `LAR`/
+`LSL`, `INVD`, the FS/GS segment pushes and pops, and `CMPXCHG8B`/`CMPXCHG16B`
+(with `CPUID.1H.ECX[13]` advertised). Each of those has a host-measured
+expectation behind it: the D1 differential ran the same instruction on the host
+CPU and on the core and compared register/flag/memory state byte for byte.
 
 Deliberately partial, and honest about it:
 

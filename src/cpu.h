@@ -71,6 +71,21 @@ typedef struct cpu {
     uint64_t gdtr_base; uint16_t gdtr_limit;
     uint64_t idtr_base; uint16_t idtr_limit;
     uint64_t tr_base;  uint16_t tr_limit;     /* H6: cached by LTR (0F 00 /3) */
+    uint16_t tr_sel;                          /* D1: the selector LTR loaded.
+                                               * STR used to report a hardcoded
+                                               * 0 (the null selector), which a
+                                               * guest cannot tell apart from
+                                               * "no task register". */
+    uint16_t ldtr_sel;                        /* D1: LLDT (0F 00 /2) records the
+                                               * LDT selector, 0 = invalid. */
+    uint64_t ldtr_base; uint16_t ldtr_limit;  /* D1: the LDT descriptor LLDT
+                                               * cached, the TR shape. VERR/VERW
+                                               * and LAR/LSL with TI=1 read
+                                               * through it; no implemented
+                                               * instruction loads a segment
+                                               * *from* the LDT yet (segment
+                                               * limit checks are not a
+                                               * protection unit here). */
 
     msr_entry_t msr[MAX_MSR];
     int msr_count;
