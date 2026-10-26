@@ -698,6 +698,30 @@ static const vec_t VECTORS[] = {
                                         "mw[0x2100]=0xFFFD,zf=1"),
     V("arpl no change",  "63 1E 00 21", "bx=0x0003,mw[0x2100]=0xFFFF",
                                         "mw[0x2100]=0xFFFF,zf=0"),
+
+    /* -- V: D3 LES/LDS far-pointer load and BOUND ------------------------------
+     * Real-address mode: the selector is just shifted (sel << 4), which is
+     * what makes these vectors exact.  The protected-mode descriptor checks
+     * (readable code allowed, DPL rule, null selector clears, table-limit
+     * fault before the register write) are pinned by the host differential in
+     * tests/d3_differential/.  #BR is delivered through a real-mode IVT entry
+     * planted at vector 5 (0x14) and observed as the frame it pushes. */
+    V("les real mode",   "C4 06 00 21", "mw[0x2100]=0x1234,mw[0x2102]=0x00A0",
+                                          "ax=0x1234,es=0x00A0"),
+    V("lds real mode",   "C5 06 00 21", "mw[0x2100]=0x5678,mw[0x2102]=0x00B0",
+                                          "ax=0x5678,ds=0x00B0"),
+    V("les 32-bit form", "66 C4 06 00 21", "md[0x2100]=0x11223344,mw[0x2104]=0x00C0",
+                                            "eax=0x11223344,es=0x00C0"),
+    V("bound in range",  "62 06 00 21", "ax=5,mw[0x2100]=0,mw[0x2102]=10",
+                                          "ax=5"),
+    V("bound 16-bit low","62 06 00 21", "ax=0xFFFB,mw[0x2100]=0xFFFB,mw[0x2102]=5",
+                                          "ax=0xFFFB"),
+    V("bound below #br", "62 06 00 21",
+      "ax=0xFFFF,mw[0x2100]=0,mw[0x2102]=10,mw[0x14]=0x2000,mw[0x16]=0,mb[0x2000]=0xF4",
+      "sp=0x7FFA,cs=0"),
+    V("bound above #br", "62 06 00 21",
+      "ax=11,mw[0x2100]=0,mw[0x2102]=10,mw[0x14]=0x2000,mw[0x16]=0,mb[0x2000]=0xF4",
+      "sp=0x7FFA,cs=0"),
 };
 
 /* --------------------------------------------------------------- runner -- */
@@ -724,6 +748,6 @@ int main(void) {
         apply_list(&m, v->expect, 0, v->name, NULL);
     }
     printf("table vectors: %zu/%zu ok\n", n, n);
-    assert(n >= 410);
+    assert(n >= 420);
     return 0;
 }

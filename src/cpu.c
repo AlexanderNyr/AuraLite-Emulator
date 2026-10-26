@@ -992,6 +992,80 @@ static int stack_unit(dctx_t *d) {
     return (cpu_addr_size(d->c)==64) ? (d->opsize==2 ? 2 : 8) : d->opsize;
 }
 
+/* ---- D3: the one place a selector becomes a segment ----------------------
+ * POP DS/ES/SS, POP FS/GS and LES/LDS all do the same thing, and the SDM's
+ * rules for it are finer than "must be a data segment":
+ *
+ *   - DS/ES/FS/GS accept a data segment OR a READABLE CODE segment; the DPL
+ *     check (max(RPL,CPL) <= DPL) applies to data and non-conforming code
+ *     only.  Measured, not guessed: at CPL3 a `les` of the user *code*
+ *     selector 0x23 succeeds on real hardware, so a data-only check would
+ *     have been wrong;
+ *   - a NULL selector is legal for DS/ES/FS/GS (the register becomes
+ *     unusable) and #GP(0) for SS;
+ *   - SS additionally requires writable data, DPL == CPL and RPL == CPL;
+ *   - the table-limit check happens BEFORE the offset register is written:
+ *     hardware leaves the destination untouched when the selector is past
+ *     the GDT/LDT limit (measured: `les eax,[..]` with 0xFFFF leaves EAX).
+ *
+ * Whatever the checks decide, the segment descriptor is cached with the
+ * selector's RPL in it.  Returns 0 (having raised #GP/#SS) on failure. */
+static int load_seg_sel_checked(machine_t *m, cpu_t *c, dctx_t *d, int sg,
+                                uint16_t sel) {
+    if (!(c->cr0 & 1)) {                     /* real mode: shift, no checks */
+        c->seg[sg].sel = sel;
+        c->seg[sg].base = (uint64_t)sel << 4;
+        c->seg[sg].limit = 0xFFFF;
+        return 1;
+    }
+    if ((sel & ~3u) == 0) {                  /* null selector */
+        if (sg == SEG_SS) {                  /* ... never legal into SS */
+            c->rip = d->start_pc;
+            raise_exception(m, 13, 1, 0);    /* #GP(0) */
+            return 0;
+        }
+        c->seg[sg].sel = sel;
+        c->seg[sg].base = 0;
+        c->seg[sg].limit = 0;
+        c->seg[sg].present = 0;
+        return 1;
+    }
+    desc_t ds;
+    if (((sel & 4u) && !c->ldtr_sel) ||
+        !read_descriptor_ck(m, (sel & 4u) ? c->ldtr_base : c->gdtr_base,
+                            (sel & 4u) ? c->ldtr_limit : c->gdtr_limit,
+                            sel, &ds, NULL)) {
+        c->rip = d->start_pc;
+        raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+        return 0;
+    }
+    int cpl = cpl_now(c), rpl = sel & 3u;
+    int maxpl = cpl > rpl ? cpl : rpl;
+    int ok;
+    if (sg == SEG_SS) {
+        ok = ds.present && ds.s && !(ds.type & 8u) && (ds.type & 2u) &&
+             ds.dpl == cpl && rpl == cpl;
+    } else if (ds.s && !(ds.type & 8u)) {              /* data */
+        ok = ds.dpl >= maxpl;
+    } else if (ds.s && (ds.type & 8u) && (ds.type & 2u)) {  /* readable code */
+        ok = (ds.type & 4u) ? 1 : (ds.dpl >= maxpl);   /* conforming skips DPL */
+    } else {
+        ok = 0;
+    }
+    if (!ok) {
+        c->rip = d->start_pc;
+        raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
+        return 0;
+    }
+    if (!ds.present) {                       /* #SS for DS/ES, per the SDM */
+        c->rip = d->start_pc;
+        raise_exception(m, 12, 1, (uint32_t)(sel & ~3u));
+        return 0;
+    }
+    load_seg_from_desc(c, sg, sel, &ds);
+    return 1;
+}
+
 /* =================== string ops: address-size plumbing ==================== */
 /* MOVS/CMPS/SCAS/LODS/STOS/INS/OUTS (and LOOP/JCXZ) share: an address-size
  * dependent pointer width (SI/DI 16-bit, ESI/EDI 32, RSI/RDI 64), a count
@@ -3830,23 +3904,10 @@ really_slow:
             int ssz = stack_unit(&d);
             uint16_t sel = (uint16_t)do_pop(&d, ssz);
             if (c->fault || c->exception_taken) break;
-            if (!(c->cr0 & 1)) {              /* real mode */
-                c->seg[sg].sel = sel; c->seg[sg].base = (uint64_t)sel << 4;
-                c->seg[sg].limit = 0xFFFF;
-            } else if (default_as == 64 && (sel & ~7u) == 0) {
+            if (default_as == 64 && (sel & ~7u) == 0) {   /* 64-bit pops */
                 c->seg[sg].sel = sel; c->seg[sg].base = 0; c->seg[sg].limit = 0;
             } else {
-                desc_t ds;
-                if (((sel & 4u) && !c->ldtr_sel) ||
-                    !read_descriptor_ck(m, (sel & 4u) ? c->ldtr_base : c->gdtr_base,
-                                        (sel & 4u) ? c->ldtr_limit : c->gdtr_limit,
-                                        sel, &ds, NULL) ||
-                    !ds.present || !ds.s || (ds.type & 8u)) {
-                    c->rip = d.start_pc;
-                    raise_exception(m, 13, 1, (uint32_t)(sel & ~3u));
-                    break;
-                }
-                load_seg_from_desc(c, sg, sel, &ds);
+                load_seg_sel_checked(m, c, &d, sg, sel);
             }
             break; }
         case 0xA3: case 0xAB: case 0xB3: case 0xBB: {
@@ -4527,6 +4588,25 @@ really_slow:
         set_zsp8(c, al);
         break; }
 
+    /* ---- BOUND (D3): #BR (vector 5) when the index leaves [lower, upper] -
+     * a signed compare at the operand size, both bounds read from memory.
+     * The 64-bit row stays #UD (0x62 is an EVEX prefix there). ---- */
+    case 0x62: {
+        if (default_as == 64) { faultf(c, "#UD BOUND in 64-bit mode (0x62 is EVEX)"); break; }
+        rm_t rm = MODRM(); FIXUP(rm);
+        if (!rm.is_mem) { faultf(c, "#UD BOUND needs a memory operand"); break; }
+        uint64_t ea = c->seg[rm.seg].base + rm_ea(&d, &rm);
+        uint64_t lo = read_mem_v(m, ea, osz);
+        if (c->fault || c->exception_taken) break;
+        uint64_t hi = read_mem_v(m, ea + (uint64_t)osz, osz);
+        if (c->fault || c->exception_taken) break;
+        int64_t idx = (osz == 2) ? (int64_t)(int16_t)get_reg(c, rm.reg_field, 2, d.has_rex)
+                                 : (int64_t)(int32_t)get_reg(c, rm.reg_field, 4, d.has_rex);
+        int64_t slo = (osz == 2) ? (int64_t)(int16_t)lo : (int64_t)(int32_t)lo;
+        int64_t shi = (osz == 2) ? (int64_t)(int16_t)hi : (int64_t)(int32_t)hi;
+        if (idx < slo || idx > shi) raise_exception(m, 5, 0, 0);   /* #BR */
+        break; }
+
     /* ---- INC/DEC (32/16-bit short forms; invalid encoding space in 64-bit mode) ---- */
     case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: {
         int r=op-0x40; uint64_t a=get_reg(c,r,osz,0), res=a+1; set_reg(c,r,osz,0,res);
@@ -4561,6 +4641,32 @@ really_slow:
             if (regs[i] != RSP) set_reg(c, regs[i], sz, 0, value);
         }
         break; }
+    /* ---- LES / LDS (D3): far pointer load, legacy modes only -----------
+     * r16/32 := [m], segment := [m + operand size].  The last two far-pointer
+     * consumers the 16-bit world has (DOS extenders, BIOS far calls,
+     * `__far` pointers) and the only remaining #UD among the one-byte
+     * instructions that guests actually execute.  C4/C5 are VEX prefixes in
+     * 64-bit mode, so the long mode rows stay #UD.  The segment goes through
+     * the same validated path as POP Sreg (D3), so a not-present or
+     * system-typed selector raises #GP instead of loading garbage. ---- */
+    case 0xC4: case 0xC5: {
+        if (default_as == 64) { faultf(c, "#UD LES/LDS in 64-bit mode (C4/C5 are VEX)"); break; }
+        int sg = (op == 0xC4) ? SEG_ES : SEG_DS;
+        rm_t rm = MODRM(); FIXUP(rm);
+        if (!rm.is_mem) { faultf(c, "#UD LES/LDS needs a memory operand"); break; }
+        uint64_t ea = c->seg[rm.seg].base + rm_ea(&d, &rm);
+        uint64_t off = read_mem_v(m, ea, osz);
+        if (c->fault || c->exception_taken) break;
+        uint16_t sel = (uint16_t)read_mem_v(m, ea + (uint64_t)osz, 2);
+        if (c->fault || c->exception_taken) break;
+        /* order matters and is measured: the selector checks run FIRST, so a
+         * selector past the GDT limit leaves the destination register
+         * untouched (hardware leaves EAX alone on `les eax,[..]` with 0xFFFF),
+         * while every successful load writes the offset. */
+        if (!load_seg_sel_checked(m, c, &d, sg, sel)) break;
+        set_reg(c, rm.reg_field, osz, d.has_rex, off);
+        break; }
+
     /* PUSH imm: the immediate width follows the operand size (imm16 when
      * osz==2 — the baseline always fetched imm32 and decoded 2 bytes past
      * the instruction, C0 ledger #8), then sign-extends into the stack unit. */
@@ -4929,8 +5035,8 @@ really_slow:
         int s = (op==0x07)?SEG_ES : (op==0x17)?SEG_SS : SEG_DS;
         if (s == SEG_SS) c->intr_delay = 1;
         uint16_t sel = (uint16_t)do_pop(&d, stack_unit(&d));
-        if (!(c->cr0&1)) { c->seg[s].sel = sel; c->seg[s].base = (uint64_t)sel<<4; c->seg[s].limit = 0xFFFF; }
-        else { desc_t dsc; read_descriptor(m, c->gdtr_base, sel, &dsc); load_seg_from_desc(c, s, sel, &dsc); }
+        if (c->fault || c->exception_taken) break;
+        load_seg_sel_checked(m, c, &d, s, sel);   /* D3: validated now */
         break; }
 
     /* ---- CALLF direct ptr16:16/32 (invalid in 64-bit mode) ---- */

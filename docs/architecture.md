@@ -159,12 +159,23 @@ Implemented: the full firmware/OS integer set (ALU incl. ADC/SBB with carry,
 MOV family, Jcc/CMOVcc/SETcc, shifts/rotates with count masking, MUL/IMUL/
 DIV/IDIV with `#DE`, BT/BTS/BTR/BTC, BSF/BSR/BSWAP, XADD, CMPXCHG, LOOP/JCXZ,
 MOVS/CMPS/SCAS/LODS/STOS + INS/OUTS with REP/REPE/REPNE, IN/OUT, LAHF/SAHF,
-XLATB, ENTER/LEAVE, CMPXCHG8B/CMPXCHG16B, DAA/DAS/AAA/AAS/AAM/AAD, ARPL), the
-system instructions (MOV CRn/DRn, LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR,
+XLATB, ENTER/LEAVE, CMPXCHG8B/CMPXCHG16B, DAA/DAS/AAA/AAS/AAM/AAD, ARPL,
+LES/LDS/BOUND), the system instructions (MOV CRn/DRn, LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR,
 LAR/LSL/VERR/VERW, LMSW/SMSW, CLTS,
 INVLPG/INVPCID, WBINVD/INVD/CLFLUSH, HLT/WAIT, STAC/CLAC), the segment-register
 pushes/pops (06/07/0E/16/17/1E/1F and `0F A0/A1/A8/A9` for FS/GS), CPUID, RDTSC/
 RDTSCP, RDMSR/WRMSR, SYSCALL/SYSRET, SWAPGS, POPCNT.
+
+The D3 lane added the last three legacy instructions a 16-bit guest actually
+executes -- `LES`/`LDS` (far-pointer load, `C4`/`C5`) and `BOUND` (`62`, with
+`#BR` on a signed out-of-range index). It also put every selector-to-segment
+load (POP `DS`/`ES`/`SS`, POP `FS`/`GS`, `LES`/`LDS`) on one validated path,
+because the SDM's rules are finer than "must be a data segment": a *readable
+code* segment is legal in `DS`/`ES`/`FS`/`GS` (measured -- `les` of the user
+code selector succeeds at CPL3), a null selector is legal everywhere except
+`SS`, `SS` additionally needs writable data with `DPL == CPL == RPL`, a
+not-present descriptor raises `#SS` rather than `#GP`, and the table-limit
+check happens *before* the offset register is written.
 
 The D2 lane added the legacy decimal-adjust set the 16-bit era is built on --
 `DAA`, `DAS`, `AAA`, `AAS`, `AAM`/`AAD` (with their `#DE` on a zero base) and

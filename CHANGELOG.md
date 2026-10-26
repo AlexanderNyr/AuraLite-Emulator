@@ -7,6 +7,40 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Fixed — patch D3 (LES/LDS/BOUND, and one validated segment-load path)
+
+> The last three legacy instructions a 16-bit guest executes were `#UD`, and
+> the four different places that turned a selector into a segment each had
+> their own idea of what a legal selector is.  One path now, measured against
+> real hardware.
+
+- **`LES`/`LDS` (`C4`/`C5`) were `#UD` in every mode.** Far-pointer load:
+  `r16/32 := [m]`, `seg := [m+osz]`. In 64-bit mode the bytes are VEX prefixes
+  and stay `#UD`.
+- **`BOUND` (`62`) was `#UD`.** Signed compare of the index against the
+  `[lower, upper]` pair, `#BR` (vector 5) when it leaves the window. `62` is an
+  EVEX prefix in 64-bit mode and stays `#UD` there.
+- **`POP DS`/`ES`/`SS` loaded whatever the descriptor slot held**, including a
+  not-present one, and skipped the table-limit check entirely. `POP DS/ES/SS`,
+  `POP FS/GS` and `LES`/`LDS` now share `load_seg_sel_checked()`, which
+  implements the SDM rules the old code approximated: a *readable code*
+  segment is legal in `DS`/`ES`/`FS`/`GS` (measured: at CPL3 `les` of the user
+  code selector `0x23` succeeds), the `max(RPL,CPL) <= DPL` rule applies to
+  data and non-conforming code only, a null selector clears the register and
+  is `#GP(0)` only for `SS`, `SS` needs writable data with `DPL == CPL == RPL`,
+  a not-present descriptor raises `#SS` rather than `#GP`, and the
+  table-limit check runs *before* the offset register is written (measured:
+  `les eax,[..]` with `0xFFFF` leaves `EAX` untouched, with `0000` it writes
+  `EAX` and clears `ES`).
+- **Coverage.** `tests/test_table.c` grows 413 -> 420 vectors (group V).
+  `tests/d3_differential/` adds the host reference: `LES`/`LDS` at CPL3 in
+  i386 compatibility mode against this core in 32-bit protected mode with a
+  Linux-shaped GDT, 10/10 cases identical, including the readable-code, null
+  and past-the-limit selectors. The host's 32-bit `BOUND` is unusable in this
+  sandbox (every attempt dies with `SEGV_MAPERR` at the instruction, in range
+  or not), so `BOUND` is pinned by the SDM rule plus table vectors instead --
+  recorded in `tests/d3_differential/README.md` rather than hidden.
+
 ### Fixed — patch D2 (legacy decimal-adjust set: DAA/DAS/AAA/AAS/AAM/AAD + ARPL)
 
 > Measurement first: `tests/test_table.c` and a one-byte opcode sweep showed
