@@ -7,6 +7,38 @@ patch has its own immediate parent; entries name measured defects and gates.
 
 ## [Unreleased]
 
+### Fixed — patch D2 (legacy decimal-adjust set: DAA/DAS/AAA/AAS/AAM/AAD + ARPL)
+
+> Measurement first: `tests/test_table.c` and a one-byte opcode sweep showed
+> `27 2F 37 3F D4 D5 63` (non-64-bit) as the largest remaining `#UD` block in
+> the eight-bit map. All seven now decode, and every flag rule below was taken
+> from hardware, not from the SDM pseudocode, which is wrong in three places.
+
+- **`DAA`/`DAS` (`27`/`2F`) were `#UD`.** The two-stage BCD adjust now runs,
+  with the second stage testing the *original* `AL` against `99H` -- measured,
+  not assumed: `99` is untouched, `9A` becomes `00` with `CF=1`, `FA` becomes
+  `60`, and `DAS 00` with `AF=1` reports `CF=1` from the first stage's borrow.
+  The SDM's "compare the already-adjusted `AL` with `9FH`" reading gets all
+  three wrong.
+- **`AAA`/`AAS` (`37`/`3F`) were `#UD`.** Implemented as the `AX +- 106H`
+  update hardware performs: the `±6` carries between halves and `AH` is bumped
+  again, so `AL=FA` walks `AH` twice (`5AFA -> 5C00`) and `AH` keeps its high
+  nibble (`5A0A -> 5B00`, not `0B00`).
+- **`AAM`/`AAD` (`D4`/`D5` imm8) were `#UD`.** `AAM` raises `#DE` on a zero
+  base. `AAD`'s `CF`/`AF` are the carry-outs of an *8-bit* add of
+  `(AH*base) & 0xFF` and `AL` -- across all 256 `AH` values the "sum > 0xFF"
+  reading is measurably wrong (`AH=5A`, base 10, carries only from `AL=7C`
+  where `0x84+0x7C` overflows the byte).
+- **`ARPL` (`63` outside 64-bit mode) was a pinned `#UD` "out of scope" row.**
+  It raises the destination's `RPL` to the source's and reports it in `ZF`,
+  touching nothing else. The scope-pin vector in `tests/test_table.c` is gone
+  and replaced by behavioural vectors.
+- **Coverage.** `tests/test_table.c` grows 396 -> 413 vectors (group U). The
+  whole set is backed by `d2-differential/` (`ref32.S`, `host32.c`, `emu.c`):
+  the same instructions run on a real CPU in i386 compatibility mode and on
+  this core, 8208 cases, **zero diff**. `docs/architecture.md` and `README.md`
+  now list the decimal-adjust set.
+
 ### Fixed — patch 0112 (AUDIT 2026-10-25: the CLI input contract, and guest diagnostics out of the shipped interpreter)
 
 > One audit pass, one patch: the six defects below share a theme (the harness

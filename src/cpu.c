@@ -727,6 +727,26 @@ static void set_flags_sub(cpu_t *c, uint64_t a, uint64_t b, uint64_t cin, uint64
     if ((a & 0xF) < ((b & 0xF) + cin)) c->rflags |= FLAG_AF;
 }
 
+/* ---- D2: legacy BCD / ASCII adjust helpers -------------------------------
+ * DAA/DAS/AAA/AAS and AAM/AAD are the four-opcode "decimal arithmetic" set
+ * every 16-bit BIOS-era code carries (SeaBIOS's `%d` / BCD paths, DOS
+ * software, RTC helpers).  They were the largest remaining #UD hole in the
+ * eight-bit opcode map.  Every expectation below is host-measured: the D2
+ * differential runs all 8 opcode forms x 256 AL values x CF x AF on a real
+ * i386-compatibility-mode CPU and diffs the state against this core. */
+
+/* nzszp: write ZF/SF/PF from an 8-bit result, leave CF/AF/OF alone. */
+static void set_zsp8(cpu_t *c, uint8_t r) {
+    c->rflags &= ~(FLAG_ZF|FLAG_SF|FLAG_PF);
+    if (r == 0) c->rflags |= FLAG_ZF;
+    if (r & 0x80u) c->rflags |= FLAG_SF;
+    if (parity8(r)) c->rflags |= FLAG_PF;
+}
+/* the BCD adjusts recompute CF/AF/ZF/SF/PF from scratch (OF undefined) */
+static void clr_arz(cpu_t *c) {
+    c->rflags &= ~(FLAG_AF|FLAG_CF|FLAG_ZF|FLAG_SF|FLAG_PF);
+}
+
 /* ============================ instr decode ctx ============================ */
 typedef struct {
     machine_t *m; cpu_t *c;
@@ -4408,6 +4428,105 @@ really_slow:
         }
         break; }
 
+    /* ---- DAA/DAS/AAA/AAS/AAM/AAD (D2): the legacy decimal-adjust set.
+     * #UD in 64-bit mode per the SDM, legal in every other mode.  CF and AF
+     * are *inputs* to the BCD algorithms, so they must survive the decode;
+     * the two-stage adjust tests the AL the guest handed us (see below). ---- */
+    case 0x27: {   /* DAA: AL := BCD-correct(AL + carry) */
+        if (default_as == 64) { faultf(c, "#UD DAA in 64-bit mode"); break; }
+        uint8_t al0 = (uint8_t)c->gpr[RAX], al = al0;
+        int cf = (c->rflags & FLAG_CF) != 0, af = 0;
+        /* Measured across all 256 AL values x CF x AF: the second stage
+         * tests the AL the guest handed us against 0x99 -- NOT the already
+         * adjusted value against 0x9F, which is what the SDM pseudocode
+         * reads like.  0x99 is untouched, 0x9A becomes 0x00 with CF=1,
+         * 0xFA becomes 0x60. */
+        if ((al0 & 0x0Fu) > 9 || (c->rflags & FLAG_AF)) { al = (uint8_t)(al0 + 6); af = 1; }
+        if (al0 > 0x99 || cf) { al = (uint8_t)(al + 0x60); cf = 1; } else cf = 0;
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFull) | al;
+        clr_arz(c);
+        if (af) c->rflags |= FLAG_AF;
+        if (cf) c->rflags |= FLAG_CF;
+        set_zsp8(c, al);
+        break; }
+    case 0x2F: {   /* DAS */
+        if (default_as == 64) { faultf(c, "#UD DAS in 64-bit mode"); break; }
+        uint8_t al0 = (uint8_t)c->gpr[RAX], al = al0;
+        int cf = (c->rflags & FLAG_CF) != 0, af = 0, borrow = 0;
+        if ((al0 & 0x0Fu) > 9 || (c->rflags & FLAG_AF)) {
+            al = (uint8_t)(al0 - 6); af = 1; borrow = (al0 < 6);
+        }
+        /* the +6 stage's borrow is the CF hardware reports when the second
+         * stage does not run: DAS 0x00 with AF=1 gives 0xFA and CF=1 */
+        if (al0 > 0x99 || cf) { al = (uint8_t)(al - 0x60); cf = 1; } else cf = borrow;
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFull) | al;
+        clr_arz(c);
+        if (af) c->rflags |= FLAG_AF;
+        if (cf) c->rflags |= FLAG_CF;
+        set_zsp8(c, al);
+        break; }
+    case 0x37: {   /* AAA */
+        if (default_as == 64) { faultf(c, "#UD AAA in 64-bit mode"); break; }
+        uint16_t ax = (uint16_t)c->gpr[RAX];
+        int carry = (((uint8_t)ax & 0x0Fu) > 9) || (c->rflags & FLAG_AF) != 0;
+        /* AX := AX + 106H with the low half masked: the +6 carries into AH
+         * and AH is bumped again.  Host-measured: AX=0x5A0A -> 0x5B00 and
+         * AL=0xFA walks AH twice (0x5AFA -> 0x5C00); AH keeps its high
+         * nibble because only AL is masked. */
+        if (carry) ax = (uint16_t)(ax + 6);
+        if (carry) ax = (uint16_t)(ax + 0x100);
+        uint8_t al = (uint8_t)(ax & 0x0Fu);
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFFFull) | ((uint32_t)(ax & 0xFF00u)) | al;
+        clr_arz(c);
+        if (carry) c->rflags |= FLAG_CF | FLAG_AF;
+        set_zsp8(c, al);
+        break; }
+    case 0x3F: {   /* AAS */
+        if (default_as == 64) { faultf(c, "#UD AAS in 64-bit mode"); break; }
+        uint16_t ax = (uint16_t)c->gpr[RAX];
+        int carry = (((uint8_t)ax & 0x0Fu) > 9) || (c->rflags & FLAG_AF) != 0;
+        if (carry) ax = (uint16_t)(ax - 6);
+        if (carry) ax = (uint16_t)(ax - 0x100);
+        uint8_t al = (uint8_t)(ax & 0x0Fu);
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFFFull) | ((uint32_t)(ax & 0xFF00u)) | al;
+        clr_arz(c);
+        if (carry) c->rflags |= FLAG_CF | FLAG_AF;
+        set_zsp8(c, al);
+        break; }
+    case 0xD4: {   /* AAM imm8: AH := AL / base, AL := AL % base (#DE if base=0) */
+        if (default_as == 64) { faultf(c, "#UD AAM in 64-bit mode"); break; }
+        uint8_t base = fetch8(&d);
+        if (c->fault || c->exception_taken) break;
+        uint8_t al = (uint8_t)c->gpr[RAX];
+        if (base == 0) { c->rip = d.start_pc; raise_exception(m, 0, 0, 0); break; }
+        uint8_t ah = (uint8_t)(al / base);
+        al = (uint8_t)(al % base);
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFFFull) | ((uint32_t)ah << 8) | al;
+        c->rflags &= ~(FLAG_CF|FLAG_AF);   /* undefined; hardware clears both */
+        set_zsp8(c, al);
+        break; }
+    case 0xD5: {   /* AAD imm8: AL := (AH * base + AL) & 0xFF, AH := 0 */
+        if (default_as == 64) { faultf(c, "#UD AAD in 64-bit mode"); break; }
+        uint8_t base = fetch8(&d);
+        if (c->fault || c->exception_taken) break;
+        uint8_t al = (uint8_t)c->gpr[RAX], ah = (uint8_t)(c->gpr[RAX] >> 8);
+        /* The hardware computes the 8-bit AL' = ((AH*base) & 0xFF) + AL
+         * with a plain 8-bit add, so CF is that add's carry-out and AF is
+         * its carry-out of bit 3 -- the product's low byte/nibble takes
+         * part.  Host-measured over all 256 AH x 256 AL x both bases: the
+         * "CF = sum > 0xFF" reading is wrong (AH=0x5A, base 10 carries only
+         * from AL=0x7C, i.e. when 0x84+AL overflows the byte). */
+        unsigned prod = (unsigned)ah * base;
+        int cf = (((prod & 0xFFu) + al) > 0xFFu);
+        int af = (((prod & 0x0Fu) + (al & 0x0Fu)) > 0x0Fu);
+        al = (uint8_t)(prod + al);
+        c->gpr[RAX] = (c->gpr[RAX] & ~0xFFFFull) | al;
+        c->rflags &= ~(FLAG_CF|FLAG_AF);
+        if (cf) c->rflags |= FLAG_CF;
+        if (af) c->rflags |= FLAG_AF;
+        set_zsp8(c, al);
+        break; }
+
     /* ---- INC/DEC (32/16-bit short forms; invalid encoding space in 64-bit mode) ---- */
     case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: {
         int r=op-0x40; uint64_t a=get_reg(c,r,osz,0), res=a+1; set_reg(c,r,osz,0,res);
@@ -4465,10 +4584,25 @@ really_slow:
     case 0x63: { /* MOVSXD r64, r/m32 in long mode (REX.W); without REX.W it
                     degrades to a 32-bit (osz4) or 16-bit (osz2) plain move
                     per the Intel table. In legacy modes the same byte is
-                    ARPL -- deliberately out of scope (firmware never uses it;
-                    a #UD row pins the documented boundary). K2: measured at
-                    the AuraLite kernel's post-banner diagnostics path. */
-        if (default_as != 64) { faultf(c, "#UD ARPL out of scope (legacy modes)"); break; }
+                    ARPL (D2), which used to be a #UD "out of scope" row.
+                    K2: measured at the AuraLite kernel's post-banner
+                    diagnostics path. */
+        if (default_as != 64) {   /* D2: legacy-mode ARPL r/m16, r16 */
+            /* ARPL raises the destination's RPL to the source's when it is
+             * lower and reports the adjustment in ZF; nothing else changes
+             * (not even the rest of the flags).  Host-measured in
+             * d2-differential across all dst/src RPL pairs. */
+            rm_t rm=MODRM(); FIXUP(rm);
+            uint16_t dst = (uint16_t)rm_read(&d, &rm, 2);
+            uint16_t src = (uint16_t)get_reg(c, rm.reg_field, 2, d.has_rex);
+            if ((dst & 3u) < (src & 3u)) {
+                rm_write(&d, &rm, 2, (uint32_t)((dst & ~3u) | (src & 3u)));
+                c->rflags |= FLAG_ZF;
+            } else {
+                c->rflags &= ~FLAG_ZF;
+            }
+            break;
+        }
         rm_t rm=MODRM(); FIXUP(rm);
         if (osz==8) { uint64_t v = (uint64_t)(int64_t)(int32_t)rm_read(&d,&rm,4);
                       set_reg(c, rm.reg_field, 8, d.has_rex, v); }

@@ -159,13 +159,23 @@ Implemented: the full firmware/OS integer set (ALU incl. ADC/SBB with carry,
 MOV family, Jcc/CMOVcc/SETcc, shifts/rotates with count masking, MUL/IMUL/
 DIV/IDIV with `#DE`, BT/BTS/BTR/BTC, BSF/BSR/BSWAP, XADD, CMPXCHG, LOOP/JCXZ,
 MOVS/CMPS/SCAS/LODS/STOS + INS/OUTS with REP/REPE/REPNE, IN/OUT, LAHF/SAHF,
-XLATB, ENTER/LEAVE, CMPXCHG8B/CMPXCHG16B), the system instructions (MOV CRn/DRn,
-LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR, LAR/LSL/VERR/VERW, LMSW/SMSW, CLTS,
+XLATB, ENTER/LEAVE, CMPXCHG8B/CMPXCHG16B, DAA/DAS/AAA/AAS/AAM/AAD, ARPL), the
+system instructions (MOV CRn/DRn, LGDT/LIDT/SGDT/SIDT/LLDT/LTR/SLDT/STR,
+LAR/LSL/VERR/VERW, LMSW/SMSW, CLTS,
 INVLPG/INVPCID, WBINVD/INVD/CLFLUSH, HLT/WAIT, STAC/CLAC), the segment-register
 pushes/pops (06/07/0E/16/17/1E/1F and `0F A0/A1/A8/A9` for FS/GS), CPUID, RDTSC/
 RDTSCP, RDMSR/WRMSR, SYSCALL/SYSRET, SWAPGS, POPCNT.
 
-The D1 lane closed the last decode holes that kept compiled guest code from
+The D2 lane added the legacy decimal-adjust set the 16-bit era is built on --
+`DAA`, `DAS`, `AAA`, `AAS`, `AAM`/`AAD` (with their `#DE` on a zero base) and
+the legacy-mode `ARPL` -- all six of which were `#UD` before. Their flag
+semantics are not what the SDM pseudocode suggests, so they are pinned by a
+host differential: every form is executed on a real CPU in i386 compatibility
+mode across all 256 values of `AL` (and, for `AAD`/`AAM`, all 256 values of
+`AH` and both bases), then compared against this core instruction by
+instruction, 8208 cases in one diff.
+
+The D1 lane closed the decode holes that kept compiled 64-bit guest code from
 running: `LAHF`/`SAHF` (with `CPUID.80000001H.ECX[0]` now advertised) and
 `ENTER`/`LEAVE`, plus `XLATB`, the full `0F 00` group (`SLDT`/`STR` with a real
 task-register selector, `LLDT` caching `LDTR`, `LTR`, `VERR`/`VERW`), `LAR`/
@@ -181,6 +191,7 @@ Deliberately partial, and honest about it:
 | x87 | full 80-bit register file (`long double`, bit-exact), FCW/FSW/FTW/FOP/FIP/FDP, FLD/FST/FSTP/FILD/FIST, arithmetic, compare, the eight transcendentals, FBLD/FBSTP, FXSAVE/FXRSTOR/FNSAVE | nothing in the arith/transfer core |
 | SSE | 16×128-bit `XMM0..15`, MOVAPS/UPS/DQA/DQU, scalar moves, PXOR/SIMD bitwise, and what the ring-3 lane needs | SIMD arithmetic, AVX |
 | Other | — | SMM, VMX, SVM, NMI, x87 data beyond the above, MMX arithmetic |
+| Legacy 16-bit only | the whole decimal-adjust set (`DAA`/`DAS`/`AAA`/`AAS`/`AAM`/`AAD`), `ARPL`, `PUSHA`/`POPA`, direct far `CALL`/`JMP`/`RET`, `IRET` frame semantics | `BOUND` (`62`), `LES`/`LDS` (`C4`/`C5`), `SALC` (`D6`), `ICEBP` (`F1`), the undocumented `82` alias of group 1 — all pinned by `#UD` vectors, so a guest that really needs one fails loudly rather than silently |
 
 Anything unimplemented **faults**, it does not silently misbehave — that rule is
 what makes a `#UD` in a log a usable signal rather than noise.

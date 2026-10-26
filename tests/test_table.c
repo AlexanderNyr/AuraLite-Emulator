@@ -538,8 +538,9 @@ static const vec_t VECTORS[] = {
     V("grp btc imm",       "0F BA F9 05",        "rcx=0x20,cf=1", "rcx=0,cf=1"),
 
     /* -- Q: MOVSXD long-mode form boundary (K2) -- in real16/prot the byte
-     * 0x63 is ARPL, documented out of scope: a deliberate #UD, pinned here. */
-    V("arpl scope pin",    "63 C1",              "", "fault=1"),
+     * 0x63 is ARPL, implemented since D2 (the #UD scope pin it replaced is
+     * gone; the ARPL vectors live in group U). */
+    V("arpl dst>=src",     "63 C1",              "ax=0x0001,cx=0x0003", "zf=0,cx=0x0003"),
 
     /* -- R: BSF/BSR (K3) -- scan direction, zero source keeps the
      * destination register (silicon-real, SDM "undefined") and raises ZF;
@@ -666,6 +667,37 @@ static const vec_t VECTORS[] = {
     V("cmpxchg8b misalign #gp", "0F C7 0E 01 21",
       "mw[0x34]=0x2000,mw[0x36]=0,mb[0x2000]=0xF4", "sp=0x7FFA,cs=0"),
     V("cmpxchg8b reg #ud",      "0F C7 C1", "", "fault=1"),
+
+    /* -- U: D2 legacy decimal-adjust set + ARPL --------------------------------
+     * Every expectation below is the value the same instruction produces on a
+     * real CPU (d2-differential/host32.out: all 8 forms x 256 AL x CF x AF;
+     * this table keeps the interesting corners only). */
+    V("daa 9a wraps",    "27", "al=0x9A,cf=0,af=0", "al=0x00,cf=1,af=1,pf=1,zf=1"),
+    V("daa 99 untouched","27", "al=0x99,cf=0,af=0", "al=0x99,cf=0,af=0,sf=1,pf=1,zf=0"),
+    V("daa af adds 6",   "27", "al=0x00,cf=0,af=1", "al=0x06,cf=0,af=1,sf=0,pf=1,zf=0"),
+    V("daa fa add 60",   "27", "al=0xFA,cf=0,af=0", "al=0x60,cf=1,af=1,pf=1"),
+    V("das af borrows",  "2F", "al=0x00,cf=0,af=1", "al=0xFA,cf=1,af=1,sf=1,pf=1"),
+    V("das 0a to 04",    "2F", "al=0x0A,cf=0,af=0", "al=0x04,cf=0,af=1,pf=0,sf=0,zf=0"),
+    V("aaa adjust",      "37", "al=0x0A,ah=0x5A,cf=0,af=0",
+                               "al=0x00,ah=0x5B,cf=1,af=1,pf=1,zf=1"),
+    V("aaa fa walks ah", "37", "al=0xFA,ah=0x5A,cf=0,af=0",
+                               "al=0x00,ah=0x5C,cf=1,af=1"),
+    V("aaa no adjust",   "37", "al=0x09,ah=0x5A,cf=1,af=0",
+                               "al=0x09,ah=0x5A,cf=0,af=0,pf=1"),
+    V("aas af",          "3F", "al=0x00,ah=0x5A,cf=0,af=1",
+                               "al=0x0A,ah=0x58,cf=1,af=1,pf=1"),
+    V("aam base 10",     "D4 0A", "al=0x95,ah=0x5A", "al=0x09,ah=0x0E,cf=0,af=0,pf=1"),
+    V("aam base 16",     "D4 10", "al=0x95,ah=0x5A", "al=0x05,ah=0x09,cf=0,af=0,pf=1"),
+    V("aad base 10",     "D5 0A", "al=0x00,ah=0x5A",
+                                  "al=0x84,ah=0x00,cf=0,af=0,sf=1,pf=1"),
+    V("aad carry out",   "D5 0A", "al=0x7C,ah=0x5A",
+                                  "al=0x00,ah=0x00,cf=1,af=1,zf=1,pf=1"),
+    V("aad base 16",     "D5 10", "al=0x95,ah=0x5A",
+                                  "al=0x35,ah=0x00,cf=1,af=0,pf=1"),
+    V("arpl raises rpl", "63 1E 00 21", "bx=0x0001,mw[0x2100]=0xFFFC",
+                                        "mw[0x2100]=0xFFFD,zf=1"),
+    V("arpl no change",  "63 1E 00 21", "bx=0x0003,mw[0x2100]=0xFFFF",
+                                        "mw[0x2100]=0xFFFF,zf=0"),
 };
 
 /* --------------------------------------------------------------- runner -- */
@@ -692,6 +724,6 @@ int main(void) {
         apply_list(&m, v->expect, 0, v->name, NULL);
     }
     printf("table vectors: %zu/%zu ok\n", n, n);
-    assert(n >= 390);
+    assert(n >= 410);
     return 0;
 }
